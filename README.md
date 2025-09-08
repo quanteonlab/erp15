@@ -178,9 +178,18 @@ Now press (Ctrl-X) to exit
 
 ### STEP 12 install frappe-bench
 
+
     sudo -H pip3 install frappe-bench
     
     bench --version
+
+
+## STEP 12.1 Setup Database Root password
+
+sudo mysql -u root
+ALTER USER 'root'@'localhost' IDENTIFIED BY '1234';
+FLUSH PRIVILEGES;
+EXIT;
     
 ### STEP 13 initilise the frappe bench & install frappe latest version 
 
