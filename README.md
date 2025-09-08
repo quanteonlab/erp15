@@ -25,6 +25,13 @@ The Easy Way: our install script for bench will install all dependencies (e.g. M
 
 New passwords will be created for the ERPNext "Administrator" user, the MariaDB root user, and the frappe user (the script displays the passwords and saves them to ~/frappe_passwords.txt).
 
+---
+
+```
+bench get-app --branch main https://github.com/quanteonlab/erp15
+bench --site dev_site_ab install-app erp15
+
+```
 
 
 ---
@@ -191,16 +198,35 @@ Now press (Ctrl-X) to exit
 Open url http://demo.com:8000 to login 
 
 
-### STEP 15 install ERPNext latest version in bench & site
+### STEP 15 install ERPNext Our Vesion
 
     
+usar la version Nuestra
+
+```
+bench get-app --branch main https://github.com/quanteonlab/erp15
+bench --site dev_site_ab install-app erpnext
+```
+
+Get started
+
+```
+bench use dev_site_ab
+bench start
+```
+
+version official
+```        
     bench get-app erpnext --branch version-15
     ###OR
     bench get-app https://github.com/frappe/erpnext --branch version-15
 
     bench --site demo.com install-app erpnext
-    
+
+
     bench start
+
+```
 ---
 
 MACOS
@@ -213,6 +239,9 @@ rm -rf /usr/local/etc/my.cnf.d
 brew service mariadb@10.11
 brew install libmpdclient
 brew link --force --overwrite mariadb@10.11
+
+bench init frappe-bench --frappe-branch version-15
+
 ```
 
 make sure to create frappe with user/db frappe/frappe123 y tabla 127.0.0.1
@@ -226,6 +255,26 @@ bench new-site dev_site_ab \
   --admin-password 'Admin123!' \
   --db-password 'SiteDBPass123!'
 
+```
+
+usar la version actual
+
+```
+bench get-app --branch main https://github.com/quanteonlab/erp15
+bench --site dev_site_ab install-app erpnext
+```
+
+Get started
+
+```
+bench use dev_site_ab
+bench start
+```
+
+user
+```
+Administrator
+Admin123!
 ```
 
 
