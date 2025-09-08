@@ -201,7 +201,50 @@ Open url http://demo.com:8000 to login
     bench --site demo.com install-app erpnext
     
     bench start
-    
+---
+
+MACOS
+
+install brew
+
+```
+rm -rf /usr/local/var/mysql
+rm -rf /usr/local/etc/my.cnf.d
+brew service mariadb@10.11
+brew install libmpdclient
+brew link --force --overwrite mariadb@10.11
+```
+
+make sure to create frappe with user/db frappe/frappe123 y tabla 127.0.0.1
+
+```
+bench new-site dev_site_ab \
+  --db-type mariadb \
+  --db-host 127.0.0.1 \
+  --mariadb-root-username frappe \
+  --mariadb-root-password 'frappe123' \
+  --admin-password 'Admin123!' \
+  --db-password 'SiteDBPass123!'
+
+```
+
+
+➜  frappe-bench sudo brew services start mariadb            
+Password:
+Error: Formula `mariadb` is not installed.
+➜  frappe-bench brew services start  mariadb@10.11
+
+==> Successfully started `mariadb@10.11` (label: homebrew.mxcl.mariadb@10.11)
+➜  frappe-bench brew services list
+
+Name          Status  User     File
+dbus          none             
+mariadb       none    root     
+mariadb@10.11 started nenewang ~/Library/LaunchAgents/homebrew.mxcl.mariadb@10.11.plist
+postgresql@14 none             
+postgresql@15 none             
+redis         none             
+unbound       none 
     
 
 
