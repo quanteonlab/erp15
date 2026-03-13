@@ -1,0 +1,4 @@
+name,parent_customer_group,is_group
+Retail,All Customer Groups,0
+Wholesale,All Customer Groups,0
+Online,All Customer Groups,0

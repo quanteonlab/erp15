@@ -1,0 +1,4 @@
+title,customer,status,source
+SEED-OPP-001 Campus library supply,CUST-WHOLESALE-001,Open,Direct
+SEED-OPP-002 Monthly stationery contract,CUST-WHOLESALE-002,Open,Website
+SEED-OPP-003 POS bundle upgrade,CUST-ONLINE-001,Open,Campaign

@@ -1,0 +1,4 @@
+subject,raised_by,customer,priority,status,description
+SEED-ISSUE-001 POS sync delay,Administrator,CUST-ONLINE-001,High,Open,Simulate sync lag complaint for offline POS reconnect.
+SEED-ISSUE-002 Wrong stock shown,Administrator,CUST-RETAIL-001,Medium,Open,Customer reported mismatch between shelf and invoice stock.
+SEED-ISSUE-003 Duplicate charge check,Administrator,CUST-RETAIL-002,High,Open,Validate idempotency and no duplicate payment posting.

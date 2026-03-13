@@ -1,0 +1,15 @@
+item_code,price_list,currency,price_list_rate
+SEED-BOOK-001,Standard Selling,ARS,8500
+SEED-BOOK-002,Standard Selling,ARS,12400
+SEED-BOOK-003,Standard Selling,ARS,15900
+SEED-STAT-001,Standard Selling,ARS,1200
+SEED-STAT-002,Standard Selling,ARS,2800
+SEED-STAT-003,Standard Selling,ARS,1950
+SEED-POS-001,Standard Selling,ARS,4300
+SEED-POS-002,Standard Selling,ARS,5100
+SEED-SVC-001,Standard Selling,ARS,22000
+SEED-SVC-002,Standard Selling,ARS,18000
+SEED-RAW-001,Standard Buying,ARS,800
+SEED-RAW-002,Standard Buying,ARS,1200
+SEED-MFG-001,Standard Selling,ARS,9500
+SEED-MFG-002,Standard Selling,ARS,7200

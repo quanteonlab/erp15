@@ -25,3 +25,10 @@ The Easy Way: our install script for bench will install all dependencies (e.g. M
 
 New passwords will be created for the ERPNext "Administrator" user, the MariaDB root user, and the frappe user (the script displays the passwords and saves them to ~/frappe_passwords.txt).
 
+
+### Documentation
+
+Useful:
+- https://deepwiki.com/frappe/erpnext
+- https://deepwiki.com/frappe/frappe
+

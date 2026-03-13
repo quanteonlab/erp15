@@ -1,0 +1,10 @@
+project,subject,status,priority
+SEED-PROJ-001 Library System Rollout,Requirements Gathering,Completed,High
+SEED-PROJ-001 Library System Rollout,System Configuration,Open,High
+SEED-PROJ-001 Library System Rollout,User Acceptance Testing,Open,Medium
+SEED-PROJ-002 POS Deployment Phase 1,Hardware Setup,Completed,High
+SEED-PROJ-002 POS Deployment Phase 1,Software Installation,Open,High
+SEED-PROJ-003 Staff Training Program,Training Material Preparation,Completed,Medium
+SEED-PROJ-003 Staff Training Program,Delivery of Training,Completed,High
+SEED-PROJ-004 Inventory Optimization,Stock Audit,Open,Low
+SEED-PROJ-004 Inventory Optimization,Reorder Point Review,Open,Medium

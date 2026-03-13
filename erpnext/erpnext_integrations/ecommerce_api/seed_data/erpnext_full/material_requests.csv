@@ -1,0 +1,6 @@
+seed_key,item_code,qty,warehouse,purpose
+SEED-MR-001,SEED-BOOK-001,50,Stores - L,Purchase
+SEED-MR-002,SEED-STAT-001,100,Stores - L,Purchase
+SEED-MR-003,SEED-POS-001,10,Stores - L,Purchase
+SEED-MR-004,SEED-RAW-001,200,Stores - L,Manufacture
+SEED-MR-005,SEED-RAW-002,150,Stores - L,Manufacture

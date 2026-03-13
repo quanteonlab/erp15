@@ -1,0 +1,15 @@
+item_code,item_name,item_group,is_stock_item,disabled,stock_uom,barcode,description
+SEED-BOOK-001,Seed Book Basic,Books,1,0,Nos,7791000000011,Seeded catalog item
+SEED-BOOK-002,Seed Book Advanced,Books,1,0,Nos,7791000000012,Seeded catalog item
+SEED-BOOK-003,Seed Book Premium,Books,1,0,Nos,,Seeded catalog item
+SEED-STAT-001,Seed Pen Blue,Stationery,1,0,Nos,7791000000021,Seeded catalog item
+SEED-STAT-002,Seed Notebook A5,Stationery,1,0,Nos,,Seeded catalog item
+SEED-STAT-003,Seed Marker Black,Stationery,1,0,Nos,,Seeded catalog item
+SEED-POS-001,Seed Barcode Roll 58mm,POS Supplies,1,0,Nos,,Seeded POS consumable
+SEED-POS-002,Seed Receipt Paper 80mm,POS Supplies,1,0,Nos,,Seeded POS consumable
+SEED-SVC-001,Seed Installation Service,Services,0,0,Nos,,Seeded service item
+SEED-SVC-002,Seed Support Subscription,Services,0,0,Nos,,Seeded service item
+SEED-RAW-001,Raw Component Alpha,Raw Materials,1,0,Nos,,Raw material for manufacturing
+SEED-RAW-002,Raw Component Beta,Raw Materials,1,0,Nos,,Raw material for manufacturing
+SEED-MFG-001,Assembled Study Kit,Manufactured Goods,1,0,Nos,,Assembled from raw components
+SEED-MFG-002,Office Bundle Set,Manufactured Goods,1,0,Nos,,Assembled office product bundle

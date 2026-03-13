@@ -1,0 +1,6 @@
+customer_name,customer_group,customer_type,territory
+CUST-RETAIL-001,Retail,Individual,All Territories
+CUST-RETAIL-002,Retail,Individual,All Territories
+CUST-WHOLESALE-001,Wholesale,Company,All Territories
+CUST-WHOLESALE-002,Wholesale,Company,All Territories
+CUST-ONLINE-001,Online,Individual,All Territories

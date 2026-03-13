@@ -1,0 +1,805 @@
+{
+	"info": {
+		"_postman_id": "erpnext-ecommerce-integration",
+		"name": "ERPNext E-Commerce API",
+		"description": "Complete API collection for e-commerce integration with ERPNext",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"auth": {
+		"type": "apikey",
+		"apikey": [
+			{
+				"key": "value",
+				"value": "token {{api_key}}:{{api_secret}}",
+				"type": "string"
+			},
+			{
+				"key": "key",
+				"value": "Authorization",
+				"type": "string"
+			}
+		]
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://127.0.0.1:8002",
+			"type": "string"
+		},
+		{
+			"key": "api_key",
+			"value": "your_api_key",
+			"type": "string"
+		},
+		{
+			"key": "api_secret",
+			"value": "your_api_secret",
+			"type": "string"
+		},
+		{
+			"key": "api_path",
+			"value": "/api/method/erpnext.erpnext_integrations.ecommerce_api.api",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "0. Health Check",
+			"item": [
+				{
+					"name": "Ping API",
+					"request": {
+						"auth": {
+							"type": "noauth"
+						},
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.ping",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.ping"]
+						},
+						"description": "Health check endpoint - no authentication required"
+					}
+				}
+			]
+		},
+		{
+			"name": "1. Products",
+			"item": [
+				{
+					"name": "Get Products",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_products?price_list=Standard Selling&page_length=20",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_products"],
+							"query": [
+								{
+									"key": "price_list",
+									"value": "Standard Selling"
+								},
+								{
+									"key": "page_length",
+									"value": "20"
+								},
+								{
+									"key": "start",
+									"value": "0",
+									"disabled": true
+								},
+								{
+									"key": "search_term",
+									"value": "",
+									"disabled": true
+								},
+								{
+									"key": "item_group",
+									"value": "",
+									"disabled": true
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Get Product Details",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_product?item_code=PROD-001&price_list=Standard Selling",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_product"],
+							"query": [
+								{
+									"key": "item_code",
+									"value": "PROD-001"
+								},
+								{
+									"key": "price_list",
+									"value": "Standard Selling"
+								},
+								{
+									"key": "warehouse",
+									"value": "",
+									"disabled": true
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Search Items",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.search_items?search_term=product&price_list=Standard Selling&limit=20",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.search_items"],
+							"query": [
+								{
+									"key": "search_term",
+									"value": "product"
+								},
+								{
+									"key": "price_list",
+									"value": "Standard Selling"
+								},
+								{
+									"key": "limit",
+									"value": "20"
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Get Item Variants",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_item_variants?item_code=PROD-TEMPLATE",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_item_variants"],
+							"query": [
+								{
+									"key": "item_code",
+									"value": "PROD-TEMPLATE"
+								}
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "2. Inventory",
+			"item": [
+				{
+					"name": "Get Stock Balance",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_stock_balance?item_code=PROD-001",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_stock_balance"],
+							"query": [
+								{
+									"key": "item_code",
+									"value": "PROD-001"
+								},
+								{
+									"key": "warehouse",
+									"value": "",
+									"disabled": true
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Check Stock Availability (Batch)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"items\": [\n    {\"item_code\": \"PROD-001\", \"qty\": 5},\n    {\"item_code\": \"PROD-002\", \"qty\": 10}\n  ],\n  \"warehouse\": \"Main Store\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.check_stock_availability",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.check_stock_availability"]
+						}
+					}
+				},
+				{
+					"name": "Update Stock",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"item_code\": \"PROD-001\",\n  \"warehouse\": \"Main Store\",\n  \"qty\": 100\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.update_stock",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.update_stock"]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "3. Customers",
+			"item": [
+				{
+					"name": "Get Customer by Email",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_customer?email=customer@example.com",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_customer"],
+							"query": [
+								{
+									"key": "email",
+									"value": "customer@example.com"
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Create Customer",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"customer_name\": \"John Doe\",\n  \"email\": \"john@example.com\",\n  \"phone\": \"+1234567890\",\n  \"customer_group\": \"Individual\",\n  \"territory\": \"United States\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.create_customer",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.create_customer"]
+						}
+					}
+				},
+				{
+					"name": "Update Customer",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"customer_name\": \"CUST-00001\",\n  \"default_currency\": \"USD\",\n  \"default_price_list\": \"Standard Selling\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.update_customer",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.update_customer"]
+						}
+					}
+				},
+				{
+					"name": "Create Address",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"customer_name\": \"CUST-00001\",\n  \"address_line1\": \"123 Main St\",\n  \"address_line2\": \"Apt 4B\",\n  \"city\": \"New York\",\n  \"state\": \"NY\",\n  \"pincode\": \"10001\",\n  \"country\": \"United States\",\n  \"address_type\": \"Shipping\",\n  \"phone\": \"+1234567890\",\n  \"is_shipping\": 1\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.create_address",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.create_address"]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "4. Orders",
+			"item": [
+				{
+					"name": "Create Order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"customer\": \"CUST-00001\",\n  \"items\": [\n    {\n      \"item_code\": \"PROD-001\",\n      \"qty\": 2\n    },\n    {\n      \"item_code\": \"PROD-002\",\n      \"qty\": 1\n    }\n  ],\n  \"order_type\": \"Shopping Cart\",\n  \"price_list\": \"Standard Selling\",\n  \"shipping_address\": \"ADDR-00001\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.create_order",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.create_order"]
+						}
+					}
+				},
+				{
+					"name": "Get Order",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_order?order_name=SO-00001",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_order"],
+							"query": [
+								{
+									"key": "order_name",
+									"value": "SO-00001"
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Get Customer Orders",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_customer_orders?customer=CUST-00001&page_length=20",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_customer_orders"],
+							"query": [
+								{
+									"key": "customer",
+									"value": "CUST-00001"
+								},
+								{
+									"key": "page_length",
+									"value": "20"
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Update Order Status",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"order_name\": \"SO-00001\",\n  \"status\": \"Closed\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.update_order_status",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.update_order_status"]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "5. Payments",
+			"item": [
+				{
+					"name": "Create Payment",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"payment_type\": \"Receive\",\n  \"party\": \"CUST-00001\",\n  \"amount\": 337.0,\n  \"payment_method\": \"Credit Card\",\n  \"reference_no\": \"TXN-12345\",\n  \"reference_doctype\": \"Sales Order\",\n  \"reference_name\": \"SO-00001\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.create_payment",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.create_payment"]
+						}
+					}
+				},
+				{
+					"name": "Get Payment Methods",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_payment_methods",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_payment_methods"]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "6. Coupons & Pricing",
+			"item": [
+				{
+					"name": "Validate Coupon",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.validate_coupon?coupon_code=SAVE10&customer=CUST-00001",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.validate_coupon"],
+							"query": [
+								{
+									"key": "coupon_code",
+									"value": "SAVE10"
+								},
+								{
+									"key": "customer",
+									"value": "CUST-00001"
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Apply Coupon to Order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"order_name\": \"SO-00001\",\n  \"coupon_code\": \"SAVE10\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.apply_coupon_to_order",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.apply_coupon_to_order"]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "7. Shipping & Delivery",
+			"item": [
+				{
+					"name": "Create Delivery Note",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"sales_order\": \"SO-00001\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.create_delivery_note",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.create_delivery_note"]
+						}
+					}
+				},
+				{
+					"name": "Update Tracking Info",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"delivery_note\": \"DN-00001\",\n  \"tracking_number\": \"1Z999AA10123456784\",\n  \"carrier\": \"UPS\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.update_tracking_info",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.update_tracking_info"]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "8. Invoices",
+			"item": [
+				{
+					"name": "Create Invoice from Order",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"sales_order\": \"SO-00001\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.create_invoice",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.create_invoice"]
+						}
+					}
+				},
+				{
+					"name": "Get Invoice",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_invoice?invoice_name=SI-00001",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_invoice"],
+							"query": [
+								{
+									"key": "invoice_name",
+									"value": "SI-00001"
+								}
+							]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "9. Shopping Cart",
+			"item": [
+				{
+					"name": "Get Cart",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_cart?session_id=test-session-123",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_cart"],
+							"query": [
+								{
+									"key": "session_id",
+									"value": "test-session-123"
+								},
+								{
+									"key": "customer",
+									"value": "CUST-00001",
+									"disabled": true
+								}
+							]
+						}
+					}
+				},
+				{
+					"name": "Add to Cart",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"item_code\": \"PROD-001\",\n  \"qty\": 2,\n  \"session_id\": \"test-session-123\",\n  \"price_list\": \"Standard Selling\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.add_to_cart",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.add_to_cart"]
+						}
+					}
+				},
+				{
+					"name": "Update Cart Item",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"item_code\": \"PROD-001\",\n  \"qty\": 5,\n  \"session_id\": \"test-session-123\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.update_cart_item",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.update_cart_item"]
+						}
+					}
+				},
+				{
+					"name": "Remove from Cart",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"item_code\": \"PROD-001\",\n  \"session_id\": \"test-session-123\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.remove_from_cart",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.remove_from_cart"]
+						}
+					}
+				},
+				{
+					"name": "Clear Cart",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"session_id\": \"test-session-123\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.clear_cart",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.clear_cart"]
+						}
+					}
+				},
+				{
+					"name": "Checkout Cart",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"session_id\": \"test-session-123\",\n  \"customer\": \"CUST-00001\",\n  \"shipping_address\": \"ADDR-00001\",\n  \"billing_address\": \"ADDR-00001\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.checkout_cart",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.checkout_cart"]
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "10. Utilities",
+			"item": [
+				{
+					"name": "Get Item Groups",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_item_groups",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_item_groups"]
+						}
+					}
+				},
+				{
+					"name": "Get Price Lists",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_price_lists",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_price_lists"]
+						}
+					}
+				},
+				{
+					"name": "Get Warehouses",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_warehouses",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_warehouses"]
+						}
+					}
+				},
+				{
+					"name": "Get Companies",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_companies",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_companies"]
+						}
+					}
+				},
+				{
+					"name": "Get Tax Rates",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{api_path}}.get_tax_rates?country=United States",
+							"host": ["{{base_url}}"],
+							"path": ["{{api_path}}.get_tax_rates"],
+							"query": [
+								{
+									"key": "country",
+									"value": "United States"
+								}
+							]
+						}
+					}
+				}
+			]
+		}
+	]
+}

@@ -1,0 +1,4 @@
+warehouse_name,company,parent_warehouse,is_group
+POSNET Stores,library,,0
+POSNET Reserve,library,,0
+POSNET Returns,library,,0

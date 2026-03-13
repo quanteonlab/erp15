@@ -1,0 +1,5 @@
+project_name,status,start_offset,end_offset
+SEED-PROJ-001 Library System Rollout,Open,-30,60
+SEED-PROJ-002 POS Deployment Phase 1,Open,-15,45
+SEED-PROJ-003 Staff Training Program,Completed,-60,-10
+SEED-PROJ-004 Inventory Optimization,Open,0,90
