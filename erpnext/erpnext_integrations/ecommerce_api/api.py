@@ -8,6 +8,11 @@ All endpoints are whitelisted and can be accessed via:
 """
 
 import frappe
+import csv
+import io
+import os
+import base64
+import zipfile
 from frappe import _
 from frappe.utils import (
 	cint,
@@ -65,6 +70,9 @@ def get_products(
 			"item_name",
 			"description",
 			"item_group",
+			"custom_normalized_title",
+			"custom_variant_group",
+			"custom_pack_qty",
 			"stock_uom",
 			"is_stock_item",
 			"has_variants",
@@ -92,31 +100,32 @@ def get_products(
 	# Default filter: only enabled items
 	filters["disabled"] = 0
 
-	# Search term filter
+	# Item group filter
+	if item_group:
+		filters["item_group"] = item_group
+
+	# Search term: use or_filters so Frappe ORs across fields while ANDing with base filters
+	or_filters = None
 	if search_term:
-		search_filters = [
+		or_filters = [
 			["item_code", "like", f"%{search_term}%"],
 			["item_name", "like", f"%{search_term}%"],
 			["description", "like", f"%{search_term}%"],
 		]
-		filters = [filters, search_filters]
-
-	# Item group filter
-	if item_group:
-		filters["item_group"] = item_group
 
 	# Get items
 	items = frappe.get_list(
 		"Item",
 		filters=filters,
+		or_filters=or_filters,
 		fields=fields,
 		start=start,
 		page_length=page_length,
 		order_by=order_by,
 	)
 
-	# Get total count
-	total_count = frappe.db.count("Item", filters=filters)
+	# Get total count (frappe.db.count doesn't support or_filters — use get_all with fields=["name"])
+	total_count = len(frappe.get_all("Item", filters=filters, or_filters=or_filters, fields=["name"], limit_page_length=0))
 
 	# Add pricing information if price_list provided
 	if price_list:
@@ -137,11 +146,33 @@ def get_products(
 		]
 		total_count = len(items)
 
+	# Attach barcode data in bulk (single query for all items)
+	_attach_barcodes(items)
+
 	return {
 		"items": items,
 		"total_count": total_count,
 		"has_more": (start + page_length) < total_count,
 	}
+
+
+def _attach_barcodes(items):
+	"""Attach barcodes list to each item dict (in-place, single DB query)."""
+	item_codes = [i.get("item_code") for i in items if i.get("item_code")]
+	if not item_codes:
+		return
+	rows = frappe.get_all(
+		"Item Barcode",
+		filters={"parent": ["in", item_codes]},
+		fields=["parent", "barcode", "barcode_type"],
+	)
+	barcode_map = {}
+	for row in rows:
+		barcode_map.setdefault(row.parent, []).append(
+			{"barcode": row.barcode, "barcode_type": row.barcode_type or "CODE128"}
+		)
+	for item in items:
+		item["barcodes"] = barcode_map.get(item.get("item_code"), [])
 
 
 @frappe.whitelist(allow_guest=True)
@@ -213,6 +244,525 @@ def get_product(item_code, price_list=None, warehouse=None, customer=None):
 	] if hasattr(item, "website_image") else []
 
 	return product
+
+
+## ── EAN-13 helpers ──────────────────────────────────────────────────────────
+
+
+def _ean13_check_digit(digits_12: str) -> int:
+	"""Return the EAN-13 check digit for a 12-character numeric string."""
+	total = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(digits_12))
+	return (10 - (total % 10)) % 10
+
+
+def _generate_ean13(sequence_num: int) -> str:
+	"""
+	Build an EAN-13 barcode for internal use.
+	Format: 200 (GS1 private-use prefix) + 9-digit zero-padded sequence + check digit.
+	Supports up to 999,999,999 unique products.
+	"""
+	body = str(sequence_num).zfill(9)
+	digits_12 = "200" + body
+	return digits_12 + str(_ean13_check_digit(digits_12))
+
+
+def _next_internal_ean13_seq() -> int:
+	"""Return the next available sequence number for internal EAN-13 barcodes."""
+	row = frappe.db.sql(
+		"SELECT MAX(CAST(SUBSTRING(barcode, 4, 9) AS UNSIGNED)) "
+		"FROM `tabItem Barcode` WHERE barcode REGEXP '^200[0-9]{10}$'",
+	)
+	last = row[0][0] if row and row[0][0] else 0
+	return int(last) + 1
+
+
+@frappe.whitelist()
+def assign_item_barcode(item_code):
+	"""
+	Assign an EAN-13 barcode to an item if it does not already have one.
+	Stores the barcode in the Item Barcode child table with type EAN.
+	Returns the barcode value (existing or newly created).
+	"""
+	existing = frappe.db.get_value("Item Barcode", {"parent": item_code}, "barcode")
+	if existing:
+		return {"barcode": existing, "created": False}
+
+	seq = _next_internal_ean13_seq()
+	barcode = _generate_ean13(seq)
+
+	item = frappe.get_doc("Item", item_code)
+	item.append("barcodes", {"barcode": barcode, "barcode_type": "EAN"})
+	item.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return {"barcode": barcode, "created": True}
+
+
+@frappe.whitelist()
+def assign_barcodes_to_all_items():
+	"""
+	Bulk-assign EAN-13 barcodes to every enabled item that has no barcode yet.
+	Returns {assigned: N, items: [{item_code, barcode}]}.
+	"""
+	items_without = frappe.db.sql(
+		"""
+		SELECT item_code FROM `tabItem`
+		WHERE disabled = 0
+		  AND item_code NOT IN (SELECT DISTINCT parent FROM `tabItem Barcode`)
+		ORDER BY item_code
+		""",
+		as_dict=True,
+	)
+
+	assigned = []
+	for row in items_without:
+		seq = _next_internal_ean13_seq()
+		barcode = _generate_ean13(seq)
+		item = frappe.get_doc("Item", row.item_code)
+		item.append("barcodes", {"barcode": barcode, "barcode_type": "EAN"})
+		item.save(ignore_permissions=True)
+		assigned.append({"item_code": row.item_code, "barcode": barcode})
+
+	if assigned:
+		frappe.db.commit()
+
+	return {"assigned": len(assigned), "items": assigned}
+
+
+@frappe.whitelist(allow_guest=True)
+def search_by_barcode(barcode, price_list=None):
+	"""
+	Find a product by barcode value.
+	Falls back to matching item_code directly if no Item Barcode record exists.
+
+	Returns the same structure as get_product().
+	"""
+	item_code = frappe.db.get_value("Item Barcode", {"barcode": barcode}, "parent")
+	if not item_code:
+		# Try direct item_code match (useful when item_code IS the barcode)
+		if frappe.db.exists("Item", barcode):
+			item_code = barcode
+	if not item_code:
+		frappe.throw(_("No item found for barcode: {0}").format(barcode), frappe.DoesNotExistError)
+	return get_product(item_code, price_list=price_list)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_items_for_label_print(price_list=None, item_codes=None):
+	"""
+	Return all active items with their barcodes and prices for bulk label printing.
+
+	Args:
+		price_list (str): Price list to fetch prices from.
+		item_codes (str|list): Optional JSON list of specific item codes to fetch.
+
+	Returns:
+		list[dict]: Items with {item_code, item_name, price_list_rate, barcodes}
+	"""
+	import json
+	filters = {"disabled": 0}
+	if item_codes:
+		if isinstance(item_codes, str):
+			item_codes = json.loads(item_codes)
+		filters["item_code"] = ["in", item_codes]
+
+	items = frappe.get_all(
+		"Item",
+		filters=filters,
+		fields=["item_code", "item_name", "image"],
+		order_by="item_name asc",
+	)
+
+	if price_list:
+		for item in items:
+			item["price_list_rate"] = get_item_price(item.item_code, price_list)
+
+	_attach_barcodes(items)
+	return items
+
+
+@frappe.whitelist(allow_guest=True)
+def get_item_groups():
+	"""Return item groups with parent metadata for category navigation."""
+	return frappe.get_all(
+		"Item Group",
+		filters={"is_group": 0},
+		fields=["name", "item_group_name", "parent_item_group", "is_group"],
+		order_by="parent_item_group asc, name asc",
+	)
+
+
+# ── Promotions ────────────────────────────────────────────────────────────────
+
+
+@frappe.whitelist(allow_guest=True)
+def get_active_promotions(price_list=None):
+	"""
+	Return all currently active, selling-side Pricing Rules with child-table data
+	(applicable_items, applicable_groups, applicable_brands) attached.
+	Called once on POS load; the client caches results for 5 minutes (or 1 minute
+	if any time-based promotions exist).
+
+	Custom scheduling fields (happy_hour_from, happy_hour_to, applicable_days,
+	flash_sale) are included when present on the Pricing Rule doctype.
+	"""
+	today = nowdate()
+
+	# Detect which custom scheduling fields have been added to Pricing Rule
+	has_time_fields = frappe.db.has_column("Pricing Rule", "happy_hour_from")
+	has_days_field  = frappe.db.has_column("Pricing Rule", "applicable_days")
+	has_flash_field = frappe.db.has_column("Pricing Rule", "flash_sale")
+
+	base_fields = [
+		"name", "title", "apply_on", "price_or_product_discount",
+		"min_qty", "max_qty", "min_amt", "max_amt",
+		"valid_from", "valid_upto",
+		"rate_or_discount", "discount_percentage", "discount_amount", "rate",
+		"same_item", "free_item", "free_qty", "free_item_rate",
+		"is_recursive", "recurse_for",
+		"threshold_percentage", "rule_description",
+	]
+	if has_time_fields:
+		base_fields += ["happy_hour_from", "happy_hour_to"]
+	if has_days_field:
+		base_fields += ["applicable_days"]
+	if has_flash_field:
+		base_fields += ["flash_sale"]
+
+	rules = frappe.get_all(
+		"Pricing Rule",
+		filters={"disable": 0, "selling": 1},
+		fields=base_fields,
+	)
+
+	# Filter by date validity
+	rules = [
+		r for r in rules
+		if (not r.get("valid_from") or getdate(r["valid_from"]) <= getdate(today))
+		and (not r.get("valid_upto") or getdate(r["valid_upto"]) >= getdate(today))
+	]
+
+	# Filter by time of day (happy hour)
+	if has_time_fields:
+		rules = [r for r in rules if _is_happy_hour_active(r)]
+
+	# Filter by day of week
+	if has_days_field:
+		rules = [r for r in rules if _is_day_active(r)]
+
+	if not rules:
+		return []
+
+	rule_names = [r["name"] for r in rules]
+
+	# Attach child table data in bulk
+	child_tables = [
+		("Pricing Rule Item Code",  "item_code",  "applicable_items"),
+		("Pricing Rule Item Group", "item_group", "applicable_groups"),
+		("Pricing Rule Brand",      "brand",      "applicable_brands"),
+	]
+	for child_dt, field, key in child_tables:
+		try:
+			rows = frappe.get_all(
+				child_dt,
+				filters={"parent": ["in", rule_names]},
+				fields=["parent", field],
+			)
+			mapping = {}
+			for row in rows:
+				mapping.setdefault(row["parent"], []).append(row[field])
+			for r in rules:
+				r[key] = mapping.get(r["name"], [])
+		except Exception:
+			for r in rules:
+				r.setdefault(key, [])
+
+	return rules
+
+
+def _is_happy_hour_active(rule):
+	"""Return True if rule has no time window or the current time is within it."""
+	hf = rule.get("happy_hour_from")
+	ht = rule.get("happy_hour_to")
+	if not hf or not ht:
+		return True
+	now = frappe.utils.nowtime()  # "HH:MM:SS"
+	return hf <= now <= ht
+
+
+def _is_day_active(rule):
+	"""Return True if rule has no day restriction or today matches."""
+	days = rule.get("applicable_days") or ""
+	if not days:
+		return True
+	day_map = {
+		0: "Lunes", 1: "Martes", 2: "Miércoles", 3: "Jueves",
+		4: "Viernes", 5: "Sábado", 6: "Domingo",
+	}
+	today_name = day_map[frappe.utils.getdate().weekday()]
+	# applicable_days is stored as a comma-separated string by MultiSelectList
+	return today_name in [d.strip() for d in days.split(",")]
+
+
+@frappe.whitelist(allow_guest=True)
+def apply_cart_promotions(items, price_list=None):
+	"""
+	Given cart items [{item_code, qty, rate, amount}], return computed discounts
+	and upsell hints using ERPNext Pricing Rules.
+
+	Returns:
+		{
+			line_discounts: [{item_code, discount_percentage, discounted_rate,
+			                  discount_amount, free_item, free_qty, rule_name}],
+			upsell_hints:   [{rule_name, title, message, items_needed,
+			                  qty_needed, progress_pct}]
+		}
+	"""
+	import json
+
+	if isinstance(items, str):
+		items = json.loads(items)
+
+	if not items:
+		return {"line_discounts": [], "upsell_hints": []}
+
+	today = nowdate()
+	line_discounts = []
+
+	for item in items:
+		try:
+			args = frappe._dict({
+				"item_code": item["item_code"],
+				"qty": flt(item["qty"]),
+				"price_list": price_list or "Standard Selling",
+				"transaction_date": today,
+				"doctype": "Sales Invoice",
+				"selling": 1,
+			})
+			result = apply_pricing_rule(args)
+			if not result:
+				continue
+			rd = result[0] if isinstance(result, list) else result
+			if not rd:
+				continue
+			disc_pct = flt(rd.get("discount_percentage") or 0)
+			if disc_pct > 0:
+				base = flt(item["rate"])
+				disc_rate = base * (1 - disc_pct / 100)
+				line_discounts.append({
+					"item_code": item["item_code"],
+					"discount_percentage": disc_pct,
+					"discounted_rate": disc_rate,
+					"discount_amount": (base - disc_rate) * flt(item["qty"]),
+					"free_item": rd.get("free_item"),
+					"free_qty": flt(rd.get("free_qty") or 0),
+					"rule_name": rd.get("pricing_rule") or "",
+				})
+		except Exception:
+			continue  # Pricing rule errors are non-fatal
+
+	# Upsell hints: active rules near their threshold but not yet triggered
+	active_rules = get_active_promotions(price_list=price_list)
+	item_qty_map = {i["item_code"]: flt(i["qty"]) for i in items}
+	total_amount = sum(flt(i.get("amount", 0)) for i in items)
+	upsell_hints = []
+
+	for rule in active_rules:
+		thresh = flt(rule.get("threshold_percentage") or 80)
+
+		# Qty-based upsell
+		if flt(rule.get("min_qty") or 0) > 0:
+			for ic in rule.get("applicable_items", []):
+				current = item_qty_map.get(ic, 0)
+				min_q = flt(rule["min_qty"])
+				needed = min_q - current
+				progress = (current / min_q) * 100 if min_q else 0
+				if 0 < needed and progress >= thresh:
+					disc_label = f"{rule.get('discount_percentage', '')}% off" if rule.get('discount_percentage') else "a discount"
+					upsell_hints.append({
+						"rule_name": rule["name"],
+						"title": rule.get("title") or rule["name"],
+						"message": f"Add {int(needed)} more to unlock {disc_label}",
+						"items_needed": [ic],
+						"qty_needed": needed,
+						"progress_pct": min(progress, 99),
+					})
+
+		# Amount-based upsell
+		if flt(rule.get("min_amt") or 0) > 0:
+			min_a = flt(rule["min_amt"])
+			needed_amt = min_a - total_amount
+			progress = (total_amount / min_a) * 100 if min_a else 0
+			if 0 < needed_amt and progress >= thresh:
+				disc_label = f"{rule.get('discount_percentage', '')}% off" if rule.get('discount_percentage') else "a discount"
+				upsell_hints.append({
+					"rule_name": rule["name"],
+					"title": rule.get("title") or rule["name"],
+					"message": f"Add ${needed_amt:.2f} more to unlock {disc_label}",
+					"items_needed": [],
+					"qty_needed": 0,
+					"progress_pct": min(progress, 99),
+				})
+
+	return {"line_discounts": line_discounts, "upsell_hints": upsell_hints[:3]}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_promotions_for_item(item_code, price_list=None):
+	"""
+	Return all promotions relevant to a specific item:
+	  - pricing_rules: active Pricing Rules targeting this item (by code, group, or brand)
+	  - bundles: Product Bundles that contain this item as a component
+
+	Used by the POS Promotion Panel when a cashier taps the "Promos" chip on a product card.
+	"""
+	pricing_rules = _get_pricing_rules_for_item(item_code)
+	bundles = _get_bundles_containing_item(item_code, price_list=price_list)
+	return {"pricing_rules": pricing_rules, "bundles": bundles}
+
+
+def _get_pricing_rules_for_item(item_code):
+	"""Return active Pricing Rules that apply to this item (direct, group, or brand match)."""
+	item = frappe.db.get_value("Item", item_code, ["item_group", "brand"], as_dict=True)
+	if not item:
+		return []
+
+	item_group = item.get("item_group") or ""
+	brand = item.get("brand") or ""
+
+	all_rules = get_active_promotions()
+	matching = []
+
+	for rule in all_rules:
+		apply_on = rule.get("apply_on", "")
+		if apply_on == "Item Code":
+			if item_code in rule.get("applicable_items", []):
+				matching.append(rule)
+		elif apply_on == "Item Group":
+			if item_group and item_group in rule.get("applicable_groups", []):
+				matching.append(rule)
+		elif apply_on == "Brand":
+			if brand and brand in rule.get("applicable_brands", []):
+				matching.append(rule)
+
+	return matching
+
+
+def _get_bundles_containing_item(item_code, price_list=None):
+	"""Return Product Bundles that have this item as a component, with full component list and price."""
+	bundle_rows = frappe.get_all(
+		"Product Bundle Item",
+		filters={"item_code": item_code},
+		fields=["parent"],
+	)
+	if not bundle_rows:
+		return []
+
+	bundle_skus = list({r["parent"] for r in bundle_rows})
+	pl = price_list or "Standard Selling"
+	result = []
+
+	for bundle_sku in bundle_skus:
+		bundle_item = frappe.db.get_value(
+			"Item", bundle_sku, ["item_name", "disabled"], as_dict=True
+		)
+		if not bundle_item or cint(bundle_item.get("disabled")):
+			continue
+
+		components = frappe.get_all(
+			"Product Bundle Item",
+			filters={"parent": bundle_sku},
+			fields=["item_code", "qty"],
+		)
+		for comp in components:
+			comp["item_name"] = (
+				frappe.db.get_value("Item", comp["item_code"], "item_name") or comp["item_code"]
+			)
+
+		bundle_price = frappe.db.get_value(
+			"Item Price",
+			{"item_code": bundle_sku, "price_list": pl, "selling": 1},
+			"price_list_rate",
+		) or 0
+
+		result.append({
+			"bundle_item_code": bundle_sku,
+			"bundle_name": bundle_item["item_name"],
+			"bundle_price": flt(bundle_price),
+			"components": components,
+		})
+
+	return result
+
+
+@frappe.whitelist(allow_guest=True)
+def validate_coupon_code(coupon_code):
+	"""
+	Check whether a coupon code is valid and return its discount details.
+	Does NOT consume the coupon (that happens at invoice submit via apply_pricing_rule).
+
+	Returns:
+		{valid, message, discount_percentage, discount_amount, free_item, coupon_name}
+	"""
+	if not coupon_code:
+		return {"valid": False, "message": "Ingresá un código de cupón"}
+
+	doc = frappe.db.get_value(
+		"Coupon Code",
+		{"coupon_code": coupon_code},
+		["name", "pricing_rule", "maximum_use", "used", "customer"],
+		as_dict=True,
+	)
+
+	if not doc:
+		return {"valid": False, "message": "Cupón no encontrado"}
+
+	max_use = cint(doc.get("maximum_use") or 0)
+	used = cint(doc.get("used") or 0)
+	if max_use and used >= max_use:
+		return {"valid": False, "message": "Cupón agotado — ya se usó el máximo de veces"}
+
+	if not doc.get("pricing_rule"):
+		return {"valid": False, "message": "Cupón sin regla de descuento configurada"}
+
+	try:
+		rule = frappe.get_doc("Pricing Rule", doc["pricing_rule"])
+	except frappe.DoesNotExistError:
+		return {"valid": False, "message": "Regla de descuento no encontrada"}
+
+	# Check rule date validity
+	today = getdate(nowdate())
+	if rule.valid_from and getdate(rule.valid_from) > today:
+		return {"valid": False, "message": "Cupón todavía no está activo"}
+	if rule.valid_upto and getdate(rule.valid_upto) < today:
+		return {"valid": False, "message": "Cupón vencido"}
+
+	return {
+		"valid": True,
+		"coupon_name": doc["name"],
+		"discount_percentage": flt(rule.discount_percentage or 0),
+		"discount_amount": flt(rule.discount_amount or 0),
+		"free_item": rule.free_item or None,
+		"message": f"Cupón válido — {rule.title or rule.name}",
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def validate_discount_pin(pin):
+	"""
+	Validate a manager PIN for authorising above-threshold cashier discounts.
+	The PIN is stored in site_config.json under the key 'pos_manager_pin'.
+	Returns {authorized: true/false}.
+	"""
+	if not pin:
+		return {"authorized": False}
+
+	expected = frappe.conf.get("pos_manager_pin")
+	if not expected:
+		# No PIN configured — all discounts allowed (open mode)
+		return {"authorized": True}
+
+	return {"authorized": str(pin) == str(expected)}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -827,6 +1377,298 @@ def update_order_status(order_name, status):
 
 	so.reload()
 	return so.as_dict()
+
+
+# ========================================
+# GUEST PREORDER (S019)
+# ========================================
+
+# ERPNext Sales Order `order_type` only allows a small set (e.g. Sales, Shopping Cart).
+# We tag guest catalog consultations in `remarks` or `terms` (some sites have no `remarks` DB column).
+GUEST_PREORDER_REMARKS_TAG = "guest_preorder=1"
+
+
+def _sales_order_table_columns():
+	return set(frappe.db.get_table_columns("Sales Order") or [])
+
+
+def _guest_preorder_tag_fieldname():
+	"""DB column to store/search the guest-preorder tag (remarks preferred, else terms)."""
+	cols = _sales_order_table_columns()
+	if "remarks" in cols:
+		return "remarks"
+	if "terms" in cols:
+		return "terms"
+	return None
+
+
+def _is_guest_preorder_sales_order(so):
+	"""True if this SO was created by create_guest_preorder (tag in remarks or terms)."""
+	tag = GUEST_PREORDER_REMARKS_TAG
+	if isinstance(so, dict):
+		for key in ("remarks", "terms"):
+			val = so.get(key) or ""
+			if tag in str(val):
+				return True
+		return False
+	for fn in ("remarks", "terms"):
+		if hasattr(so, fn):
+			val = getattr(so, fn, None) or ""
+			if tag in str(val):
+				return True
+	return False
+
+
+@frappe.whitelist(allow_guest=True)
+def create_guest_preorder(
+	items,
+	guest_phone=None,
+	guest_name=None,
+	price_list="Standard Selling",
+	delivery_date=None,
+	order_type="Sales",
+	company=None,
+):
+	"""
+	Create a draft Sales Order to represent a guest preorder (no payment).
+
+	This is intentionally implemented as a normal Sales Order left in Draft
+	docstatus so the owner can later confirm/prepare it.
+
+	Uses a valid ERPNext ``order_type`` (default ``Sales``). The flow is identified
+	via ``remarks`` containing ``guest_preorder=1``.
+
+	Returns: { preorder_name, estimated_total, currency, status }
+	"""
+	if isinstance(items, str):
+		import json
+		items = json.loads(items)
+
+	if not items:
+		frappe.throw(_("Cart is empty"))
+
+	# Resolve defaults
+	if not company:
+		company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
+	if not company:
+		frappe.throw(_("No Company configured"))
+
+	# Use a safe default customer for guest orders (Walk-in Customer or first Customer).
+	customer = frappe.db.get_value("Customer", {"customer_name": "Walk-in Customer"}, "name") \
+		or frappe.db.get_value("Customer", {}, "name") \
+		or "_Test Customer"
+
+	if not frappe.db.exists("Customer", customer):
+		frappe.throw(_("Customer {0} not found").format(customer))
+
+	# Create Sales Order in Draft (do NOT submit)
+	so = frappe.new_doc("Sales Order")
+	so.customer = customer
+	# Must be one of the site's allowed Sales Order order types (commonly Sales, Shopping Cart, …).
+	so.order_type = order_type or "Sales"
+	so.transaction_date = nowdate()
+	so.delivery_date = delivery_date or add_days(nowdate(), 7)
+	so.company = company
+	so.selling_price_list = price_list
+
+	remarks_parts = [GUEST_PREORDER_REMARKS_TAG, f"customer:{customer}"]
+	if guest_phone:
+		remarks_parts.append(f"guest_phone:{guest_phone}")
+	if guest_name:
+		remarks_parts.append(f"guest_name:{guest_name}")
+	tag_text = " | ".join(remarks_parts)
+	tag_fn = _guest_preorder_tag_fieldname()
+	if not tag_fn:
+		frappe.throw(
+			_("Sales Order has no suitable text field (remarks/terms) to store guest preorder tag")
+		)
+	if tag_fn == "remarks":
+		so.remarks = tag_text
+	else:
+		so.terms = tag_text
+
+	# Add items
+	for item in items:
+		item_code = item.get("item_code")
+		qty = flt(item.get("qty", 1))
+		rate = flt(item.get("rate", 0))
+
+		if not item_code:
+			continue
+
+		# Get item rate if not provided or zero (mirrors create_order logic)
+		if not rate:
+			item_details = get_item_details_base({
+				"item_code": item_code,
+				"customer": customer,
+				"company": company,
+				"selling_price_list": price_list,
+				"doctype": "Sales Order",
+			})
+			rate = item_details.get("price_list_rate", 0)
+
+		so.append("items", {
+			"item_code": item_code,
+			"qty": qty,
+			"rate": rate,
+			"delivery_date": so.delivery_date,
+		})
+
+	# Calculate totals
+	so.run_method("calculate_taxes_and_totals")
+
+	# Save as Draft
+	so.insert(ignore_permissions=True)
+
+	return {
+		"preorder_name": so.name,
+		"estimated_total": flt(so.grand_total),
+		"currency": so.currency,
+		"status": so.status,
+	}
+
+
+@frappe.whitelist()
+def get_guest_preorders_list(status=None, start=0, page_length=20):
+	"""
+	List Guest Preorders created by `create_guest_preorder`.
+
+	These are Sales Orders tagged with ``guest_preorder=1`` in ``remarks`` or ``terms``.
+	"""
+	tag_fn = _guest_preorder_tag_fieldname()
+	if not tag_fn:
+		return {"preorders": [], "total_count": 0}
+
+	filters = {tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]}
+
+	if status:
+		if str(status).lower() == "draft":
+			filters["docstatus"] = 0
+		elif str(status).lower() in ("submitted", "confirmed"):
+			filters["docstatus"] = 1
+		else:
+			filters["status"] = status
+
+	total_count = frappe.db.count("Sales Order", filters=filters)
+
+	orders = frappe.get_all(
+		"Sales Order",
+		filters=filters,
+		fields=[
+			"name",
+			"transaction_date",
+			"delivery_date",
+			"grand_total",
+			"currency",
+			"docstatus",
+			"status",
+		],
+		start=start,
+		limit_page_length=page_length,
+		order_by="transaction_date desc",
+	)
+
+	order_names = [o["name"] for o in orders]
+	items_count_map = {}
+	if order_names:
+		rows = frappe.db.sql(
+			"""
+			SELECT parent, COUNT(*) as items_count
+			FROM `tabSales Order Item`
+			WHERE parent IN ({placeholders})
+			GROUP BY parent
+			""".format(placeholders=", ".join(["%s"] * len(order_names))),
+			tuple(order_names),
+			as_dict=True,
+		)
+		for r in rows or []:
+			items_count_map[r.parent] = r.items_count
+
+	for o in orders:
+		o["items_count"] = items_count_map.get(o["name"], 0)
+
+	return {"preorders": orders, "total_count": total_count}
+
+
+@frappe.whitelist()
+def get_guest_preorder(preorder_name):
+	"""
+	Get one guest preorder (Sales Order doc).
+	"""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	return {
+		"name": so.name,
+		"order_type": so.order_type,
+		"customer": so.customer,
+		"transaction_date": so.transaction_date,
+		"delivery_date": so.delivery_date,
+		"docstatus": so.docstatus,
+		"status": so.status,
+		"estimated_total": flt(so.grand_total),
+		"currency": so.currency,
+		"remarks": getattr(so, "remarks", None),
+		"terms": getattr(so, "terms", None),
+		"items": [
+			{
+				"item_code": d.item_code,
+				"item_name": d.item_name,
+				"qty": flt(d.qty),
+				"rate": flt(d.rate),
+				"amount": flt(d.amount),
+			}
+			for d in (so.items or [])
+		],
+	}
+
+
+@frappe.whitelist()
+def confirm_guest_preorder(preorder_name):
+	"""
+	Confirm a guest preorder.
+
+	Best-effort workflow:
+	- submit if it is still a Draft
+	- set status to "To Deliver and Bill"
+	"""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus == 0:
+		so.submit()
+
+	so.update_status("To Deliver and Bill")
+	so.reload()
+	return get_guest_preorder(preorder_name)
+
+
+@frappe.whitelist()
+def mark_prepared_guest_preorder(preorder_name):
+	"""
+	Mark a guest preorder as prepared/completed (best-effort).
+	"""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus == 0:
+		so.submit()
+
+	so.update_status("Completed")
+	so.reload()
+	return get_guest_preorder(preorder_name)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1469,8 +2311,8 @@ def update_cart_item(item_code, qty, session_id=None, customer=None):
 		frappe.throw(_("Item not found in cart"))
 
 	if flt(qty) <= 0:
-		# Remove item if quantity is 0 or negative
-		frappe.delete_doc("Shopping Cart Item", cart_item.name, ignore_permissions=True)
+		# Remove item using direct DB delete to avoid document-level locking on the parent cart
+		frappe.db.delete("Shopping Cart Item", {"name": cart_item.name})
 	else:
 		# Update quantity
 		frappe.db.set_value("Shopping Cart Item", cart_item.name, {
@@ -1672,6 +2514,21 @@ def ping():
 	}
 
 
+@frappe.whitelist()
+def get_user_roles_for_auth(username):
+	"""
+	Return role names for a specific user.
+	Used by the React auth bootstrap to derive frontend privileges.
+	"""
+	if not username:
+		frappe.throw(_("username is required"))
+
+	if not frappe.db.exists("User", username):
+		frappe.throw(_("User {0} not found").format(username))
+
+	return frappe.get_roles(username)
+
+
 # ========================================
 # POSNET APIs
 # ========================================
@@ -1687,6 +2544,7 @@ def create_pos_sale(
 	cashier_id=None,
 	device_id=None,
 	branch_id=None,
+	sale_mode="WHITE",
 ):
 	"""
 	Create a POS sale as a submitted Sales Invoice + Payment Entry.
@@ -1718,6 +2576,23 @@ def create_pos_sale(
 
 	if not items:
 		frappe.throw(_("At least one item is required to create a POS sale."))
+
+	# ── i008: Validate sale_mode and enforce payment method policy ────────────
+	sale_mode = (sale_mode or "WHITE").upper()
+	if sale_mode not in ("WHITE", "BLACK"):
+		frappe.throw(_("Invalid sale_mode: must be WHITE or BLACK."))
+
+	is_borrador = 1 if sale_mode == "BLACK" else 0
+
+	BLACK_ALLOWED_METHODS = {"Cash", "Mobile Money"}
+	if sale_mode == "BLACK" and payment_method not in BLACK_ALLOWED_METHODS:
+		frappe.throw(
+			_(
+				"Payment method '{0}' is not allowed when sale_mode=BLACK. "
+				"Allowed methods: {1}."
+			).format(payment_method, ", ".join(sorted(BLACK_ALLOWED_METHODS))),
+			exc=frappe.ValidationError,
+		)
 
 	# ── Idempotency check ────────────────────────────────────────────────────
 	# We store offline_order_uuid in the `remarks` field so we can look it up
@@ -1757,6 +2632,7 @@ def create_pos_sale(
 		f"offline_order_uuid:{offline_order_uuid} | receipt:{receipt_number}"
 		f" | cashier:{cashier_id or 'unknown'} | device:{device_id or 'unknown'}"
 		f" | branch:{branch_id or 'unknown'}"
+		f" | sale_mode:{sale_mode} | is_borrador:{is_borrador}"
 	)
 
 	invoice = frappe.get_doc(
@@ -1800,6 +2676,9 @@ def create_pos_sale(
 	from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
 	payment = get_payment_entry("Sales Invoice", invoice.name)
+	# Validate mode_of_payment exists; fall back to Cash if not found
+	if not frappe.db.exists("Mode of Payment", payment_method):
+		payment_method = "Cash"
 	payment.mode_of_payment = payment_method
 	payment.reference_no = receipt_number
 	payment.reference_date = nowdate()
@@ -1819,6 +2698,8 @@ def create_pos_sale(
 		"invoice_id": invoice.name,
 		"payment_id": payment.name,
 		"offline_order_uuid": offline_order_uuid,
+		"sale_mode": sale_mode,
+		"is_borrador": is_borrador,
 		"status": "created",
 	}
 
@@ -1915,3 +2796,1108 @@ def sync_stock_events(events):
 		"processed": processed,
 		"conflicts": conflicts,
 	}
+
+
+# ========================================
+# MERCADO PAGO QR PAYMENT APIs
+# ========================================
+
+_MP_API = "https://api.mercadopago.com"
+
+
+@frappe.whitelist(allow_guest=True)
+def create_mp_qr_preference(items, total_amount, receipt_number=None):
+	"""
+	Create a Mercado Pago Checkout Pro preference for QR display at the POS.
+
+	Args:
+		items (list[dict]): [{item_code, item_name, qty, rate}]
+		total_amount (float): Cart total for display/logging.
+		receipt_number (str): Used as external_reference to track the sale.
+
+	Returns:
+		dict: {preference_id, checkout_url, external_reference, is_test}
+	"""
+	import json as _json
+
+	if isinstance(items, str):
+		items = _json.loads(items)
+
+	total_amount = flt(total_amount)
+	external_reference = receipt_number or f"POS-{frappe.generate_hash(length=10)}"
+
+	doc = frappe.get_doc("Mercado Pago Settings")
+	if not doc.enabled:
+		frappe.throw(_("Mercado Pago integration is not enabled"))
+
+	token = doc._get_access_token()
+	is_test = token.startswith("TEST-")
+	idempotency_key = frappe.generate_hash(length=32)
+
+	mp_items = [
+		{
+			"id": str(item.get("item_code", f"ITEM-{i}")),
+			"title": str(item.get("item_name", "Product")),
+			"quantity": int(item.get("qty", 1)),
+			"unit_price": flt(item.get("rate", 0)),
+			"currency_id": "ARS",
+		}
+		for i, item in enumerate(items)
+	]
+
+	payload = {
+		"items": mp_items,
+		"back_urls": {
+			"success": "https://httpbin.org/get?back_url=success",
+			"failure": "https://httpbin.org/get?back_url=failure",
+			"pending": "https://httpbin.org/get?back_url=pending",
+		},
+		"auto_return": "approved",
+		"external_reference": external_reference,
+	}
+
+	from frappe.integrations.utils import make_post_request
+
+	headers = {
+		"Authorization": f"Bearer {token}",
+		"Content-Type": "application/json",
+		"X-Idempotency-Key": idempotency_key,
+	}
+
+	try:
+		response = make_post_request(
+			url=f"{_MP_API}/checkout/preferences",
+			headers=headers,
+			json=payload,
+		)
+	except Exception as exc:
+		raw = getattr(getattr(exc, "response", None), "text", "")
+		frappe.log_error(raw, "MP QR - create_preference failed")
+		frappe.throw(_("Could not create Mercado Pago preference: {0}").format(raw))
+
+	preference_id = response.get("id")
+	checkout_url = response.get("sandbox_init_point") if is_test else response.get("init_point")
+
+	return {
+		"preference_id": preference_id,
+		"checkout_url": checkout_url,
+		"external_reference": external_reference,
+		"is_test": is_test,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_mp_payment_status(external_reference):
+	"""
+	Poll Mercado Pago for payment status using the external_reference (receipt number).
+
+	Args:
+		external_reference (str): Receipt number set as external_reference on the preference.
+
+	Returns:
+		dict: {status: 'pending'|'approved'|'rejected'|'error', payment_id, status_detail}
+	"""
+	from frappe.integrations.utils import make_get_request
+
+	doc = frappe.get_doc("Mercado Pago Settings")
+	token = doc._get_access_token()
+	headers = {"Authorization": f"Bearer {token}"}
+
+	try:
+		response = make_get_request(
+			url=(
+				f"{_MP_API}/v1/payments/search"
+				f"?external_reference={external_reference}"
+				f"&sort=date_created&criteria=desc"
+			),
+			headers=headers,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "MP QR - get_payment_status failed")
+		return {"status": "error"}
+
+	results = response.get("results", []) if isinstance(response, dict) else []
+	if not results:
+		return {"status": "pending"}
+
+	latest = results[0]
+	return {
+		"status": latest.get("status", "pending"),
+		"payment_id": latest.get("id"),
+		"status_detail": latest.get("status_detail"),
+	}
+
+
+# ── i012: Merchandise Receiving ──────────────────────────────────────────────
+
+@frappe.whitelist(allow_guest=True)
+def search_items_for_receiving(search_term=None, page_length=8):
+	"""Lean item search for the receiving screen — includes last purchase price."""
+	page_length = cint(page_length)
+	filters = {"disabled": 0, "is_stock_item": 1}
+	or_filters = None
+	if search_term:
+		or_filters = [
+			["item_code", "like", f"%{search_term}%"],
+			["item_name", "like", f"%{search_term}%"],
+			["Item Barcode", "barcode", "like", f"%{search_term}%"],
+		]
+	items = frappe.get_list(
+		"Item",
+		filters=filters,
+		or_filters=or_filters,
+		fields=["item_code", "item_name", "stock_uom", "item_group"],
+		page_length=page_length,
+	)
+	# Attach barcodes
+	if items:
+		barcodes = frappe.get_all(
+			"Item Barcode",
+			filters={"parent": ["in", [i.item_code for i in items]]},
+			fields=["parent", "barcode"],
+		)
+		bc_map = {}
+		for b in barcodes:
+			bc_map.setdefault(b.parent, []).append(b.barcode)
+		for item in items:
+			item["barcodes"] = bc_map.get(item.item_code, [])
+	return items
+
+
+@frappe.whitelist(allow_guest=True)
+def commit_receiving_session(session_id, reference, supplier, warehouse, lines, draft_items):
+	"""
+	Atomically:
+	1. Create new ERPNext Items for draft items
+	2. Create a submitted Stock Entry (Material Receipt)
+	Returns { stock_entry_id, new_item_codes }
+	"""
+	import json
+	if isinstance(lines, str):
+		lines = json.loads(lines)
+	if isinstance(draft_items, str):
+		draft_items = json.loads(draft_items)
+
+	# 1. Create draft items
+	import uuid as _uuid
+	new_item_codes = {}
+	for d in draft_items:
+		if frappe.db.exists("Item", d.get("item_code") or ""):
+			new_item_codes[d["draft_id"]] = d["item_code"]
+			continue
+		# item_code is mandatory in ERPNext — generate a unique one if not provided
+		item_code_val = (d.get("item_code") or "").strip() or str(_uuid.uuid4())
+		item_doc = frappe.get_doc({
+			"doctype": "Item",
+			"item_code": item_code_val,
+			"item_name": d["item_name"],
+			"item_group": d.get("item_group") or "Products",
+			"stock_uom": d.get("stock_uom") or "Nos",
+			"is_stock_item": 1,
+			"include_item_in_manufacturing": 0,
+			"description": d["item_name"],
+		})
+		item_doc.insert(ignore_permissions=True)
+		# Add barcode if provided — skip silently if ERPNext rejects the format
+		if d.get("barcode"):
+			try:
+				item_doc.append("barcodes", {"barcode": d["barcode"], "barcode_type": "EAN"})
+				item_doc.save(ignore_permissions=True)
+			except Exception:
+				pass  # barcode is optional; don't abort the commit over a format error
+		# Add selling price if estimated
+		if flt(d.get("estimated_price") or 0) > 0:
+			frappe.get_doc({
+				"doctype": "Item Price",
+				"item_code": item_doc.item_code,
+				"price_list": "Standard Selling",
+				"price_list_rate": flt(d["estimated_price"]),
+				"selling": 1,
+			}).insert(ignore_permissions=True)
+		new_item_codes[d["draft_id"]] = item_doc.name  # name == item_code after insert
+
+	# Commit item inserts so the Stock Entry link-field validation can resolve them
+	if new_item_codes:
+		frappe.db.commit()
+
+	# 2. Resolve draft item_codes in lines
+	resolved_lines = []
+	for line in lines:
+		item_code = line.get("item_code")
+		if not item_code and line.get("draft_item_id"):
+			item_code = new_item_codes.get(line["draft_item_id"])
+		if not item_code:
+			continue
+		basic_rate = flt(line.get("unit_cost") or 0)
+		resolved_lines.append({
+			"item_code": item_code,
+			"qty": flt(line.get("qty") or 0),
+			"basic_rate": basic_rate,
+			"t_warehouse": warehouse,
+			"allow_zero_valuation_rate": 1 if basic_rate == 0 else 0,
+		})
+
+	if not resolved_lines:
+		frappe.throw("No valid lines to receive")
+
+	# 3. Create Stock Entry
+	se = frappe.get_doc({
+		"doctype": "Stock Entry",
+		"stock_entry_type": "Material Receipt",
+		"posting_date": nowdate(),
+		"to_warehouse": warehouse,
+		"items": resolved_lines,
+		"remarks": f"Receiving session {session_id}" + (f" — ref: {reference}" if reference else ""),
+	})
+	se.insert(ignore_permissions=True)
+	se.submit()
+	frappe.db.commit()
+
+	return {
+		"stock_entry_id": se.name,
+		"new_item_codes": new_item_codes,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def simulate_receiving_flow():
+	"""Return a deterministic sample payload for testing the receiving screen."""
+	# Use 3 existing items + 2 fake new ones
+	existing = frappe.get_all(
+		"Item",
+		filters={"disabled": 0, "is_stock_item": 1},
+		fields=["item_code", "item_name", "stock_uom"],
+		limit=3,
+	)
+	import uuid
+	draft_items = [
+		{
+			"draft_id": str(uuid.uuid4()),
+			"item_name": "Libro de Prueba Nuevo A",
+			"item_group": "Products",
+			"stock_uom": "Nos",
+			"barcode": "",           # intentionally empty to test soft validation
+			"estimated_price": 15.0,
+			"estimated_cost": 0,     # intentionally empty to test soft validation
+			"is_new": True,
+		},
+		{
+			"draft_id": str(uuid.uuid4()),
+			"item_name": "Libro de Prueba Nuevo B",
+			"item_group": "Products",
+			"stock_uom": "Nos",
+			"barcode": "9780306406157",  # valid EAN-13 check digit
+			"estimated_price": 22.5,
+			"estimated_cost": 12.0,
+			"is_new": True,
+		},
+		{
+			"draft_id": str(uuid.uuid4()),
+			"item_name": "Libro de Prueba Nuevo C",
+			"item_group": "Products",
+			"stock_uom": "Nos",
+			"barcode": "",           # intentionally empty to test soft validation
+			"estimated_price": 18.0,
+			"estimated_cost": 0,     # intentionally empty to test soft validation
+			"is_new": True,
+		},
+	]
+	lines = [
+		{"line_id": str(uuid.uuid4()), "item_code": e["item_code"], "item_name": e["item_name"], "qty": i + 2, "unit_cost": 10.0 + i * 2}
+		for i, e in enumerate(existing)
+	] + [
+		{"line_id": str(uuid.uuid4()), "item_code": None, "draft_item_id": draft_items[0]["draft_id"], "item_name": draft_items[0]["item_name"], "qty": 5, "unit_cost": 0},
+		{"line_id": str(uuid.uuid4()), "item_code": None, "draft_item_id": draft_items[1]["draft_id"], "item_name": draft_items[1]["item_name"], "qty": 3, "unit_cost": 12.0},
+		{"line_id": str(uuid.uuid4()), "item_code": None, "draft_item_id": draft_items[2]["draft_id"], "item_name": draft_items[2]["item_name"], "qty": 4, "unit_cost": 0},
+	]
+	return {
+		"reference": "Container-SIM-001",
+		"supplier": "",   # intentionally empty
+		"warehouse": "POSNET Stores - L",
+		"lines": lines,
+		"draft_items": draft_items,
+	}
+
+
+# ── CSV Catalog Import (stable index mapping) ────────────────────────────────
+
+CATALOG_CSV_COLUMN_GUIDE = [
+	{"index": 0, "key": "item_code", "english": "SKU / Item Code", "chinese": "商品编码", "required": 1},
+	{"index": 1, "key": "barcode", "english": "Barcode", "chinese": "条码", "required": 0},
+	{"index": 2, "key": "item_name", "english": "Title", "chinese": "商品名称", "required": 0},
+	{"index": 3, "key": "unused_3", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 4, "key": "title_simplified", "english": "Simplified Title", "chinese": "简化名称", "required": 0},
+	{"index": 5, "key": "pack_qty", "english": "Pack Quantity", "chinese": "包装数量", "required": 0},
+	{"index": 6, "key": "stock_uom", "english": "UOM", "chinese": "单位", "required": 0},
+	{"index": 7, "key": "unused_7", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 8, "key": "unused_8", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 9, "key": "item_group", "english": "Category", "chinese": "分类", "required": 0},
+	{"index": 10, "key": "unused_10", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 11, "key": "unused_11", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 12, "key": "price", "english": "Selling Price", "chinese": "销售价格", "required": 0},
+	{"index": 13, "key": "unused_13", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 14, "key": "unused_14", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 15, "key": "unused_15", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 16, "key": "unused_16", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 17, "key": "last_price", "english": "Last Price", "chinese": "上次价格", "required": 0},
+	{"index": 18, "key": "last_price_date", "english": "Last Price Date", "chinese": "上次价格日期", "required": 0},
+	{"index": 19, "key": "unused_19", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 20, "key": "unused_20", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 21, "key": "unused_21", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 22, "key": "stock_hint", "english": "Stock Hint", "chinese": "库存提示", "required": 0},
+	{"index": 23, "key": "unused_23", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 24, "key": "unused_24", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 25, "key": "unused_25", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 26, "key": "unused_26", "english": "Unused", "chinese": "未使用", "required": 0},
+	{"index": 27, "key": "unused_27", "english": "Unused", "chinese": "未使用", "required": 0},
+]
+
+
+def _row_value(row, index):
+	if index < 0 or index >= len(row):
+		return ""
+	return (row[index] or "").strip()
+
+
+def _safe_float(value):
+	if value in (None, ""):
+		return 0.0
+	try:
+		return flt(str(value).replace(",", "."))
+	except Exception:
+		return 0.0
+
+
+def _parse_catalog_csv(csv_text):
+	if not csv_text:
+		return [], 0
+
+	reader = csv.reader(io.StringIO(csv_text))
+	rows = list(reader)
+	if not rows:
+		return [], 0
+
+	data_rows = rows[1:] if len(rows) > 1 else []
+	parsed = []
+
+	for line_no, row in enumerate(data_rows, start=2):
+		if not any((cell or "").strip() for cell in row):
+			continue
+
+		if len(row) < 28:
+			row = row + [""] * (28 - len(row))
+
+		item_code = _row_value(row, 0)
+		item_name = _row_value(row, 2) or _row_value(row, 4) or item_code
+		title_simplified = _row_value(row, 4)
+		barcode = _row_value(row, 1)
+		stock_uom = _row_value(row, 6) or "Nos"
+		item_group = _row_value(row, 9) or "Products"
+		price = _safe_float(_row_value(row, 12))
+		last_price = _safe_float(_row_value(row, 17))
+		stock_hint = _safe_float(_row_value(row, 22))
+
+		errors = []
+		if not item_code:
+			errors.append("Missing item_code at index 0.")
+		if not item_name:
+			errors.append("Missing item_name/title at indexes 2/4.")
+
+		parsed.append(
+			{
+				"line_no": line_no,
+				"item_code": item_code,
+				"item_name": item_name,
+				"title_simplified": title_simplified,
+				"barcode": barcode,
+				"stock_uom": stock_uom,
+				"item_group": item_group,
+				"price": price,
+				"last_price": last_price,
+				"stock_hint": stock_hint,
+				"errors": errors,
+			}
+		)
+
+	return parsed, len(data_rows)
+
+
+def _resolve_uom_for_import(uom):
+	if uom and frappe.db.exists("UOM", uom):
+		return uom
+	if frappe.db.exists("UOM", "Nos"):
+		return "Nos"
+	return frappe.db.get_value("UOM", {}, "name") or "Nos"
+
+
+def _resolve_item_group_for_import(item_group, default_item_group="Products", create_missing_groups=0):
+	if item_group and frappe.db.exists("Item Group", item_group):
+		return item_group
+
+	if item_group and cint(create_missing_groups):
+		parent_group = "All Item Groups"
+		if not frappe.db.exists("Item Group", item_group):
+			frappe.get_doc(
+				{
+					"doctype": "Item Group",
+					"item_group_name": item_group,
+					"parent_item_group": parent_group,
+					"is_group": 0,
+				}
+			).insert(ignore_permissions=True)
+		return item_group
+
+	if default_item_group and frappe.db.exists("Item Group", default_item_group):
+		return default_item_group
+	if frappe.db.exists("Item Group", "Products"):
+		return "Products"
+	return frappe.db.get_value("Item Group", {"is_group": 0}, "name") or "All Item Groups"
+
+
+@frappe.whitelist(allow_guest=True)
+def get_catalog_csv_column_guide():
+	"""Return stable CSV index mapping used by catalog import."""
+	return CATALOG_CSV_COLUMN_GUIDE
+
+
+@frappe.whitelist()
+def preview_catalog_csv_import(csv_text):
+	"""Preview parsed CSV rows using stable column indexes (header names ignored)."""
+	parsed_rows, total_rows = _parse_catalog_csv(csv_text)
+	valid_rows = [r for r in parsed_rows if not r.get("errors")]
+	invalid_rows = [r for r in parsed_rows if r.get("errors")]
+	return {
+		"total_rows": total_rows,
+		"parsed_rows": len(parsed_rows),
+		"valid_rows": len(valid_rows),
+		"invalid_rows": len(invalid_rows),
+		"preview": parsed_rows[:25],
+		"guide": CATALOG_CSV_COLUMN_GUIDE,
+	}
+
+
+@frappe.whitelist()
+def import_catalog_csv_products(
+	csv_text,
+	price_list="Standard Selling",
+	default_item_group="Products",
+	update_existing=1,
+	create_missing_groups=0,
+	start=0,
+	batch_size=0,
+):
+	"""
+	Create/update Item + Item Price records from catalog CSV.
+	CSV header text is ignored; only stable column order is used.
+	"""
+	parsed_rows, total_rows = _parse_catalog_csv(csv_text)
+	start = cint(start)
+	batch_size = cint(batch_size)
+	if start < 0:
+		start = 0
+	if batch_size < 0:
+		batch_size = 0
+
+	selected_rows = parsed_rows
+	if batch_size > 0:
+		selected_rows = parsed_rows[start : start + batch_size]
+
+	report = {
+		"total_rows": total_rows,
+		"parsed_rows": len(parsed_rows),
+		"processed_rows": len(selected_rows),
+		"start": start,
+		"batch_size": batch_size,
+		"has_more": 0,
+		"next_start": None,
+		"created_items": 0,
+		"updated_items": 0,
+		"skipped_invalid": 0,
+		"skipped_existing": 0,
+		"price_updates": 0,
+		"barcode_updates": 0,
+		"errors": [],
+		"warnings": [],
+	}
+
+	for row in selected_rows:
+		if row.get("errors"):
+			report["skipped_invalid"] += 1
+			report["errors"].append({"line_no": row["line_no"], "errors": row["errors"]})
+			continue
+
+		item_code = row["item_code"]
+		item_name = row["item_name"]
+		description = row["title_simplified"] or item_name
+		barcode = row.get("barcode")
+		target_uom = _resolve_uom_for_import(row.get("stock_uom"))
+		target_group = _resolve_item_group_for_import(
+			row.get("item_group"),
+			default_item_group=default_item_group,
+			create_missing_groups=create_missing_groups,
+		)
+
+		try:
+			existing = frappe.db.exists("Item", item_code)
+			if existing and not cint(update_existing):
+				report["skipped_existing"] += 1
+				continue
+
+			if existing:
+				item_doc = frappe.get_doc("Item", item_code)
+				report["updated_items"] += 1
+			else:
+				item_doc = frappe.new_doc("Item")
+				item_doc.item_code = item_code
+				report["created_items"] += 1
+
+			item_doc.item_name = item_name
+			item_doc.description = description
+			item_doc.item_group = target_group
+			item_doc.stock_uom = target_uom
+			item_doc.is_stock_item = 1
+			item_doc.include_item_in_manufacturing = 0
+			item_doc.disabled = 0
+
+			if existing:
+				item_doc.save(ignore_permissions=True)
+			else:
+				item_doc.insert(ignore_permissions=True)
+
+			if barcode:
+				existing_same = frappe.db.exists("Item Barcode", {"parent": item_doc.item_code, "barcode": barcode})
+				owner = frappe.db.get_value("Item Barcode", {"barcode": barcode}, "parent")
+				if owner and owner != item_doc.item_code:
+					report["warnings"].append(
+						{
+							"line_no": row["line_no"],
+							"message": f"Barcode {barcode} already assigned to {owner}; skipped for {item_doc.item_code}.",
+						}
+					)
+				elif not existing_same:
+					item_doc.append("barcodes", {"barcode": barcode, "barcode_type": "EAN"})
+					item_doc.save(ignore_permissions=True)
+					report["barcode_updates"] += 1
+
+			if flt(row.get("price")) > 0:
+				price_name = frappe.db.get_value(
+					"Item Price",
+					{"item_code": item_doc.item_code, "price_list": price_list, "selling": 1},
+					"name",
+				)
+				if price_name:
+					frappe.db.set_value("Item Price", price_name, "price_list_rate", flt(row["price"]))
+				else:
+					frappe.get_doc(
+						{
+							"doctype": "Item Price",
+							"item_code": item_doc.item_code,
+							"price_list": price_list,
+							"price_list_rate": flt(row["price"]),
+							"selling": 1,
+						}
+					).insert(ignore_permissions=True)
+				report["price_updates"] += 1
+
+		except Exception as exc:
+			report["errors"].append({"line_no": row["line_no"], "errors": [str(exc)]})
+
+	frappe.db.commit()
+	if batch_size > 0:
+		next_start = start + len(selected_rows)
+		if next_start < len(parsed_rows):
+			report["has_more"] = 1
+			report["next_start"] = next_start
+	return report
+
+
+@frappe.whitelist()
+def import_catalog_image_zip(zip_base64=None):
+	"""
+	Import product images from a ZIP payload.
+	File name (without extension) must match Item.item_code.
+	Supported image types: jpg, jpeg, png, webp, gif.
+	"""
+	zip_bytes = None
+	if zip_base64:
+		try:
+			zip_bytes = base64.b64decode(zip_base64)
+		except Exception:
+			frappe.throw(_("Invalid zip_base64 payload"))
+	else:
+		req_files = getattr(getattr(frappe.local, "request", None), "files", None)
+		uploaded = None
+		if req_files:
+			uploaded = req_files.get("file") or req_files.get("zip_file")
+		if uploaded:
+			zip_bytes = uploaded.read()
+		if not zip_bytes:
+			frappe.throw(_("Provide zip_base64 or upload a file field named 'file'."))
+
+	report = {
+		"total_files": 0,
+		"supported_files": 0,
+		"updated_items": 0,
+		"missing_items": 0,
+		"skipped_unsupported": 0,
+		"errors": [],
+	}
+
+	supported_ext = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+	with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as archive:
+		members = [m for m in archive.namelist() if not m.endswith("/")]
+		report["total_files"] = len(members)
+
+		for member in members:
+			base_name = os.path.basename(member)
+			if not base_name:
+				continue
+
+			stem, ext = os.path.splitext(base_name)
+			ext = ext.lower()
+			if ext not in supported_ext:
+				report["skipped_unsupported"] += 1
+				continue
+
+			report["supported_files"] += 1
+			item_code = _resolve_item_code_from_image_stem(stem)
+			if not item_code:
+				report["missing_items"] += 1
+				continue
+
+			try:
+				content = archive.read(member)
+				_apply_item_image(item_code, f"{item_code}{ext}", content)
+				report["updated_items"] += 1
+			except Exception as exc:
+				report["errors"].append({"file": member, "error": str(exc)})
+
+	frappe.db.commit()
+	return report
+
+
+def _apply_item_image(item_code, file_name, content):
+	"""Attach image file to an Item and set Item.image."""
+	from frappe.utils.file_manager import save_file
+
+	if isinstance(content, str):
+		content = content.encode("utf-8")
+
+	file_doc = save_file(
+		file_name,
+		content,
+		"Item",
+		item_code,
+		is_private=0,
+	)
+	frappe.db.set_value("Item", item_code, "image", file_doc.file_url)
+
+
+def _resolve_item_code_from_image_stem(stem):
+	"""
+	Resolve image filename stem to Item.item_code.
+	Order:
+	1) exact item_code
+	2) item_code after trimming leading zeros
+	3) exact barcode -> Item Barcode.parent
+	4) trimmed barcode -> Item Barcode.parent
+	"""
+	key = (stem or "").strip()
+	if not key:
+		return None
+
+	candidates = [key]
+	trimmed = key.lstrip("0")
+	if trimmed and trimmed != key:
+		candidates.append(trimmed)
+
+	for candidate in candidates:
+		if frappe.db.exists("Item", candidate):
+			return candidate
+
+	for candidate in candidates:
+		parent = frappe.db.get_value("Item Barcode", {"barcode": candidate}, "parent")
+		if parent:
+			return parent
+
+	return None
+
+
+@frappe.whitelist()
+def import_catalog_image_batch(images):
+	"""
+	Import a small batch of product images.
+	Each image entry must include:
+	- file_name: original name (e.g., 24792.jpg)
+	- content_base64: file bytes base64
+	"""
+	if isinstance(images, str):
+		images = frappe.parse_json(images)
+	if not isinstance(images, list):
+		frappe.throw(_("images must be a list"))
+
+	report = {
+		"total_files": len(images),
+		"supported_files": 0,
+		"updated_items": 0,
+		"missing_items": 0,
+		"skipped_unsupported": 0,
+		"errors": [],
+	}
+
+	supported_ext = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+	for entry in images:
+		file_name = os.path.basename((entry or {}).get("file_name") or "")
+		content_base64 = (entry or {}).get("content_base64")
+		if not file_name or not content_base64:
+			report["errors"].append({"file": file_name or "(unknown)", "error": "Missing file_name or content_base64."})
+			continue
+
+		stem, ext = os.path.splitext(file_name)
+		ext = ext.lower()
+		if ext not in supported_ext:
+			report["skipped_unsupported"] += 1
+			continue
+
+		report["supported_files"] += 1
+		item_code = _resolve_item_code_from_image_stem(stem)
+		if not item_code:
+			report["missing_items"] += 1
+			continue
+
+		try:
+			content = base64.b64decode(content_base64)
+			_apply_item_image(item_code, file_name, content)
+			report["updated_items"] += 1
+		except Exception as exc:
+			report["errors"].append({"file": file_name, "error": str(exc)})
+
+	frappe.db.commit()
+	return report
+
+
+# ── i013: Dashboard mock-data seeding ────────────────────────────────────────
+
+@frappe.whitelist()
+def seed_bazar_dashboard_mock_data(
+	anchor_date=None,
+	days=60,
+	invoices_per_day=6,
+	item_count=120,
+	regenerate=0,
+	seed_value=13013,
+):
+	"""
+	Prepopulate dashboard-oriented mock data for the bazar admin workspace.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.seed_bazar_dashboard_mock_data import run
+
+	return run(
+		anchor_date=anchor_date,
+		days=days,
+		invoices_per_day=invoices_per_day,
+		item_count=item_count,
+		regenerate=regenerate,
+		seed_value=seed_value,
+	)
+
+
+@frappe.whitelist()
+def clear_bazar_dashboard_mock_data():
+	"""Clear previously seeded mock data for bazar dashboards."""
+	from erpnext.erpnext_integrations.ecommerce_api.seed_bazar_dashboard_mock_data import clear_mock_data
+
+	return clear_mock_data()
+
+
+# ── i016: Product Manager Page ────────────────────────────────────────────────
+
+def _pm_has_col(col):
+	return frappe.db.has_column("Item", col)
+
+
+def _pm_item_select():
+	"""Build SELECT field list depending on which custom fields exist."""
+	always = [
+		"i.item_code", "i.item_name", "i.brand", "i.item_group",
+		"i.stock_uom", "i.image", "i.disabled", "i.modified",
+	]
+	custom = [
+		"custom_pack_qty", "custom_pack_size", "custom_pack_unit",
+		"custom_normalized_title", "custom_match_confidence", "custom_review_notes",
+	]
+	parts = always[:]
+	for c in custom:
+		parts.append(f"i.{c}" if _pm_has_col(c) else f"NULL AS {c}")
+	parts += [
+		"(SELECT barcode FROM `tabItem Barcode` ib"
+		"  WHERE ib.parent = i.item_code ORDER BY ib.idx LIMIT 1) AS barcode",
+		"(SELECT price_list_rate FROM `tabItem Price` ip"
+		"  WHERE ip.item_code = i.item_code"
+		"  AND ip.price_list = 'Standard Selling' AND ip.selling = 1 LIMIT 1) AS list_price",
+	]
+	return ", ".join(parts)
+
+
+@frappe.whitelist()
+def get_product_rows(filters=None, page=1, page_length=200):
+	"""Return paginated, joined item rows for the Product Manager grid."""
+	filters = frappe.parse_json(filters or "{}")
+	page = max(1, cint(page))
+	page_length = max(1, min(cint(page_length), 500))
+	offset = (page - 1) * page_length
+
+	conditions = []
+	values = []
+
+	search = (filters.get("search") or "").strip()
+	if search:
+		conditions.append(
+			"(i.item_name LIKE %s OR i.item_code LIKE %s OR i.brand LIKE %s)"
+		)
+		like = f"%{search}%"
+		values += [like, like, like]
+
+	category = (filters.get("category") or "").strip()
+	if category:
+		conditions.append("i.item_group = %s")
+		values.append(category)
+
+	brand = (filters.get("brand") or "").strip()
+	if brand:
+		conditions.append("i.brand = %s")
+		values.append(brand)
+
+	if filters.get("active_only"):
+		conditions.append("i.disabled = 0")
+
+	where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+	select = _pm_item_select()
+
+	rows = frappe.db.sql(
+		f"""
+		SELECT {select}
+		FROM `tabItem` i
+		{where}
+		ORDER BY i.item_name
+		LIMIT %s OFFSET %s
+		""",
+		values + [page_length, offset],
+		as_dict=True,
+	)
+
+	total = frappe.db.sql(
+		f"SELECT COUNT(*) AS cnt FROM `tabItem` i {where}", values, as_dict=True
+	)[0]["cnt"]
+
+	# Attach tags (frappe Tag Link)
+	if rows:
+		codes = [r["item_code"] for r in rows]
+		ph = ", ".join(["%s"] * len(codes))
+		tag_rows = frappe.db.sql(
+			f"SELECT document_name, tag FROM `tabTag Link`"
+			f" WHERE document_type='Item' AND document_name IN ({ph})",
+			codes,
+			as_dict=True,
+		)
+		tags_map = {}
+		for t in tag_rows:
+			tags_map.setdefault(t["document_name"], []).append(t["tag"])
+		for r in rows:
+			r["tags"] = tags_map.get(r["item_code"], [])
+			r["is_active"] = 0 if r.get("disabled") else 1
+			r["modified"] = str(r.get("modified") or "")
+
+	return {"rows": rows, "total": total}
+
+
+@frappe.whitelist()
+def save_product_row(item_code, changes):
+	"""Apply a dict of changed fields for one item."""
+	from frappe.utils import flt as _flt
+	from frappe.desk.tags import add_tag
+
+	changes = frappe.parse_json(changes)
+	if not frappe.db.exists("Item", item_code):
+		frappe.throw(f"Item {item_code} not found")
+
+	# ── direct Item fields ───────────────────────────────────────────────────
+	ITEM_FIELD_MAP = {
+		"source_title": "item_name",
+		"brand": "brand",
+		"source_category": "item_group",
+		"stock_uom": "stock_uom",
+		"normalized_title": "custom_normalized_title",
+		"review_notes": "custom_review_notes",
+		"pack_qty": "custom_pack_qty",
+		"pack_size": "custom_pack_size",
+		"unit": "custom_pack_unit",
+	}
+	item_updates = {}
+	for grid_field, db_field in ITEM_FIELD_MAP.items():
+		if grid_field in changes and _pm_has_col(db_field.replace("custom_", "custom_")):
+			item_updates[db_field] = changes[grid_field]
+
+	if "is_active" in changes:
+		item_updates["disabled"] = 0 if changes["is_active"] else 1
+
+	if item_updates:
+		frappe.db.set_value("Item", item_code, item_updates)
+
+	# ── brand: auto-create if missing ────────────────────────────────────────
+	if "brand" in changes and changes["brand"]:
+		bname = str(changes["brand"]).strip()
+		if bname and not frappe.db.exists("Brand", bname):
+			frappe.get_doc({"doctype": "Brand", "brand": bname}).insert(
+				ignore_permissions=True
+			)
+		frappe.db.set_value("Item", item_code, "brand", bname)
+
+	# ── price ─────────────────────────────────────────────────────────────────
+	if "list_price" in changes:
+		rate = _flt(changes["list_price"])
+		existing_price = frappe.db.get_value(
+			"Item Price",
+			{"item_code": item_code, "price_list": "Standard Selling", "selling": 1},
+			"name",
+		)
+		if existing_price:
+			frappe.db.set_value("Item Price", existing_price, "price_list_rate", rate)
+		else:
+			frappe.get_doc(
+				{
+					"doctype": "Item Price",
+					"item_code": item_code,
+					"price_list": "Standard Selling",
+					"selling": 1,
+					"price_list_rate": rate,
+				}
+			).insert(ignore_permissions=True)
+
+	# ── barcode ───────────────────────────────────────────────────────────────
+	if "barcode" in changes:
+		bc = str(changes["barcode"] or "").strip()
+		existing_bc = frappe.db.get_value(
+			"Item Barcode", {"parent": item_code, "idx": 1}, "name"
+		)
+		if existing_bc:
+			frappe.db.set_value("Item Barcode", existing_bc, "barcode", bc)
+		elif bc:
+			item_doc = frappe.get_doc("Item", item_code)
+			item_doc.append("barcodes", {"barcode": bc})
+			item_doc.save(ignore_permissions=True)
+
+	# ── tags ─────────────────────────────────────────────────────────────────
+	if "tags" in changes:
+		new_tags = set(str(t).strip() for t in (changes["tags"] or []) if t)
+		old_tag_rows = frappe.db.get_all(
+			"Tag Link",
+			{"document_type": "Item", "document_name": item_code},
+			["name", "tag"],
+		)
+		old_tags = {r["tag"] for r in old_tag_rows}
+		for r in old_tag_rows:
+			if r["tag"] not in new_tags:
+				frappe.db.delete("Tag Link", r["name"])
+		for t in new_tags - old_tags:
+			add_tag(t, "Item", item_code)
+
+	frappe.db.commit()
+	modified = frappe.db.get_value("Item", item_code, "modified")
+	return {"ok": True, "item_code": item_code, "modified": str(modified)}
+
+
+@frappe.whitelist()
+def save_product_rows_bulk(rows):
+	"""Batch-save multiple rows. rows = JSON list of {item_code, changes}."""
+	rows = frappe.parse_json(rows)
+	results = {}
+	errors = []
+	for entry in rows:
+		item_code = entry.get("item_code")
+		try:
+			r = save_product_row(item_code, frappe.as_json(entry.get("changes", {})))
+			results[item_code] = r
+		except Exception as exc:
+			errors.append({"item_code": item_code, "error": str(exc)})
+	return {"ok": True, "results": results, "errors": errors}
+
+
+@frappe.whitelist()
+def set_items_active_bulk(item_codes, is_active):
+	"""Enable or disable a list of items."""
+	item_codes = frappe.parse_json(item_codes)
+	disabled = 0 if (is_active in (True, "true", "1", 1)) else 1
+	for code in item_codes:
+		if frappe.db.exists("Item", code):
+			frappe.db.set_value("Item", code, "disabled", disabled)
+	frappe.db.commit()
+	return {"ok": True, "count": len(item_codes)}
+
+
+@frappe.whitelist()
+def get_brand_suggestions(query=""):
+	"""Return up to 20 Brand names matching the query string."""
+	query = (query or "").strip()
+	like = f"%{query}%"
+	brands = frappe.db.sql(
+		"SELECT name FROM `tabBrand` WHERE name LIKE %s ORDER BY name LIMIT 20",
+		[like],
+		as_dict=True,
+	)
+	return [b["name"] for b in brands]
+
+
+@frappe.whitelist()
+def get_category_list():
+	"""Return all Item Group names, sorted."""
+	groups = frappe.db.get_all("Item Group", fields=["name"], order_by="name")
+	return [g["name"] for g in groups]
+
+
+@frappe.whitelist()
+def export_product_rows(filters=None):
+	"""Return all matching rows as CSV text."""
+	import csv, io
+	filters = frappe.parse_json(filters or "{}")
+	# Reuse get_product_rows with large page_length
+	result = get_product_rows(filters=frappe.as_json(filters), page=1, page_length=5000)
+	rows = result.get("rows", [])
+
+	COLS = [
+		"item_code", "item_name", "brand", "item_group", "barcode",
+		"list_price", "stock_uom", "custom_pack_qty", "custom_pack_size",
+		"custom_pack_unit", "is_active", "custom_normalized_title",
+		"custom_match_confidence", "custom_review_notes", "tags", "modified",
+	]
+	HEADERS = [
+		"SKU", "Title", "Brand", "Category", "Barcode",
+		"Price", "UOM", "Pack Qty", "Pack Size", "Unit",
+		"Active", "Normalized Title", "Confidence", "Notes", "Tags", "Modified",
+	]
+
+	buf = io.StringIO()
+	w = csv.writer(buf)
+	w.writerow(HEADERS)
+	for r in rows:
+		w.writerow([
+			r.get("item_code", ""),
+			r.get("item_name", ""),
+			r.get("brand", ""),
+			r.get("item_group", ""),
+			r.get("barcode", ""),
+			r.get("list_price", ""),
+			r.get("stock_uom", ""),
+			r.get("custom_pack_qty", ""),
+			r.get("custom_pack_size", ""),
+			r.get("custom_pack_unit", ""),
+			r.get("is_active", ""),
+			r.get("custom_normalized_title", ""),
+			r.get("custom_match_confidence", ""),
+			r.get("custom_review_notes", ""),
+			"|".join(r.get("tags") or []),
+			r.get("modified", ""),
+		])
+	return buf.getvalue()

@@ -1,0 +1,26 @@
+{
+ "content": null,
+ "creation": "2026-03-20 00:00:00.000000",
+ "docstatus": 0,
+ "doctype": "Page",
+ "idx": 0,
+ "modified": "2026-03-20 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "product-manager",
+ "owner": "Administrator",
+ "page_name": "product-manager",
+ "roles": [
+  {
+   "role": "Item Manager"
+  },
+  {
+   "role": "System Manager"
+  }
+ ],
+ "script": null,
+ "standard": "Yes",
+ "style": null,
+ "system_page": 0,
+ "title": "Product Manager"
+}
