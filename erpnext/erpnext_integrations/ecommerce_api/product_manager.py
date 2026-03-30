@@ -118,6 +118,7 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
     price_list = price_list or _default_price_list()
     if warehouse in ("", None, "null"):
         warehouse = None
+    has_unit_sku_col = frappe.db.has_column("Item", "custom_unit_sku")
 
     page = cint(page) or 1
     page_length = cint(page_length) or 100
@@ -140,6 +141,21 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
             ")"
         )
         values["search"] = f"%{search}%"
+
+    title_contains = (filters.get("title_contains") or "").strip()
+    if title_contains:
+        conditions.append("i.item_name LIKE %(title_contains)s")
+        values["title_contains"] = f"%{title_contains}%"
+
+    barcode_contains = (filters.get("barcode_contains") or "").strip()
+    if barcode_contains:
+        conditions.append(
+            "EXISTS ("
+            " SELECT 1 FROM `tabItem Barcode` ibf"
+            " WHERE ibf.parent = i.item_code AND ibf.barcode LIKE %(barcode_contains)s"
+            ")"
+        )
+        values["barcode_contains"] = f"%{barcode_contains}%"
 
     category = filters.get("category")
     if category:
@@ -176,19 +192,25 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
     if cint(filters.get("no_image")):
         conditions.append("(i.image IS NULL OR i.image = '')")
 
+    if cint(filters.get("has_image")):
+        conditions.append("(i.image IS NOT NULL AND i.image != '')")
+
     if cint(filters.get("barcode_empty")):
         conditions.append(
             "NOT EXISTS (SELECT 1 FROM `tabItem Barcode` ibx WHERE ibx.parent = i.item_code)"
         )
 
     if cint(filters.get("main_product_only")):
-        conditions.append(
-            "IFNULL(i.custom_pack_qty, 1) = 1 AND ("
-            " SELECT COUNT(*) FROM `tabItem` i2"
-            " WHERE COALESCE(NULLIF(TRIM(i2.custom_normalized_title), ''), i2.item_name)"
-            "     = COALESCE(NULLIF(TRIM(i.custom_normalized_title), ''), i.item_name)"
-            ") = 1"
-        )
+        # Main/base products: keep rows where unit SKU is empty or points to itself.
+        # If unit SKU points to another product, this row is considered a derived pack.
+        if has_unit_sku_col:
+            conditions.append(
+                "(COALESCE(NULLIF(TRIM(i.custom_unit_sku), ''), i.item_code) = i.item_code)"
+            )
+        else:
+            # Fallback for legacy sites without custom_unit_sku.
+            # Treat pack_qty == 1 (or empty) as "main" to preserve previous behavior.
+            conditions.append("IFNULL(i.custom_pack_qty, 1) = 1")
 
     list_price_gt = filters.get("list_price_gt")
     if list_price_gt is not None and str(list_price_gt).strip() != "":
@@ -228,6 +250,8 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
         """
         bin_select = "COALESCE(bsum.stock_qty, 0) AS stock_qty"
 
+    unit_sku_select = "COALESCE(i.custom_unit_sku, NULL) AS unit_sku" if has_unit_sku_col else "NULL AS unit_sku"
+
     sql = f"""
         SELECT
             i.item_code              AS client_sku,
@@ -238,6 +262,7 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
             COALESCE(i.custom_pack_qty, NULL)          AS pack_qty,
             COALESCE(i.custom_pack_size, NULL)         AS pack_size,
             COALESCE(i.custom_pack_unit, NULL)         AS unit,
+            {unit_sku_select},
             i.disabled               AS _disabled,
             COALESCE(i.custom_normalized_title, NULL)  AS _raw_norm,
             COALESCE(NULLIF(TRIM(i.custom_normalized_title), ''), i.item_name) AS normalized_title,
@@ -316,6 +341,8 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True):
         "image": "image",
         "source_category": "item_group",
     }
+    if frappe.db.has_column("Item", "custom_unit_sku"):
+        direct_field_map["unit_sku"] = "custom_unit_sku"
 
     updates: dict = {}
 
@@ -514,6 +541,31 @@ def apply_interest_adjustment_bulk(item_codes, percent, price_list=None):
 
     frappe.db.commit()
     return {"ok": True, "updated": updated}
+
+
+# ---------------------------------------------------------------------------
+# delete_products_bulk
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def delete_products_bulk(item_codes):
+    if isinstance(item_codes, str):
+        item_codes = json.loads(item_codes)
+
+    frappe.has_permission("Item", "delete", throw=True)
+
+    deleted = []
+    failed = []
+    for code in item_codes:
+        try:
+            frappe.delete_doc("Item", code, force=True, ignore_permissions=False)
+            deleted.append(code)
+        except Exception as e:
+            failed.append({"item_code": code, "error": str(e)})
+
+    frappe.db.commit()
+    return {"ok": True, "deleted": deleted, "failed": failed}
 
 
 # ---------------------------------------------------------------------------
