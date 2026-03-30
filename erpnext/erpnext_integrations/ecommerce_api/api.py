@@ -3614,6 +3614,11 @@ def clear_bazar_dashboard_mock_data():
 
 # ── i016: Product Manager Page ────────────────────────────────────────────────
 
+
+def _pm_module():
+	from erpnext.erpnext_integrations.ecommerce_api import product_manager as pm
+	return pm
+
 def _pm_has_col(col):
 	return frappe.db.has_column("Item", col)
 
@@ -3643,261 +3648,41 @@ def _pm_item_select():
 
 @frappe.whitelist()
 def get_product_rows(filters=None, page=1, page_length=200):
-	"""Return paginated, joined item rows for the Product Manager grid."""
-	filters = frappe.parse_json(filters or "{}")
-	page = max(1, cint(page))
-	page_length = max(1, min(cint(page_length), 500))
-	offset = (page - 1) * page_length
-
-	conditions = []
-	values = []
-
-	search = (filters.get("search") or "").strip()
-	if search:
-		conditions.append(
-			"(i.item_name LIKE %s OR i.item_code LIKE %s OR i.brand LIKE %s)"
-		)
-		like = f"%{search}%"
-		values += [like, like, like]
-
-	category = (filters.get("category") or "").strip()
-	if category:
-		conditions.append("i.item_group = %s")
-		values.append(category)
-
-	brand = (filters.get("brand") or "").strip()
-	if brand:
-		conditions.append("i.brand = %s")
-		values.append(brand)
-
-	if filters.get("active_only"):
-		conditions.append("i.disabled = 0")
-
-	where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-	select = _pm_item_select()
-
-	rows = frappe.db.sql(
-		f"""
-		SELECT {select}
-		FROM `tabItem` i
-		{where}
-		ORDER BY i.item_name
-		LIMIT %s OFFSET %s
-		""",
-		values + [page_length, offset],
-		as_dict=True,
-	)
-
-	total = frappe.db.sql(
-		f"SELECT COUNT(*) AS cnt FROM `tabItem` i {where}", values, as_dict=True
-	)[0]["cnt"]
-
-	# Attach tags (frappe Tag Link)
-	if rows:
-		codes = [r["item_code"] for r in rows]
-		ph = ", ".join(["%s"] * len(codes))
-		tag_rows = frappe.db.sql(
-			f"SELECT document_name, tag FROM `tabTag Link`"
-			f" WHERE document_type='Item' AND document_name IN ({ph})",
-			codes,
-			as_dict=True,
-		)
-		tags_map = {}
-		for t in tag_rows:
-			tags_map.setdefault(t["document_name"], []).append(t["tag"])
-		for r in rows:
-			r["tags"] = tags_map.get(r["item_code"], [])
-			r["is_active"] = 0 if r.get("disabled") else 1
-			r["modified"] = str(r.get("modified") or "")
-
-	return {"rows": rows, "total": total}
+	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
+	return _pm_module().get_product_rows(filters=filters, page=page, page_length=page_length)
 
 
 @frappe.whitelist()
 def save_product_row(item_code, changes):
-	"""Apply a dict of changed fields for one item."""
-	from frappe.utils import flt as _flt
-	from frappe.desk.tags import add_tag
-
-	changes = frappe.parse_json(changes)
-	if not frappe.db.exists("Item", item_code):
-		frappe.throw(f"Item {item_code} not found")
-
-	# ── direct Item fields ───────────────────────────────────────────────────
-	ITEM_FIELD_MAP = {
-		"source_title": "item_name",
-		"brand": "brand",
-		"source_category": "item_group",
-		"stock_uom": "stock_uom",
-		"normalized_title": "custom_normalized_title",
-		"review_notes": "custom_review_notes",
-		"pack_qty": "custom_pack_qty",
-		"pack_size": "custom_pack_size",
-		"unit": "custom_pack_unit",
-	}
-	item_updates = {}
-	for grid_field, db_field in ITEM_FIELD_MAP.items():
-		if grid_field in changes and _pm_has_col(db_field.replace("custom_", "custom_")):
-			item_updates[db_field] = changes[grid_field]
-
-	if "is_active" in changes:
-		item_updates["disabled"] = 0 if changes["is_active"] else 1
-
-	if item_updates:
-		frappe.db.set_value("Item", item_code, item_updates)
-
-	# ── brand: auto-create if missing ────────────────────────────────────────
-	if "brand" in changes and changes["brand"]:
-		bname = str(changes["brand"]).strip()
-		if bname and not frappe.db.exists("Brand", bname):
-			frappe.get_doc({"doctype": "Brand", "brand": bname}).insert(
-				ignore_permissions=True
-			)
-		frappe.db.set_value("Item", item_code, "brand", bname)
-
-	# ── price ─────────────────────────────────────────────────────────────────
-	if "list_price" in changes:
-		rate = _flt(changes["list_price"])
-		existing_price = frappe.db.get_value(
-			"Item Price",
-			{"item_code": item_code, "price_list": "Standard Selling", "selling": 1},
-			"name",
-		)
-		if existing_price:
-			frappe.db.set_value("Item Price", existing_price, "price_list_rate", rate)
-		else:
-			frappe.get_doc(
-				{
-					"doctype": "Item Price",
-					"item_code": item_code,
-					"price_list": "Standard Selling",
-					"selling": 1,
-					"price_list_rate": rate,
-				}
-			).insert(ignore_permissions=True)
-
-	# ── barcode ───────────────────────────────────────────────────────────────
-	if "barcode" in changes:
-		bc = str(changes["barcode"] or "").strip()
-		existing_bc = frappe.db.get_value(
-			"Item Barcode", {"parent": item_code, "idx": 1}, "name"
-		)
-		if existing_bc:
-			frappe.db.set_value("Item Barcode", existing_bc, "barcode", bc)
-		elif bc:
-			item_doc = frappe.get_doc("Item", item_code)
-			item_doc.append("barcodes", {"barcode": bc})
-			item_doc.save(ignore_permissions=True)
-
-	# ── tags ─────────────────────────────────────────────────────────────────
-	if "tags" in changes:
-		new_tags = set(str(t).strip() for t in (changes["tags"] or []) if t)
-		old_tag_rows = frappe.db.get_all(
-			"Tag Link",
-			{"document_type": "Item", "document_name": item_code},
-			["name", "tag"],
-		)
-		old_tags = {r["tag"] for r in old_tag_rows}
-		for r in old_tag_rows:
-			if r["tag"] not in new_tags:
-				frappe.db.delete("Tag Link", r["name"])
-		for t in new_tags - old_tags:
-			add_tag(t, "Item", item_code)
-
-	frappe.db.commit()
-	modified = frappe.db.get_value("Item", item_code, "modified")
-	return {"ok": True, "item_code": item_code, "modified": str(modified)}
+	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
+	return _pm_module().save_product_row(item_code=item_code, changes=changes)
 
 
 @frappe.whitelist()
 def save_product_rows_bulk(rows):
-	"""Batch-save multiple rows. rows = JSON list of {item_code, changes}."""
-	rows = frappe.parse_json(rows)
-	results = {}
-	errors = []
-	for entry in rows:
-		item_code = entry.get("item_code")
-		try:
-			r = save_product_row(item_code, frappe.as_json(entry.get("changes", {})))
-			results[item_code] = r
-		except Exception as exc:
-			errors.append({"item_code": item_code, "error": str(exc)})
-	return {"ok": True, "results": results, "errors": errors}
+	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
+	return _pm_module().save_product_rows_bulk(rows=rows)
 
 
 @frappe.whitelist()
 def set_items_active_bulk(item_codes, is_active):
-	"""Enable or disable a list of items."""
-	item_codes = frappe.parse_json(item_codes)
-	disabled = 0 if (is_active in (True, "true", "1", 1)) else 1
-	for code in item_codes:
-		if frappe.db.exists("Item", code):
-			frappe.db.set_value("Item", code, "disabled", disabled)
-	frappe.db.commit()
-	return {"ok": True, "count": len(item_codes)}
+	"""Legacy wrapper for older clients; canonical name is set_active_bulk."""
+	return _pm_module().set_active_bulk(item_codes=item_codes, is_active=is_active)
 
 
 @frappe.whitelist()
 def get_brand_suggestions(query=""):
-	"""Return up to 20 Brand names matching the query string."""
-	query = (query or "").strip()
-	like = f"%{query}%"
-	brands = frappe.db.sql(
-		"SELECT name FROM `tabBrand` WHERE name LIKE %s ORDER BY name LIMIT 20",
-		[like],
-		as_dict=True,
-	)
-	return [b["name"] for b in brands]
+	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
+	return _pm_module().get_brand_suggestions(query=query)
 
 
 @frappe.whitelist()
 def get_category_list():
-	"""Return all Item Group names, sorted."""
-	groups = frappe.db.get_all("Item Group", fields=["name"], order_by="name")
-	return [g["name"] for g in groups]
+	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
+	return _pm_module().get_category_list()
 
 
 @frappe.whitelist()
 def export_product_rows(filters=None):
-	"""Return all matching rows as CSV text."""
-	import csv, io
-	filters = frappe.parse_json(filters or "{}")
-	# Reuse get_product_rows with large page_length
-	result = get_product_rows(filters=frappe.as_json(filters), page=1, page_length=5000)
-	rows = result.get("rows", [])
-
-	COLS = [
-		"item_code", "item_name", "brand", "item_group", "barcode",
-		"list_price", "stock_uom", "custom_pack_qty", "custom_pack_size",
-		"custom_pack_unit", "is_active", "custom_normalized_title",
-		"custom_match_confidence", "custom_review_notes", "tags", "modified",
-	]
-	HEADERS = [
-		"SKU", "Title", "Brand", "Category", "Barcode",
-		"Price", "UOM", "Pack Qty", "Pack Size", "Unit",
-		"Active", "Normalized Title", "Confidence", "Notes", "Tags", "Modified",
-	]
-
-	buf = io.StringIO()
-	w = csv.writer(buf)
-	w.writerow(HEADERS)
-	for r in rows:
-		w.writerow([
-			r.get("item_code", ""),
-			r.get("item_name", ""),
-			r.get("brand", ""),
-			r.get("item_group", ""),
-			r.get("barcode", ""),
-			r.get("list_price", ""),
-			r.get("stock_uom", ""),
-			r.get("custom_pack_qty", ""),
-			r.get("custom_pack_size", ""),
-			r.get("custom_pack_unit", ""),
-			r.get("is_active", ""),
-			r.get("custom_normalized_title", ""),
-			r.get("custom_match_confidence", ""),
-			r.get("custom_review_notes", ""),
-			"|".join(r.get("tags") or []),
-			r.get("modified", ""),
-		])
-	return buf.getvalue()
+	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
+	return _pm_module().export_rows(filters=filters)
