@@ -1614,6 +1614,8 @@ def get_guest_preorder(preorder_name):
 		"currency": so.currency,
 		"remarks": getattr(so, "remarks", None),
 		"terms": getattr(so, "terms", None),
+		"additional_discount_amount": flt(getattr(so, "additional_discount_amount", 0)),
+		"advance_paid": flt(getattr(so, "advance_paid", 0)),
 		"items": [
 			{
 				"item_code": d.item_code,
@@ -1621,6 +1623,7 @@ def get_guest_preorder(preorder_name):
 				"qty": flt(d.qty),
 				"rate": flt(d.rate),
 				"amount": flt(d.amount),
+				"discount_percentage": flt(getattr(d, "discount_percentage", 0)),
 			}
 			for d in (so.items or [])
 		],
@@ -1671,8 +1674,123 @@ def mark_prepared_guest_preorder(preorder_name):
 	return get_guest_preorder(preorder_name)
 
 
-@frappe.whitelist(allow_guest=True)
-def get_customer_orders(customer, start=0, page_length=20):
+@frappe.whitelist()
+def unmark_prepared_guest_preorder(preorder_name):
+	"""Toggle a Completed preorder back to To Deliver and Bill."""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus == 1:
+		so.db_set("status", "To Deliver and Bill")
+	so.reload()
+	return get_guest_preorder(preorder_name)
+
+
+@frappe.whitelist()
+def update_guest_preorder_prices(preorder_name, items, additional_discount_amount=0):
+	"""Update item rates/qty and global discount on a draft preorder (docstatus=0 only)."""
+	import json as _json
+
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus != 0:
+		frappe.throw(_("Price editing is only allowed on draft orders (before confirming)"))
+
+	if isinstance(items, str):
+		items = _json.loads(items)
+
+	item_map = {i["item_code"]: i for i in items}
+
+	for row in so.items:
+		if row.item_code in item_map:
+			override = item_map[row.item_code]
+			row.rate = flt(override.get("rate", row.rate))
+			row.qty = flt(override.get("qty", row.qty))
+			row.discount_percentage = flt(override.get("discount_percentage", 0))
+			row.amount = row.rate * row.qty
+
+	so.apply_discount_on = "Grand Total"
+	so.additional_discount_amount = flt(additional_discount_amount)
+	so.run_method("calculate_taxes_and_totals")
+	so.save(ignore_permissions=True)
+	so.reload()
+	return get_guest_preorder(preorder_name)
+
+
+@frappe.whitelist()
+def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectivo"):
+	"""Create a Payment Entry for a confirmed preorder."""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus != 1:
+		frappe.throw(_("Payment can only be recorded on submitted (confirmed) orders"))
+
+	paid_amount = flt(paid_amount)
+	if paid_amount <= 0:
+		frappe.throw(_("Paid amount must be greater than zero"))
+
+	company = so.company
+
+	receivable_account = frappe.get_value("Company", company, "default_receivable_account")
+	cash_account = frappe.db.get_value(
+		"Mode of Payment Account",
+		{"parent": mode_of_payment, "company": company},
+		"default_account",
+	)
+	if not cash_account:
+		cash_account = frappe.db.get_value(
+			"Account",
+			{"account_type": "Cash", "company": company, "is_group": 0},
+			"name",
+		)
+
+	if not receivable_account or not cash_account:
+		frappe.throw(_("Could not find debit/credit accounts for payment. Check company defaults."))
+
+	outstanding = flt(so.grand_total) - flt(getattr(so, "advance_paid", 0))
+	allocated = min(paid_amount, outstanding) if outstanding > 0 else paid_amount
+
+	pe = frappe.new_doc("Payment Entry")
+	pe.payment_type = "Receive"
+	pe.company = company
+	pe.party_type = "Customer"
+	pe.party = so.customer
+	pe.paid_from = receivable_account
+	pe.paid_to = cash_account
+	pe.paid_from_account_currency = so.currency
+	pe.paid_to_account_currency = so.currency
+	pe.paid_amount = paid_amount
+	pe.received_amount = paid_amount
+	pe.reference_date = nowdate()
+	pe.reference_no = preorder_name
+	if allocated > 0:
+		pe.append("references", {
+			"reference_doctype": "Sales Order",
+			"reference_name": preorder_name,
+			"total_amount": flt(so.grand_total),
+			"outstanding_amount": outstanding,
+			"allocated_amount": allocated,
+		})
+	pe.insert(ignore_permissions=True)
+	pe.submit()
+	return get_guest_preorder(preorder_name)
+
+
+
 	"""
 	Get all orders for a customer
 
