@@ -1,0 +1,177 @@
+{
+ "actions": [],
+ "creation": "2026-04-06 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "free_section",
+  "use_duckduckgo",
+  "ddg_info",
+  "google_section",
+  "google_api_key",
+  "google_cx",
+  "google_daily_limit",
+  "bing_section",
+  "bing_api_key",
+  "bing_hourly_limit",
+  "worker_section",
+  "worker_enabled",
+  "batch_size",
+  "worker_interval_minutes",
+  "column_break_worker",
+  "process_existing_items",
+  "auto_enqueue_new_products",
+  "image_section",
+  "min_image_width",
+  "min_image_height",
+  "target_image_count"
+ ],
+ "fields": [
+  {
+   "fieldname": "free_section",
+   "fieldtype": "Section Break",
+   "label": "DuckDuckGo Images (FREE - Recommended)"
+  },
+  {
+   "fieldname": "use_duckduckgo",
+   "fieldtype": "Check",
+   "label": "Enable DuckDuckGo Image Search",
+   "default": "1",
+   "description": "100% Free - No API key required!"
+  },
+  {
+   "fieldname": "ddg_info",
+   "fieldtype": "HTML",
+   "options": "<div class='alert alert-success'><strong>DuckDuckGo is FREE</strong> and requires no API keys.<br>Install: <code>pip install ddgs</code><br><strong>Note:</strong> Add 1-2 second delays between requests to avoid rate limiting.</div>"
+  },
+  {
+   "fieldname": "google_section",
+   "fieldtype": "Section Break",
+   "label": "Google Custom Search (Optional Fallback)"
+  },
+  {
+   "fieldname": "google_api_key",
+   "fieldtype": "Password",
+   "label": "Google API Key",
+   "description": "Optional - only used if DuckDuckGo fails"
+  },
+  {
+   "fieldname": "google_cx",
+   "fieldtype": "Data",
+   "label": "Google Custom Search Engine ID"
+  },
+  {
+   "fieldname": "google_daily_limit",
+   "fieldtype": "Int",
+   "label": "Google Daily Query Limit",
+   "default": "100"
+  },
+  {
+   "fieldname": "bing_section",
+   "fieldtype": "Section Break",
+   "label": "Bing Image Search (Optional Fallback)"
+  },
+  {
+   "fieldname": "bing_api_key",
+   "fieldtype": "Password",
+   "label": "Bing API Key",
+   "description": "Optional - only used if DuckDuckGo fails"
+  },
+  {
+   "fieldname": "bing_hourly_limit",
+   "fieldtype": "Int",
+   "label": "Bing Hourly Query Limit",
+   "default": "40"
+  },
+  {
+   "fieldname": "worker_section",
+   "fieldtype": "Section Break",
+   "label": "Worker Settings"
+  },
+  {
+   "fieldname": "worker_enabled",
+   "fieldtype": "Check",
+   "label": "Enable Background Worker",
+   "default": "1"
+  },
+  {
+   "fieldname": "batch_size",
+   "fieldtype": "Int",
+   "label": "Batch Size",
+   "default": "10",
+   "description": "Number of jobs to process per batch"
+  },
+  {
+   "fieldname": "worker_interval_minutes",
+   "fieldtype": "Int",
+   "label": "Worker Interval (minutes)",
+   "default": "15",
+   "description": "How often to check for new jobs"
+  },
+  {
+   "fieldname": "column_break_worker",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "process_existing_items",
+   "fieldtype": "Check",
+   "label": "Process Existing Items Without Images",
+   "default": "1",
+   "description": "Automatically find images for existing items that have no image"
+  },
+  {
+   "fieldname": "auto_enqueue_new_products",
+   "fieldtype": "Check",
+   "label": "Auto-Enqueue New Products",
+   "default": "1",
+   "description": "Automatically search images for new products"
+  },
+  {
+   "fieldname": "image_section",
+   "fieldtype": "Section Break",
+   "label": "Image Quality"
+  },
+  {
+   "fieldname": "min_image_width",
+   "fieldtype": "Int",
+   "label": "Minimum Image Width",
+   "default": "200"
+  },
+  {
+   "fieldname": "min_image_height",
+   "fieldtype": "Int",
+   "label": "Minimum Image Height",
+   "default": "200"
+  },
+  {
+   "fieldname": "target_image_count",
+   "fieldtype": "Int",
+   "label": "Target Images per Product",
+   "default": "6"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-04-06 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Image Search",
+ "name": "Image Search Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

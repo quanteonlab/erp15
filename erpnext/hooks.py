@@ -396,6 +396,10 @@ doc_events = {
 	"Integration Request": {
 		"validate": "erpnext.accounts.doctype.payment_request.payment_request.validate_payment"
 	},
+	"Item": {
+		"after_insert": "erpnext.image_search.hooks_handlers.enqueue_item_image_search",
+		"on_update": "erpnext.image_search.hooks_handlers.check_item_image_removed"
+	},
 }
 
 # function should expect the variable and doc as arguments
@@ -414,6 +418,7 @@ scheduler_events = {
 	"cron": {
 		"0/15 * * * *": [
 			"erpnext.manufacturing.doctype.bom_update_log.bom_update_log.resume_bom_cost_update_jobs",
+			"erpnext.image_search.scheduler.run_image_search_worker",
 		],
 		"0/30 * * * *": [
 			"erpnext.utilities.doctype.video.video.update_youtube_data",
@@ -461,6 +466,7 @@ scheduler_events = {
 		"erpnext.accounts.utils.auto_create_exchange_rate_revaluation_daily",
 		"erpnext.accounts.utils.run_ledger_health_checks",
 		"erpnext.assets.doctype.asset_maintenance_log.asset_maintenance_log.update_asset_maintenance_log_status",
+		"erpnext.image_search.scheduler.scan_products_without_images",
 	],
 	"weekly": [
 		"erpnext.accounts.utils.auto_create_exchange_rate_revaluation_weekly",

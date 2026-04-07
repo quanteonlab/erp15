@@ -192,6 +192,13 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
     if cint(filters.get("no_image")):
         conditions.append("(i.image IS NULL OR i.image = '')")
 
+    if cint(filters.get("no_image_with_candidates")):
+        conditions.append("(i.image IS NULL OR i.image = '')")
+        conditions.append(
+            "EXISTS (SELECT 1 FROM `tabProduct Image Candidate` pic"
+            " WHERE pic.product_type = 'Item' AND pic.product_id = i.item_code)"
+        )
+
     if cint(filters.get("has_image")):
         conditions.append("(i.image IS NOT NULL AND i.image != '')")
 
@@ -476,6 +483,65 @@ def upload_item_image(item_code, filedata, filename="image.jpg"):
     frappe.db.set_value("Item", item_code, "image", file_url)
     frappe.db.commit()
     return {"ok": True, "image": file_url}
+
+
+# ---------------------------------------------------------------------------
+# image search helpers for POS products modal
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def get_item_image_candidates(item_code):
+    """Return image-search candidates and latest job state for one Item."""
+    frappe.has_permission("Item", "read", throw=True)
+    from erpnext.image_search.api import get_product_images_ui
+
+    return get_product_images_ui("Item", item_code)
+
+
+@frappe.whitelist()
+def enqueue_item_image_search(item_code, priority="High"):
+    """Queue an image-search job for one Item."""
+    frappe.has_permission("Item", "write", throw=True)
+    from erpnext.image_search.api import enqueue_product_image_search
+
+    return enqueue_product_image_search("Item", item_code, priority)
+
+
+@frappe.whitelist()
+def select_item_image_candidate(item_code, candidate_name):
+    """Set one candidate as primary Item image."""
+    frappe.has_permission("Item", "write", throw=True)
+    from erpnext.image_search.api import select_primary_image
+
+    return select_primary_image("Item", item_code, candidate_name)
+
+
+@frappe.whitelist()
+def get_item_image_jobs(status_group="running", limit=100):
+    """Return item image-search jobs for the POS jobs modal."""
+    frappe.has_permission("Item", "read", throw=True)
+    from erpnext.image_search.api import get_product_jobs_ui
+
+    return get_product_jobs_ui("Item", status_group, limit)
+
+
+@frappe.whitelist()
+def get_item_image_queue_stats():
+    """Return image-search queue counts for the POS jobs button."""
+    frappe.has_permission("Item", "read", throw=True)
+    from erpnext.image_search.api import get_queue_stats
+
+    return get_queue_stats()
+
+
+@frappe.whitelist()
+def enqueue_items_without_images_and_candidates(priority="Low", limit=None):
+    """Queue items that still have no image and no candidate options."""
+    frappe.has_permission("Item", "write", throw=True)
+    from erpnext.image_search.api import enqueue_items_without_images_and_candidates as enqueue_missing
+
+    return enqueue_missing(priority=priority, limit=limit)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,202 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:IMG-JOB-{####}",
+ "creation": "2026-04-06 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "product_info_section",
+  "product_type",
+  "product_id",
+  "product_name",
+  "column_break_product",
+  "search_query",
+  "priority",
+  "status",
+  "job_details_section",
+  "images_found",
+  "target_count",
+  "column_break_job",
+  "attempt_count",
+  "max_attempts",
+  "error_message",
+  "timing_section",
+  "created_at",
+  "started_at",
+  "column_break_timing",
+  "completed_at",
+  "next_retry_at",
+  "api_calls_section",
+  "api_calls_made"
+ ],
+ "fields": [
+  {
+   "fieldname": "product_info_section",
+   "fieldtype": "Section Break",
+   "label": "Product Information"
+  },
+  {
+   "fieldname": "product_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Product Type",
+   "options": "Item\nProduct Approval Queue",
+   "reqd": 1
+  },
+  {
+   "fieldname": "product_id",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "label": "Product ID",
+   "options": "product_type",
+   "reqd": 1
+  },
+  {
+   "fieldname": "product_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Product Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_product",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "search_query",
+   "fieldtype": "Data",
+   "label": "Search Query",
+   "description": "Generated from product title + brand"
+  },
+  {
+   "fieldname": "priority",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Priority",
+   "options": "Critical\nHigh\nNormal\nLow",
+   "default": "Normal"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Pending\nQueued\nIn Progress\nCompleted\nFailed\nRetrying",
+   "default": "Pending"
+  },
+  {
+   "fieldname": "job_details_section",
+   "fieldtype": "Section Break",
+   "label": "Job Details"
+  },
+  {
+   "fieldname": "images_found",
+   "fieldtype": "Int",
+   "label": "Images Found",
+   "default": "0",
+   "read_only": 1
+  },
+  {
+   "fieldname": "target_count",
+   "fieldtype": "Int",
+   "label": "Target Image Count",
+   "default": "6"
+  },
+  {
+   "fieldname": "column_break_job",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "attempt_count",
+   "fieldtype": "Int",
+   "label": "Attempt Count",
+   "default": "0",
+   "read_only": 1
+  },
+  {
+   "fieldname": "max_attempts",
+   "fieldtype": "Int",
+   "label": "Max Attempts",
+   "default": "3"
+  },
+  {
+   "fieldname": "error_message",
+   "fieldtype": "Long Text",
+   "label": "Error Message",
+   "read_only": 1
+  },
+  {
+   "fieldname": "timing_section",
+   "fieldtype": "Section Break",
+   "label": "Timing"
+  },
+  {
+   "fieldname": "created_at",
+   "fieldtype": "Datetime",
+   "label": "Created At",
+   "read_only": 1,
+   "default": "Now"
+  },
+  {
+   "fieldname": "started_at",
+   "fieldtype": "Datetime",
+   "label": "Started At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_timing",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "completed_at",
+   "fieldtype": "Datetime",
+   "label": "Completed At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "next_retry_at",
+   "fieldtype": "Datetime",
+   "label": "Next Retry At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "api_calls_section",
+   "fieldtype": "Section Break",
+   "label": "API Calls"
+  },
+  {
+   "fieldname": "api_calls_made",
+   "fieldtype": "JSON",
+   "label": "API Calls Made",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-04-06 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Image Search",
+ "name": "Product Image Search Job",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

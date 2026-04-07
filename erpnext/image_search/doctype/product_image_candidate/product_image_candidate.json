@@ -1,0 +1,173 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:IMG-CAND-{#####}",
+ "creation": "2026-04-06 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "product_section",
+  "product_type",
+  "product_id",
+  "rank",
+  "column_break_product",
+  "is_selected",
+  "is_downloaded",
+  "image_section",
+  "image_url",
+  "thumbnail_url",
+  "file_attachment",
+  "quality_section",
+  "width",
+  "height",
+  "column_break_quality",
+  "file_size",
+  "quality_score",
+  "source_section",
+  "source",
+  "metadata"
+ ],
+ "fields": [
+  {
+   "fieldname": "product_section",
+   "fieldtype": "Section Break",
+   "label": "Product"
+  },
+  {
+   "fieldname": "product_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Product Type",
+   "options": "Item\nProduct Approval Queue",
+   "reqd": 1
+  },
+  {
+   "fieldname": "product_id",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Product ID",
+   "options": "product_type",
+   "reqd": 1
+  },
+  {
+   "fieldname": "rank",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Rank",
+   "description": "Position in search results (1-6)"
+  },
+  {
+   "fieldname": "column_break_product",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "is_selected",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Selected as Primary",
+   "default": "0"
+  },
+  {
+   "fieldname": "is_downloaded",
+   "fieldtype": "Check",
+   "label": "Downloaded to Server",
+   "default": "0"
+  },
+  {
+   "fieldname": "image_section",
+   "fieldtype": "Section Break",
+   "label": "Image URLs"
+  },
+  {
+   "fieldname": "image_url",
+   "fieldtype": "Data",
+   "label": "Image URL",
+   "reqd": 1
+  },
+  {
+   "fieldname": "thumbnail_url",
+   "fieldtype": "Data",
+   "label": "Thumbnail URL"
+  },
+  {
+   "fieldname": "file_attachment",
+   "fieldtype": "Attach Image",
+   "label": "Downloaded Image"
+  },
+  {
+   "fieldname": "quality_section",
+   "fieldtype": "Section Break",
+   "label": "Quality Metrics"
+  },
+  {
+   "fieldname": "width",
+   "fieldtype": "Int",
+   "label": "Width (px)"
+  },
+  {
+   "fieldname": "height",
+   "fieldtype": "Int",
+   "label": "Height (px)"
+  },
+  {
+   "fieldname": "column_break_quality",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "file_size",
+   "fieldtype": "Int",
+   "label": "File Size (bytes)"
+  },
+  {
+   "fieldname": "quality_score",
+   "fieldtype": "Float",
+   "label": "Quality Score",
+   "description": "0-1 score based on resolution, aspect ratio, etc.",
+   "precision": "2"
+  },
+  {
+   "fieldname": "source_section",
+   "fieldtype": "Section Break",
+   "label": "Source"
+  },
+  {
+   "fieldname": "source",
+   "fieldtype": "Select",
+   "label": "Source",
+   "options": "DuckDuckGo Images\nGoogle Images\nBing Images\nProduct API\nManual Upload"
+  },
+  {
+   "fieldname": "metadata",
+   "fieldtype": "JSON",
+   "label": "Metadata"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-04-06 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Image Search",
+ "name": "Product Image Candidate",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
