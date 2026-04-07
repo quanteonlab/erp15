@@ -46,8 +46,8 @@ class ImageSearchWorker:
                 time.sleep(2)
             except Exception as e:
                 frappe.log_error(
-                    f"Error processing job {job.name}: {str(e)}",
-                    "Image Search Worker Error"
+                    title="Image Search Worker Error",
+                    message=f"Error processing job {job.name}: {str(e)}"
                 )
                 self.queue_manager.mark_job_failed(job.name, str(e))
 
@@ -79,24 +79,26 @@ class ImageSearchWorker:
             # Search for images
             images = self.search_service.search_images(
                 query=job['search_query'],
-                target_count=6
+                target_count=12
             )
 
             # Save image candidates
             saved_count = 0
-            for rank, image_data in enumerate(images[:6], start=1):
+            for image_data in images:
+                if saved_count >= 6:
+                    break
                 try:
                     self._save_image_candidate(
                         product_type=job['product_type'],
                         product_id=job['product_id'],
                         image_data=image_data,
-                        rank=rank
+                        rank=saved_count + 1
                     )
                     saved_count += 1
                 except Exception as e:
                     frappe.log_error(
-                        f"Error saving image candidate: {str(e)}",
-                        "Image Search Worker - Save Error"
+                        title="Image Search Worker - Save Error",
+                        message=f"Error saving image candidate for {job_name}: {str(e)}"
                     )
 
             # Mark job as completed
@@ -119,7 +121,7 @@ class ImageSearchWorker:
             "doctype": "Product Image Candidate",
             "product_type": product_type,
             "product_id": product_id,
-            "image_url": image_data['url'],
+            "image_url": image_data.get('url'),
             "thumbnail_url": image_data.get('thumbnail_url'),
             "source": image_data['source'],
             "width": image_data.get('width'),
@@ -128,6 +130,10 @@ class ImageSearchWorker:
             "rank": rank,
             "metadata": json.dumps(image_data.get('metadata', {}))
         })
+
+        if not candidate.image_url:
+            raise ValueError("Candidate has no image_url")
+
         candidate.insert(ignore_permissions=True)
         frappe.db.commit()
 

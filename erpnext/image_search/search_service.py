@@ -29,7 +29,7 @@ class ImageSearchService:
                 all_images.extend(ddg_images)
                 frappe.logger().info(f"DuckDuckGo returned {len(ddg_images)} images for '{query}'")
             except Exception as e:
-                frappe.log_error(f"DuckDuckGo search failed: {str(e)}", "Image Search Error")
+                frappe.log_error(title="Image Search Error", message=f"DuckDuckGo search failed: {str(e)}")
 
         # If we have enough images from DuckDuckGo, return them
         if len(all_images) >= target_count:
@@ -45,7 +45,7 @@ class ImageSearchService:
                 all_images.extend(google_images)
                 frappe.logger().info(f"Google returned {len(google_images)} images for '{query}'")
             except Exception as e:
-                frappe.log_error(f"Google search failed: {str(e)}", "Image Search Error")
+                frappe.log_error(title="Image Search Error", message=f"Google search failed: {str(e)}")
 
         # FALLBACK: Bing (if configured and still need more)
         if len(all_images) < target_count and self.settings.bing_api_key:
@@ -55,7 +55,7 @@ class ImageSearchService:
                 all_images.extend(bing_images)
                 frappe.logger().info(f"Bing returned {len(bing_images)} images for '{query}'")
             except Exception as e:
-                frappe.log_error(f"Bing search failed: {str(e)}", "Image Search Error")
+                frappe.log_error(title="Image Search Error", message=f"Bing search failed: {str(e)}")
 
         # Deduplicate and rank
         unique_images = self._deduplicate_images(all_images)

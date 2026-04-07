@@ -84,11 +84,13 @@
    "fieldname": "image_url",
    "fieldtype": "Data",
    "label": "Image URL",
+    "length": 500,
    "reqd": 1
   },
   {
    "fieldname": "thumbnail_url",
    "fieldtype": "Data",
+    "length": 500,
    "label": "Thumbnail URL"
   },
   {
