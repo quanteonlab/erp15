@@ -23,6 +23,9 @@ dependencies = [
 
     # Not used directly - required by PyQRCode for PNG generation
     "pypng~=0.20220715.0",
+
+    # Image search (free provider)
+    "ddgs>=7.0.0",
 ]
 
 [build-system]

@@ -130,7 +130,7 @@ class ImageSearchService:
                 results_count=0,
                 error_message=error_msg
             )
-            return []
+            raise RuntimeError(error_msg)
         except Exception as e:
             error_msg = str(e)
             self._log_api_call(
