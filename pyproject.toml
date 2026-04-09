@@ -14,6 +14,7 @@ dependencies = [
     "barcodenumber~=0.5.0",
     "rapidfuzz~=3.12.2",
     "holidays~=0.28",
+    "ddgs>=9.0.0,<10.0.0",
 
     # integration dependencies
     "googlemaps",
