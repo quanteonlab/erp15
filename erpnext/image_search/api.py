@@ -365,6 +365,15 @@ def get_product_images_ui(product_type, product_id):
     Returns:
         Dict with candidates and job status
     """
+    # Hydrate legacy static results into DB on first read when needed.
+    if product_type == "Item" and not frappe.db.exists(
+        "Product Image Candidate",
+        {"product_type": "Item", "product_id": product_id},
+    ):
+        from erpnext.image_search.legacy_candidate_import import import_candidates_for_item
+
+        import_candidates_for_item(product_id)
+
     # Get candidates
     candidates = get_product_image_candidates(product_type, product_id)
 
