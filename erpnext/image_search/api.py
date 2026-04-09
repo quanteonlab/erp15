@@ -336,6 +336,56 @@ def get_product_jobs_ui(product_type, status_group="running", limit=100):
 
 
 @frappe.whitelist()
+def clear_product_jobs_ui(product_type, include_failed=0):
+    """
+    Clear finalized image-search jobs for one product type.
+
+    Args:
+        product_type: "Item" or "Product Approval Queue"
+        include_failed: truthy value to also clear Failed jobs
+
+    Returns:
+        Dict with deleted count and statuses removed
+    """
+    statuses = ["Completed"]
+    if frappe.utils.cint(include_failed):
+        statuses.append("Failed")
+
+    names = frappe.get_all(
+        "Product Image Search Job",
+        filters={
+            "product_type": product_type,
+            "status": ["in", statuses],
+        },
+        pluck="name",
+        limit_page_length=0,
+    )
+
+    if not names:
+        return {
+            "deleted_count": 0,
+            "statuses": statuses,
+            "product_type": product_type,
+        }
+
+    for name in names:
+        frappe.delete_doc(
+            "Product Image Search Job",
+            name,
+            ignore_permissions=True,
+            delete_permanently=True,
+        )
+
+    frappe.db.commit()
+
+    return {
+        "deleted_count": len(names),
+        "statuses": statuses,
+        "product_type": product_type,
+    }
+
+
+@frappe.whitelist()
 def trigger_worker():
     """
     Manually trigger the background worker

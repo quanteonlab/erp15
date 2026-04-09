@@ -544,6 +544,15 @@ def enqueue_items_without_images_and_candidates(priority="Low", limit=None):
     return enqueue_missing(priority=priority, limit=limit)
 
 
+@frappe.whitelist()
+def clear_item_completed_image_jobs(include_failed=0):
+    """Clear completed Item image-search jobs for the POS jobs modal."""
+    frappe.has_permission("Item", "write", throw=True)
+    from erpnext.image_search.api import clear_product_jobs_ui
+
+    return clear_product_jobs_ui("Item", include_failed=include_failed)
+
+
 # ---------------------------------------------------------------------------
 # generate_barcodes_bulk — only rows without existing barcode
 # ---------------------------------------------------------------------------
