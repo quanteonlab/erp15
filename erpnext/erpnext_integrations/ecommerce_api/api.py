@@ -1772,9 +1772,10 @@ def set_guest_preorder_status(preorder_name, target_status):
 	"""
 	Unified status transition for the custom workflow.
 
-	Accepts target_status as one of: Orden, Preparado, En Delivery, Completado.
+	Accepts target_status as one of: Consulta, Orden, Preparado, En Delivery, Completado.
+	Consulta reverts a submitted order back to Draft.
 	"""
-	if target_status not in WORKFLOW_STATUSES or target_status == "Consulta":
+	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
 
 	if not frappe.db.exists("Sales Order", preorder_name):
@@ -1787,7 +1788,22 @@ def set_guest_preorder_status(preorder_name, target_status):
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot change status of a cancelled order"))
 
-	# Submit draft if needed
+	# Revert to Consulta (Draft)
+	if target_status == "Consulta":
+		if so.docstatus == 1:
+			so.flags.ignore_permissions = True
+			so.cancel()
+			# Create a new draft copy
+			new_so = frappe.copy_doc(so)
+			new_so.amended_from = so.name
+			new_so.docstatus = 0
+			new_so.insert(ignore_permissions=True)
+			frappe.db.commit()
+			return get_guest_preorder(new_so.name)
+		# Already draft
+		return get_guest_preorder(preorder_name)
+
+	# Submit draft if needed for forward transitions
 	if so.docstatus == 0:
 		so.submit()
 		so.reload()
@@ -4083,3 +4099,49 @@ def get_category_list():
 def export_product_rows(filters=None):
 	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
 	return _pm_module().export_rows(filters=filters)
+
+
+@frappe.whitelist()
+def update_product_info(item_code, item_name=None, price_list_rate=None, price_list=None):
+	"""
+	Update a product's official item_name and/or price_list_rate.
+
+	Args:
+		item_code: The item to update
+		item_name: New display name (optional)
+		price_list_rate: New price (optional)
+		price_list: Which price list to update (defaults to 'Standard Selling')
+	"""
+	if not frappe.db.exists("Item", item_code):
+		frappe.throw(_("Item {0} not found").format(item_code))
+
+	item = frappe.get_doc("Item", item_code)
+
+	if item_name is not None and item_name != item.item_name:
+		item.item_name = item_name
+		item.save(ignore_permissions=True)
+
+	if price_list_rate is not None:
+		price_list_rate = flt(price_list_rate)
+		pl = price_list or "Standard Selling"
+		existing = frappe.db.get_value(
+			"Item Price",
+			{"item_code": item_code, "price_list": pl, "selling": 1},
+			"name",
+		)
+		if existing:
+			frappe.db.set_value("Item Price", existing, "price_list_rate", price_list_rate)
+		else:
+			ip = frappe.new_doc("Item Price")
+			ip.item_code = item_code
+			ip.price_list = pl
+			ip.selling = 1
+			ip.price_list_rate = price_list_rate
+			ip.insert(ignore_permissions=True)
+
+	frappe.db.commit()
+	return {
+		"item_code": item_code,
+		"item_name": frappe.db.get_value("Item", item_code, "item_name"),
+		"price_list_rate": get_item_price(item_code, price_list or "Standard Selling"),
+	}
