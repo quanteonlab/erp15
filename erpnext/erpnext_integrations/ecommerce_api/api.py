@@ -1533,7 +1533,8 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 	"""
 	List Guest Preorders created by `create_guest_preorder`.
 
-	These are Sales Orders tagged with ``guest_preorder=1`` in ``remarks`` or ``terms``.
+	Cancelled orders that have been superseded by an amended version are excluded.
+	Only user-archived orders (no successor) and active orders are shown.
 	"""
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -1549,8 +1550,6 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 		else:
 			filters["status"] = status
 
-	total_count = frappe.db.count("Sales Order", filters=filters)
-
 	orders = frappe.get_all(
 		"Sales Order",
 		filters=filters,
@@ -1562,13 +1561,37 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 			"currency",
 			"docstatus",
 			"status",
+			"amended_from",
 		],
 		start=start,
-		limit_page_length=page_length,
-		order_by="transaction_date desc",
+		limit_page_length=int(page_length) + 50,  # fetch extra to account for filtering
+		order_by="transaction_date desc, creation desc",
 	)
 
-	order_names = [o["name"] for o in orders]
+	# Find cancelled orders that have been replaced by an amendment
+	superseded = set()
+	for o in orders:
+		if o.get("amended_from"):
+			superseded.add(o["amended_from"])
+
+	# Also check globally for superseded orders not in the current page
+	if orders:
+		order_names = [o["name"] for o in orders if o.get("docstatus") == 2]
+		if order_names:
+			amenders = frappe.get_all(
+				"Sales Order",
+				filters={"amended_from": ["in", order_names]},
+				fields=["amended_from"],
+			)
+			for a in amenders:
+				superseded.add(a["amended_from"])
+
+	# Filter out superseded cancelled orders
+	filtered = [o for o in orders if not (o.get("docstatus") == 2 and o["name"] in superseded)]
+	total_count = len(filtered)
+	filtered = filtered[:int(page_length)]
+
+	order_names = [o["name"] for o in filtered]
 	items_count_map = {}
 	if order_names:
 		rows = frappe.db.sql(
@@ -1584,10 +1607,23 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 		for r in rows or []:
 			items_count_map[r.parent] = r.items_count
 
-	for o in orders:
+	for o in filtered:
 		o["items_count"] = items_count_map.get(o["name"], 0)
+		# Compute display status from docstatus + status
+		ds = o.get("docstatus", 0)
+		st = o.get("status", "")
+		if ds == 0:
+			o["display_status"] = "Consulta"
+		elif ds == 2:
+			o["display_status"] = "Archivado"
+		elif st in ("Preparado", "En Delivery"):
+			o["display_status"] = st
+		elif st == "Completed":
+			o["display_status"] = "Completado"
+		else:
+			o["display_status"] = "Orden"
 
-	return {"preorders": orders, "total_count": total_count}
+	return {"preorders": filtered, "total_count": total_count}
 
 
 @frappe.whitelist()
@@ -1610,12 +1646,14 @@ def get_guest_preorder(preorder_name):
 		"delivery_date": so.delivery_date,
 		"docstatus": so.docstatus,
 		"status": so.status,
+		"display_status": _display_status(so),
 		"estimated_total": flt(so.grand_total),
 		"currency": so.currency,
 		"remarks": getattr(so, "remarks", None),
 		"terms": getattr(so, "terms", None),
 		"additional_discount_amount": flt(getattr(so, "additional_discount_amount", 0)),
 		"advance_paid": flt(getattr(so, "advance_paid", 0)),
+		"amended_from": so.amended_from or None,
 		"items": [
 			{
 				"item_code": d.item_code,
@@ -1628,6 +1666,143 @@ def get_guest_preorder(preorder_name):
 			for d in (so.items or [])
 		],
 	}
+
+
+@frappe.whitelist()
+def get_guest_preorder_history(preorder_name):
+	"""
+	Return the full version chain for a guest preorder.
+
+	Walks the amended_from chain backward to find the original,
+	then walks forward to collect all versions in chronological order.
+	"""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	# Walk backward to find the root
+	root = preorder_name
+	visited = {root}
+	while True:
+		amended_from = frappe.db.get_value("Sales Order", root, "amended_from")
+		if not amended_from or amended_from in visited:
+			break
+		visited.add(amended_from)
+		root = amended_from
+
+	# Walk forward from root collecting all versions
+	versions = []
+	current = root
+	while current:
+		so_data = frappe.db.get_value(
+			"Sales Order",
+			current,
+			["name", "transaction_date", "grand_total", "currency", "docstatus", "status", "creation"],
+			as_dict=True,
+		)
+		if not so_data:
+			break
+		items_count = frappe.db.count("Sales Order Item", {"parent": current})
+		versions.append({
+			"name": so_data.name,
+			"transaction_date": so_data.transaction_date,
+			"estimated_total": flt(so_data.grand_total),
+			"currency": so_data.currency,
+			"docstatus": so_data.docstatus,
+			"status": so_data.status,
+			"creation": so_data.creation,
+			"items_count": items_count,
+		})
+		# Find the next version (the one that has amended_from = current)
+		next_version = frappe.db.get_value(
+			"Sales Order", {"amended_from": current}, "name"
+		)
+		if next_version and next_version not in visited:
+			visited.add(next_version)
+			current = next_version
+		else:
+			break
+
+	return {
+		"current": preorder_name,
+		"versions": versions,
+	}
+
+
+# ── Custom workflow status helpers ────────────────────────────────────────────
+# Display statuses: Consulta → Orden → Preparado → En Delivery → Completado
+# Mapping to ERPNext:
+#   Consulta   = docstatus 0 (Draft)
+#   Orden      = docstatus 1, status "To Deliver and Bill"
+#   Preparado  = docstatus 1, status "Preparado"   (custom via db_set)
+#   En Delivery= docstatus 1, status "En Delivery"  (custom via db_set)
+#   Completado = docstatus 1, status "Completed"
+#   Archivado  = docstatus 2 (Cancelled)
+
+WORKFLOW_STATUSES = ["Consulta", "Orden", "Preparado", "En Delivery", "Completado"]
+
+def _display_status(so):
+	"""Return the user-facing workflow status for a Sales Order."""
+	if so.docstatus == 0:
+		return "Consulta"
+	if so.docstatus == 2:
+		return "Archivado"
+	# docstatus == 1
+	s = so.status
+	if s in ("Preparado", "En Delivery"):
+		return s
+	if s == "Completed":
+		return "Completado"
+	# "To Deliver and Bill", "To Deliver", "To Bill", etc.
+	return "Orden"
+
+
+def _erp_status_for_display(display_status):
+	"""Map display status → ERPNext status string."""
+	return {
+		"Orden": "To Deliver and Bill",
+		"Preparado": "Preparado",
+		"En Delivery": "En Delivery",
+		"Completado": "Completed",
+	}.get(display_status)
+
+
+@frappe.whitelist()
+def set_guest_preorder_status(preorder_name, target_status):
+	"""
+	Unified status transition for the custom workflow.
+
+	Accepts target_status as one of: Orden, Preparado, En Delivery, Completado.
+	"""
+	if target_status not in WORKFLOW_STATUSES or target_status == "Consulta":
+		frappe.throw(_("Invalid target status: {0}").format(target_status))
+
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus == 2:
+		frappe.throw(_("Cannot change status of a cancelled order"))
+
+	# Submit draft if needed
+	if so.docstatus == 0:
+		so.submit()
+		so.reload()
+
+	erp_status = _erp_status_for_display(target_status)
+	if not erp_status:
+		frappe.throw(_("Invalid target status"))
+
+	# For standard ERPNext statuses, use update_status; for custom ones, db_set
+	if erp_status in ("To Deliver and Bill", "Completed"):
+		so.update_status(erp_status)
+	else:
+		so.db_set("status", erp_status)
+
+	so.reload()
+	return get_guest_preorder(preorder_name)
 
 
 @frappe.whitelist()
@@ -1688,6 +1863,109 @@ def unmark_prepared_guest_preorder(preorder_name):
 		so.db_set("status", "To Deliver and Bill")
 	so.reload()
 	return get_guest_preorder(preorder_name)
+
+
+@frappe.whitelist()
+def cancel_guest_preorder(preorder_name):
+	"""Cancel (archive) a guest preorder. Works on both draft and submitted orders."""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus == 2:
+		frappe.throw(_("Order is already cancelled"))
+
+	so.flags.ignore_permissions = True
+	if so.docstatus == 1:
+		so.cancel()
+	else:
+		so.docstatus = 2
+		so.save()
+	so.reload()
+	return {"ok": True, "name": preorder_name, "status": "Cancelled"}
+
+
+@frappe.whitelist()
+def update_guest_preorder_items(preorder_name, items, additional_discount_amount=0):
+	"""
+	Full item replacement on a guest preorder.
+
+	For draft orders (docstatus=0): edits in place.
+	For submitted orders (docstatus=1): amends (cancel old, create amended copy, submit).
+
+	Returns the updated preorder detail (may have a new name if amended).
+	"""
+	import json as _json
+
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+
+	if so.docstatus == 2:
+		frappe.throw(_("Cannot edit a cancelled order"))
+
+	if isinstance(items, str):
+		items = _json.loads(items)
+
+	if not items:
+		frappe.throw(_("Items list cannot be empty"))
+
+	if so.docstatus == 1:
+		# Amend: cancel original, create amended copy with changes, submit
+		amended = frappe.copy_doc(so)
+		amended.amended_from = so.name
+		amended.docstatus = 0
+		so.flags.ignore_permissions = True
+		so.cancel()
+		_apply_item_changes(amended, items, additional_discount_amount)
+		amended.insert(ignore_permissions=True)
+		amended.submit()
+		amended.reload()
+		return get_guest_preorder(amended.name)
+
+	# Draft: edit in place
+	_apply_item_changes(so, items, additional_discount_amount)
+	so.save(ignore_permissions=True)
+	so.reload()
+	return get_guest_preorder(preorder_name)
+
+
+def _apply_item_changes(so, items, additional_discount_amount):
+	"""Apply item list changes to a Sales Order document (not yet saved)."""
+	new_item_map = {i["item_code"]: i for i in items}
+
+	# Remove rows not in the new list
+	so.items = [row for row in so.items if row.item_code in new_item_map]
+
+	# Update existing rows
+	existing_codes = {row.item_code for row in so.items}
+	for row in so.items:
+		override = new_item_map[row.item_code]
+		row.rate = flt(override.get("rate", row.rate))
+		row.qty = flt(override.get("qty", row.qty))
+		row.discount_percentage = flt(override.get("discount_percentage", 0))
+		row.amount = row.rate * row.qty
+
+	# Add new items
+	for item in items:
+		if item["item_code"] not in existing_codes:
+			so.append("items", {
+				"item_code": item["item_code"],
+				"qty": flt(item.get("qty", 1)),
+				"rate": flt(item.get("rate", 0)),
+				"discount_percentage": flt(item.get("discount_percentage", 0)),
+				"delivery_date": so.delivery_date,
+			})
+
+	so.apply_discount_on = "Grand Total"
+	so.additional_discount_amount = flt(additional_discount_amount)
+	so.run_method("calculate_taxes_and_totals")
 
 
 @frappe.whitelist()
