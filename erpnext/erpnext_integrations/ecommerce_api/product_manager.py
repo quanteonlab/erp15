@@ -72,6 +72,59 @@ def _parse_filters(filters):
     return filters or {}
 
 
+def _default_item_group() -> str:
+    """Return a leaf Item Group name for new Item creation."""
+    row = frappe.db.sql(
+        """
+        SELECT name
+        FROM `tabItem Group`
+        WHERE is_group = 0
+        ORDER BY lft ASC
+        LIMIT 1
+        """
+    )
+    if row and row[0][0]:
+        return row[0][0]
+    return "All Item Groups"
+
+
+def _generate_unique_item_code(exclude_codes=None) -> str:
+    """Generate a numeric item_code that does not exist in Item or the excluded list."""
+    excluded = set()
+    if isinstance(exclude_codes, str):
+        try:
+            exclude_codes = json.loads(exclude_codes)
+        except Exception:
+            exclude_codes = []
+    if isinstance(exclude_codes, list):
+        excluded = {str(x).strip() for x in exclude_codes if str(x).strip()}
+
+    max_numeric = frappe.db.sql(
+        """
+        SELECT MAX(CAST(item_code AS UNSIGNED))
+        FROM `tabItem`
+        WHERE item_code REGEXP '^[0-9]+$'
+        """
+    )
+    current = int((max_numeric[0][0] or 0))
+
+    for _ in range(1000):
+        current += 1
+        candidate = str(current)
+        if candidate in excluded:
+            continue
+        if not frappe.db.exists("Item", candidate):
+            return candidate
+
+    # Fallback in the very unlikely event of heavy collisions.
+    while True:
+        candidate = str(100000 + secrets.randbelow(900000))
+        if candidate in excluded:
+            continue
+        if not frappe.db.exists("Item", candidate):
+            return candidate
+
+
 # ---------------------------------------------------------------------------
 # get_pm_context — price lists, warehouses, default POS list
 # ---------------------------------------------------------------------------
@@ -433,6 +486,103 @@ def save_product_rows_bulk(rows, price_list=None):
 
     frappe.db.commit()
     return results
+
+
+@frappe.whitelist()
+def generate_item_code(exclude_codes=None):
+    """Generate a new unique SKU/item_code for POS product creation flows."""
+    frappe.has_permission("Item", "write", throw=True)
+    item_code = _generate_unique_item_code(exclude_codes=exclude_codes)
+    return {"item_code": item_code}
+
+
+@frappe.whitelist()
+def create_product_row(item_code=None, changes=None, price_list=None, activate=0):
+    """Create a new Item from POS products page and optionally activate it."""
+    frappe.has_permission("Item", "write", throw=True)
+
+    if isinstance(changes, str):
+        changes = json.loads(changes)
+    changes = changes or {}
+
+    title = (changes.get("source_title") or "").strip()
+    if not title:
+        frappe.throw(_("Product name is required"))
+
+    candidate_code = (item_code or changes.get("client_sku") or "").strip()
+    if not candidate_code:
+        candidate_code = _generate_unique_item_code()
+
+    if frappe.db.exists("Item", candidate_code):
+        frappe.throw(_("SKU already exists: {0}").format(candidate_code))
+
+    is_active = 1 if cint(activate) else cint(changes.get("is_active") or 0)
+    item_group = (changes.get("source_category") or "").strip() or _default_item_group()
+    stock_uom = (changes.get("stock_uom") or "").strip() or "Nos"
+
+    if not frappe.db.exists("Item Group", item_group):
+        item_group = _default_item_group()
+
+    brand_name = (changes.get("brand") or "").strip()
+    if brand_name and not frappe.db.exists("Brand", brand_name):
+        frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(ignore_permissions=True)
+
+    item_doc = frappe.get_doc(
+        {
+            "doctype": "Item",
+            "item_code": candidate_code,
+            "item_name": title,
+            "item_group": item_group,
+            "stock_uom": stock_uom,
+            "disabled": 0 if is_active else 1,
+            "brand": brand_name or None,
+            "custom_normalized_title": (changes.get("normalized_title") or "").strip() or None,
+            "custom_pack_qty": changes.get("pack_qty"),
+            "custom_pack_size": changes.get("pack_size"),
+            "custom_pack_unit": (changes.get("unit") or "").strip() or None,
+            "custom_review_notes": (changes.get("review_notes") or "").strip() or None,
+            "image": (changes.get("image") or "").strip() or None,
+        }
+    )
+
+    if frappe.db.has_column("Item", "custom_unit_sku"):
+        unit_sku = (changes.get("unit_sku") or "").strip()
+        item_doc.custom_unit_sku = unit_sku or None
+
+    item_doc.insert(ignore_permissions=True)
+
+    if changes.get("list_price") not in (None, ""):
+        _upsert_item_price(candidate_code, flt(changes.get("list_price")), price_list)
+
+    barcode = (changes.get("barcode") or "").strip()
+    if barcode:
+        _upsert_barcode(candidate_code, barcode)
+
+    if "tags" in changes:
+        _sync_tags(candidate_code, changes.get("tags"))
+
+    queued_image_search = False
+    if title:
+        try:
+            from erpnext.image_search.api import enqueue_product_image_search
+
+            enqueue_product_image_search("Item", candidate_code, "Low")
+            queued_image_search = True
+        except Exception:
+            frappe.log_error(
+                title="Create Product - Image Search Queue Error",
+                message=f"Could not queue image search for {candidate_code}",
+            )
+
+    frappe.db.commit()
+
+    modified = frappe.db.get_value("Item", candidate_code, "modified")
+    return {
+        "ok": True,
+        "item_code": candidate_code,
+        "modified": str(modified),
+        "queued_image_search": queued_image_search,
+    }
 
 
 # ---------------------------------------------------------------------------

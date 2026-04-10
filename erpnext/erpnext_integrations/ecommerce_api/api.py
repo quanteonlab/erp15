@@ -3184,7 +3184,7 @@ def simulate_receiving_flow():
 	existing = frappe.get_all(
 		"Item",
 		filters={"disabled": 0, "is_stock_item": 1},
-		fields=["item_code", "item_name", "stock_uom"],
+		fields=["item_code", "item_name", "stock_uom", "image"],
 		limit=3,
 	)
 	import uuid
@@ -3221,7 +3221,7 @@ def simulate_receiving_flow():
 		},
 	]
 	lines = [
-		{"line_id": str(uuid.uuid4()), "item_code": e["item_code"], "item_name": e["item_name"], "qty": i + 2, "unit_cost": 10.0 + i * 2}
+		{"line_id": str(uuid.uuid4()), "item_code": e["item_code"], "item_name": e["item_name"], "qty": i + 2, "unit_cost": 10.0 + i * 2, "image": e.get("image") or None}
 		for i, e in enumerate(existing)
 	] + [
 		{"line_id": str(uuid.uuid4()), "item_code": None, "draft_item_id": draft_items[0]["draft_id"], "item_name": draft_items[0]["item_name"], "qty": 5, "unit_cost": 0},
