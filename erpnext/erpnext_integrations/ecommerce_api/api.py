@@ -1692,6 +1692,7 @@ def get_guest_preorder_history(preorder_name):
 	# Walk forward from root collecting all versions
 	versions = []
 	current = root
+	forward_visited = {root}
 	while current:
 		so_data = frappe.db.get_value(
 			"Sales Order",
@@ -1716,8 +1717,8 @@ def get_guest_preorder_history(preorder_name):
 		next_version = frappe.db.get_value(
 			"Sales Order", {"amended_from": current}, "name"
 		)
-		if next_version and next_version not in visited:
-			visited.add(next_version)
+		if next_version and next_version not in forward_visited:
+			forward_visited.add(next_version)
 			current = next_version
 		else:
 			break
