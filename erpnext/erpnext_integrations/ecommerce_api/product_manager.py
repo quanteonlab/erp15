@@ -8,7 +8,7 @@ import secrets
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt
+from frappe.utils import cint, flt, nowtime, today
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,80 @@ def _new_unique_barcode() -> str:
     return body + _ean_check_digit(body)
 
 
+def _reconcile_item_stock_qty(item_code: str, warehouse: str, target_qty: float) -> None:
+    """Set absolute stock in *warehouse* via Stock Reconciliation (POS Product Manager)."""
+    target_qty = flt(target_qty)
+    if target_qty < 0:
+        frappe.throw(_("Quantity cannot be negative"))
+
+    item = frappe.get_doc("Item", item_code)
+    if not item.is_stock_item:
+        frappe.throw(_("Item {0} is not a stock item").format(item_code))
+    if item.has_serial_no or item.has_batch_no:
+        frappe.throw(
+            _(
+                "Quantity cannot be adjusted from Product Manager for serialized or batched item {0}"
+            ).format(item_code)
+        )
+
+    company = frappe.db.get_value("Warehouse", warehouse, "company")
+    if not company:
+        frappe.throw(_("Could not determine company for warehouse {0}").format(warehouse))
+
+    current = flt(
+        frappe.db.get_value(
+            "Bin", {"item_code": item_code, "warehouse": warehouse}, "actual_qty"
+        )
+        or 0
+    )
+    if abs(current - target_qty) < 1e-6:
+        return
+
+    expense_account = frappe.get_cached_value("Company", company, "stock_adjustment_account")
+    if not expense_account:
+        expense_account = frappe.db.get_value(
+            "Account",
+            {"account_type": "Stock Adjustment", "company": company, "disabled": 0},
+            "name",
+            order_by="name asc",
+        )
+    if not expense_account:
+        frappe.throw(_("No Stock Adjustment account for company {0}").format(company))
+
+    cost_center = frappe.get_cached_value("Company", company, "cost_center")
+    if not cost_center:
+        cost_center = frappe.db.get_value(
+            "Cost Center",
+            {"company": company, "is_group": 0, "disabled": 0},
+            "name",
+            order_by="name asc",
+        )
+
+    sr = frappe.new_doc("Stock Reconciliation")
+    sr.purpose = "Stock Reconciliation"
+    sr.company = company
+    sr.posting_date = today()
+    sr.posting_time = nowtime()
+    sr.set_posting_time = 1
+    sr.expense_account = expense_account
+    if cost_center:
+        sr.cost_center = cost_center
+    sr.append(
+        "items",
+        {
+            "item_code": item_code,
+            "warehouse": warehouse,
+            "qty": target_qty,
+        },
+    )
+    frappe.flags.ignore_permissions = True
+    try:
+        sr.insert()
+        sr.submit()
+    finally:
+        frappe.flags.ignore_permissions = False
+
+
 def _upsert_item_price(item_code: str, rate: float, price_list: str | None = None) -> None:
     pl = price_list or _default_price_list()
     existing = frappe.db.get_value(
@@ -70,6 +144,113 @@ def _parse_filters(filters):
     if isinstance(filters, str):
         filters = json.loads(filters)
     return filters or {}
+
+
+def _item_lex_sort_sql(alias: str = "i") -> str:
+    """Lowercase lexicographic key: TRIM(COALESCE(normalized, item_name)) in SQL."""
+    if frappe.db.has_column("Item", "custom_normalized_title"):
+        return (
+            f"LOWER(TRIM(COALESCE(NULLIF(TRIM({alias}.custom_normalized_title), ''), "
+            f"{alias}.item_name)))"
+        )
+    return f"LOWER(TRIM({alias}.item_name))"
+
+
+def _anchor_lex_sort_from_item_row(item: dict) -> str:
+    if not item:
+        return ""
+    name = (item.get("item_name") or "").strip()
+    if frappe.db.has_column("Item", "custom_normalized_title"):
+        nt = (item.get("custom_normalized_title") or "").strip()
+        key = nt if nt else name
+    else:
+        key = name
+    return key.lower()
+
+
+# ---------------------------------------------------------------------------
+# get_unit_sku_neighbors — i025 lexicographic title neighbors for Unit SKU picker
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def get_unit_sku_neighbors(anchor_item_code, limit=10):
+    """
+    Return Items immediately before and after the anchor in lexicographic order
+    on LOWER(TRIM(COALESCE(normalized_title, item_name))), tie-break item_code.
+    """
+    frappe.has_permission("Item", "read", throw=True)
+
+    anchor_item_code = (anchor_item_code or "").strip()
+    if not anchor_item_code:
+        frappe.throw(_("Item code is required"))
+    if not frappe.db.exists("Item", anchor_item_code):
+        frappe.throw(_("Item {0} not found").format(anchor_item_code))
+
+    limit_n = cint(limit) or 10
+    limit_n = max(4, min(limit_n, 30))
+    half = limit_n // 2
+    before_n = half
+    after_n = limit_n - half
+
+    fields = ["item_name"]
+    if frappe.db.has_column("Item", "custom_normalized_title"):
+        fields.append("custom_normalized_title")
+    item = frappe.db.get_value("Item", anchor_item_code, fields, as_dict=True)
+    anchor_sort = _anchor_lex_sort_from_item_row(item or {})
+
+    lex = _item_lex_sort_sql("i")
+
+    before = frappe.db.sql(
+        f"""
+        SELECT i.item_code, i.item_name, {lex} AS sort_title
+        FROM `tabItem` i
+        WHERE IFNULL(i.disabled, 0) = 0
+          AND i.item_code != %(anchor)s
+          AND (
+               ({lex}) < %(asort)s
+            OR (({lex}) = %(asort)s AND i.item_code < %(anchor)s)
+          )
+        ORDER BY {lex} DESC, i.item_code DESC
+        LIMIT %(bn)s
+        """,
+        {"anchor": anchor_item_code, "asort": anchor_sort, "bn": before_n},
+        as_dict=True,
+    )
+
+    after = frappe.db.sql(
+        f"""
+        SELECT i.item_code, i.item_name, {lex} AS sort_title
+        FROM `tabItem` i
+        WHERE IFNULL(i.disabled, 0) = 0
+          AND i.item_code != %(anchor)s
+          AND (
+               ({lex}) > %(asort)s
+            OR (({lex}) = %(asort)s AND i.item_code > %(anchor)s)
+          )
+        ORDER BY {lex} ASC, i.item_code ASC
+        LIMIT %(an)s
+        """,
+        {"anchor": anchor_item_code, "asort": anchor_sort, "an": after_n},
+        as_dict=True,
+    )
+
+    def row_out(r):
+        return {
+            "item_code": r.get("item_code"),
+            "title": r.get("item_name"),
+            "sort_title": (r.get("sort_title") or "")[:500],
+        }
+
+    b = [row_out(x) for x in (before or [])]
+    a = [row_out(x) for x in (after or [])]
+
+    return {
+        "anchor_sort_title": anchor_sort,
+        "before": b,
+        "after": a,
+        "total_returned": len(b) + len(a),
+    }
 
 
 def _default_item_group() -> str:
@@ -382,9 +563,12 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
 # ---------------------------------------------------------------------------
 
 
-def _save_product_row_impl(item_code, changes, price_list=None, commit=True):
+def _save_product_row_impl(item_code, changes, price_list=None, commit=True, warehouse=None):
     if isinstance(changes, str):
         changes = json.loads(changes)
+
+    changes = dict(changes)
+    stock_qty_target = changes.pop("stock_qty", None)
 
     frappe.has_permission("Item", "write", throw=True)
 
@@ -433,6 +617,13 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True):
     if "tags" in changes:
         _sync_tags(item_code, changes["tags"])
 
+    if stock_qty_target is not None:
+        if not warehouse:
+            frappe.throw(
+                _("Select a warehouse in Product Manager before saving quantity changes.")
+            )
+        _reconcile_item_stock_qty(item_code, warehouse, flt(stock_qty_target))
+
     if commit:
         frappe.db.commit()
     modified = frappe.db.get_value("Item", item_code, "modified")
@@ -440,8 +631,14 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True):
 
 
 @frappe.whitelist()
-def save_product_row(item_code, changes, price_list=None):
-    return _save_product_row_impl(item_code, changes, price_list=price_list, commit=True)
+def save_product_row(item_code, changes, price_list=None, warehouse=None):
+    return _save_product_row_impl(
+        item_code,
+        changes,
+        price_list=price_list,
+        commit=True,
+        warehouse=warehouse,
+    )
 
 
 def _upsert_barcode(item_code: str, barcode: str) -> None:
@@ -468,7 +665,7 @@ def _sync_tags(item_code: str, new_tags) -> None:
 
 
 @frappe.whitelist()
-def save_product_rows_bulk(rows, price_list=None):
+def save_product_rows_bulk(rows, price_list=None, warehouse=None):
     if isinstance(rows, str):
         rows = json.loads(rows)
 
@@ -481,6 +678,7 @@ def save_product_rows_bulk(rows, price_list=None):
             entry["changes"],
             price_list=price_list,
             commit=False,
+            warehouse=warehouse,
         )
         results.append(result)
 
@@ -497,13 +695,15 @@ def generate_item_code(exclude_codes=None):
 
 
 @frappe.whitelist()
-def create_product_row(item_code=None, changes=None, price_list=None, activate=0):
+def create_product_row(item_code=None, changes=None, price_list=None, activate=0, warehouse=None):
     """Create a new Item from POS products page and optionally activate it."""
     frappe.has_permission("Item", "write", throw=True)
 
     if isinstance(changes, str):
         changes = json.loads(changes)
     changes = changes or {}
+    if isinstance(warehouse, str) and not warehouse.strip():
+        warehouse = None
 
     title = (changes.get("source_title") or "").strip()
     if not title:
@@ -573,6 +773,9 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
                 title="Create Product - Image Search Queue Error",
                 message=f"Could not queue image search for {candidate_code}",
             )
+
+    if warehouse and changes.get("stock_qty") is not None:
+        _reconcile_item_stock_qty(candidate_code, warehouse, flt(changes["stock_qty"]))
 
     frappe.db.commit()
 

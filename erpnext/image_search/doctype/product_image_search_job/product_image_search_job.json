@@ -67,7 +67,7 @@
    "fieldname": "search_query",
    "fieldtype": "Data",
    "label": "Search Query",
-   "description": "Generated from product title + brand"
+   "description": "Generated from brand (full) + up to 6 chars of title + up to 3 chars of first barcode"
   },
   {
    "fieldname": "priority",
@@ -102,7 +102,7 @@
    "fieldname": "target_count",
    "fieldtype": "Int",
    "label": "Target Image Count",
-   "default": "6"
+   "default": "9"
   },
   {
    "fieldname": "column_break_job",

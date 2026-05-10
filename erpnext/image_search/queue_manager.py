@@ -7,6 +7,51 @@ import frappe
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
+_TITLE_QUERY_LEN = 6
+_BARCODE_QUERY_LEN = 3
+
+
+def _compose_image_search_query(
+    brand: str, title_text: str, barcode_text: Optional[str]
+) -> str:
+    """Brand (full) + up to 6 chars from title + up to 3 from barcode."""
+    title_part = (title_text or "").strip()[:_TITLE_QUERY_LEN]
+    barcode_part = (barcode_text or "").strip()[:_BARCODE_QUERY_LEN]
+    parts = []
+    b = (brand or "").strip()
+    if b:
+        parts.append(b)
+    if title_part:
+        parts.append(title_part)
+    if barcode_part:
+        parts.append(barcode_part)
+    return " ".join(parts).strip()
+
+
+def _first_item_barcode(item_code: str, item_doc) -> Optional[str]:
+    for row in getattr(item_doc, "barcodes", []) or []:
+        bc = (getattr(row, "barcode", None) or "").strip()
+        if bc:
+            return bc
+    rows = frappe.get_all(
+        "Item Barcode",
+        filters={"parent": item_code},
+        fields=["barcode"],
+        order_by="idx asc",
+        limit_page_length=1,
+    )
+    if rows and rows[0].get("barcode"):
+        return (rows[0]["barcode"] or "").strip() or None
+    return None
+
+
+def _first_paq_barcode(product_doc) -> Optional[str]:
+    for fname in ("barcode", "source_barcode"):
+        v = getattr(product_doc, fname, None)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
 
 class ImageSearchQueueManager:
     """Manages the queue of image search jobs"""
@@ -61,7 +106,7 @@ class ImageSearchQueueManager:
             "search_query": search_query,
             "priority": priority,
             "status": "Pending",
-            "target_count": self.settings.target_image_count or 6,
+            "target_count": self.settings.target_image_count or 9,
             "created_at": frappe.utils.now()
         })
         job.insert(ignore_permissions=True)
@@ -88,14 +133,18 @@ class ImageSearchQueueManager:
             if product_type == "Item":
                 item = frappe.get_doc("Item", product_id)
                 brand = item.brand or ""
-                name = item.item_name or item.item_code
-                return f"{brand} {name}".strip()
+                title_src = item.item_name or item.item_code or ""
+                barcode_src = _first_item_barcode(product_id, item)
+                q = _compose_image_search_query(brand, title_src, barcode_src)
+                return q or product_id
 
             elif product_type == "Product Approval Queue":
                 product = frappe.get_doc("Product Approval Queue", product_id)
                 brand = product.brand or ""
-                title = product.normalized_title or product.source_title
-                return f"{brand} {title}".strip()
+                title_src = product.normalized_title or product.source_title or ""
+                barcode_src = _first_paq_barcode(product)
+                q = _compose_image_search_query(brand, title_src, barcode_src)
+                return q or product_id
         except Exception as e:
             frappe.log_error(f"Error generating search query: {str(e)}")
             return product_id
@@ -121,7 +170,8 @@ class ImageSearchQueueManager:
             "Product Image Search Job",
             filters={"status": ["in", ["Pending", "Retrying"]]},
             fields=["name", "product_type", "product_id", "product_name",
-                    "search_query", "priority", "attempt_count", "max_attempts", "next_retry_at", "status"],
+                    "search_query", "priority", "attempt_count", "max_attempts", "next_retry_at", "status",
+                    "target_count"],
             order_by="CASE priority "
                      "WHEN 'Critical' THEN 1 "
                      "WHEN 'High' THEN 2 "

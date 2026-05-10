@@ -14,7 +14,7 @@ class ImageSearchService:
     def __init__(self):
         self.settings = frappe.get_single("Image Search Settings")
 
-    def search_images(self, query: str, target_count: int = 6) -> List[Dict]:
+    def search_images(self, query: str, target_count: int = 9) -> List[Dict]:
         """
         Search for images using multiple providers (FREE options prioritized)
 
@@ -22,7 +22,7 @@ class ImageSearchService:
         """
         all_images = []
 
-        # FREE OPTION 1: DuckDuckGo (6 images - no API key needed!)
+        # FREE OPTION 1: DuckDuckGo (no API key needed)
         if self.settings.use_duckduckgo:
             try:
                 ddg_images = self.search_duckduckgo(query, num_results=target_count)
@@ -41,7 +41,7 @@ class ImageSearchService:
         if self.settings.google_api_key:
             try:
                 needed = target_count - len(all_images)
-                google_images = self.search_google(query, num_results=min(needed, 3))
+                google_images = self.search_google(query, num_results=min(needed, 6))
                 all_images.extend(google_images)
                 frappe.logger().info(f"Google returned {len(google_images)} images for '{query}'")
             except Exception as e:
@@ -51,7 +51,7 @@ class ImageSearchService:
         if len(all_images) < target_count and self.settings.bing_api_key:
             try:
                 needed = target_count - len(all_images)
-                bing_images = self.search_bing(query, num_results=min(needed, 3))
+                bing_images = self.search_bing(query, num_results=min(needed, 6))
                 all_images.extend(bing_images)
                 frappe.logger().info(f"Bing returned {len(bing_images)} images for '{query}'")
             except Exception as e:
@@ -63,7 +63,7 @@ class ImageSearchService:
 
         return ranked_images[:target_count]
 
-    def search_duckduckgo(self, query: str, num_results: int = 6) -> List[Dict]:
+    def search_duckduckgo(self, query: str, num_results: int = 9) -> List[Dict]:
         """
         Search DuckDuckGo Images (100% FREE - No API key needed!)
 

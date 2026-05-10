@@ -147,7 +147,7 @@
    "fieldname": "target_image_count",
    "fieldtype": "Int",
    "label": "Target Images per Product",
-   "default": "6"
+   "default": "9"
   }
  ],
  "index_web_pages_for_search": 1,

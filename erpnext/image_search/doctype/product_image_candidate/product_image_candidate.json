@@ -56,7 +56,7 @@
    "fieldtype": "Int",
    "in_list_view": 1,
    "label": "Rank",
-   "description": "Position in search results (1-6)"
+   "description": "Position in search results (1-9)"
   },
   {
    "fieldname": "column_break_product",

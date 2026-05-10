@@ -5,6 +5,7 @@ Background worker that processes image search jobs
 
 import json
 import frappe
+from frappe.utils import cint
 from frappe.utils.background_jobs import enqueue
 from typing import List, Dict
 import time
@@ -76,16 +77,19 @@ class ImageSearchWorker:
         self.queue_manager.mark_job_started(job_name)
 
         try:
-            # Search for images
+            target = cint(job.get("target_count")) or 9
+            # Request a few extra URLs in case some fail quality / dedupe
+            fetch_count = max(target, 12)
+
             images = self.search_service.search_images(
                 query=job['search_query'],
-                target_count=12
+                target_count=fetch_count,
             )
 
             # Save image candidates
             saved_count = 0
             for image_data in images:
-                if saved_count >= 6:
+                if saved_count >= target:
                     break
                 try:
                     self._save_image_candidate(

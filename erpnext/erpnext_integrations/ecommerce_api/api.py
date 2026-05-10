@@ -4066,15 +4066,17 @@ def get_product_rows(filters=None, page=1, page_length=200):
 
 
 @frappe.whitelist()
-def save_product_row(item_code, changes):
+def save_product_row(item_code, changes, warehouse=None):
 	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
-	return _pm_module().save_product_row(item_code=item_code, changes=changes)
+	return _pm_module().save_product_row(
+		item_code=item_code, changes=changes, warehouse=warehouse
+	)
 
 
 @frappe.whitelist()
-def save_product_rows_bulk(rows):
+def save_product_rows_bulk(rows, warehouse=None):
 	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
-	return _pm_module().save_product_rows_bulk(rows=rows)
+	return _pm_module().save_product_rows_bulk(rows=rows, warehouse=warehouse)
 
 
 @frappe.whitelist()
@@ -4093,6 +4095,14 @@ def get_brand_suggestions(query=""):
 def get_category_list():
 	"""Legacy wrapper; canonical implementation lives in ecommerce_api.product_manager."""
 	return _pm_module().get_category_list()
+
+
+@frappe.whitelist()
+def get_unit_sku_neighbors(anchor_item_code=None, limit=10):
+	"""i025: lexicographic title neighbors for Unit SKU picker."""
+	return _pm_module().get_unit_sku_neighbors(
+		anchor_item_code=anchor_item_code, limit=limit
+	)
 
 
 @frappe.whitelist()
