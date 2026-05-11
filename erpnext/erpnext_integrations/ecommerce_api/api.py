@@ -3991,6 +3991,150 @@ def import_catalog_image_batch(images):
 	return report
 
 
+@frappe.whitelist()
+def upload_item_image_mobile(item_code=None, image_base64=None, filename=None):
+	"""
+	Mobile-optimized image upload endpoint for single item images.
+	
+	Accepts:
+	- item_code: SKU/item code (required, can also resolve from barcode)
+	- image_base64: base64-encoded image data (with or without data URL prefix)
+	- filename: original filename (optional, used for file extension detection)
+	
+	Supports:
+	- Direct multipart form file upload (field name: 'file' or 'image')
+	- Base64 payload in JSON request body
+	- Auto-resolution: barcode → item_code
+	- Image types: jpg, jpeg, png, webp, gif
+	
+	Returns:
+	{
+		"ok": true/false,
+		"image": "<file_url>",     # URL to uploaded image (if ok=true)
+		"item_code": "<item_code>", # Resolved item code
+		"message": "<msg>",        # Status message
+		"error": "<error>"         # Error details (if ok=false)
+	}
+	"""
+	frappe.has_permission("Item", "write", throw=True)
+	
+	response = {
+		"ok": False,
+		"image": None,
+		"item_code": None,
+		"message": None,
+		"error": None,
+	}
+	
+	try:
+		# Step 1: Resolve item_code
+		if not item_code:
+			frappe.throw(_("item_code is required"))
+		
+		resolved_code = _resolve_item_code_from_image_stem(item_code)
+		if not resolved_code:
+			# Try as-is (might be exact item_code)
+			if frappe.db.exists("Item", item_code):
+				resolved_code = item_code
+			else:
+				response["error"] = f"Item not found: {item_code}"
+				return response
+		
+		response["item_code"] = resolved_code
+		
+		# Step 2: Get image content
+		image_bytes = None
+		
+		# Try multipart file upload first
+		req_files = getattr(getattr(frappe.local, "request", None), "files", None)
+		if req_files:
+			uploaded_file = req_files.get("file") or req_files.get("image")
+			if uploaded_file:
+				image_bytes = uploaded_file.read()
+				if not filename:
+					filename = getattr(uploaded_file, "filename", None)
+		
+		# Fall back to base64 payload
+		if not image_bytes:
+			if not image_base64:
+				frappe.throw(_("No image data provided. Send multipart file or image_base64."))
+			
+			# Handle data URL format: "data:image/jpeg;base64,..."
+			if "," in image_base64:
+				image_base64 = image_base64.split(",", 1)[1]
+			
+			try:
+				image_bytes = base64.b64decode(image_base64)
+			except Exception as e:
+				response["error"] = f"Invalid base64 data: {str(e)}"
+				return response
+		
+		if not image_bytes:
+			response["error"] = "No valid image data"
+			return response
+		
+		# Step 3: Validate image format
+		if filename:
+			_, ext = os.path.splitext(filename)
+		else:
+			# Try to detect from bytes magic number
+			ext = _detect_image_format(image_bytes)
+			if not ext:
+				ext = ".jpg"  # Default
+			filename = f"{resolved_code}{ext}"
+		
+		ext = ext.lower()
+		supported_ext = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+		if ext not in supported_ext:
+			response["error"] = f"Unsupported image format: {ext}. Supported: {', '.join(supported_ext)}"
+			return response
+		
+		if not filename:
+			filename = f"{resolved_code}{ext}"
+		
+		# Step 4: Save image to Frappe
+		try:
+			_apply_item_image(resolved_code, filename, image_bytes)
+			file_url = frappe.db.get_value("Item", resolved_code, "image")
+			response["ok"] = True
+			response["image"] = file_url
+			response["message"] = f"Image uploaded successfully for {resolved_code}"
+			frappe.db.commit()
+		except Exception as e:
+			response["error"] = f"Failed to save image: {str(e)}"
+			return response
+		
+		return response
+	
+	except frappe.PermissionError:
+		response["error"] = "Permission denied"
+		return response
+	except Exception as e:
+		response["error"] = str(e)
+		return response
+
+
+def _detect_image_format(data):
+	"""Detect image format from file magic bytes."""
+	if not data or len(data) < 4:
+		return None
+	
+	# JPEG: FF D8 FF
+	if data[:3] == b'\xff\xd8\xff':
+		return '.jpg'
+	# PNG: 89 50 4E 47
+	elif data[:4] == b'\x89PNG':
+		return '.png'
+	# GIF: 47 49 46
+	elif data[:3] == b'GIF':
+		return '.gif'
+	# WebP: RIFF ... WEBP
+	elif data[:4] == b'RIFF' and len(data) >= 12 and data[8:12] == b'WEBP':
+		return '.webp'
+	
+	return None
+
+
 # ── i013: Dashboard mock-data seeding ────────────────────────────────────────
 
 @frappe.whitelist()
