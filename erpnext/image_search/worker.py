@@ -108,6 +108,13 @@ class ImageSearchWorker:
             # Mark job as completed
             self.queue_manager.mark_job_completed(job_name, saved_count)
 
+            # For rows missing an image, auto-select rank-1 candidate after successful search.
+            if saved_count > 0:
+                self._auto_apply_first_candidate_if_missing_image(
+                    product_type=job['product_type'],
+                    product_id=job['product_id'],
+                )
+
             frappe.logger().info(
                 f"Completed job {job_name} for {job['product_name']}: {saved_count} images found"
             )
@@ -140,6 +147,59 @@ class ImageSearchWorker:
 
         candidate.insert(ignore_permissions=True)
         frappe.db.commit()
+
+    def _auto_apply_first_candidate_if_missing_image(self, product_type: str, product_id: str):
+        """When product has no image, set rank-1 candidate as selected + primary image."""
+        try:
+            if product_type == "Item":
+                current = frappe.db.get_value("Item", product_id, "image")
+                if current:
+                    return
+            elif product_type == "Product Approval Queue":
+                if not frappe.db.exists("DocType", "Product Approval Queue"):
+                    return
+                current = frappe.db.get_value("Product Approval Queue", product_id, "image")
+                if current:
+                    return
+            else:
+                return
+
+            candidate = frappe.db.sql(
+                """
+                SELECT name, image_url
+                FROM `tabProduct Image Candidate`
+                WHERE product_type = %s AND product_id = %s
+                ORDER BY rank ASC, creation ASC
+                LIMIT 1
+                """,
+                (product_type, product_id),
+                as_dict=True,
+            )
+            candidate = candidate[0] if candidate else None
+            if not candidate or not candidate.get("image_url"):
+                return
+
+            frappe.db.sql(
+                """
+                UPDATE `tabProduct Image Candidate`
+                SET is_selected = 0
+                WHERE product_type = %s AND product_id = %s
+                """,
+                (product_type, product_id),
+            )
+            frappe.db.set_value("Product Image Candidate", candidate.name, "is_selected", 1)
+
+            if product_type == "Item":
+                frappe.db.set_value("Item", product_id, "image", candidate.image_url)
+            else:
+                frappe.db.set_value("Product Approval Queue", product_id, "image", candidate.image_url)
+
+            frappe.db.commit()
+        except Exception as exc:
+            frappe.log_error(
+                title="Image Search Worker - Auto Apply First Candidate",
+                message=f"{product_type} {product_id}: {str(exc)}",
+            )
 
 
 # Module-level functions for enqueue

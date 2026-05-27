@@ -898,6 +898,119 @@ def enqueue_items_without_images_and_candidates(priority="Low", limit=None):
 
 
 @frappe.whitelist()
+def auto_apply_first_image_for_missing_items(priority="Low", limit=None, dry_run=0):
+    """
+    For Item rows without an image:
+    - if candidates already exist, apply the first candidate image
+    - if no candidates exist, enqueue image search
+
+    Args:
+        priority: Job priority for queued searches
+        limit: Optional max number of items to process
+        dry_run: When truthy, return counts only and do not modify data
+    """
+    frappe.has_permission("Item", "write", throw=True)
+
+    from erpnext.image_search.api import enqueue_product_image_search, select_primary_image
+
+    limit_val = cint(limit) if limit not in (None, "", 0, "0") else None
+    dry = cint(dry_run) == 1
+
+    where_clause = "WHERE IFNULL(image, '') = ''"
+    limit_clause = f"LIMIT {limit_val}" if limit_val and limit_val > 0 else ""
+
+    item_rows = frappe.db.sql(
+        f"""
+        SELECT name
+        FROM `tabItem`
+        {where_clause}
+        ORDER BY modified DESC
+        {limit_clause}
+        """,
+        as_dict=True,
+    )
+
+    total_missing = len(item_rows)
+    with_candidates_not_selected = 0
+    with_candidates_selected = 0
+    without_candidates = 0
+
+    applied_count = 0
+    queued_count = 0
+    already_queued_or_existing_job = 0
+    errors = []
+
+    for row in item_rows:
+        item_code = row.name
+
+        selected_candidate = frappe.db.get_value(
+            "Product Image Candidate",
+            {
+                "product_type": "Item",
+                "product_id": item_code,
+                "is_selected": 1,
+            },
+            ["name", "rank", "image_url"],
+            as_dict=True,
+        )
+
+        first_candidate = frappe.db.sql(
+            """
+            SELECT name, rank, image_url
+            FROM `tabProduct Image Candidate`
+            WHERE product_type = 'Item' AND product_id = %s
+            ORDER BY rank ASC, creation ASC
+            LIMIT 1
+            """,
+            (item_code,),
+            as_dict=True,
+        )
+
+        first_candidate = first_candidate[0] if first_candidate else None
+
+        if first_candidate:
+            if selected_candidate:
+                with_candidates_selected += 1
+            else:
+                with_candidates_not_selected += 1
+
+            if dry:
+                continue
+
+            try:
+                select_primary_image("Item", item_code, first_candidate.name)
+                applied_count += 1
+            except Exception as exc:
+                errors.append({"item_code": item_code, "error": str(exc)})
+            continue
+
+        without_candidates += 1
+        if dry:
+            continue
+
+        try:
+            queued = enqueue_product_image_search("Item", item_code, priority)
+            if queued.get("success"):
+                queued_count += 1
+            else:
+                already_queued_or_existing_job += 1
+        except Exception as exc:
+            errors.append({"item_code": item_code, "error": str(exc)})
+
+    return {
+        "dry_run": dry,
+        "total_missing_image": total_missing,
+        "with_candidates_not_selected": with_candidates_not_selected,
+        "with_candidates_selected": with_candidates_selected,
+        "without_candidates": without_candidates,
+        "applied_count": applied_count,
+        "queued_count": queued_count,
+        "already_queued_or_existing_job": already_queued_or_existing_job,
+        "errors": errors,
+    }
+
+
+@frappe.whitelist()
 def clear_item_completed_image_jobs(include_failed=0):
     """Clear completed Item image-search jobs for the POS jobs modal."""
     frappe.has_permission("Item", "write", throw=True)
