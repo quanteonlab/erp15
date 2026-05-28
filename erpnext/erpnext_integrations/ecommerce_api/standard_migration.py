@@ -28,7 +28,6 @@ STANDARD_COLUMNS = {
     "inferred_brand",
     "inferred_pack_size",
     "inferred_pack_qty",
-    "match_confidence",
     "review_notes",
 }
 

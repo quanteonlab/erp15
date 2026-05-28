@@ -4188,7 +4188,7 @@ def _pm_item_select():
 	]
 	custom = [
 		"custom_pack_qty", "custom_pack_size", "custom_pack_unit",
-		"custom_normalized_title", "custom_match_confidence", "custom_review_notes",
+		"custom_normalized_title", "custom_review_notes",
 	]
 	parts = always[:]
 	for c in custom:

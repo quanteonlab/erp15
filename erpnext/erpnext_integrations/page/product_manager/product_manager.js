@@ -206,7 +206,6 @@ class ProductManagerPage {
 			components: {
 				imageCellRenderer: ImageCellRenderer,
 				activeCellRenderer: ActiveCellRenderer,
-				confidenceCellRenderer: ConfidenceCellRenderer,
 				notesCellRenderer: NotesCellRenderer,
 				tagsCellRenderer: TagsCellRenderer,
 				tagsCellEditor: TagsCellEditor,
@@ -336,14 +335,6 @@ class ProductManagerPage {
 				field: 'custom_normalized_title', headerName: 'Normalized',
 				width: 220, minWidth: 80, editable: true,
 				hide: hide('custom_normalized_title'),
-			},
-			// ── confidence
-			{
-				field: 'custom_match_confidence', headerName: 'Conf',
-				width: 65, minWidth: 55, editable: false,
-				cellRenderer: 'confidenceCellRenderer',
-				filter: 'agNumberColumnFilter',
-				hide: hide('custom_match_confidence'),
 			},
 			// ── notes
 			{
@@ -726,7 +717,6 @@ class ProductManagerPage {
 			}
 			.pm-active-badge.on  { background: #dcfce7; color: #16a34a; }
 			.pm-active-badge.off { background: #fee2e2; color: #dc2626; }
-			.pm-conf-bar { height: 6px; border-radius: 3px; margin-top: 2px; }
 			.pm-note-chip {
 				display: inline-block; background: #fef3c7; color: #92400e;
 				border-radius: 4px; padding: 1px 5px; font-size: 10px; max-width: 140px;
@@ -797,23 +787,6 @@ ActiveCellRenderer.prototype._render = function (val) {
 };
 ActiveCellRenderer.prototype.getGui = function () { return this.eGui; };
 ActiveCellRenderer.prototype.refresh = function (p) { this._render(p.value); return true; };
-
-function ConfidenceCellRenderer() {}
-ConfidenceCellRenderer.prototype.init = function (params) {
-	this.eGui = document.createElement('div');
-	this._render(params.value);
-};
-ConfidenceCellRenderer.prototype._render = function (val) {
-	const pct = val != null ? Math.round(val * 100) : null;
-	if (pct == null) { this.eGui.textContent = '—'; return; }
-	const hue = Math.round(pct * 1.2); // 0=red 100=green (roughly)
-	this.eGui.innerHTML = `
-		<span style="font-size:11px;">${pct}%</span>
-		<div class="pm-conf-bar" style="width:${pct}%; background: hsl(${hue},70%,50%);"></div>
-	`;
-};
-ConfidenceCellRenderer.prototype.getGui = function () { return this.eGui; };
-ConfidenceCellRenderer.prototype.refresh = function (p) { this._render(p.value); return true; };
 
 function NotesCellRenderer() {}
 NotesCellRenderer.prototype.init = function (params) {

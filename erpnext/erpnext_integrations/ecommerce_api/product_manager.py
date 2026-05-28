@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import importlib
 import json
 import secrets
 
 import frappe
 from frappe import _
+from frappe.utils.background_jobs import enqueue
 from frappe.utils import cint, flt, nowtime, today
 
 
@@ -314,6 +316,7 @@ def _generate_unique_item_code(exclude_codes=None) -> str:
 @frappe.whitelist()
 def get_pm_context():
     default_pl = _default_price_list()
+    default_company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
     price_lists = frappe.get_all(
         "Price List",
         filters={"selling": 1},
@@ -329,6 +332,7 @@ def get_pm_context():
     )
     return {
         "default_price_list": default_pl,
+        "default_company": default_company,
         "price_lists": price_lists or [],
         "warehouses": warehouses or [],
     }
@@ -507,7 +511,6 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
             i.disabled               AS _disabled,
             COALESCE(i.custom_normalized_title, NULL)  AS _raw_norm,
             COALESCE(NULLIF(TRIM(i.custom_normalized_title), ''), i.item_name) AS normalized_title,
-            COALESCE(i.custom_match_confidence, NULL)  AS match_confidence,
             COALESCE(i.custom_review_notes, NULL)      AS review_notes,
             i.image                  AS image,
             i.modified               AS last_synced,
@@ -1020,6 +1023,368 @@ def clear_item_completed_image_jobs(include_failed=0):
 
 
 # ---------------------------------------------------------------------------
+# description automation helpers for POS products modal
+# ---------------------------------------------------------------------------
+
+
+_DESC_MARKER = "DESC_AUTOMATION"
+_DESC_STATUS_QUEUED = "Desc Queued"
+_DESC_STATUS_IN_PROGRESS = "Desc In Progress"
+_DESC_STATUS_COMPLETED = "Desc Completed"
+_DESC_STATUS_FAILED = "Desc Failed"
+_DESC_RUNNING_STATUSES = [_DESC_STATUS_QUEUED, _DESC_STATUS_IN_PROGRESS]
+_DESC_DONE_STATUSES = [_DESC_STATUS_COMPLETED, _DESC_STATUS_FAILED]
+
+
+def _description_source_field() -> str | None:
+    if frappe.db.has_column("Item", "description"):
+        return "description"
+    if frappe.db.has_column("Item", "web_long_description"):
+        return "web_long_description"
+    return None
+
+
+def _build_item_description_text(item_code: str) -> str:
+    item = frappe.db.get_value(
+        "Item",
+        item_code,
+        [
+            "item_name",
+            "brand",
+            "item_group",
+            "stock_uom",
+            "custom_pack_qty",
+            "custom_pack_size",
+            "custom_pack_unit",
+            "custom_normalized_title",
+        ],
+        as_dict=True,
+    ) or {}
+
+    title = (item.get("custom_normalized_title") or item.get("item_name") or item_code or "").strip()
+    brand = (item.get("brand") or "").strip()
+    category = (item.get("item_group") or "").strip()
+    uom = (item.get("stock_uom") or "").strip()
+    pack_qty = item.get("custom_pack_qty")
+    pack_size = item.get("custom_pack_size")
+    pack_unit = (item.get("custom_pack_unit") or "").strip()
+
+    chunks = []
+    if title:
+        chunks.append(title)
+    if brand:
+        chunks.append(_("Brand") + f": {brand}")
+    if category:
+        chunks.append(_("Category") + f": {category}")
+
+    pack_parts = []
+    if pack_qty not in (None, ""):
+        pack_parts.append(_("qty") + f" {pack_qty}")
+    if pack_size not in (None, ""):
+        unit_suffix = f" {pack_unit}" if pack_unit else ""
+        pack_parts.append(_("size") + f" {pack_size}{unit_suffix}")
+    if pack_parts:
+        chunks.append(_("Pack") + ": " + ", ".join(pack_parts))
+
+    if uom:
+        chunks.append(_("Stock UOM") + f": {uom}")
+
+    if not chunks:
+        return item_code
+
+    return ". ".join(chunks) + "."
+
+
+def _create_description_job(item_code: str, priority: str = "Low") -> str:
+    item_name = frappe.db.get_value("Item", item_code, "item_name") or item_code
+    job = frappe.get_doc(
+        {
+            "doctype": "Product Image Search Job",
+            "product_type": "Item",
+            "product_id": item_code,
+            "product_name": item_name,
+            "search_query": f"{_DESC_MARKER}:{item_code}",
+            "priority": priority,
+            # Insert with a valid status first; then switch to description-only status.
+            "status": "Completed",
+            "images_found": 0,
+            "target_count": 0,
+            "created_at": frappe.utils.now(),
+            "attempt_count": 0,
+        }
+    )
+    job.insert(ignore_permissions=True)
+    frappe.db.set_value(
+        "Product Image Search Job",
+        job.name,
+        {
+            "status": _DESC_STATUS_QUEUED,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+            "images_found": 0,
+            "attempt_count": 0,
+        },
+        update_modified=False,
+    )
+    return job.name
+
+
+def _enqueue_description_jobs(priority="Low", limit=None, include_existing=0):
+    source_field = _description_source_field()
+    if not source_field:
+        return {
+            "queued_count": 0,
+            "eligible_count": 0,
+            "already_queued": 0,
+            "job_names": [],
+            "reason": "No Item description field available",
+        }
+
+    limit_val = cint(limit) if limit not in (None, "", 0, "0") else None
+    limit_clause = f"LIMIT {limit_val}" if limit_val and limit_val > 0 else ""
+
+    if cint(include_existing):
+        where_clause = "1=1"
+    else:
+        where_clause = f"IFNULL(i.{source_field}, '') = ''"
+
+    candidates = frappe.db.sql(
+        f"""
+        SELECT i.name
+        FROM `tabItem` i
+        WHERE {where_clause}
+        ORDER BY i.modified DESC
+        {limit_clause}
+        """,
+        as_dict=True,
+    )
+
+    job_names = []
+    already_queued = 0
+    for row in candidates:
+        item_code = row.name
+        existing = frappe.db.exists(
+            "Product Image Search Job",
+            {
+                "product_type": "Item",
+                "product_id": item_code,
+                "search_query": ["like", f"{_DESC_MARKER}:%"],
+                "status": ["in", _DESC_RUNNING_STATUSES],
+            },
+        )
+        if existing:
+            already_queued += 1
+            continue
+
+        job_name = _create_description_job(item_code=item_code, priority=priority)
+        job_names.append(job_name)
+        enqueue(
+            "erpnext.erpnext_integrations.ecommerce_api.product_manager.process_item_description_job",
+            queue="default",
+            timeout=300,
+            is_async=True,
+            job_name=job_name,
+        )
+
+    frappe.db.commit()
+    return {
+        "queued_count": len(job_names),
+        "eligible_count": len(candidates),
+        "already_queued": already_queued,
+        "job_names": job_names,
+        "include_existing": cint(include_existing),
+    }
+
+
+def process_item_description_job(job_name):
+    """Background worker: generate and save one Item description, then finalize job status."""
+    try:
+        job = frappe.get_doc("Product Image Search Job", job_name)
+    except Exception:
+        return
+
+    if not (job.search_query or "").startswith(f"{_DESC_MARKER}:"):
+        return
+
+    try:
+        frappe.db.set_value(
+            "Product Image Search Job",
+            job_name,
+            {
+                "status": _DESC_STATUS_IN_PROGRESS,
+                "started_at": frappe.utils.now(),
+                "error_message": None,
+                "attempt_count": cint(job.attempt_count or 0) + 1,
+            },
+            update_modified=False,
+        )
+
+        item_code = job.product_id
+        if not frappe.db.exists("Item", item_code):
+            raise frappe.ValidationError(_("Item {0} not found").format(item_code))
+
+        text = _build_item_description_text(item_code)
+        updates = {}
+        if frappe.db.has_column("Item", "description"):
+            updates["description"] = text
+        if frappe.db.has_column("Item", "web_long_description"):
+            updates["web_long_description"] = text
+        if not updates:
+            raise frappe.ValidationError(_("No writable Item description field found"))
+
+        frappe.db.set_value("Item", item_code, updates)
+
+        frappe.db.set_value(
+            "Product Image Search Job",
+            job_name,
+            {
+                "status": _DESC_STATUS_COMPLETED,
+                "completed_at": frappe.utils.now(),
+                "images_found": len(text),
+                "error_message": None,
+            },
+            update_modified=False,
+        )
+        frappe.db.commit()
+    except Exception as exc:
+        frappe.db.set_value(
+            "Product Image Search Job",
+            job_name,
+            {
+                "status": _DESC_STATUS_FAILED,
+                "completed_at": frappe.utils.now(),
+                "error_message": str(exc),
+            },
+            update_modified=False,
+        )
+        frappe.db.commit()
+
+
+@frappe.whitelist()
+def enqueue_items_without_descriptions(priority="Low", limit=None):
+    """Queue Items that currently have no description text."""
+    frappe.has_permission("Item", "write", throw=True)
+    return _enqueue_description_jobs(priority=priority, limit=limit, include_existing=0)
+
+
+@frappe.whitelist()
+def enqueue_items_for_description_refresh(priority="Low", limit=None):
+    """Queue Items for description regeneration regardless of current description value."""
+    frappe.has_permission("Item", "write", throw=True)
+    return _enqueue_description_jobs(priority=priority, limit=limit, include_existing=1)
+
+
+@frappe.whitelist()
+def get_item_description_jobs(status_group="running", limit=100):
+    """Return Item description-automation jobs for the POS automation modal."""
+    frappe.has_permission("Item", "read", throw=True)
+    try:
+        row_limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        row_limit = 100
+
+    group = (status_group or "running").strip().lower()
+    statuses = _DESC_DONE_STATUSES if group == "done" else _DESC_RUNNING_STATUSES
+    if group != "done":
+        group = "running"
+
+    jobs = frappe.get_all(
+        "Product Image Search Job",
+        filters={
+            "product_type": "Item",
+            "search_query": ["like", f"{_DESC_MARKER}:%"],
+            "status": ["in", statuses],
+        },
+        fields=[
+            "name",
+            "product_type",
+            "product_id",
+            "product_name",
+            "status",
+            "priority",
+            "images_found",
+            "attempt_count",
+            "error_message",
+            "created_at",
+            "started_at",
+            "completed_at",
+            "modified",
+        ],
+        order_by="IFNULL(completed_at, modified) DESC",
+        limit_page_length=row_limit,
+    )
+    return {"status_group": group, "jobs": jobs}
+
+
+@frappe.whitelist()
+def get_item_description_queue_stats():
+    """Return counts for description automation statuses."""
+    frappe.has_permission("Item", "read", throw=True)
+
+    def _count(st):
+        return frappe.db.count(
+            "Product Image Search Job",
+            {
+                "product_type": "Item",
+                "search_query": ["like", f"{_DESC_MARKER}:%"],
+                "status": st,
+            },
+        )
+
+    return {
+        "pending": 0,
+        "queued": _count(_DESC_STATUS_QUEUED),
+        "in_progress": _count(_DESC_STATUS_IN_PROGRESS),
+        "completed": _count(_DESC_STATUS_COMPLETED),
+        "failed": _count(_DESC_STATUS_FAILED),
+        "retrying": 0,
+    }
+
+
+@frappe.whitelist()
+def clear_item_completed_description_jobs(include_failed=0):
+    """Clear completed description-automation jobs from UI history."""
+    frappe.has_permission("Item", "write", throw=True)
+    statuses = [_DESC_STATUS_COMPLETED]
+    if cint(include_failed):
+        statuses.append(_DESC_STATUS_FAILED)
+
+    names = frappe.get_all(
+        "Product Image Search Job",
+        filters={
+            "product_type": "Item",
+            "search_query": ["like", f"{_DESC_MARKER}:%"],
+            "status": ["in", statuses],
+        },
+        pluck="name",
+        limit_page_length=0,
+    )
+
+    if not names:
+        return {
+            "deleted_count": 0,
+            "statuses": statuses,
+            "product_type": "Item",
+        }
+
+    for name in names:
+        frappe.delete_doc(
+            "Product Image Search Job",
+            name,
+            ignore_permissions=True,
+            delete_permanently=True,
+        )
+
+    frappe.db.commit()
+    return {
+        "deleted_count": len(names),
+        "statuses": statuses,
+        "product_type": "Item",
+    }
+
+
+# ---------------------------------------------------------------------------
 # generate_barcodes_bulk — only rows without existing barcode
 # ---------------------------------------------------------------------------
 
@@ -1181,7 +1546,6 @@ def export_rows(filters=None, price_list=None, warehouse=None):
         "unit",
         "is_active",
         "normalized_title",
-        "match_confidence",
         "review_notes",
         "tags",
         "image",
@@ -1199,3 +1563,179 @@ def export_rows(filters=None, price_list=None, warehouse=None):
         writer.writerow(row)
 
     return {"csv": output.getvalue()}
+
+
+# ---------------------------------------------------------------------------
+# Floor Map APIs (bench-side canonical service wrappers)
+# ---------------------------------------------------------------------------
+
+
+def _floor_map_api_module():
+    # Source of truth remains in bench app service code.
+    return importlib.import_module("webshop.webshop.webshop.floor_map_api")
+
+
+@frappe.whitelist()
+def get_floors(company=None):
+    return _floor_map_api_module().get_floors(company=company)
+
+
+@frappe.whitelist()
+def get_floor_sections(floor_id, company=None):
+    return _floor_map_api_module().get_floor_sections(floor_id, company=company)
+
+
+@frappe.whitelist()
+def get_section_details(section_id, company=None):
+    return _floor_map_api_module().get_section_details(section_id, company=company)
+
+
+@frappe.whitelist()
+def save_floor_map(location_name, floor_name, sections_data=None, notes_data=None, canvas_width=1400, canvas_height=900, company=None):
+    if isinstance(sections_data, list):
+        sections_data = json.dumps(sections_data)
+    if isinstance(notes_data, list):
+        notes_data = json.dumps(notes_data)
+    return _floor_map_api_module().save_floor_map(
+        location_name,
+        floor_name,
+        sections_data or "[]",
+        notes_data or "[]",
+        canvas_width,
+        canvas_height,
+        company=company,
+    )
+
+
+@frappe.whitelist()
+def delete_floor_map(floor_id, company=None):
+    return _floor_map_api_module().delete_floor_map(floor_id, company=company)
+
+
+def _coerce_floor_sections_for_export(payload):
+    sections = []
+    for section in payload or []:
+        if not isinstance(section, dict):
+            continue
+        sections.append(
+            {
+                "id": section.get("id") or "",
+                "code": section.get("code") or "",
+                "name": section.get("name") or "",
+                "x": cint(section.get("x") or 0),
+                "y": cint(section.get("y") or 0),
+                "width": cint(section.get("width") or 0),
+                "height": cint(section.get("height") or 0),
+                "color": section.get("color") or "#94a3b8",
+                "products": section.get("products") or [],
+            }
+        )
+    return sections
+
+
+def _floor_map_svg_export(sections, width=1400, height=900):
+    width = max(1, cint(width) or 1400)
+    height = max(1, cint(height) or 900)
+
+    svg = [
+        f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}">',
+        f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
+        '<defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">',
+        '<path d="M 24 0 L 0 0 0 24" fill="none" stroke="#e0e0e0" stroke-width="0.5"/>',
+        '</pattern></defs>',
+        f'<rect width="{width}" height="{height}" fill="url(#grid)"/>',
+    ]
+
+    sections_map = []
+    for section in sections:
+        x = cint(section.get("x") or 0)
+        y = cint(section.get("y") or 0)
+        w = max(0, cint(section.get("width") or 0))
+        h = max(0, cint(section.get("height") or 0))
+        color = section.get("color") or "#94a3b8"
+        sid = frappe.safe_encode(section.get("id") or "").decode("utf-8", errors="ignore")
+        code = frappe.safe_encode(section.get("code") or "").decode("utf-8", errors="ignore")
+        name = frappe.safe_encode(section.get("name") or "").decode("utf-8", errors="ignore")
+
+        svg.append(f'<g id="section-{sid}">')
+        svg.append(
+            f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{color}20" stroke="{color}" stroke-width="2"/>'
+        )
+        svg.append(
+            f'<text x="{x + 5}" y="{y + 15}" font-size="12" font-weight="bold" font-family="Arial" fill="#000000">{code}</text>'
+        )
+        svg.append(
+            f'<text x="{x + 5}" y="{y + 28}" font-size="10" font-family="Arial" fill="#333333">{name}</text>'
+        )
+        svg.append("</g>")
+
+        sections_map.append(
+            {
+                "id": section.get("id"),
+                "code": section.get("code"),
+                "x": x,
+                "y": y,
+                "width": w,
+                "height": h,
+            }
+        )
+
+    svg.append("</svg>")
+    return "".join(svg), sections_map
+
+
+@frappe.whitelist()
+def export_floor_map_svg(floor_id, width=1400, height=900, company=None):
+    floor = get_floor_sections(floor_id, company=company)
+    sections = _coerce_floor_sections_for_export((floor or {}).get("sections") or [])
+    svg, sections_map = _floor_map_svg_export(sections, width=width, height=height)
+    return {
+        "svg": svg,
+        "sections_map": sections_map,
+    }
+
+
+@frappe.whitelist()
+def export_floor_map_png(floor_id, width=1400, height=900, company=None):
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        frappe.throw(_("Pillow is required for floor map PNG export"))
+
+    floor = get_floor_sections(floor_id, company=company)
+    sections = _coerce_floor_sections_for_export((floor or {}).get("sections") or [])
+
+    width = max(1, cint(width) or 1400)
+    height = max(1, cint(height) or 900)
+
+    image = Image.new("RGB", (width, height), "#ffffff")
+    draw = ImageDraw.Draw(image)
+
+    grid_size = 24
+    for x in range(0, width + 1, grid_size):
+        draw.line([(x, 0), (x, height)], fill="#e0e0e0", width=1)
+    for y in range(0, height + 1, grid_size):
+        draw.line([(0, y), (width, y)], fill="#e0e0e0", width=1)
+
+    for section in sections:
+        x = cint(section.get("x") or 0)
+        y = cint(section.get("y") or 0)
+        w = max(0, cint(section.get("width") or 0))
+        h = max(0, cint(section.get("height") or 0))
+        color = section.get("color") or "#94a3b8"
+        code = str(section.get("code") or "")
+        name = str(section.get("name") or "")
+
+        draw.rectangle([(x, y), (x + w, y + h)], outline=color, width=2)
+        draw.text((x + 5, y + 3), code, fill="#000000")
+        draw.text((x + 5, y + 18), name, fill="#333333")
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    return {
+        "png_base64": png_b64,
+        "filename": f"floor-map-{floor_id}.png",
+        "content_type": "image/png",
+    }
