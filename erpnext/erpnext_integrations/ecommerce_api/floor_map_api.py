@@ -10,6 +10,7 @@ def get_floors():
         "ECommerce Floor Map",
         fields=["name", "location_name", "floor_name", "canvas_width", "canvas_height", "sections_data", "accent"],
         order_by="modified desc",
+        ignore_permissions=True,
     )
 
     floors = []
@@ -40,7 +41,9 @@ def get_floor_sections(floor_id):
     if not frappe.db.exists("ECommerce Floor Map", floor_id):
         frappe.throw(_("Floor {0} not found").format(floor_id), frappe.DoesNotExistError)
 
+    frappe.flags.ignore_permissions = True
     doc = frappe.get_doc("ECommerce Floor Map", floor_id)
+    frappe.flags.ignore_permissions = False
     sections = json.loads(doc.sections_data or "[]")
     notes = json.loads(doc.notes_data or "[]")
 
@@ -107,7 +110,7 @@ def delete_floor_map(floor_id):
 
 @frappe.whitelist(allow_guest=True)
 def get_section_details(section_id):
-    floors = frappe.get_all("ECommerce Floor Map", fields=["name", "sections_data"])
+    floors = frappe.get_all("ECommerce Floor Map", fields=["name", "sections_data"], ignore_permissions=True)
     for f in floors:
         for section in json.loads(f.sections_data or "[]"):
             if isinstance(section, dict) and section.get("id") == section_id:
