@@ -1572,7 +1572,7 @@ def export_rows(filters=None, price_list=None, warehouse=None):
 
 def _floor_map_api_module():
     # Source of truth remains in bench app service code.
-    return importlib.import_module("webshop.webshop.webshop.floor_map_api")
+    return importlib.import_module("webshop.webshop.floor_map_api")
 
 
 @frappe.whitelist()
