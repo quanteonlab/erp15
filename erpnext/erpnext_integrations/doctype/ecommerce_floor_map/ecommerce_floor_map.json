@@ -1,0 +1,94 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:FLMAP-{####}",
+ "creation": "2026-05-28 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "location_name",
+  "floor_name",
+  "column_break_1",
+  "canvas_width",
+  "canvas_height",
+  "accent",
+  "section_break_2",
+  "sections_data",
+  "notes_data"
+ ],
+ "fields": [
+  {
+   "fieldname": "location_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Location Name",
+   "reqd": 1
+  },
+  {
+   "fieldname": "floor_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Floor Name",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1400",
+   "fieldname": "canvas_width",
+   "fieldtype": "Int",
+   "label": "Canvas Width"
+  },
+  {
+   "default": "900",
+   "fieldname": "canvas_height",
+   "fieldtype": "Int",
+   "label": "Canvas Height"
+  },
+  {
+   "fieldname": "accent",
+   "fieldtype": "Data",
+   "label": "Accent Color"
+  },
+  {
+   "fieldname": "section_break_2",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "sections_data",
+   "fieldtype": "Long Text",
+   "label": "Sections Data (JSON)"
+  },
+  {
+   "fieldname": "notes_data",
+   "fieldtype": "Long Text",
+   "label": "Notes Data (JSON)"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-05-28 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "ECommerce Floor Map",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 0
+}
