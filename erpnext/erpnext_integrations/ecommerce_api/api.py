@@ -127,11 +127,15 @@ def get_products(
 	# Get total count (frappe.db.count doesn't support or_filters — use get_all with fields=["name"])
 	total_count = len(frappe.get_all("Item", filters=filters, or_filters=or_filters, fields=["name"], limit_page_length=0))
 
-	# Add pricing information if price_list provided
-	if price_list:
-		for item in items:
-			item["price_list_rate"] = get_item_price(item.item_code, price_list)
-			item["price_list"] = price_list
+	# Pricing: default to selling price list so callers always get rates
+	if not price_list:
+		price_list = (
+			frappe.db.get_single_value("Selling Settings", "selling_price_list")
+			or "Standard Selling"
+		)
+	for item in items:
+		item["price_list_rate"] = get_item_price(item.item_code, price_list)
+		item["price_list"] = price_list
 
 	# Add stock information
 	for item in items:
@@ -478,6 +482,464 @@ def get_active_promotions(price_list=None):
 				r.setdefault(key, [])
 
 	return rules
+
+
+def _pricing_rule_field_list():
+	"""Shared field list for Pricing Rule list/get (includes disable + optional custom fields)."""
+	has_time_fields = frappe.db.has_column("Pricing Rule", "happy_hour_from")
+	has_days_field = frappe.db.has_column("Pricing Rule", "applicable_days")
+	has_flash_field = frappe.db.has_column("Pricing Rule", "flash_sale")
+	base_fields = [
+		"name",
+		"title",
+		"disable",
+		"selling",
+		"apply_on",
+		"price_or_product_discount",
+		"min_qty",
+		"max_qty",
+		"min_amt",
+		"max_amt",
+		"valid_from",
+		"valid_upto",
+		"rate_or_discount",
+		"discount_percentage",
+		"discount_amount",
+		"rate",
+		"same_item",
+		"free_item",
+		"free_qty",
+		"free_item_rate",
+		"is_recursive",
+		"recurse_for",
+		"threshold_percentage",
+		"rule_description",
+		"for_price_list",
+		"currency",
+		"company",
+		"priority",
+	]
+	if has_time_fields:
+		base_fields += ["happy_hour_from", "happy_hour_to"]
+	if has_days_field:
+		base_fields += ["applicable_days"]
+	if has_flash_field:
+		base_fields += ["flash_sale"]
+	return base_fields
+
+
+def _attach_pricing_rule_children(rules):
+	"""Attach applicable_items / groups / brands arrays onto Pricing Rule dicts."""
+	if not rules:
+		return rules
+	rule_names = [r["name"] for r in rules]
+	child_tables = [
+		("Pricing Rule Item Code", "item_code", "applicable_items"),
+		("Pricing Rule Item Group", "item_group", "applicable_groups"),
+		("Pricing Rule Brand", "brand", "applicable_brands"),
+	]
+	for child_dt, field, key in child_tables:
+		try:
+			rows = frappe.get_all(
+				child_dt,
+				filters={"parent": ["in", rule_names]},
+				fields=["parent", field],
+			)
+			mapping = {}
+			for row in rows:
+				mapping.setdefault(row["parent"], []).append(row[field])
+			for r in rules:
+				r[key] = mapping.get(r["name"], [])
+		except Exception:
+			for r in rules:
+				r.setdefault(key, [])
+	return rules
+
+
+def _default_pricing_currency():
+	company = frappe.db.get_single_value("Global Defaults", "default_company")
+	if company:
+		currency = frappe.db.get_value("Company", company, "default_currency")
+		if currency:
+			return currency, company
+	currency = frappe.db.get_single_value("Global Defaults", "default_currency")
+	return currency or "ARS", company
+
+
+def _parse_target_list(raw):
+	if raw is None:
+		return []
+	if isinstance(raw, str):
+		parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
+		return [p for p in parts if p]
+	if isinstance(raw, (list, tuple)):
+		return [str(x).strip() for x in raw if str(x).strip()]
+	return []
+
+
+@frappe.whitelist()
+def list_pricing_rules(include_disabled=1, price_list=None):
+	"""
+	Admin list of selling-side Pricing Rules (no date/happy-hour filtering).
+	Includes disabled rules when include_disabled=1.
+	"""
+	filters = {"selling": 1}
+	if not cint(include_disabled):
+		filters["disable"] = 0
+
+	rules = frappe.get_all(
+		"Pricing Rule",
+		filters=filters,
+		fields=_pricing_rule_field_list(),
+		order_by="modified desc",
+	)
+	if price_list:
+		rules = [
+			r
+			for r in rules
+			if not r.get("for_price_list") or r.get("for_price_list") == price_list
+		]
+
+	_attach_pricing_rule_children(rules)
+	return {"rules": rules, "total_count": len(rules)}
+
+
+@frappe.whitelist()
+def get_pricing_rule(name):
+	"""Return one Pricing Rule with child targets for the admin editor."""
+	if not name or not frappe.db.exists("Pricing Rule", name):
+		frappe.throw(_("Pricing Rule not found"), frappe.DoesNotExistError)
+	fields = _pricing_rule_field_list()
+	row = frappe.db.get_value("Pricing Rule", name, fields, as_dict=True)
+	_attach_pricing_rule_children([row])
+	return row
+
+
+@frappe.whitelist()
+def save_pricing_rule(data):
+	"""
+	Create or update a selling Pricing Rule.
+	data: JSON object with title, apply_on, discount fields, vigencia, targets, disable, etc.
+	"""
+	if isinstance(data, str):
+		data = frappe.parse_json(data) or {}
+	data = frappe._dict(data or {})
+
+	title = (data.get("title") or "").strip()
+	if not title:
+		frappe.throw(_("Title is required"))
+
+	apply_on = data.get("apply_on") or "Item Code"
+	if apply_on not in ("Item Code", "Item Group", "Brand", "Transaction"):
+		frappe.throw(_("Invalid apply_on"))
+
+	price_or_product = data.get("price_or_product_discount") or "Price"
+	if price_or_product not in ("Price", "Product"):
+		frappe.throw(_("Invalid price_or_product_discount"))
+
+	currency, company = _default_pricing_currency()
+	currency = data.get("currency") or currency
+	company = data.get("company") or company
+
+	name = (data.get("name") or "").strip() or None
+	is_new = not name
+	if name and not frappe.db.exists("Pricing Rule", name):
+		frappe.throw(_("Pricing Rule not found"), frappe.DoesNotExistError)
+
+	doc = frappe.new_doc("Pricing Rule") if is_new else frappe.get_doc("Pricing Rule", name)
+
+	doc.title = title
+	doc.selling = 1
+	doc.buying = cint(data.get("buying") or 0)
+	doc.disable = cint(data.get("disable") or 0)
+	doc.apply_on = apply_on
+	doc.price_or_product_discount = price_or_product
+	doc.currency = currency
+	if company:
+		doc.company = company
+	doc.for_price_list = data.get("for_price_list") or None
+	doc.rate_or_discount = data.get("rate_or_discount") or "Discount Percentage"
+	doc.discount_percentage = flt(data.get("discount_percentage") or 0)
+	doc.discount_amount = flt(data.get("discount_amount") or 0)
+	doc.rate = flt(data.get("rate") or 0)
+	doc.min_qty = flt(data.get("min_qty") or 0)
+	doc.max_qty = flt(data.get("max_qty") or 0)
+	doc.min_amt = flt(data.get("min_amt") or 0)
+	doc.max_amt = flt(data.get("max_amt") or 0)
+	doc.valid_from = data.get("valid_from") or None
+	doc.valid_upto = data.get("valid_upto") or None
+	doc.rule_description = data.get("rule_description") or None
+	doc.threshold_percentage = flt(data.get("threshold_percentage") or 0)
+	doc.same_item = cint(data.get("same_item") or 0)
+	doc.free_item = data.get("free_item") or None
+	doc.free_qty = flt(data.get("free_qty") or 0)
+	doc.free_item_rate = flt(data.get("free_item_rate") or 0)
+	doc.is_recursive = cint(data.get("is_recursive") or 0)
+	doc.recurse_for = flt(data.get("recurse_for") or 0)
+	if data.get("priority"):
+		doc.has_priority = 1
+		doc.priority = str(data.get("priority"))
+
+	# Optional custom scheduling fields
+	if frappe.db.has_column("Pricing Rule", "happy_hour_from"):
+		doc.happy_hour_from = data.get("happy_hour_from") or None
+		doc.happy_hour_to = data.get("happy_hour_to") or None
+	if frappe.db.has_column("Pricing Rule", "applicable_days"):
+		doc.applicable_days = data.get("applicable_days") or None
+	if frappe.db.has_column("Pricing Rule", "flash_sale"):
+		doc.flash_sale = cint(data.get("flash_sale") or 0)
+
+	# Rebuild child targets
+	doc.set("items", [])
+	doc.set("item_groups", [])
+	doc.set("brands", [])
+
+	items = _parse_target_list(data.get("applicable_items"))
+	groups = _parse_target_list(data.get("applicable_groups"))
+	brands = _parse_target_list(data.get("applicable_brands"))
+
+	if apply_on == "Item Code":
+		for code in items:
+			doc.append("items", {"item_code": code})
+	elif apply_on == "Item Group":
+		for g in groups:
+			doc.append("item_groups", {"item_group": g})
+	elif apply_on == "Brand":
+		for b in brands:
+			doc.append("brands", {"brand": b})
+
+	doc.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	row = frappe.db.get_value("Pricing Rule", doc.name, _pricing_rule_field_list(), as_dict=True)
+	_attach_pricing_rule_children([row])
+	return {"ok": True, "name": doc.name, "rule": row}
+
+
+@frappe.whitelist()
+def set_pricing_rule_disabled(name, disabled=1):
+	"""Enable/disable a Pricing Rule (disable=1 means inactive)."""
+	if not name or not frappe.db.exists("Pricing Rule", name):
+		frappe.throw(_("Pricing Rule not found"), frappe.DoesNotExistError)
+	frappe.db.set_value("Pricing Rule", name, "disable", cint(disabled))
+	frappe.db.commit()
+	return {"ok": True, "name": name, "disable": cint(disabled)}
+
+
+@frappe.whitelist()
+def delete_pricing_rule(name):
+	"""Permanently delete a Pricing Rule."""
+	if not name or not frappe.db.exists("Pricing Rule", name):
+		frappe.throw(_("Pricing Rule not found"), frappe.DoesNotExistError)
+	frappe.delete_doc("Pricing Rule", name, ignore_permissions=True, force=1)
+	frappe.db.commit()
+	return {"ok": True, "name": name}
+
+
+def _bundle_price(item_code, price_list=None):
+	pl = price_list or frappe.db.get_single_value("Selling Settings", "selling_price_list") or "Standard Selling"
+	return (
+		frappe.db.get_value(
+			"Item Price",
+			{"item_code": item_code, "price_list": pl, "selling": 1},
+			"price_list_rate",
+		)
+		or 0
+	)
+
+
+def _serialize_product_bundle(name, price_list=None):
+	doc = frappe.get_doc("Product Bundle", name)
+	item = frappe.db.get_value(
+		"Item",
+		doc.new_item_code,
+		["item_name", "disabled", "image"],
+		as_dict=True,
+	) or {}
+	pl = price_list or frappe.db.get_single_value("Selling Settings", "selling_price_list") or "Standard Selling"
+	components = []
+	components_total = 0.0
+	for row in doc.items:
+		rate = flt(get_item_price(row.item_code, pl))
+		qty = flt(row.qty)
+		amount = rate * qty
+		components_total += amount
+		components.append(
+			{
+				"item_code": row.item_code,
+				"qty": qty,
+				"item_name": frappe.db.get_value("Item", row.item_code, "item_name") or row.item_code,
+				"uom": row.uom,
+				"rate": rate,
+				"amount": amount,
+			}
+		)
+	bundle_price = flt(_bundle_price(doc.new_item_code, pl))
+	discount_amount = max(0.0, components_total - bundle_price) if components_total else 0.0
+	discount_pct = (discount_amount / components_total * 100.0) if components_total else 0.0
+	return {
+		"name": doc.name,
+		"new_item_code": doc.new_item_code,
+		"description": doc.description,
+		"disabled": cint(doc.disabled),
+		"bundle_name": item.get("item_name") or doc.new_item_code,
+		"item_disabled": cint(item.get("disabled")),
+		"image": item.get("image"),
+		"bundle_price": bundle_price,
+		"components_total": components_total,
+		"estimated_discount_amount": discount_amount,
+		"estimated_discount_pct": discount_pct,
+		"components": components,
+	}
+
+
+@frappe.whitelist()
+def list_product_bundles(include_disabled=1, price_list=None):
+	"""Admin list of Product Bundle docs with components and selling price."""
+	filters = {}
+	if not cint(include_disabled):
+		filters["disabled"] = 0
+	names = frappe.get_all(
+		"Product Bundle",
+		filters=filters,
+		pluck="name",
+		order_by="modified desc",
+	)
+	bundles = [_serialize_product_bundle(n, price_list) for n in names]
+	return {"bundles": bundles, "total_count": len(bundles)}
+
+
+@frappe.whitelist()
+def get_product_bundle(name, price_list=None):
+	"""Return one Product Bundle with components."""
+	if not name or not frappe.db.exists("Product Bundle", name):
+		frappe.throw(_("Product Bundle not found"), frappe.DoesNotExistError)
+	return _serialize_product_bundle(name, price_list)
+
+
+@frappe.whitelist()
+def save_product_bundle(data):
+	"""
+	Create or update a Product Bundle.
+	data: {
+	  name?, new_item_code, description?, disabled?,
+	  bundle_price?, price_list?,
+	  items: [{item_code, qty}, ...]
+	}
+	Ensures parent Item exists as non-stock; upserts Item Price when bundle_price set.
+	"""
+	if isinstance(data, str):
+		data = frappe.parse_json(data) or {}
+	data = frappe._dict(data or {})
+
+	new_item_code = (data.get("new_item_code") or data.get("name") or "").strip()
+	if not new_item_code:
+		frappe.throw(_("Bundle SKU (new_item_code) is required"))
+
+	items_raw = data.get("items") or data.get("components") or []
+	if isinstance(items_raw, str):
+		items_raw = frappe.parse_json(items_raw) or []
+	components = []
+	for row in items_raw:
+		code = (row.get("item_code") or "").strip()
+		if not code:
+			continue
+		qty = flt(row.get("qty") or 1)
+		if qty <= 0:
+			frappe.throw(_("Component qty must be > 0 for {0}").format(code))
+		if not frappe.db.exists("Item", code):
+			frappe.throw(_("Item {0} not found").format(code))
+		components.append({"item_code": code, "qty": qty})
+
+	if not components:
+		frappe.throw(_("Add at least one component item"))
+
+	# Ensure parent Item (non-stock) exists
+	if not frappe.db.exists("Item", new_item_code):
+		item_group = (
+			frappe.db.get_single_value("Stock Settings", "item_group")
+			or (frappe.db.exists("Item Group", "Products") and "Products")
+			or frappe.db.get_value("Item Group", {"is_group": 0}, "name")
+			or "All Item Groups"
+		)
+		item = frappe.get_doc(
+			{
+				"doctype": "Item",
+				"item_code": new_item_code,
+				"item_name": (data.get("bundle_name") or data.get("description") or new_item_code)[:140],
+				"item_group": item_group,
+				"stock_uom": "Nos",
+				"is_stock_item": 0,
+				"include_item_in_manufacturing": 0,
+				"disabled": 0,
+			}
+		)
+		item.insert(ignore_permissions=True)
+	else:
+		# Parent must not be stock item for Product Bundle
+		if cint(frappe.db.get_value("Item", new_item_code, "is_stock_item")):
+			frappe.db.set_value("Item", new_item_code, "is_stock_item", 0)
+		if data.get("bundle_name"):
+			frappe.db.set_value("Item", new_item_code, "item_name", str(data.get("bundle_name"))[:140])
+
+	price_list = (
+		data.get("price_list")
+		or frappe.db.get_single_value("Selling Settings", "selling_price_list")
+		or "Standard Selling"
+	)
+	if data.get("bundle_price") is not None and data.get("bundle_price") != "":
+		rate = flt(data.get("bundle_price"))
+		existing = frappe.db.get_value(
+			"Item Price",
+			{"item_code": new_item_code, "price_list": price_list, "selling": 1},
+			"name",
+		)
+		if existing:
+			frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
+		else:
+			frappe.get_doc(
+				{
+					"doctype": "Item Price",
+					"item_code": new_item_code,
+					"price_list": price_list,
+					"selling": 1,
+					"price_list_rate": rate,
+				}
+			).insert(ignore_permissions=True)
+
+	exists = frappe.db.exists("Product Bundle", new_item_code)
+	if exists:
+		doc = frappe.get_doc("Product Bundle", new_item_code)
+		doc.description = data.get("description") or doc.description
+		doc.disabled = cint(data.get("disabled") or 0)
+		doc.set("items", [])
+		for c in components:
+			doc.append("items", c)
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc(
+			{
+				"doctype": "Product Bundle",
+				"new_item_code": new_item_code,
+				"description": data.get("description") or "",
+				"disabled": cint(data.get("disabled") or 0),
+				"items": components,
+			}
+		)
+		doc.insert(ignore_permissions=True)
+
+	frappe.db.commit()
+	return {"ok": True, "name": doc.name, "bundle": _serialize_product_bundle(doc.name, price_list)}
+
+
+@frappe.whitelist()
+def delete_product_bundle(name):
+	"""Delete a Product Bundle (parent Item is kept)."""
+	if not name or not frappe.db.exists("Product Bundle", name):
+		frappe.throw(_("Product Bundle not found"), frappe.DoesNotExistError)
+	frappe.delete_doc("Product Bundle", name, ignore_permissions=True, force=1)
+	frappe.db.commit()
+	return {"ok": True, "name": name}
 
 
 def _is_happy_hour_active(rule):
@@ -1642,6 +2104,7 @@ def get_guest_preorder(preorder_name):
 		"name": so.name,
 		"order_type": so.order_type,
 		"customer": so.customer,
+		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
 		"transaction_date": so.transaction_date,
 		"delivery_date": so.delivery_date,
 		"docstatus": so.docstatus,
@@ -1848,38 +2311,14 @@ def confirm_guest_preorder(preorder_name):
 
 @frappe.whitelist()
 def mark_prepared_guest_preorder(preorder_name):
-	"""
-	Mark a guest preorder as prepared/completed (best-effort).
-	"""
-	if not frappe.db.exists("Sales Order", preorder_name):
-		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
-
-	so = frappe.get_doc("Sales Order", preorder_name)
-	if not _is_guest_preorder_sales_order(so):
-		frappe.throw(_("Not a Guest Preorder"))
-
-	if so.docstatus == 0:
-		so.submit()
-
-	so.update_status("Completed")
-	so.reload()
-	return get_guest_preorder(preorder_name)
+	"""Mark a guest preorder as Preparado (custom workflow step)."""
+	return set_guest_preorder_status(preorder_name, "Preparado")
 
 
 @frappe.whitelist()
 def unmark_prepared_guest_preorder(preorder_name):
-	"""Toggle a Completed preorder back to To Deliver and Bill."""
-	if not frappe.db.exists("Sales Order", preorder_name):
-		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
-
-	so = frappe.get_doc("Sales Order", preorder_name)
-	if not _is_guest_preorder_sales_order(so):
-		frappe.throw(_("Not a Guest Preorder"))
-
-	if so.docstatus == 1:
-		so.db_set("status", "To Deliver and Bill")
-	so.reload()
-	return get_guest_preorder(preorder_name)
+	"""Move Preparado / later custom steps back to Orden."""
+	return set_guest_preorder_status(preorder_name, "Orden")
 
 
 @frappe.whitelist()
@@ -1903,6 +2342,107 @@ def cancel_guest_preorder(preorder_name):
 		so.save()
 	so.reload()
 	return {"ok": True, "name": preorder_name, "status": "Cancelled"}
+
+
+@frappe.whitelist()
+def update_guest_preorder_details(preorder_name, data=None):
+	"""
+	Update guest-preorder header fields (not line items).
+
+	data: {
+	  delivery_date?,
+	  customer?,          # Customer link (must exist)
+	  customer_name?,     # Display name on Customer
+	  paid_amount?,       # Absolute advance_paid target
+	  new_name?,          # Rename Sales Order
+	}
+	"""
+	if isinstance(data, str):
+		data = frappe.parse_json(data) or {}
+	data = frappe._dict(data or {})
+
+	if not preorder_name or not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	if so.docstatus == 2:
+		frappe.throw(_("Cannot edit a cancelled order"))
+
+	current_name = so.name
+
+	if data.get("delivery_date"):
+		so.delivery_date = getdate(data.get("delivery_date"))
+		for row in so.items or []:
+			row.delivery_date = so.delivery_date
+
+	if data.get("customer"):
+		customer = str(data.get("customer")).strip()
+		if not frappe.db.exists("Customer", customer):
+			frappe.throw(_("Customer {0} not found").format(customer))
+		so.customer = customer
+		# Keep guest tag metadata in sync
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn:
+			raw = getattr(so, tag_fn, None) or ""
+			parts = [p for p in str(raw).split("|") if p.strip() and not p.strip().startswith("customer:")]
+			parts.append(f"customer:{customer}")
+			setattr(so, tag_fn, " | ".join(p.strip() for p in parts if p.strip()))
+
+	if so.docstatus == 0:
+		so.save(ignore_permissions=True)
+	else:
+		# Submitted: persist allowed header fields without full amend
+		updates = {}
+		if data.get("delivery_date"):
+			updates["delivery_date"] = so.delivery_date
+		if data.get("customer"):
+			updates["customer"] = so.customer
+			tag_fn = _guest_preorder_tag_fieldname()
+			if tag_fn:
+				updates[tag_fn] = getattr(so, tag_fn, None)
+		if updates:
+			frappe.db.set_value("Sales Order", current_name, updates)
+			if data.get("delivery_date"):
+				frappe.db.sql(
+					"""
+					UPDATE `tabSales Order Item`
+					SET delivery_date=%s
+					WHERE parent=%s
+					""",
+					(so.delivery_date, current_name),
+				)
+
+	if data.get("customer_name") is not None:
+		cname = str(data.get("customer_name") or "").strip()
+		cust = so.customer if not data.get("customer") else str(data.get("customer")).strip()
+		if cname and cust and frappe.db.exists("Customer", cust):
+			frappe.db.set_value("Customer", cust, "customer_name", cname[:140])
+
+	if data.get("paid_amount") is not None and data.get("paid_amount") != "":
+		target = flt(data.get("paid_amount"))
+		if target < 0:
+			frappe.throw(_("Paid amount cannot be negative"))
+		current_paid = flt(frappe.db.get_value("Sales Order", current_name, "advance_paid") or 0)
+		delta = target - current_paid
+		if abs(delta) >= 0.005:
+			if delta > 0 and frappe.db.get_value("Sales Order", current_name, "docstatus") == 1:
+				# Proper payment entry for increase
+				record_preorder_payment(current_name, delta)
+			else:
+				# Draft or reduction: set absolute advance (guest admin override)
+				frappe.db.set_value("Sales Order", current_name, "advance_paid", target)
+
+	new_name = (data.get("new_name") or "").strip()
+	if new_name and new_name != current_name:
+		if frappe.db.exists("Sales Order", new_name):
+			frappe.throw(_("Sales Order {0} already exists").format(new_name))
+		frappe.rename_doc("Sales Order", current_name, new_name, force=True, merge=False)
+		current_name = new_name
+
+	frappe.db.commit()
+	return get_guest_preorder(current_name)
 
 
 @frappe.whitelist()

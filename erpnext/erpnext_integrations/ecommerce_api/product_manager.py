@@ -122,6 +122,8 @@ def _reconcile_item_stock_qty(item_code: str, warehouse: str, target_qty: float)
 
 
 def _upsert_item_price(item_code: str, rate: float, price_list: str | None = None) -> None:
+    from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
     pl = price_list or _default_price_list()
     existing = frappe.db.get_value(
         "Item Price",
@@ -129,9 +131,11 @@ def _upsert_item_price(item_code: str, rate: float, price_list: str | None = Non
         "name",
     )
     if existing:
+        old = frappe.db.get_value("Item Price", existing, "price_list_rate")
         frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
+        log_field_changes("Item Price", existing, [("price_list_rate", old, rate)])
     else:
-        frappe.get_doc(
+        doc = frappe.get_doc(
             {
                 "doctype": "Item Price",
                 "item_code": item_code,
@@ -139,7 +143,9 @@ def _upsert_item_price(item_code: str, rate: float, price_list: str | None = Non
                 "selling": 1,
                 "price_list_rate": rate,
             }
-        ).insert(ignore_permissions=True)
+        )
+        doc.insert(ignore_permissions=True)
+        log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
 
 
 def _parse_filters(filters):
@@ -335,6 +341,143 @@ def get_pm_context():
         "default_company": default_company,
         "price_lists": price_lists or [],
         "warehouses": warehouses or [],
+    }
+
+
+@frappe.whitelist()
+def clone_price_list(source_price_list, new_name):
+    """
+    Create a new selling Price List by copying metadata and all Item Price rows
+    from *source_price_list*.
+    """
+    source_price_list = (source_price_list or "").strip()
+    new_name = (new_name or "").strip()
+    if not source_price_list:
+        frappe.throw(_("Source price list is required"))
+    if not new_name:
+        frappe.throw(_("New price list name is required"))
+    if not frappe.db.exists("Price List", source_price_list):
+        frappe.throw(_("Price List {0} not found").format(source_price_list))
+    if frappe.db.exists("Price List", new_name):
+        frappe.throw(_("Price List {0} already exists").format(new_name))
+
+    src = frappe.get_doc("Price List", source_price_list)
+    new_pl = frappe.copy_doc(src)
+    new_pl.price_list_name = new_name
+    new_pl.insert(ignore_permissions=False)
+
+    # Bulk SQL copy — far faster than per-row Document.insert for large lists
+    cols = [
+        "name",
+        "creation",
+        "modified",
+        "modified_by",
+        "owner",
+        "docstatus",
+        "idx",
+        "item_code",
+        "uom",
+        "packing_unit",
+        "item_name",
+        "brand",
+        "item_description",
+        "price_list",
+        "customer",
+        "supplier",
+        "batch_no",
+        "buying",
+        "selling",
+        "currency",
+        "price_list_rate",
+        "valid_from",
+        "lead_time_days",
+        "valid_upto",
+        "note",
+        "reference",
+    ]
+    existing = {c[0] for c in frappe.db.sql("DESC `tabItem Price`")}
+    cols = [c for c in cols if c in existing]
+    col_sql = ", ".join(f"`{c}`" for c in cols)
+    select_exprs = []
+    params: list = []
+    user = frappe.session.user
+    for c in cols:
+        if c == "name":
+            select_exprs.append("CONCAT(%s, '-', REPLACE(UUID(), '-', ''))")
+            params.append(new_pl.name)
+        elif c == "price_list":
+            select_exprs.append("%s")
+            params.append(new_pl.name)
+        elif c in ("creation", "modified"):
+            select_exprs.append("NOW(6)")
+        elif c in ("owner", "modified_by"):
+            select_exprs.append("%s")
+            params.append(user)
+        else:
+            select_exprs.append(f"`{c}`")
+    select_sql = ", ".join(select_exprs)
+    params.append(source_price_list)
+    frappe.db.sql(
+        f"""
+        INSERT INTO `tabItem Price` ({col_sql})
+        SELECT {select_sql}
+        FROM `tabItem Price`
+        WHERE price_list = %s
+        """,
+        tuple(params),
+    )
+    copied = cint(frappe.db.count("Item Price", {"price_list": new_pl.name}))
+    frappe.db.commit()
+    return {
+        "ok": True,
+        "name": new_pl.name,
+        "copied_prices": copied,
+        "source": source_price_list,
+    }
+
+
+@frappe.whitelist()
+def clone_warehouse(source_warehouse, new_name):
+    """
+    Create a new leaf Warehouse copying company/parent/type from *source_warehouse*.
+    Does not copy stock balances (use Stock Entry / Reconciliation separately).
+    """
+    source_warehouse = (source_warehouse or "").strip()
+    new_name = (new_name or "").strip()
+    if not source_warehouse:
+        frappe.throw(_("Source warehouse is required"))
+    if not new_name:
+        frappe.throw(_("New warehouse name is required"))
+    if not frappe.db.exists("Warehouse", source_warehouse):
+        frappe.throw(_("Warehouse {0} not found").format(source_warehouse))
+
+    src = frappe.get_doc("Warehouse", source_warehouse)
+    abbr = frappe.get_cached_value("Company", src.company, "abbr") or ""
+    suffix = f" - {abbr}" if abbr else ""
+    expected = new_name if (suffix and new_name.endswith(suffix)) else f"{new_name}{suffix}"
+    if frappe.db.exists("Warehouse", expected) or frappe.db.exists("Warehouse", new_name):
+        frappe.throw(_("Warehouse {0} already exists").format(expected or new_name))
+
+    # warehouse_name without company suffix (ERPNext autoname appends abbr)
+    warehouse_name = new_name[: -len(suffix)] if suffix and new_name.endswith(suffix) else new_name
+
+    doc = frappe.new_doc("Warehouse")
+    doc.warehouse_name = warehouse_name
+    doc.company = src.company
+    doc.parent_warehouse = src.parent_warehouse
+    doc.warehouse_type = src.warehouse_type
+    doc.is_group = 0
+    doc.disabled = 0
+    if src.account:
+        doc.account = src.account
+    if getattr(src, "default_in_transit_warehouse", None):
+        doc.default_in_transit_warehouse = src.default_in_transit_warehouse
+    doc.insert(ignore_permissions=False)
+    frappe.db.commit()
+    return {
+        "ok": True,
+        "name": doc.name,
+        "source": source_warehouse,
     }
 
 
@@ -1693,6 +1836,194 @@ def export_floor_map_svg(floor_id, width=1400, height=900, company=None):
         "svg": svg,
         "sections_map": sections_map,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tables: field history + employees (thin re-exports)
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def list_field_history(doctype, name, limit=50, price_list=None):
+    from erpnext.erpnext_integrations.ecommerce_api.table_history import (
+        list_field_history as _impl,
+    )
+
+    return _impl(doctype, name, limit=limit, price_list=price_list)
+
+
+@frappe.whitelist()
+def revert_field_change(doctype, name, field, value):
+    from erpnext.erpnext_integrations.ecommerce_api.table_history import (
+        revert_field_change as _impl,
+    )
+
+    return _impl(doctype, name, field, value)
+
+
+@frappe.whitelist()
+def list_employees(search=None, status=None, page=1, page_length=100):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import list_employees as _impl
+
+    return _impl(search=search, status=status, page=page, page_length=page_length)
+
+
+@frappe.whitelist()
+def get_employee(name):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import get_employee as _impl
+
+    return _impl(name)
+
+
+@frappe.whitelist()
+def save_employee(name=None, data=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import save_employee as _impl
+
+    return _impl(name=name, data=data)
+
+
+@frappe.whitelist()
+def create_employee_user(employee, email=None, roles=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        create_employee_user as _impl,
+    )
+
+    return _impl(employee, email=email, roles=roles)
+
+
+@frappe.whitelist()
+def reset_employee_user_password(employee):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        reset_employee_user_password as _impl,
+    )
+
+    return _impl(employee)
+
+
+@frappe.whitelist()
+def list_employee_groups():
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_employee_groups as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def save_employee_group(name=None, employee_group_name=None, members=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        save_employee_group as _impl,
+    )
+
+    return _impl(name=name, employee_group_name=employee_group_name, members=members)
+
+
+@frappe.whitelist()
+def delete_employee_group(name):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        delete_employee_group as _impl,
+    )
+
+    return _impl(name)
+
+
+@frappe.whitelist()
+def list_employee_meta():
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_employee_meta as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def get_extra_fields_bundle(scope, row_keys=None):
+    from erpnext.erpnext_integrations.ecommerce_api.extra_fields import (
+        get_extra_fields_bundle as _impl,
+    )
+
+    return _impl(scope, row_keys=row_keys)
+
+
+@frappe.whitelist()
+def get_extra_row(scope, row_key):
+    from erpnext.erpnext_integrations.ecommerce_api.extra_fields import get_extra_row as _impl
+
+    return _impl(scope, row_key)
+
+
+@frappe.whitelist()
+def save_extra_row(scope, row_key, values=None):
+    from erpnext.erpnext_integrations.ecommerce_api.extra_fields import save_extra_row as _impl
+
+    return _impl(scope, row_key, values=values)
+
+
+@frappe.whitelist()
+def add_extra_column(scope, label, fieldtype="string"):
+    from erpnext.erpnext_integrations.ecommerce_api.extra_fields import add_extra_column as _impl
+
+    return _impl(scope, label, fieldtype=fieldtype)
+
+
+@frappe.whitelist()
+def update_extra_column(scope, column_id, label=None, fieldtype=None, hidden=None):
+    from erpnext.erpnext_integrations.ecommerce_api.extra_fields import (
+        update_extra_column as _impl,
+    )
+
+    return _impl(scope, column_id, label=label, fieldtype=fieldtype, hidden=hidden)
+
+
+@frappe.whitelist()
+def remove_extra_column(scope, column_id, scrub_values=1):
+    from erpnext.erpnext_integrations.ecommerce_api.extra_fields import (
+        remove_extra_column as _impl,
+    )
+
+    return _impl(scope, column_id, scrub_values=scrub_values)
+
+
+@frappe.whitelist()
+def get_screen_notes(scope):
+    from erpnext.erpnext_integrations.ecommerce_api.screen_notes import get_screen_notes as _impl
+
+    return _impl(scope)
+
+
+@frappe.whitelist()
+def add_note_block(scope, block_type="note"):
+    from erpnext.erpnext_integrations.ecommerce_api.screen_notes import add_note_block as _impl
+
+    return _impl(scope, block_type=block_type)
+
+
+@frappe.whitelist()
+def lock_note_block(scope, block_id):
+    from erpnext.erpnext_integrations.ecommerce_api.screen_notes import lock_note_block as _impl
+
+    return _impl(scope, block_id)
+
+
+@frappe.whitelist()
+def unlock_note_block(scope, block_id):
+    from erpnext.erpnext_integrations.ecommerce_api.screen_notes import unlock_note_block as _impl
+
+    return _impl(scope, block_id)
+
+
+@frappe.whitelist()
+def update_note_block(scope, block_id, patch=None):
+    from erpnext.erpnext_integrations.ecommerce_api.screen_notes import update_note_block as _impl
+
+    return _impl(scope, block_id, patch=patch)
+
+
+@frappe.whitelist()
+def remove_note_block(scope, block_id):
+    from erpnext.erpnext_integrations.ecommerce_api.screen_notes import remove_note_block as _impl
+
+    return _impl(scope, block_id)
 
 
 @frappe.whitelist()
