@@ -10,7 +10,7 @@ import secrets
 import frappe
 from frappe import _
 from frappe.utils.background_jobs import enqueue
-from frappe.utils import cint, flt, nowtime, today
+from frappe.utils import cint, flt, get_datetime, nowtime, today
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +622,11 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
         )
         values["list_price_lt"] = flt(list_price_lt)
 
+    modified_after = filters.get("modified_after")
+    if modified_after not in (None, "", "null"):
+        conditions.append("i.modified >= %(modified_after)s")
+        values["modified_after"] = get_datetime(modified_after)
+
     where_clause = " AND ".join(conditions) if conditions else "1=1"
 
     bin_join = ""
@@ -680,7 +685,7 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
         ) ib ON ib.parent = i.item_code
         {bin_join}
         WHERE {where_clause}
-        ORDER BY i.item_name ASC
+        ORDER BY {"i.modified DESC" if values.get("modified_after") else "i.item_name ASC"}
         LIMIT %(page_length)s OFFSET %(offset)s
     """
     values["page_length"] = page_length
@@ -1957,6 +1962,69 @@ def save_extra_row(scope, row_key, values=None):
     from erpnext.erpnext_integrations.ecommerce_api.extra_fields import save_extra_row as _impl
 
     return _impl(scope, row_key, values=values)
+
+
+@frappe.whitelist()
+def list_pos_profiles(search=None):
+    from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
+        list_pos_profiles as _impl,
+    )
+
+    return _impl(search=search)
+
+
+@frappe.whitelist()
+def get_pos_profile(name):
+    from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
+        get_pos_profile as _impl,
+    )
+
+    return _impl(name)
+
+
+@frappe.whitelist()
+def list_pos_profile_meta():
+    from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
+        list_pos_profile_meta as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def save_pos_profile(name=None, data=None):
+    from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
+        save_pos_profile as _impl,
+    )
+
+    return _impl(name=name, data=data)
+
+
+@frappe.whitelist()
+def get_accounting_constants(as_of_date=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        get_accounting_constants as _impl,
+    )
+
+    return _impl(as_of_date=as_of_date)
+
+
+@frappe.whitelist()
+def get_accounting_sheet(scope=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        get_accounting_sheet as _impl,
+    )
+
+    return _impl(scope=scope)
+
+
+@frappe.whitelist()
+def save_accounting_sheet(scope=None, sheets=None, active_sheet_id=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        save_accounting_sheet as _impl,
+    )
+
+    return _impl(scope=scope, sheets=sheets, active_sheet_id=active_sheet_id)
 
 
 @frappe.whitelist()
