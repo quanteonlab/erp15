@@ -1,0 +1,94 @@
+// Blank the desk navbar logo — the brand mark isn't shown, just empty space
+// where it used to be.
+.navbar-home .app-logo {
+	display: none;
+}
+
+// Hover-dropdown tab strip injected at the top of every Workspace page,
+// one tab per "card" section on the page (see workspace_subnav.js).
+.workspace-subnav {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 2px;
+	padding: 8px 0 12px;
+	margin-bottom: 4px;
+	border-bottom: 1px solid var(--border-color);
+}
+
+.workspace-subnav-tab {
+	position: relative;
+}
+
+.workspace-subnav-tab-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 6px 12px;
+	border: 1px solid transparent;
+	border-radius: var(--border-radius-md, 8px);
+	background: transparent;
+	color: var(--text-color);
+	font-size: var(--text-sm, 12px);
+	font-weight: 500;
+	cursor: pointer;
+	white-space: nowrap;
+
+	svg {
+		width: 10px;
+		height: 10px;
+		opacity: 0.6;
+		transition: transform 0.15s ease-in-out;
+	}
+
+	&:hover {
+		background: var(--fg-hover-color);
+		border-color: var(--border-color);
+	}
+}
+
+.workspace-subnav-tab.open .workspace-subnav-tab-btn {
+	background: var(--fg-hover-color);
+	border-color: var(--border-color);
+
+	svg {
+		transform: rotate(180deg);
+	}
+}
+
+.workspace-subnav-menu {
+	display: none;
+	position: absolute;
+	top: 100%;
+	left: 0;
+	z-index: 60;
+	min-width: 190px;
+	max-width: 280px;
+	margin-top: 4px;
+	padding: 4px;
+	background: var(--fg-color);
+	border: 1px solid var(--border-color);
+	border-radius: var(--border-radius-md, 8px);
+	box-shadow: var(--shadow-md, 0 4px 16px rgba(0, 0, 0, 0.12));
+}
+
+.workspace-subnav-tab.open .workspace-subnav-menu {
+	display: block;
+}
+
+.workspace-subnav-item {
+	display: block;
+	padding: 6px 10px;
+	border-radius: var(--border-radius-md, 6px);
+	color: var(--text-color);
+	font-size: var(--text-sm, 12px);
+	text-decoration: none;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+
+	&:hover {
+		background: var(--fg-hover-color);
+		text-decoration: none;
+		color: var(--text-color);
+	}
+}
