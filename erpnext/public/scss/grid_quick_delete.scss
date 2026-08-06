@@ -1,0 +1,10 @@
+// Quick-delete button injected next to the pencil (edit) icon on grid rows —
+// see grid_quick_delete.js. Reuses .btn-open-row's layout/spacing and only
+// adds a red hover tint so it reads as destructive.
+.grid-body .btn-quick-delete-row {
+	cursor: pointer;
+
+	&:hover {
+		color: var(--red-500);
+	}
+}

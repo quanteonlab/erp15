@@ -1,0 +1,86 @@
+// Desk decluttering — see desk_declutter.js for the JS half.
+
+// 1) Non-dev mode (default until "Toggle Developer Mode" is used from the
+//    navbar user menu): hide modules that are still experimental. Titles must
+//    match each Workspace's exact title text (the sidebar's [item-name] attr)
+//    — adjust here if a title doesn't match what's actually configured.
+body.erpnext-non-dev-mode .desk-sidebar {
+	[item-name="Bazar Intelligence"],
+	[item-name="Airplane Mode"],
+	[item-name="Manufacturing"],
+	[item-name="Quality"],
+	[item-name="Projects"],
+	[item-name="Support"],
+	[item-name="Integrations"],
+	[item-name="ERPNext Integrations"],
+	[item-name="Build"],
+	[item-name="Custom Dashes"] {
+		display: none !important;
+	}
+}
+
+// 2) Workspace page header: the big module title ("Accounting", "Selling", …)
+//    and its hamburger are redundant — the sidebar already highlights the
+//    active workspace, and the hamburger now lives in the navbar (see
+//    desk_declutter.js). Hide both and shrink the now near-empty header bar
+//    to reclaim vertical space. Scoped to the Workspaces page only — other
+//    pages (forms, lists, reports) keep their normal page-head size, since
+//    those can have real content on the right (actions, filters, …).
+#page-Workspaces {
+	--page-head-height: 8px;
+
+	.page-head {
+		margin-bottom: 0;
+	}
+
+	.page-title {
+		.title-text,
+		.sidebar-toggle-btn {
+			display: none;
+		}
+	}
+}
+
+// 3) Shared sidebar-toggle button relocated into the persistent navbar.
+.navbar-sidebar-toggle-btn {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 30px;
+	height: 30px;
+	margin-right: 4px;
+	border-radius: var(--border-radius-md, 6px);
+	color: var(--text-color);
+
+	&:hover {
+		background: var(--fg-hover-color);
+	}
+}
+
+// 4) Help dropdown removed entirely — "Keyboard Shortcuts" is copied into the
+//    account/user dropdown instead (see
+//    erpnext.patches.v15_0.add_keyboard_shortcuts_to_settings_dropdown).
+.navbar .dropdown-help {
+	display: none !important;
+}
+
+// 5) List-family pages (List/Report/Kanban/… — anything routed under
+//    "List/<doctype>/…"): the title just repeats the breadcrumb, so hide it.
+//    Unlike the Workspaces page, the hamburger here stays — it toggles the
+//    real per-page filter sidebar — it's just re-skinned as a filter icon
+//    below, and the header keeps its default height since the right side
+//    (Add/List View/…) is genuinely used here.
+.page-container[data-page-route^="List/"] .page-title .title-text {
+	display: none;
+}
+
+// 6) Per-page sidebar-toggle icon on list pages restyled as a filter icon
+//    (see restyle_list_sidebar_toggle_icons in desk_declutter.js) — the
+//    originals are hidden rather than removed since core keeps rewriting
+//    their href on every click.
+.page-container[data-page-route^="List/"] .sidebar-toggle-btn {
+	.sidebar-toggle-placeholder,
+	.sidebar-toggle-icon {
+		display: none;
+	}
+}

@@ -37,5 +37,7 @@ import "./financial_statements.js";
 import "./sales_trends_filters.js";
 import "./purchase_trends_filters.js";
 import "./workspace_subnav.js";
+import "./grid_quick_delete.js";
+import "./desk_declutter.js";
 
 // import { sum } from 'frappe/public/utils/util.js'

@@ -10,9 +10,19 @@
 	display: flex;
 	flex-wrap: wrap;
 	gap: 2px;
-	padding: 8px 0 12px;
+	padding: 4px 0 8px;
 	margin-bottom: 4px;
 	border-bottom: 1px solid var(--border-color);
+}
+
+// Shortcut blocks relocated here (out of the page's normal block order) by
+// declutter_body() in workspace_subnav.js, right under the tab strip above.
+// Reproduces the flex-wrap layout .codex-editor__redactor normally gives
+// them, since moving them out of that container drops it.
+.workspace-relocated-shortcuts {
+	display: flex;
+	flex-wrap: wrap;
+	margin: 0 -7px 8px;
 }
 
 .workspace-subnav-tab {
