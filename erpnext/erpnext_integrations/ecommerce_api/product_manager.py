@@ -1719,23 +1719,26 @@ def export_rows(filters=None, price_list=None, warehouse=None):
 
 
 def _floor_map_api_module():
-    # Source of truth remains in bench app service code.
-    return importlib.import_module("webshop.webshop.floor_map_api")
+    # Source of truth is the local ecommerce_api implementation.
+    # Never point this at webshop.* -- that app directory is intentionally empty.
+    return importlib.import_module("erpnext.erpnext_integrations.ecommerce_api.floor_map_api")
 
 
 @frappe.whitelist()
 def get_floors(company=None):
-    return _floor_map_api_module().get_floors(company=company)
+    # `company` is accepted for API compatibility but unused: ECommerce Floor Map
+    # has no company field and the underlying implementation doesn't filter by it.
+    return _floor_map_api_module().get_floors()
 
 
 @frappe.whitelist()
 def get_floor_sections(floor_id, company=None):
-    return _floor_map_api_module().get_floor_sections(floor_id, company=company)
+    return _floor_map_api_module().get_floor_sections(floor_id)
 
 
 @frappe.whitelist()
 def get_section_details(section_id, company=None):
-    return _floor_map_api_module().get_section_details(section_id, company=company)
+    return _floor_map_api_module().get_section_details(section_id)
 
 
 @frappe.whitelist()
@@ -1751,13 +1754,12 @@ def save_floor_map(location_name, floor_name, sections_data=None, notes_data=Non
         notes_data or "[]",
         canvas_width,
         canvas_height,
-        company=company,
     )
 
 
 @frappe.whitelist()
 def delete_floor_map(floor_id, company=None):
-    return _floor_map_api_module().delete_floor_map(floor_id, company=company)
+    return _floor_map_api_module().delete_floor_map(floor_id)
 
 
 def _coerce_floor_sections_for_export(payload):
