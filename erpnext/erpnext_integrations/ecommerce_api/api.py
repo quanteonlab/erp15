@@ -3921,7 +3921,8 @@ def search_items_for_receiving(search_term=None, page_length=8):
 def commit_receiving_session(session_id, reference, supplier, warehouse, lines, draft_items):
 	"""
 	Atomically:
-	1. Create new ERPNext Items for draft items
+	1. Create new ERPNext Items for draft items (disabled/inactive until Aprobaciones
+	   approves them — unless draft already has approved_at)
 	2. Create a submitted Stock Entry (Material Receipt)
 	Returns { stock_entry_id, new_item_codes }
 	"""
@@ -3931,7 +3932,7 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 	if isinstance(draft_items, str):
 		draft_items = json.loads(draft_items)
 
-	# 1. Create draft items
+	# 1. Create draft items (inactive until Aprobaciones marks them approved)
 	import uuid as _uuid
 	new_item_codes = {}
 	for d in draft_items:
@@ -3940,7 +3941,12 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			continue
 		# item_code is mandatory in ERPNext — generate a unique one if not provided
 		item_code_val = (d.get("item_code") or "").strip() or str(_uuid.uuid4())
-		item_doc = frappe.get_doc({
+		# Already approved in IndexedDB before commit → create active; otherwise disabled
+		is_approved = bool(d.get("approved_at"))
+		brand_name = (d.get("brand") or "").strip()
+		if brand_name and not frappe.db.exists("Brand", brand_name):
+			frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(ignore_permissions=True)
+		item_fields = {
 			"doctype": "Item",
 			"item_code": item_code_val,
 			"item_name": d["item_name"],
@@ -3948,8 +3954,26 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			"stock_uom": d.get("stock_uom") or "Nos",
 			"is_stock_item": 1,
 			"include_item_in_manufacturing": 0,
-			"description": d["item_name"],
-		})
+			"description": d.get("normalized_title") or d["item_name"],
+			"disabled": 0 if is_approved else 1,
+		}
+		if brand_name:
+			item_fields["brand"] = brand_name
+		if frappe.db.has_column("Item", "custom_pack_qty") and d.get("pack_qty") is not None:
+			item_fields["custom_pack_qty"] = flt(d.get("pack_qty"))
+		if frappe.db.has_column("Item", "custom_pack_size") and d.get("pack_size") is not None:
+			item_fields["custom_pack_size"] = flt(d.get("pack_size"))
+		if frappe.db.has_column("Item", "custom_pack_unit") and d.get("unit"):
+			item_fields["custom_pack_unit"] = d.get("unit")
+		if frappe.db.has_column("Item", "custom_normalized_title") and d.get("normalized_title"):
+			item_fields["custom_normalized_title"] = d.get("normalized_title")
+		if frappe.db.has_column("Item", "custom_review_notes") and d.get("review_notes"):
+			item_fields["custom_review_notes"] = d.get("review_notes")
+		if frappe.db.has_column("Item", "custom_unit_sku") and d.get("unit_sku"):
+			item_fields["custom_unit_sku"] = d.get("unit_sku")
+		if d.get("image"):
+			item_fields["image"] = d.get("image")
+		item_doc = frappe.get_doc(item_fields)
 		item_doc.insert(ignore_permissions=True)
 		# Add barcode if provided — skip silently if ERPNext rejects the format
 		if d.get("barcode"):
@@ -3958,15 +3982,21 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 				item_doc.save(ignore_permissions=True)
 			except Exception:
 				pass  # barcode is optional; don't abort the commit over a format error
-		# Add selling price if estimated
-		if flt(d.get("estimated_price") or 0) > 0:
+		# Add selling price if estimated / list
+		price = flt(d.get("list_price") or d.get("estimated_price") or 0)
+		if price > 0:
 			frappe.get_doc({
 				"doctype": "Item Price",
 				"item_code": item_doc.item_code,
 				"price_list": "Standard Selling",
-				"price_list_rate": flt(d["estimated_price"]),
+				"price_list_rate": price,
 				"selling": 1,
 			}).insert(ignore_permissions=True)
+		tags = d.get("tags") or []
+		if isinstance(tags, list) and tags:
+			tag_str = ",".join(sorted({str(t).strip() for t in tags if t and str(t).strip()}))
+			if tag_str:
+				frappe.db.set_value("Item", item_doc.name, "_user_tags", tag_str)
 		new_item_codes[d["draft_id"]] = item_doc.name  # name == item_code after insert
 
 	# Commit item inserts so the Stock Entry link-field validation can resolve them
