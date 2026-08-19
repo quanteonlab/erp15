@@ -60,7 +60,10 @@ before_install = [
 	"erpnext.setup.install.check_frappe_version",
 ]
 after_install = "erpnext.setup.install.after_install"
-after_migrate = "erpnext.erpnext_integrations.ecommerce_api.product_manager.ensure_product_manager_custom_fields"
+after_migrate = [
+	"erpnext.erpnext_integrations.ecommerce_api.product_manager.ensure_product_manager_custom_fields",
+	"erpnext.erpnext_integrations.ecommerce_api.api.ensure_product_bundle_promo_fields",
+]
 
 boot_session = "erpnext.startup.boot.boot_session"
 notification_config = "erpnext.startup.notifications.get_notification_config"

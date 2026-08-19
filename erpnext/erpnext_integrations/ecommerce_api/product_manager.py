@@ -18,6 +18,66 @@ from frappe.utils import cint, flt, get_datetime, nowtime, today
 # ---------------------------------------------------------------------------
 
 
+def _default_buying_price_list() -> str:
+    """Buying Settings buying price list, else Standard Buying."""
+    bs = frappe.db.get_single_value("Buying Settings", "buying_price_list")
+    if bs:
+        return bs
+    return "Standard Buying"
+
+
+def _ensure_buying_price_list() -> str:
+    name = _default_buying_price_list()
+    if frappe.db.exists("Price List", name):
+        return name
+    currency = (
+        frappe.db.get_single_value("Global Defaults", "default_currency")
+        or "ARS"
+    )
+    frappe.get_doc(
+        {
+            "doctype": "Price List",
+            "price_list_name": name,
+            "enabled": 1,
+            "buying": 1,
+            "selling": 0,
+            "currency": currency,
+        }
+    ).insert(ignore_permissions=True)
+    return name
+
+
+def _upsert_item_price_buying(item_code: str, rate: float) -> None:
+    from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
+    rate = flt(rate)
+    if rate <= 0:
+        return
+    pl = _ensure_buying_price_list()
+    existing = frappe.db.get_value(
+        "Item Price",
+        {"item_code": item_code, "price_list": pl, "buying": 1},
+        "name",
+    )
+    if existing:
+        old = frappe.db.get_value("Item Price", existing, "price_list_rate")
+        frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
+        log_field_changes("Item Price", existing, [("price_list_rate", old, rate)])
+        return
+    doc = frappe.get_doc(
+        {
+            "doctype": "Item Price",
+            "item_code": item_code,
+            "price_list": pl,
+            "buying": 1,
+            "selling": 0,
+            "price_list_rate": rate,
+        }
+    )
+    doc.insert(ignore_permissions=True)
+    log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
+
+
 def _default_price_list() -> str:
     """Prefer first POS Profile selling price list, then Selling Settings, then Standard Selling."""
     row = frappe.db.sql(
@@ -324,6 +384,7 @@ def get_pm_context():
         filters={"selling": 1},
         pluck="name",
         order_by="name asc",
+        ignore_permissions=True,
     )
     warehouses = frappe.get_all(
         "Warehouse",
@@ -331,11 +392,21 @@ def get_pm_context():
         pluck="name",
         order_by="name asc",
         limit=200,
+        ignore_permissions=True,
+    )
+    buying_price_lists = frappe.get_all(
+        "Price List",
+        filters={"buying": 1},
+        pluck="name",
+        order_by="name asc",
+        ignore_permissions=True,
     )
     return {
         "default_price_list": default_pl,
+        "default_buying_price_list": _default_buying_price_list(),
         "default_company": default_company,
         "price_lists": price_lists or [],
+        "buying_price_lists": buying_price_lists or [],
         "warehouses": warehouses or [],
     }
 
@@ -558,7 +629,11 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
     offset = (page - 1) * page_length
 
     conditions = []
-    values: dict = {"price_list": price_list}
+    buying_price_list = _default_buying_price_list()
+    values: dict = {
+        "price_list": price_list,
+        "buying_price_list": buying_price_list,
+    }
 
     search = (filters.get("search") or "").strip()
     if search:
@@ -685,18 +760,27 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
     where_clause = " AND ".join(conditions) if conditions else "1=1"
 
     bin_join = ""
-    bin_select = "NULL AS stock_qty"
+    bin_select = "NULL AS stock_qty, val.valuation_rate AS valuation_rate"
+    val_join = """
+        LEFT JOIN (
+            SELECT item_code, MAX(valuation_rate) AS valuation_rate
+            FROM `tabBin`
+            WHERE IFNULL(valuation_rate, 0) > 0
+            GROUP BY item_code
+        ) val ON val.item_code = i.item_code
+    """
     if warehouse:
         values["warehouse"] = warehouse
         bin_join = """
         LEFT JOIN (
-            SELECT item_code, SUM(actual_qty) AS stock_qty
+            SELECT item_code, SUM(actual_qty) AS stock_qty, MAX(valuation_rate) AS valuation_rate
             FROM `tabBin`
             WHERE warehouse = %(warehouse)s
             GROUP BY item_code
         ) bsum ON bsum.item_code = i.item_code
         """
-        bin_select = "COALESCE(bsum.stock_qty, 0) AS stock_qty"
+        bin_select = "COALESCE(bsum.stock_qty, 0) AS stock_qty, bsum.valuation_rate AS valuation_rate"
+        val_join = ""
 
     unit_sku_select = "COALESCE(i.custom_unit_sku, NULL) AS unit_sku" if has_unit_sku_col else "NULL AS unit_sku"
 
@@ -719,6 +803,8 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
             i.modified               AS last_synced,
             i._user_tags             AS _user_tags,
             ip.price_list_rate       AS list_price,
+            bp.price_list_rate       AS buying_price,
+            i.last_purchase_rate     AS last_purchase_rate,
             ib.barcode               AS barcode,
             {bin_select}
         FROM `tabItem` i
@@ -730,6 +816,13 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
             GROUP BY item_code
         ) ip ON ip.item_code = i.item_code
         LEFT JOIN (
+            SELECT item_code, MAX(price_list_rate) AS price_list_rate
+            FROM `tabItem Price`
+            WHERE price_list = %(buying_price_list)s
+              AND buying = 1
+            GROUP BY item_code
+        ) bp ON bp.item_code = i.item_code
+        LEFT JOIN (
             SELECT parent, barcode
             FROM `tabItem Barcode`
             WHERE idx = (
@@ -739,6 +832,7 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
             )
         ) ib ON ib.parent = i.item_code
         {bin_join}
+        {val_join}
         WHERE {where_clause}
         ORDER BY {"i.modified DESC" if values.get("modified_after") else "i.item_name ASC"}
         LIMIT %(page_length)s OFFSET %(offset)s
@@ -753,6 +847,16 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
         row["tags"] = [t.strip() for t in raw.split(",") if t.strip()] if raw else []
         row["is_active"] = 0 if row.pop("_disabled", 0) else 1
         row.pop("_raw_norm", None)
+        buying = flt(row.pop("buying_price", None) or 0)
+        last_purchase = flt(row.pop("last_purchase_rate", None) or 0)
+        valuation = flt(row.pop("valuation_rate", None) or 0)
+        fallback = last_purchase if last_purchase > 0 else valuation
+        if buying > 0:
+            row["cost_price"] = buying
+            row["cost_from_buying"] = 1
+        else:
+            row["cost_price"] = fallback if fallback > 0 else None
+            row["cost_from_buying"] = 0
 
     count_vals = {k: v for k, v in values.items() if k not in ("page_length", "offset")}
     total = frappe.db.sql(
@@ -775,6 +879,7 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
 
     changes = dict(changes)
     stock_qty_target = changes.pop("stock_qty", None)
+    changes.pop("cost_from_buying", None)
 
     # Ecommerce API-key callers may not hold Item write roles; whitelist is the gate.
     frappe.flags.ignore_permissions = True
@@ -817,6 +922,9 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
 
         if "list_price" in changes:
             _upsert_item_price(item_code, flt(changes["list_price"]), pl)
+
+        if "cost_price" in changes and changes["cost_price"] not in (None, ""):
+            _upsert_item_price_buying(item_code, flt(changes["cost_price"]))
 
         if "barcode" in changes:
             _upsert_barcode(item_code, changes["barcode"])
@@ -962,6 +1070,9 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
 
     if changes.get("list_price") not in (None, ""):
         _upsert_item_price(candidate_code, flt(changes.get("list_price")), price_list)
+
+    if changes.get("cost_price") not in (None, ""):
+        _upsert_item_price_buying(candidate_code, flt(changes.get("cost_price")))
 
     barcode = (changes.get("barcode") or "").strip()
     if barcode:
@@ -1747,6 +1858,8 @@ def export_rows(filters=None, price_list=None, warehouse=None):
         "source_category",
         "barcode",
         "list_price",
+        "cost_price",
+        "cost_from_buying",
         "stock_uom",
         "pack_qty",
         "pack_size",
@@ -2059,6 +2172,24 @@ def save_pos_profile(name=None, data=None):
     )
 
     return _impl(name=name, data=data)
+
+
+@frappe.whitelist()
+def list_cash_register_sessions(warehouse=None, search=None, page=1, page_length=200):
+    from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
+        list_cash_register_sessions as _impl,
+    )
+
+    return _impl(warehouse=warehouse, search=search, page=page, page_length=page_length)
+
+
+@frappe.whitelist()
+def get_cash_register_session(session_id):
+    from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
+        get_cash_register_session as _impl,
+    )
+
+    return _impl(session_id)
 
 
 @frappe.whitelist()

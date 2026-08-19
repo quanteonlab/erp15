@@ -152,6 +152,7 @@ def get_products(
 
 	# Attach barcode data in bulk (single query for all items)
 	_attach_barcodes(items)
+	_attach_receiving_meta(items, price_list)
 
 	return {
 		"items": items,
@@ -177,6 +178,120 @@ def _attach_barcodes(items):
 		)
 	for item in items:
 		item["barcodes"] = barcode_map.get(item.get("item_code"), [])
+
+
+def _attach_receiving_meta(items, price_list=None):
+	"""Attach last_cost + default_supplier for receiving screen (in-place)."""
+	item_codes = [i.get("item_code") for i in items if i.get("item_code")]
+	if not item_codes:
+		return
+
+	# Latest Purchase Receipt rate per item
+	pr_rows = frappe.db.sql(
+		"""
+		SELECT pri.item_code, pri.rate
+		FROM `tabPurchase Receipt Item` pri
+		INNER JOIN `tabPurchase Receipt` pr ON pr.name = pri.parent
+		WHERE pri.item_code IN %(codes)s
+		  AND pr.docstatus = 1
+		ORDER BY pr.posting_date DESC, pr.creation DESC
+		""",
+		{"codes": item_codes},
+		as_dict=True,
+	)
+	last_cost = {}
+	for row in pr_rows:
+		code = row.item_code
+		if code not in last_cost and flt(row.rate) > 0:
+			last_cost[code] = flt(row.rate)
+
+	# Fallback: bin valuation_rate
+	missing = [c for c in item_codes if c not in last_cost]
+	if missing:
+		bin_rows = frappe.db.sql(
+			"""
+			SELECT item_code, valuation_rate
+			FROM `tabBin`
+			WHERE item_code IN %(codes)s
+			  AND IFNULL(valuation_rate, 0) > 0
+			ORDER BY modified DESC
+			""",
+			{"codes": missing},
+			as_dict=True,
+		)
+		for row in bin_rows:
+			if row.item_code not in last_cost:
+				last_cost[row.item_code] = flt(row.valuation_rate)
+
+	# Item Default supplier
+	sup_rows = frappe.get_all(
+		"Item Default",
+		filters={"parent": ["in", item_codes], "default_supplier": ["is", "set"]},
+		fields=["parent", "default_supplier"],
+		ignore_permissions=True,
+	)
+	sup_map = {r.parent: r.default_supplier for r in sup_rows if r.default_supplier}
+
+	buying_pl = (
+		frappe.db.get_single_value("Buying Settings", "buying_price_list")
+		or "Standard Buying"
+	)
+	buy_rows = frappe.db.sql(
+		"""
+		SELECT item_code, MAX(price_list_rate) AS rate
+		FROM `tabItem Price`
+		WHERE price_list = %(pl)s
+		  AND buying = 1
+		  AND item_code IN %(codes)s
+		GROUP BY item_code
+		""",
+		{"pl": buying_pl, "codes": item_codes},
+		as_dict=True,
+	)
+	buy_map = {r.item_code: flt(r.rate) for r in buy_rows if flt(r.rate) > 0}
+
+	for item in items:
+		code = item.get("item_code")
+		item["last_cost"] = last_cost.get(code) or 0
+		item["buying_price"] = buy_map.get(code) or 0
+		item["cost_from_buying"] = 1 if item["buying_price"] else 0
+		item["default_supplier"] = sup_map.get(code) or None
+		# Ensure price_list_rate present for overwrite comparisons
+		if item.get("price_list_rate") is None and price_list:
+			item["price_list_rate"] = get_item_price(code, price_list)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_receiving_item_meta(item_codes=None, price_list=None):
+	"""Batch meta for receiving submit warnings: last_cost, list_price, supplier, stock."""
+	import json
+
+	if isinstance(item_codes, str):
+		item_codes = json.loads(item_codes)
+	item_codes = [c for c in (item_codes or []) if c]
+	if not item_codes:
+		return {"items": {}}
+
+	if not price_list:
+		price_list = (
+			frappe.db.get_single_value("Selling Settings", "selling_price_list")
+			or "Standard Selling"
+		)
+
+	stubs = [{"item_code": c} for c in item_codes]
+	_attach_receiving_meta(stubs, price_list)
+	out = {}
+	for stub in stubs:
+		code = stub["item_code"]
+		out[code] = {
+			"last_cost": stub.get("last_cost") or 0,
+			"buying_price": stub.get("buying_price") or 0,
+			"cost_from_buying": stub.get("cost_from_buying") or 0,
+			"default_supplier": stub.get("default_supplier"),
+			"price_list_rate": get_item_price(code, price_list) or 0,
+			"stock_qty": get_stock_balance(code) or 0,
+		}
+	return {"items": out}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -425,6 +540,7 @@ def get_active_promotions(price_list=None):
 		"same_item", "free_item", "free_qty", "free_item_rate",
 		"is_recursive", "recurse_for",
 		"threshold_percentage", "rule_description",
+		"for_price_list",
 	]
 	if has_time_fields:
 		base_fields += ["happy_hour_from", "happy_hour_to"]
@@ -437,6 +553,7 @@ def get_active_promotions(price_list=None):
 		"Pricing Rule",
 		filters={"disable": 0, "selling": 1},
 		fields=base_fields,
+		ignore_permissions=True,
 	)
 
 	# Filter by date validity
@@ -445,6 +562,10 @@ def get_active_promotions(price_list=None):
 		if (not r.get("valid_from") or getdate(r["valid_from"]) <= getdate(today))
 		and (not r.get("valid_upto") or getdate(r["valid_upto"]) >= getdate(today))
 	]
+
+	# Empty / * for_price_list = all selling lists
+	if price_list:
+		rules = [r for r in rules if _price_list_applies(r.get("for_price_list"), price_list)]
 
 	# Filter by time of day (happy hour)
 	if has_time_fields:
@@ -471,6 +592,7 @@ def get_active_promotions(price_list=None):
 				child_dt,
 				filters={"parent": ["in", rule_names]},
 				fields=["parent", field],
+				ignore_permissions=True,
 			)
 			mapping = {}
 			for row in rows:
@@ -544,6 +666,7 @@ def _attach_pricing_rule_children(rules):
 				child_dt,
 				filters={"parent": ["in", rule_names]},
 				fields=["parent", field],
+				ignore_permissions=True,
 			)
 			mapping = {}
 			for row in rows:
@@ -577,6 +700,47 @@ def _parse_target_list(raw):
 	return []
 
 
+_ALL_MARKERS = {"*", "ALL", "TODOS"}
+
+
+def _is_all_marker(value):
+	return str(value or "").strip().upper() in _ALL_MARKERS
+
+
+def _is_all_targets(values):
+	return any(_is_all_marker(v) for v in (values or []))
+
+
+def _normalize_price_list(value):
+	pl = (value or "").strip() if isinstance(value, str) else (str(value).strip() if value else "")
+	if not pl or _is_all_marker(pl):
+		return None
+	return pl
+
+
+def _price_list_applies(rule_pl, current_pl):
+	"""Empty or * on the rule = every selling list. Empty current filter = no restriction."""
+	rule_pl = _normalize_price_list(rule_pl)
+	current_pl = _normalize_price_list(current_pl)
+	if not rule_pl:
+		return True
+	if not current_pl:
+		return True
+	return rule_pl == current_pl
+
+
+def _selling_price_lists():
+	return (
+		frappe.get_all(
+			"Price List",
+			filters={"selling": 1, "enabled": 1},
+			pluck="name",
+			ignore_permissions=True,
+		)
+		or []
+	)
+
+
 @frappe.whitelist()
 def list_pricing_rules(include_disabled=1, price_list=None):
 	"""
@@ -592,13 +756,10 @@ def list_pricing_rules(include_disabled=1, price_list=None):
 		filters=filters,
 		fields=_pricing_rule_field_list(),
 		order_by="modified desc",
+		ignore_permissions=True,
 	)
 	if price_list:
-		rules = [
-			r
-			for r in rules
-			if not r.get("for_price_list") or r.get("for_price_list") == price_list
-		]
+		rules = [r for r in rules if _price_list_applies(r.get("for_price_list"), price_list)]
 
 	_attach_pricing_rule_children(rules)
 	return {"rules": rules, "total_count": len(rules)}
@@ -642,11 +803,20 @@ def save_pricing_rule(data):
 	company = data.get("company") or company
 
 	name = (data.get("name") or "").strip() or None
-	is_new = not name
-	if name and not frappe.db.exists("Pricing Rule", name):
-		frappe.throw(_("Pricing Rule not found"), frappe.DoesNotExistError)
+	promo_sku = (data.get("promo_sku") or "").strip() or None
+	existing_name = name if name and frappe.db.exists("Pricing Rule", name) else None
+	is_new = not existing_name
+	set_name = None
+	if is_new:
+		set_name = promo_sku or (name if name else None)
+		if set_name and frappe.db.exists("Pricing Rule", set_name):
+			frappe.throw(_("A pricing rule with code {0} already exists").format(set_name))
+	else:
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Pricing Rule", existing_name)
+		frappe.flags.ignore_permissions = False
 
-	doc = frappe.new_doc("Pricing Rule") if is_new else frappe.get_doc("Pricing Rule", name)
+	doc = frappe.new_doc("Pricing Rule") if is_new else doc
 
 	doc.title = title
 	doc.selling = 1
@@ -657,7 +827,7 @@ def save_pricing_rule(data):
 	doc.currency = currency
 	if company:
 		doc.company = company
-	doc.for_price_list = data.get("for_price_list") or None
+	doc.for_price_list = _normalize_price_list(data.get("for_price_list"))
 	doc.rate_or_discount = data.get("rate_or_discount") or "Discount Percentage"
 	doc.discount_percentage = flt(data.get("discount_percentage") or 0)
 	doc.discount_amount = flt(data.get("discount_amount") or 0)
@@ -689,7 +859,7 @@ def save_pricing_rule(data):
 	if frappe.db.has_column("Pricing Rule", "flash_sale"):
 		doc.flash_sale = cint(data.get("flash_sale") or 0)
 
-	# Rebuild child targets
+	# Rebuild child targets. "*" / ALL / TODOS = every product → apply_on Transaction.
 	doc.set("items", [])
 	doc.set("item_groups", [])
 	doc.set("brands", [])
@@ -698,17 +868,33 @@ def save_pricing_rule(data):
 	groups = _parse_target_list(data.get("applicable_groups"))
 	brands = _parse_target_list(data.get("applicable_brands"))
 
+	if apply_on == "Item Code" and _is_all_targets(items):
+		apply_on = "Transaction"
+		doc.apply_on = "Transaction"
+	elif apply_on == "Item Group" and _is_all_targets(groups):
+		apply_on = "Transaction"
+		doc.apply_on = "Transaction"
+
 	if apply_on == "Item Code":
 		for code in items:
-			doc.append("items", {"item_code": code})
+			if not _is_all_marker(code):
+				doc.append("items", {"item_code": code})
 	elif apply_on == "Item Group":
 		for g in groups:
-			doc.append("item_groups", {"item_group": g})
+			if not _is_all_marker(g):
+				doc.append("item_groups", {"item_group": g})
 	elif apply_on == "Brand":
 		for b in brands:
-			doc.append("brands", {"brand": b})
+			if not _is_all_marker(b):
+				doc.append("brands", {"brand": b})
 
-	doc.save(ignore_permissions=True)
+	if is_new:
+		if set_name:
+			doc.insert(ignore_permissions=True, set_name=set_name)
+		else:
+			doc.insert(ignore_permissions=True)
+	else:
+		doc.save(ignore_permissions=True)
 	frappe.db.commit()
 
 	row = frappe.db.get_value("Pricing Rule", doc.name, _pricing_rule_field_list(), as_dict=True)
@@ -736,6 +922,61 @@ def delete_pricing_rule(name):
 	return {"ok": True, "name": name}
 
 
+_bundle_fields_ready = False
+
+
+def ensure_product_bundle_promo_fields():
+	"""
+	Custom vigencia + price-list fields on Product Bundle.
+	Empty custom_for_price_list = applies to every selling list.
+	Idempotent — create_custom_fields skips existing fields.
+	"""
+	global _bundle_fields_ready
+	if _bundle_fields_ready and frappe.db.has_column("Product Bundle", "custom_valid_from"):
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+	create_custom_fields(
+		{
+			"Product Bundle": [
+				{
+					"fieldname": "custom_valid_from",
+					"fieldtype": "Date",
+					"label": "Valid From",
+					"insert_after": "disabled",
+				},
+				{
+					"fieldname": "custom_valid_upto",
+					"fieldtype": "Date",
+					"label": "Valid Upto",
+					"insert_after": "custom_valid_from",
+				},
+				{
+					"fieldname": "custom_for_price_list",
+					"fieldtype": "Link",
+					"options": "Price List",
+					"label": "For Price List",
+					"insert_after": "custom_valid_upto",
+				},
+			]
+		},
+		ignore_validate=True,
+	)
+	frappe.clear_cache(doctype="Product Bundle")
+	_bundle_fields_ready = True
+
+
+def _bundle_in_vigencia(row_or_doc):
+	today = getdate(nowdate())
+	vf = row_or_doc.get("valid_from") or row_or_doc.get("custom_valid_from")
+	vu = row_or_doc.get("valid_upto") or row_or_doc.get("custom_valid_upto")
+	if vf and getdate(vf) > today:
+		return False
+	if vu and getdate(vu) < today:
+		return False
+	return True
+
+
 def _bundle_price(item_code, price_list=None):
 	pl = price_list or frappe.db.get_single_value("Selling Settings", "selling_price_list") or "Standard Selling"
 	return (
@@ -749,7 +990,10 @@ def _bundle_price(item_code, price_list=None):
 
 
 def _serialize_product_bundle(name, price_list=None):
+	ensure_product_bundle_promo_fields()
+	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc("Product Bundle", name)
+	frappe.flags.ignore_permissions = False
 	item = frappe.db.get_value(
 		"Item",
 		doc.new_item_code,
@@ -777,6 +1021,9 @@ def _serialize_product_bundle(name, price_list=None):
 	bundle_price = flt(_bundle_price(doc.new_item_code, pl))
 	discount_amount = max(0.0, components_total - bundle_price) if components_total else 0.0
 	discount_pct = (discount_amount / components_total * 100.0) if components_total else 0.0
+	for_price_list = _normalize_price_list(doc.get("custom_for_price_list"))
+	valid_from = doc.get("custom_valid_from")
+	valid_upto = doc.get("custom_valid_upto")
 	return {
 		"name": doc.name,
 		"new_item_code": doc.new_item_code,
@@ -790,6 +1037,9 @@ def _serialize_product_bundle(name, price_list=None):
 		"estimated_discount_amount": discount_amount,
 		"estimated_discount_pct": discount_pct,
 		"components": components,
+		"valid_from": str(valid_from) if valid_from else None,
+		"valid_upto": str(valid_upto) if valid_upto else None,
+		"for_price_list": for_price_list,
 	}
 
 
@@ -804,8 +1054,18 @@ def list_product_bundles(include_disabled=1, price_list=None):
 		filters=filters,
 		pluck="name",
 		order_by="modified desc",
+		ignore_permissions=True,
 	)
 	bundles = [_serialize_product_bundle(n, price_list) for n in names]
+	if not cint(include_disabled):
+		bundles = [
+			b
+			for b in bundles
+			if _bundle_in_vigencia(b) and _price_list_applies(b.get("for_price_list"), price_list)
+		]
+	elif price_list:
+		# Admin view: still show packs that apply to this list (including all-lists).
+		bundles = [b for b in bundles if _price_list_applies(b.get("for_price_list"), price_list)]
 	return {"bundles": bundles, "total_count": len(bundles)}
 
 
@@ -882,36 +1142,59 @@ def save_product_bundle(data):
 		if data.get("bundle_name"):
 			frappe.db.set_value("Item", new_item_code, "item_name", str(data.get("bundle_name"))[:140])
 
-	price_list = (
-		data.get("price_list")
-		or frappe.db.get_single_value("Selling Settings", "selling_price_list")
-		or "Standard Selling"
-	)
+	ensure_product_bundle_promo_fields()
+
+	stored_pl = _normalize_price_list(data.get("price_list") or data.get("for_price_list"))
+	price_lists_to_write = [stored_pl] if stored_pl else _selling_price_lists()
+	# Fallback if no selling lists exist
+	if not price_lists_to_write:
+		price_lists_to_write = [
+			frappe.db.get_single_value("Selling Settings", "selling_price_list") or "Standard Selling"
+		]
+
 	if data.get("bundle_price") is not None and data.get("bundle_price") != "":
 		rate = flt(data.get("bundle_price"))
-		existing = frappe.db.get_value(
+		allowed = set(price_lists_to_write)
+		existing_prices = frappe.get_all(
 			"Item Price",
-			{"item_code": new_item_code, "price_list": price_list, "selling": 1},
-			"name",
+			filters={"item_code": new_item_code, "selling": 1},
+			fields=["name", "price_list"],
+			ignore_permissions=True,
 		)
-		if existing:
-			frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
-		else:
-			frappe.get_doc(
-				{
-					"doctype": "Item Price",
-					"item_code": new_item_code,
-					"price_list": price_list,
-					"selling": 1,
-					"price_list_rate": rate,
-				}
-			).insert(ignore_permissions=True)
+		for row in existing_prices:
+			if stored_pl and row.price_list not in allowed:
+				frappe.delete_doc("Item Price", row.name, ignore_permissions=True, force=1)
+		for pl in price_lists_to_write:
+			existing = frappe.db.get_value(
+				"Item Price",
+				{"item_code": new_item_code, "price_list": pl, "selling": 1},
+				"name",
+			)
+			if existing:
+				frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
+			else:
+				frappe.get_doc(
+					{
+						"doctype": "Item Price",
+						"item_code": new_item_code,
+						"price_list": pl,
+						"selling": 1,
+						"price_list_rate": rate,
+					}
+				).insert(ignore_permissions=True)
 
 	exists = frappe.db.exists("Product Bundle", new_item_code)
+	valid_from = data.get("valid_from") or None
+	valid_upto = data.get("valid_upto") or None
 	if exists:
+		frappe.flags.ignore_permissions = True
 		doc = frappe.get_doc("Product Bundle", new_item_code)
+		frappe.flags.ignore_permissions = False
 		doc.description = data.get("description") or doc.description
 		doc.disabled = cint(data.get("disabled") or 0)
+		doc.custom_valid_from = valid_from
+		doc.custom_valid_upto = valid_upto
+		doc.custom_for_price_list = stored_pl
 		doc.set("items", [])
 		for c in components:
 			doc.append("items", c)
@@ -923,13 +1206,17 @@ def save_product_bundle(data):
 				"new_item_code": new_item_code,
 				"description": data.get("description") or "",
 				"disabled": cint(data.get("disabled") or 0),
+				"custom_valid_from": valid_from,
+				"custom_valid_upto": valid_upto,
+				"custom_for_price_list": stored_pl,
 				"items": components,
 			}
 		)
 		doc.insert(ignore_permissions=True)
 
+	serialize_pl = stored_pl or (price_lists_to_write[0] if price_lists_to_write else None)
 	frappe.db.commit()
-	return {"ok": True, "name": doc.name, "bundle": _serialize_product_bundle(doc.name, price_list)}
+	return {"ok": True, "name": doc.name, "bundle": _serialize_product_bundle(doc.name, serialize_pl)}
 
 
 @frappe.whitelist()
@@ -966,18 +1253,268 @@ def _is_day_active(rule):
 	return today_name in [d.strip() for d in days.split(",")]
 
 
+def _bogo_nxm_label(min_qty, free_qty):
+	take = cint(min_qty)
+	free = cint(free_qty)
+	if take <= 0 or free <= 0 or free >= take:
+		return None
+	return f"{take}x{take - free}"
+
+
+def _rule_applies_to_item(rule, item_code, item_group="", brand=""):
+	apply_on = rule.get("apply_on") or ""
+	if apply_on == "Transaction":
+		return True
+	if apply_on == "Item Code":
+		items = rule.get("applicable_items") or []
+		if _is_all_targets(items):
+			return True
+		return item_code in items
+	if apply_on == "Item Group":
+		groups = rule.get("applicable_groups") or []
+		if _is_all_targets(groups):
+			return True
+		return bool(item_group) and item_group in groups
+	if apply_on == "Brand":
+		return bool(brand) and brand in (rule.get("applicable_brands") or [])
+	return False
+
+
+def _put_line_discount(line_map, item, discount_amount, rule_name, free_qty=0, label=""):
+	qty = flt(item.get("qty") or 0)
+	amount = flt(item.get("amount") or 0)
+	rate = flt(item.get("rate") or 0)
+	item_code = item.get("item_code")
+	discount_amount = min(flt(discount_amount), amount)
+	if discount_amount <= 0 or not item_code:
+		return
+	prev = line_map.get(item_code)
+	if prev and flt(prev.get("discount_amount") or 0) >= discount_amount:
+		return
+	discounted_amount = max(0, amount - discount_amount)
+	line_map[item_code] = {
+		"item_code": item_code,
+		"discount_percentage": (discount_amount / amount * 100.0) if amount else 0,
+		"discounted_rate": (discounted_amount / qty) if qty else rate,
+		"discount_amount": discount_amount,
+		"free_item": item_code if free_qty else None,
+		"free_qty": flt(free_qty or 0),
+		"rule_name": rule_name or "",
+		"label": label or "",
+	}
+
+
+def _compute_cart_promotions_local(items, price_list=None):
+	"""NxM 3x2 + % price rules + product-bundle packs. Used by apply_cart_promotions."""
+	active_rules = get_active_promotions(price_list=price_list)
+	line_map = {}
+	upsell_hints = []
+	applied_bundles = []
+	remaining = {i["item_code"]: flt(i.get("qty") or 0) for i in items}
+	by_code = {i["item_code"]: i for i in items}
+
+	for item in items:
+		item_code = item.get("item_code")
+		qty = flt(item.get("qty") or 0)
+		rate = flt(item.get("rate") or 0)
+		best = None
+		for rule in active_rules:
+			if (rule.get("price_or_product_discount") or "") != "Product":
+				continue
+			if not rule.get("same_item"):
+				continue
+			if not _rule_applies_to_item(rule, item_code):
+				continue
+			min_qty = flt(rule.get("min_qty") or 0)
+			free_qty = flt(rule.get("free_qty") or 0)
+			if min_qty <= 0 or free_qty <= 0:
+				continue
+			label = _bogo_nxm_label(min_qty, free_qty) or "PROMO"
+			packs = int(qty // min_qty) if min_qty else 0
+			if packs < 1:
+				needed = min_qty - qty
+				thresh = flt(rule.get("threshold_percentage") or 80)
+				progress = (qty / min_qty) * 100 if min_qty else 0
+				if needed > 0 and progress >= thresh:
+					upsell_hints.append({
+						"rule_name": rule["name"],
+						"title": rule.get("title") or rule["name"],
+						"message": f"Agregá {int(needed)} más para aplicar {label}",
+						"items_needed": [item_code],
+						"qty_needed": needed,
+						"progress_pct": min(progress, 99),
+					})
+				continue
+			free = min(qty, packs * free_qty)
+			discount = free * rate
+			if best is None or discount > best["discount"]:
+				best = {"rule": rule, "free": free, "discount": discount, "label": label, "min_qty": min_qty}
+		if best:
+			_put_line_discount(
+				line_map, item, best["discount"], best["rule"]["name"],
+				free_qty=best["free"], label=best["label"],
+			)
+			consumed = int(qty // best["min_qty"]) * best["min_qty"]
+			remaining[item_code] = max(0, qty - consumed)
+
+	for item in items:
+		item_code = item.get("item_code")
+		if item_code in line_map:
+			continue
+		qty = flt(item.get("qty") or 0)
+		amount = flt(item.get("amount") or 0)
+		best_discount = 0
+		best_rule = None
+		for rule in active_rules:
+			if (rule.get("price_or_product_discount") or "") != "Price":
+				continue
+			if not _rule_applies_to_item(rule, item_code):
+				continue
+			min_qty = flt(rule.get("min_qty") or 0)
+			min_amt = flt(rule.get("min_amt") or 0)
+			if min_qty > 0 and qty < min_qty:
+				needed = min_qty - qty
+				thresh = flt(rule.get("threshold_percentage") or 80)
+				progress = (qty / min_qty) * 100 if min_qty else 0
+				if needed > 0 and progress >= thresh:
+					pct = flt(rule.get("discount_percentage") or 0)
+					disc_label = f"{int(pct)}% OFF" if pct else (rule.get("title") or "descuento")
+					upsell_hints.append({
+						"rule_name": rule["name"],
+						"title": rule.get("title") or rule["name"],
+						"message": f"Agregá {int(needed)} más para {disc_label}",
+						"items_needed": [item_code],
+						"qty_needed": needed,
+						"progress_pct": min(progress, 99),
+					})
+				continue
+			if min_amt > 0 and amount < min_amt:
+				continue
+			discount = 0
+			if flt(rule.get("discount_percentage") or 0) > 0:
+				discount = amount * flt(rule.get("discount_percentage")) / 100.0
+			elif flt(rule.get("discount_amount") or 0) > 0:
+				discount = flt(rule.get("discount_amount"))
+			if discount > best_discount:
+				best_discount = discount
+				best_rule = rule
+		if best_rule and best_discount > 0:
+			pct = flt(best_rule.get("discount_percentage") or 0)
+			_put_line_discount(
+				line_map, item, best_discount, best_rule["name"],
+				label=f"{int(pct)}%" if pct else "PROMO",
+			)
+
+	try:
+		bundle_names = frappe.get_all(
+			"Product Bundle",
+			filters={"disabled": 0},
+			pluck="name",
+			ignore_permissions=True,
+		)
+	except Exception:
+		bundle_names = []
+
+	parent_skus = {i["item_code"] for i in items}
+	candidates = []
+	for bname in bundle_names:
+		try:
+			frappe.flags.ignore_permissions = True
+			row = _serialize_product_bundle(bname, price_list)
+			frappe.flags.ignore_permissions = False
+		except Exception:
+			frappe.flags.ignore_permissions = False
+			continue
+		if cint(row.get("item_disabled")):
+			continue
+		if not _bundle_in_vigencia(row):
+			continue
+		if not _price_list_applies(row.get("for_price_list"), price_list):
+			continue
+		sku = row.get("new_item_code")
+		if sku in parent_skus:
+			continue
+		bundle_price = flt(row.get("bundle_price") or 0)
+		components = row.get("components") or []
+		if bundle_price <= 0 or not components:
+			continue
+		if any(flt(c.get("qty") or 0) <= 0 for c in components):
+			continue
+		packs = min(int(remaining.get(c["item_code"], 0) // flt(c["qty"])) for c in components)
+		if packs < 1:
+			continue
+		pack_list = 0.0
+		for c in components:
+			line = by_code.get(c["item_code"])
+			unit = flt(line.get("rate") if line else 0) or flt(c.get("rate") or 0)
+			pack_list += unit * flt(c["qty"])
+		savings = (pack_list - bundle_price) * packs
+		if savings <= 0:
+			continue
+		candidates.append({
+			"sku": sku,
+			"name": row.get("bundle_name") or sku,
+			"price": bundle_price,
+			"components": components,
+			"packs": packs,
+			"pack_list": pack_list,
+			"savings": savings,
+		})
+
+	candidates.sort(key=lambda c: c["savings"], reverse=True)
+	for cand in candidates:
+		still = min(
+			cand["packs"],
+			min(int(remaining.get(c["item_code"], 0) // flt(c["qty"])) for c in cand["components"]),
+		)
+		if still < 1:
+			continue
+		savings_per_pack = cand["pack_list"] - cand["price"]
+		savings = savings_per_pack * still
+		applied_bundles.append({
+			"bundle_item_code": cand["sku"],
+			"bundle_name": cand["name"],
+			"packs": still,
+			"savings": savings,
+		})
+		for c in cand["components"]:
+			line = by_code.get(c["item_code"])
+			if not line:
+				continue
+			unit = flt(line.get("rate") or 0) or flt(c.get("rate") or 0)
+			share = (unit * flt(c["qty"]) / cand["pack_list"]) if cand["pack_list"] else 0
+			item_savings = savings_per_pack * still * share
+			prev = flt((line_map.get(c["item_code"]) or {}).get("discount_amount") or 0)
+			_put_line_discount(
+				line_map, line, prev + item_savings, cand["sku"], label="PACK",
+			)
+			remaining[c["item_code"]] = max(
+				0, remaining.get(c["item_code"], 0) - flt(c["qty"]) * still
+			)
+
+	return {
+		"line_discounts": list(line_map.values()),
+		"upsell_hints": upsell_hints[:3],
+		"applied_bundles": applied_bundles,
+	}
+
+
 @frappe.whitelist(allow_guest=True)
 def apply_cart_promotions(items, price_list=None):
 	"""
 	Given cart items [{item_code, qty, rate, amount}], return computed discounts
-	and upsell hints using ERPNext Pricing Rules.
+	and upsell hints using ERPNext Pricing Rules and Product Bundles.
+
+	3x2 (same_item Product discount) is applied as "Llevá N, pagás N-free":
+	adding min_qty units grants free_qty free units.
 
 	Returns:
 		{
 			line_discounts: [{item_code, discount_percentage, discounted_rate,
-			                  discount_amount, free_item, free_qty, rule_name}],
+			                  discount_amount, free_item, free_qty, rule_name, label}],
 			upsell_hints:   [{rule_name, title, message, items_needed,
-			                  qty_needed, progress_pct}]
+			                  qty_needed, progress_pct}],
+			applied_bundles: [{bundle_item_code, bundle_name, packs, savings}]
 		}
 	"""
 	import json
@@ -986,12 +1523,17 @@ def apply_cart_promotions(items, price_list=None):
 		items = json.loads(items)
 
 	if not items:
-		return {"line_discounts": [], "upsell_hints": []}
+		return {"line_discounts": [], "upsell_hints": [], "applied_bundles": []}
 
+	computed = _compute_cart_promotions_local(items, price_list=price_list)
+	line_map = {d["item_code"]: d for d in computed["line_discounts"]}
+
+	# Merge ERPNext % Price rules that apply_on Item Group / Brand (local engine
+	# only matches Item Code unless group/brand is on the cart line).
 	today = nowdate()
-	line_discounts = []
-
 	for item in items:
+		if item.get("item_code") in line_map:
+			continue
 		try:
 			args = frappe._dict({
 				"item_code": item["item_code"],
@@ -1011,7 +1553,7 @@ def apply_cart_promotions(items, price_list=None):
 			if disc_pct > 0:
 				base = flt(item["rate"])
 				disc_rate = base * (1 - disc_pct / 100)
-				line_discounts.append({
+				line_map[item["item_code"]] = {
 					"item_code": item["item_code"],
 					"discount_percentage": disc_pct,
 					"discounted_rate": disc_rate,
@@ -1019,54 +1561,42 @@ def apply_cart_promotions(items, price_list=None):
 					"free_item": rd.get("free_item"),
 					"free_qty": flt(rd.get("free_qty") or 0),
 					"rule_name": rd.get("pricing_rule") or "",
-				})
+					"label": f"{int(disc_pct)}%",
+				}
 		except Exception:
 			continue  # Pricing rule errors are non-fatal
 
-	# Upsell hints: active rules near their threshold but not yet triggered
+	# Amount-based upsell (cart-level min_amt)
 	active_rules = get_active_promotions(price_list=price_list)
-	item_qty_map = {i["item_code"]: flt(i["qty"]) for i in items}
 	total_amount = sum(flt(i.get("amount", 0)) for i in items)
-	upsell_hints = []
-
+	upsell_hints = list(computed["upsell_hints"])
 	for rule in active_rules:
+		if flt(rule.get("min_amt") or 0) <= 0:
+			continue
+		min_a = flt(rule["min_amt"])
+		needed_amt = min_a - total_amount
 		thresh = flt(rule.get("threshold_percentage") or 80)
+		progress = (total_amount / min_a) * 100 if min_a else 0
+		if 0 < needed_amt and progress >= thresh:
+			disc_label = (
+				f"{rule.get('discount_percentage', '')}% off"
+				if rule.get("discount_percentage")
+				else "un descuento"
+			)
+			upsell_hints.append({
+				"rule_name": rule["name"],
+				"title": rule.get("title") or rule["name"],
+				"message": f"Agregá ${needed_amt:.2f} más para {disc_label}",
+				"items_needed": [],
+				"qty_needed": 0,
+				"progress_pct": min(progress, 99),
+			})
 
-		# Qty-based upsell
-		if flt(rule.get("min_qty") or 0) > 0:
-			for ic in rule.get("applicable_items", []):
-				current = item_qty_map.get(ic, 0)
-				min_q = flt(rule["min_qty"])
-				needed = min_q - current
-				progress = (current / min_q) * 100 if min_q else 0
-				if 0 < needed and progress >= thresh:
-					disc_label = f"{rule.get('discount_percentage', '')}% off" if rule.get('discount_percentage') else "a discount"
-					upsell_hints.append({
-						"rule_name": rule["name"],
-						"title": rule.get("title") or rule["name"],
-						"message": f"Add {int(needed)} more to unlock {disc_label}",
-						"items_needed": [ic],
-						"qty_needed": needed,
-						"progress_pct": min(progress, 99),
-					})
-
-		# Amount-based upsell
-		if flt(rule.get("min_amt") or 0) > 0:
-			min_a = flt(rule["min_amt"])
-			needed_amt = min_a - total_amount
-			progress = (total_amount / min_a) * 100 if min_a else 0
-			if 0 < needed_amt and progress >= thresh:
-				disc_label = f"{rule.get('discount_percentage', '')}% off" if rule.get('discount_percentage') else "a discount"
-				upsell_hints.append({
-					"rule_name": rule["name"],
-					"title": rule.get("title") or rule["name"],
-					"message": f"Add ${needed_amt:.2f} more to unlock {disc_label}",
-					"items_needed": [],
-					"qty_needed": 0,
-					"progress_pct": min(progress, 99),
-				})
-
-	return {"line_discounts": line_discounts, "upsell_hints": upsell_hints[:3]}
+	return {
+		"line_discounts": list(line_map.values()),
+		"upsell_hints": upsell_hints[:3],
+		"applied_bundles": computed.get("applied_bundles") or [],
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1078,13 +1608,13 @@ def get_promotions_for_item(item_code, price_list=None):
 
 	Used by the POS Promotion Panel when a cashier taps the "Promos" chip on a product card.
 	"""
-	pricing_rules = _get_pricing_rules_for_item(item_code)
+	pricing_rules = _get_pricing_rules_for_item(item_code, price_list=price_list)
 	bundles = _get_bundles_containing_item(item_code, price_list=price_list)
 	return {"pricing_rules": pricing_rules, "bundles": bundles}
 
 
-def _get_pricing_rules_for_item(item_code):
-	"""Return active Pricing Rules that apply to this item (direct, group, or brand match)."""
+def _get_pricing_rules_for_item(item_code, price_list=None):
+	"""Return active Pricing Rules that apply to this item (direct, group, brand, or all)."""
 	item = frappe.db.get_value("Item", item_code, ["item_group", "brand"], as_dict=True)
 	if not item:
 		return []
@@ -1092,20 +1622,12 @@ def _get_pricing_rules_for_item(item_code):
 	item_group = item.get("item_group") or ""
 	brand = item.get("brand") or ""
 
-	all_rules = get_active_promotions()
+	all_rules = get_active_promotions(price_list=price_list)
 	matching = []
 
 	for rule in all_rules:
-		apply_on = rule.get("apply_on", "")
-		if apply_on == "Item Code":
-			if item_code in rule.get("applicable_items", []):
-				matching.append(rule)
-		elif apply_on == "Item Group":
-			if item_group and item_group in rule.get("applicable_groups", []):
-				matching.append(rule)
-		elif apply_on == "Brand":
-			if brand and brand in rule.get("applicable_brands", []):
-				matching.append(rule)
+		if _rule_applies_to_item(rule, item_code, item_group, brand):
+			matching.append(rule)
 
 	return matching
 
@@ -1116,42 +1638,30 @@ def _get_bundles_containing_item(item_code, price_list=None):
 		"Product Bundle Item",
 		filters={"item_code": item_code},
 		fields=["parent"],
+		ignore_permissions=True,
 	)
 	if not bundle_rows:
 		return []
 
 	bundle_skus = list({r["parent"] for r in bundle_rows})
-	pl = price_list or "Standard Selling"
 	result = []
 
 	for bundle_sku in bundle_skus:
-		bundle_item = frappe.db.get_value(
-			"Item", bundle_sku, ["item_name", "disabled"], as_dict=True
-		)
-		if not bundle_item or cint(bundle_item.get("disabled")):
+		try:
+			row = _serialize_product_bundle(bundle_sku, price_list)
+		except Exception:
 			continue
-
-		components = frappe.get_all(
-			"Product Bundle Item",
-			filters={"parent": bundle_sku},
-			fields=["item_code", "qty"],
-		)
-		for comp in components:
-			comp["item_name"] = (
-				frappe.db.get_value("Item", comp["item_code"], "item_name") or comp["item_code"]
-			)
-
-		bundle_price = frappe.db.get_value(
-			"Item Price",
-			{"item_code": bundle_sku, "price_list": pl, "selling": 1},
-			"price_list_rate",
-		) or 0
-
+		if cint(row.get("disabled")) or cint(row.get("item_disabled")):
+			continue
+		if not _bundle_in_vigencia(row):
+			continue
+		if not _price_list_applies(row.get("for_price_list"), price_list):
+			continue
 		result.append({
-			"bundle_item_code": bundle_sku,
-			"bundle_name": bundle_item["item_name"],
-			"bundle_price": flt(bundle_price),
-			"components": components,
+			"bundle_item_code": row["new_item_code"],
+			"bundle_name": row.get("bundle_name") or row["new_item_code"],
+			"bundle_price": flt(row.get("bundle_price") or 0),
+			"components": row.get("components") or [],
 		})
 
 	return result
@@ -1498,6 +2008,52 @@ def get_customer(customer_name=None, email=None):
 	result["contacts"] = contact_list
 
 	return result
+
+
+CONSUMIDOR_FINAL_NAME = "Consumidor Final"
+
+
+def _get_or_create_consumidor_final():
+	"""Return the walk-in Customer used for POS / guest preorders.
+
+	Looks up by customer_name (case-insensitive). Creates the record if missing
+	so Sales Invoice set_missing_values never hits a None customer.
+	"""
+	existing = frappe.db.sql(
+		"""
+		SELECT name FROM `tabCustomer`
+		WHERE LOWER(TRIM(customer_name)) = %s
+		LIMIT 1
+		""",
+		CONSUMIDOR_FINAL_NAME.lower(),
+	)
+	if existing:
+		return existing[0][0]
+
+	customer_group = (
+		frappe.db.get_single_value("Selling Settings", "customer_group")
+		or (frappe.db.exists("Customer Group", "Individual") and "Individual")
+		or frappe.db.get_value("Customer Group", {"is_group": 0}, "name")
+	)
+	territory = (
+		frappe.db.get_single_value("Selling Settings", "territory")
+		or (frappe.db.exists("Territory", "All Territories") and "All Territories")
+		or frappe.db.get_value("Territory", {"is_group": 0}, "name")
+	)
+	if not customer_group or not territory:
+		frappe.throw(_("Cannot create Consumidor Final: Customer Group or Territory is missing."))
+
+	doc = frappe.get_doc(
+		{
+			"doctype": "Customer",
+			"customer_name": CONSUMIDOR_FINAL_NAME,
+			"customer_type": "Individual",
+			"customer_group": customer_group,
+			"territory": territory,
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	return doc.name
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1915,13 +2471,7 @@ def create_guest_preorder(
 	if not company:
 		frappe.throw(_("No Company configured"))
 
-	# Use a safe default customer for guest orders (Walk-in Customer or first Customer).
-	customer = frappe.db.get_value("Customer", {"customer_name": "Walk-in Customer"}, "name") \
-		or frappe.db.get_value("Customer", {}, "name") \
-		or "_Test Customer"
-
-	if not frappe.db.exists("Customer", customer):
-		frappe.throw(_("Customer {0} not found").format(customer))
+	customer = _get_or_create_consumidor_final()
 
 	# Create Sales Order in Draft (do NOT submit)
 	so = frappe.new_doc("Sales Order")
@@ -3487,6 +4037,85 @@ def get_user_roles_for_auth(username):
 # ========================================
 
 
+def _normalize_pos_payments(payment_method, payments, sale_mode):
+	"""Build [{mode_of_payment, amount, cash_received}] from mixed or single pay."""
+	import json
+
+	BLACK_ALLOWED_METHODS = {"Cash", "Mobile Money"}
+	rows = []
+	if isinstance(payments, str):
+		payments = json.loads(payments) if payments else []
+	if payments:
+		for p in payments:
+			mode = (p.get("mode_of_payment") or p.get("method") or "").strip()
+			amount = flt(p.get("amount") or 0)
+			if amount <= 0:
+				continue
+			rows.append({
+				"mode_of_payment": mode or "Cash",
+				"amount": amount,
+				"cash_received": flt(p.get("cash_received") or 0),
+			})
+	if not rows:
+		rows = [{
+			"mode_of_payment": payment_method or "Cash",
+			"amount": 0,  # filled with outstanding later
+			"cash_received": 0,
+		}]
+
+	if sale_mode == "BLACK":
+		for p in rows:
+			if p["mode_of_payment"] not in BLACK_ALLOWED_METHODS:
+				frappe.throw(
+					_(
+						"Payment method '{0}' is not allowed when sale_mode=BLACK. "
+						"Allowed methods: {1}."
+					).format(p["mode_of_payment"], ", ".join(sorted(BLACK_ALLOWED_METHODS))),
+					exc=frappe.ValidationError,
+				)
+	return rows
+
+
+def _submit_pos_payments(invoice, payments, receipt_number, remarks_tag, cash_received=0):
+	"""Create one Payment Entry per split. Last row absorbs rounding remainder."""
+	from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+
+	invoice.reload()
+	remaining = flt(invoice.outstanding_amount)
+	ids = []
+	for i, p in enumerate(payments):
+		if remaining <= 0:
+			break
+		amount = flt(p.get("amount") or 0)
+		if i == len(payments) - 1 or amount <= 0:
+			amount = remaining
+		amount = min(amount, remaining)
+		if amount <= 0:
+			continue
+		mode = p.get("mode_of_payment") or "Cash"
+		if not frappe.db.exists("Mode of Payment", mode):
+			mode = "Cash"
+		pe = get_payment_entry("Sales Invoice", invoice.name)
+		pe.mode_of_payment = mode
+		pe.paid_amount = amount
+		pe.received_amount = amount
+		if pe.references:
+			pe.references[0].allocated_amount = amount
+		pe.reference_no = receipt_number
+		pe.reference_date = nowdate()
+		row_remarks = remarks_tag
+		received = flt(p.get("cash_received") or 0) or (flt(cash_received) if mode == "Cash" else 0)
+		if received:
+			row_remarks = f"{remarks_tag} | cash_received:{received}"
+		pe.remarks = row_remarks
+		pe.insert(ignore_permissions=True)
+		pe.submit()
+		ids.append(pe.name)
+		invoice.reload()
+		remaining = flt(invoice.outstanding_amount)
+	return ids
+
+
 @frappe.whitelist()
 def create_pos_sale(
 	offline_order_uuid,
@@ -3498,6 +4127,8 @@ def create_pos_sale(
 	device_id=None,
 	branch_id=None,
 	sale_mode="WHITE",
+	payments=None,
+	cash_received=None,
 ):
 	"""
 	Create a POS sale as a submitted Sales Invoice + Payment Entry.
@@ -3510,13 +4141,15 @@ def create_pos_sale(
 		receipt_number (str): Human-readable receipt number (e.g. MAIN-A1B2-20260311-0042).
 		items (list[dict]): List of {item_code, item_name, qty, rate, amount}.
 		total_amount (float): Expected grand total — validated against computed invoice total.
-		payment_method (str): Mode of payment (Cash / Card / Mobile Money).
+		payment_method (str): Mode of payment when `payments` is omitted (Cash / Card / Mobile Money).
+		payments (list[dict]): Optional split: [{mode_of_payment|method, amount, cash_received?}].
+		cash_received (float): Cash tendered by the customer (for change / audit).
 		cashier_id (str): Cashier identifier for audit trail.
 		device_id (str): Device/terminal identifier for audit trail.
 		branch_id (str): Branch identifier — used to resolve warehouse.
 
 	Returns:
-		dict: {invoice_id, payment_id, offline_order_uuid, status}
+		dict: {invoice_id, payment_id, payment_ids, offline_order_uuid, status}
 
 	Raises:
 		frappe.ValidationError: If items are empty or total does not match.
@@ -3536,16 +4169,8 @@ def create_pos_sale(
 		frappe.throw(_("Invalid sale_mode: must be WHITE or BLACK."))
 
 	is_borrador = 1 if sale_mode == "BLACK" else 0
-
-	BLACK_ALLOWED_METHODS = {"Cash", "Mobile Money"}
-	if sale_mode == "BLACK" and payment_method not in BLACK_ALLOWED_METHODS:
-		frappe.throw(
-			_(
-				"Payment method '{0}' is not allowed when sale_mode=BLACK. "
-				"Allowed methods: {1}."
-			).format(payment_method, ", ".join(sorted(BLACK_ALLOWED_METHODS))),
-			exc=frappe.ValidationError,
-		)
+	pay_rows = _normalize_pos_payments(payment_method, payments, sale_mode)
+	cash_received = flt(cash_received or 0)
 
 	# ── Idempotency check ────────────────────────────────────────────────────
 	# We store offline_order_uuid in the `remarks` field so we can look it up
@@ -3559,6 +4184,7 @@ def create_pos_sale(
 		return {
 			"invoice_id": existing,
 			"payment_id": "",
+			"payment_ids": [],
 			"offline_order_uuid": offline_order_uuid,
 			"status": "already_exists",
 		}
@@ -3567,11 +4193,7 @@ def create_pos_sale(
 	company = frappe.defaults.get_user_default("Company") or frappe.db.get_single_value(
 		"Global Defaults", "default_company"
 	)
-	pos_customer = (
-		frappe.db.get_value("Customer", {"customer_name": "Walk-in Customer"}, "name")
-		or frappe.db.get_value("Customer", {}, "name")
-		or "_Test Customer"
-	)
+	pos_customer = _get_or_create_consumidor_final()
 
 	# Resolve warehouse: prefer branch_id as warehouse name, fall back to default
 	warehouse = (
@@ -3580,13 +4202,18 @@ def create_pos_sale(
 		"Warehouse", {"is_group": 0, "company": company}, "name"
 	)
 
+	pay_summary = " + ".join(p["mode_of_payment"] for p in pay_rows) or (payment_method or "Cash")
+
 	# ── Build Sales Invoice ───────────────────────────────────────────────────
 	remarks_tag = (
 		f"offline_order_uuid:{offline_order_uuid} | receipt:{receipt_number}"
 		f" | cashier:{cashier_id or 'unknown'} | device:{device_id or 'unknown'}"
 		f" | branch:{branch_id or 'unknown'}"
 		f" | sale_mode:{sale_mode} | is_borrador:{is_borrador}"
+		f" | payments:{pay_summary}"
 	)
+	if cash_received:
+		remarks_tag += f" | cash_received:{cash_received}"
 
 	invoice = frappe.get_doc(
 		{
@@ -3625,23 +4252,15 @@ def create_pos_sale(
 	invoice.insert(ignore_permissions=True)
 	invoice.submit()
 
-	# ── Create Payment Entry ──────────────────────────────────────────────────
-	from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
-
-	payment = get_payment_entry("Sales Invoice", invoice.name)
-	# Validate mode_of_payment exists; fall back to Cash if not found
-	if not frappe.db.exists("Mode of Payment", payment_method):
-		payment_method = "Cash"
-	payment.mode_of_payment = payment_method
-	payment.reference_no = receipt_number
-	payment.reference_date = nowdate()
-	payment.remarks = remarks_tag
-	payment.insert(ignore_permissions=True)
-	payment.submit()
+	# ── Create Payment Entry (one per split) ──────────────────────────────────
+	payment_ids = _submit_pos_payments(
+		invoice, pay_rows, receipt_number, remarks_tag, cash_received=cash_received
+	)
+	payment_id = payment_ids[0] if payment_ids else ""
 
 	# ── Store payment entry name back on invoice (best-effort) ───────────────
 	try:
-		frappe.db.set_value("Sales Invoice", invoice.name, "custom_payment_entry", payment.name)
+		frappe.db.set_value("Sales Invoice", invoice.name, "custom_payment_entry", payment_id)
 	except Exception:
 		pass  # custom_payment_entry field may not exist — non-fatal
 
@@ -3649,7 +4268,8 @@ def create_pos_sale(
 
 	return {
 		"invoice_id": invoice.name,
-		"payment_id": payment.name,
+		"payment_id": payment_id,
+		"payment_ids": payment_ids,
 		"offline_order_uuid": offline_order_uuid,
 		"sale_mode": sale_mode,
 		"is_borrador": is_borrador,
@@ -3921,7 +4541,7 @@ def search_items_for_receiving(search_term=None, page_length=8):
 def commit_receiving_session(session_id, reference, supplier, warehouse, lines, draft_items):
 	"""
 	Atomically:
-	1. Create new ERPNext Items for draft items (disabled/inactive until Aprobaciones
+	1. Create new ERPNext Items for draft items (disabled/inactive until Review
 	   approves them — unless draft already has approved_at)
 	2. Create a submitted Stock Entry (Material Receipt)
 	Returns { stock_entry_id, new_item_codes }
@@ -3932,10 +4552,67 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 	if isinstance(draft_items, str):
 		draft_items = json.loads(draft_items)
 
-	# 1. Create draft items (inactive until Aprobaciones marks them approved)
+	def _upsert_receiving_item_price(item_code: str, rate: float) -> None:
+		pl = (
+			frappe.db.get_single_value("Selling Settings", "selling_price_list")
+			or "Standard Selling"
+		)
+		existing = frappe.db.get_value(
+			"Item Price",
+			{"item_code": item_code, "price_list": pl, "selling": 1},
+			"name",
+		)
+		if existing:
+			frappe.db.set_value("Item Price", existing, "price_list_rate", flt(rate))
+		else:
+			frappe.get_doc({
+				"doctype": "Item Price",
+				"item_code": item_code,
+				"price_list": pl,
+				"price_list_rate": flt(rate),
+				"selling": 1,
+			}).insert(ignore_permissions=True)
+
+	def _upsert_item_default_supplier(item_code: str, supplier_name: str) -> None:
+		if not frappe.db.exists("Supplier", supplier_name):
+			frappe.get_doc({
+				"doctype": "Supplier",
+				"supplier_name": supplier_name,
+				"supplier_group": "All Supplier Groups",
+			}).insert(ignore_permissions=True)
+		company = frappe.db.get_single_value("Global Defaults", "default_company")
+		defaults = frappe.get_all(
+			"Item Default",
+			filters={"parent": item_code},
+			fields=["name", "default_supplier", "company"],
+			limit=1,
+		)
+		if defaults:
+			frappe.db.set_value("Item Default", defaults[0].name, "default_supplier", supplier_name)
+		else:
+			item_doc = frappe.get_doc("Item", item_code)
+			row = {"default_supplier": supplier_name}
+			if company:
+				row["company"] = company
+			item_doc.append("item_defaults", row)
+			item_doc.save(ignore_permissions=True)
+
+	# 1. Create draft items (inactive until Review marks them approved)
 	import uuid as _uuid
 	new_item_codes = {}
 	for d in draft_items:
+		# Existing product marked for review — keep active, store note only
+		if d.get("needs_review") and d.get("item_code") and frappe.db.exists("Item", d.get("item_code")):
+			new_item_codes[d["draft_id"]] = d["item_code"]
+			note = d.get("review_note") or d.get("review_notes")
+			if note and frappe.db.has_column("Item", "custom_review_notes"):
+				frappe.db.set_value(
+					"Item",
+					d["item_code"],
+					"custom_review_notes",
+					f"review: {note}" if not str(note).startswith("review:") else note,
+				)
+			continue
 		if frappe.db.exists("Item", d.get("item_code") or ""):
 			new_item_codes[d["draft_id"]] = d["item_code"]
 			continue
@@ -3985,13 +4662,13 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 		# Add selling price if estimated / list
 		price = flt(d.get("list_price") or d.get("estimated_price") or 0)
 		if price > 0:
-			frappe.get_doc({
-				"doctype": "Item Price",
-				"item_code": item_doc.item_code,
-				"price_list": "Standard Selling",
-				"price_list_rate": price,
-				"selling": 1,
-			}).insert(ignore_permissions=True)
+			_upsert_receiving_item_price(item_doc.item_code, price)
+		est_cost = flt(d.get("estimated_cost") or 0)
+		if est_cost > 0:
+			from erpnext.erpnext_integrations.ecommerce_api.product_manager import (
+				_upsert_item_price_buying,
+			)
+			_upsert_item_price_buying(item_doc.item_code, est_cost)
 		tags = d.get("tags") or []
 		if isinstance(tags, list) and tags:
 			tag_str = ",".join(sorted({str(t).strip() for t in tags if t and str(t).strip()}))
@@ -4011,17 +4688,41 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			item_code = new_item_codes.get(line["draft_item_id"])
 		if not item_code:
 			continue
+		if flt(line.get("qty") or 0) <= 0:
+			continue
 		basic_rate = flt(line.get("unit_cost") or 0)
+		# unit_cost 0 / empty → do not force valuation overwrite (allow current valuation)
 		resolved_lines.append({
 			"item_code": item_code,
 			"qty": flt(line.get("qty") or 0),
 			"basic_rate": basic_rate,
 			"t_warehouse": warehouse,
-			"allow_zero_valuation_rate": 1 if basic_rate == 0 else 0,
+			"allow_zero_valuation_rate": 1 if basic_rate <= 0 else 0,
 		})
+
+		# Overwrite selling price only when line carries an explicit price > 0
+		sell_price = flt(line.get("list_price") or 0)
+		if sell_price > 0:
+			_upsert_receiving_item_price(item_code, sell_price)
+		if cint(line.get("assign_buying_cost") or line.get("cost_edited")) and basic_rate > 0:
+			from erpnext.erpnext_integrations.ecommerce_api.product_manager import (
+				_upsert_item_price_buying,
+			)
+			_upsert_item_price_buying(item_code, basic_rate)
 
 	if not resolved_lines:
 		frappe.throw("No valid lines to receive")
+
+	# Optional: overwrite Item Default supplier when session supplier is set
+	supplier_name = (supplier or "").strip()
+	if supplier_name:
+		for line in lines:
+			code = line.get("item_code")
+			if not code and line.get("draft_item_id"):
+				code = new_item_codes.get(line["draft_item_id"])
+			if not code:
+				continue
+			_upsert_item_default_supplier(code, supplier_name)
 
 	# 3. Create Stock Entry
 	se = frappe.get_doc({

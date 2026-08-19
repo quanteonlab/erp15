@@ -97,11 +97,9 @@ def _get_defaults():
         "Global Defaults", "default_company"
     )
     warehouse = frappe.db.get_value("Warehouse", {"is_group": 0, "company": company}, "name")
-    customer = (
-        frappe.db.get_value("Customer", {"customer_name": "Walk-in Customer"}, "name")
-        or frappe.db.get_value("Customer", {}, "name")
-        or "_Test Customer"
-    )
+    from erpnext.erpnext_integrations.ecommerce_api.api import _get_or_create_consumidor_final
+
+    customer = _get_or_create_consumidor_final()
     return company, warehouse, customer
 
 

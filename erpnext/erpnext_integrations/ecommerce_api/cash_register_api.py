@@ -279,3 +279,350 @@ def save_pos_profile(name=None, data=None):
 
 	frappe.db.commit()
 	return {"ok": True, "cash_register": _serialize_pos_profile(doc.name)}
+
+
+# ---------------------------------------------------------------------------
+# Sessions = submitted POS Sales Invoices grouped by warehouse + posting date.
+# There is no POS Opening/Closing Entry in this deploy; a "session" is one
+# register-day. Start/end are the first/last invoice posting times that day.
+# ---------------------------------------------------------------------------
+
+
+def _parse_invoice_remarks(remarks: str | None) -> dict:
+	out = {
+		"offline_order_uuid": None,
+		"receipt": None,
+		"cashier": None,
+		"device": None,
+		"branch": None,
+		"sale_mode": None,
+		"payments_label": None,
+		"cash_received": None,
+	}
+	if not remarks:
+		return out
+	for part in str(remarks).split(" | "):
+		if ":" not in part:
+			continue
+		key, val = part.split(":", 1)
+		key = key.strip()
+		val = val.strip()
+		if key == "offline_order_uuid":
+			out["offline_order_uuid"] = val
+		elif key == "receipt":
+			out["receipt"] = val
+		elif key == "cashier":
+			out["cashier"] = val
+		elif key == "device":
+			out["device"] = val
+		elif key == "branch":
+			out["branch"] = val
+		elif key == "sale_mode":
+			out["sale_mode"] = val
+		elif key == "payments":
+			out["payments_label"] = val
+		elif key == "cash_received":
+			out["cash_received"] = flt(val)
+	return out
+
+
+def _warehouse_register_map() -> dict:
+	rows = frappe.get_all(
+		"POS Profile",
+		fields=["name", "warehouse"],
+		ignore_permissions=True,
+	)
+	mapping = {}
+	for r in rows:
+		wh = r.get("warehouse")
+		if wh and wh not in mapping:
+			mapping[wh] = r.get("name")
+	return mapping
+
+
+def _session_id(warehouse: str, posting_date) -> str:
+	return f"{warehouse or ''}::{posting_date}"
+
+
+def _split_session_id(session_id: str) -> tuple[str, str]:
+	if not session_id or "::" not in session_id:
+		frappe.throw(_("Invalid session id"))
+	warehouse, posting_date = session_id.rsplit("::", 1)
+	return warehouse, posting_date
+
+
+def _pos_invoice_where(values: dict, warehouse=None, posting_date=None):
+	"""WHERE clause for submitted POS sales (uuid tag or item warehouse in a POS Profile)."""
+	wh_map = _warehouse_register_map()
+	warehouses = list(wh_map.keys())
+	clauses = ["si.docstatus = 1"]
+	if posting_date:
+		clauses.append("si.posting_date = %(posting_date)s")
+		values["posting_date"] = posting_date
+	if warehouse:
+		clauses.append(
+			"""
+			EXISTS (
+				SELECT 1 FROM `tabSales Invoice Item` siiw
+				WHERE siiw.parent = si.name AND siiw.warehouse = %(warehouse)s
+			)
+			"""
+		)
+		values["warehouse"] = warehouse
+	else:
+		pos_clause = "si.remarks LIKE %(uuid_tag)s"
+		values["uuid_tag"] = "%offline_order_uuid:%"
+		if warehouses:
+			values["warehouses"] = warehouses
+			pos_clause = (
+				"("
+				+ pos_clause
+				+ """
+				OR EXISTS (
+					SELECT 1 FROM `tabSales Invoice Item` siiw
+					WHERE siiw.parent = si.name
+					  AND siiw.warehouse IN %(warehouses)s
+				)
+				)"""
+			)
+		clauses.append(pos_clause)
+	return " AND ".join(clauses), wh_map
+
+
+def _payments_for_invoices(invoice_names: list[str]) -> dict[str, list]:
+	if not invoice_names:
+		return {}
+	rows = frappe.db.sql(
+		"""
+		SELECT
+			per.reference_name AS invoice,
+			pe.name AS payment_id,
+			pe.mode_of_payment AS mode_of_payment,
+			per.allocated_amount AS amount,
+			pe.posting_date AS posting_date,
+			pe.creation AS creation
+		FROM `tabPayment Entry Reference` per
+		INNER JOIN `tabPayment Entry` pe ON pe.name = per.parent
+		WHERE pe.docstatus = 1
+		  AND per.reference_doctype = 'Sales Invoice'
+		  AND per.reference_name IN %(names)s
+		ORDER BY pe.creation ASC
+		""",
+		{"names": invoice_names},
+		as_dict=True,
+	)
+	out: dict[str, list] = {}
+	for r in rows:
+		out.setdefault(r.invoice, []).append(
+			{
+				"payment_id": r.payment_id,
+				"mode_of_payment": r.mode_of_payment or "Cash",
+				"amount": flt(r.amount),
+			}
+		)
+	return out
+
+
+def _items_for_invoices(invoice_names: list[str]) -> dict[str, list]:
+	if not invoice_names:
+		return {}
+	rows = frappe.get_all(
+		"Sales Invoice Item",
+		filters={"parent": ["in", invoice_names]},
+		fields=["parent", "item_code", "item_name", "qty", "rate", "amount", "warehouse", "idx"],
+		order_by="idx asc",
+		ignore_permissions=True,
+	)
+	out: dict[str, list] = {}
+	for r in rows:
+		out.setdefault(r.parent, []).append(
+			{
+				"item_code": r.item_code,
+				"item_name": r.item_name,
+				"qty": flt(r.qty),
+				"rate": flt(r.rate),
+				"amount": flt(r.amount),
+				"warehouse": r.warehouse,
+			}
+		)
+	return out
+
+
+@frappe.whitelist()
+def list_cash_register_sessions(warehouse=None, search=None, page=1, page_length=200):
+	"""List POS sale sessions (one row per cash register + day)."""
+	values: dict = {}
+	where_sql, wh_map = _pos_invoice_where(values, warehouse=warehouse or None)
+	page = max(cint(page) or 1, 1)
+	page_length = min(max(cint(page_length) or 200, 1), 500)
+	offset = (page - 1) * page_length
+
+	rows = frappe.db.sql(
+		f"""
+		SELECT
+			t.warehouse AS warehouse,
+			t.posting_date AS posting_date,
+			MIN(t.posting_time) AS started_at,
+			MAX(t.posting_time) AS ended_at,
+			COUNT(*) AS sales_count,
+			COALESCE(SUM(t.grand_total), 0) AS total_sale
+		FROM (
+			SELECT
+				si.name,
+				si.posting_date,
+				si.posting_time,
+				si.grand_total,
+				(
+					SELECT sii.warehouse
+					FROM `tabSales Invoice Item` sii
+					WHERE sii.parent = si.name
+					ORDER BY sii.idx
+					LIMIT 1
+				) AS warehouse
+			FROM `tabSales Invoice` si
+			WHERE {where_sql}
+		) t
+		GROUP BY t.warehouse, t.posting_date
+		ORDER BY t.posting_date DESC, MIN(t.posting_time) DESC
+		LIMIT %(limit)s OFFSET %(offset)s
+		""",
+		{**values, "limit": page_length, "offset": offset},
+		as_dict=True,
+	)
+
+	total_row = frappe.db.sql(
+		f"""
+		SELECT COUNT(*) AS c FROM (
+			SELECT
+				(
+					SELECT sii.warehouse
+					FROM `tabSales Invoice Item` sii
+					WHERE sii.parent = si.name
+					ORDER BY sii.idx
+					LIMIT 1
+				) AS warehouse,
+				si.posting_date
+			FROM `tabSales Invoice` si
+			WHERE {where_sql}
+			GROUP BY warehouse, si.posting_date
+		) x
+		""",
+		values,
+		as_dict=True,
+	)
+	total = cint(total_row[0]["c"]) if total_row else 0
+
+	q = (search or "").strip().lower()
+	sessions = []
+	today = str(nowdate())
+	for r in rows:
+		wh = r.warehouse or ""
+		register = wh_map.get(wh) or wh or "—"
+		date_s = str(r.posting_date)
+		if q and q not in register.lower() and q not in date_s and q not in wh.lower():
+			continue
+		sessions.append(
+			{
+				"session_id": _session_id(wh, date_s),
+				"warehouse": wh or None,
+				"register": register,
+				"posting_date": date_s,
+				"started_at": str(r.started_at) if r.started_at else None,
+				"ended_at": str(r.ended_at) if r.ended_at else None,
+				"sales_count": cint(r.sales_count),
+				"total_sale": flt(r.total_sale),
+				"is_open": 1 if date_s == today else 0,
+			}
+		)
+
+	return {"rows": sessions, "total": total}
+
+
+@frappe.whitelist()
+def get_cash_register_session(session_id):
+	"""One register-day: header totals + each sale with items and payments."""
+	warehouse, posting_date = _split_session_id(session_id)
+	values: dict = {}
+	where_sql, wh_map = _pos_invoice_where(
+		values, warehouse=warehouse or None, posting_date=posting_date
+	)
+
+	invoices = frappe.db.sql(
+		f"""
+		SELECT
+			si.name,
+			si.posting_date,
+			si.posting_time,
+			si.grand_total,
+			si.outstanding_amount,
+			si.remarks,
+			si.owner,
+			si.creation
+		FROM `tabSales Invoice` si
+		WHERE {where_sql}
+		ORDER BY si.posting_time ASC, si.creation ASC
+		""",
+		values,
+		as_dict=True,
+	)
+
+	names = [r.name for r in invoices]
+	pay_map = _payments_for_invoices(names)
+	item_map = _items_for_invoices(names)
+	register = wh_map.get(warehouse) or warehouse or "—"
+
+	sales = []
+	pay_totals: dict[str, float] = {}
+	started = None
+	ended = None
+	for inv in invoices:
+		meta = _parse_invoice_remarks(inv.remarks)
+		payments = pay_map.get(inv.name) or []
+		if not payments and meta.get("payments_label"):
+			payments = [
+				{
+					"payment_id": None,
+					"mode_of_payment": meta["payments_label"],
+					"amount": flt(inv.grand_total),
+				}
+			]
+		for p in payments:
+			mop = p.get("mode_of_payment") or "Cash"
+			pay_totals[mop] = pay_totals.get(mop, 0) + flt(p.get("amount"))
+		ptime = str(inv.posting_time) if inv.posting_time else None
+		if ptime:
+			started = ptime if started is None else min(started, ptime)
+			ended = ptime if ended is None else max(ended, ptime)
+		sales.append(
+			{
+				"name": inv.name,
+				"posting_date": str(inv.posting_date) if inv.posting_date else posting_date,
+				"posting_time": ptime,
+				"grand_total": flt(inv.grand_total),
+				"outstanding_amount": flt(inv.outstanding_amount),
+				"receipt": meta.get("receipt") or inv.name,
+				"cashier": meta.get("cashier"),
+				"device": meta.get("device"),
+				"sale_mode": meta.get("sale_mode"),
+				"cash_received": meta.get("cash_received"),
+				"payments": payments,
+				"items": item_map.get(inv.name) or [],
+			}
+		)
+
+	today = str(nowdate())
+	return {
+		"session_id": session_id,
+		"warehouse": warehouse or None,
+		"register": register,
+		"posting_date": posting_date,
+		"started_at": started,
+		"ended_at": ended,
+		"sales_count": len(sales),
+		"total_sale": flt(sum(s["grand_total"] for s in sales)),
+		"is_open": 1 if posting_date == today else 0,
+		"payment_totals": [
+			{"mode_of_payment": k, "amount": flt(v)} for k, v in sorted(pay_totals.items())
+		],
+		"sales": sales,
+	}
