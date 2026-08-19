@@ -373,7 +373,7 @@ def _pos_invoice_where(values: dict, warehouse=None, posting_date=None):
 		pos_clause = "si.remarks LIKE %(uuid_tag)s"
 		values["uuid_tag"] = "%offline_order_uuid:%"
 		if warehouses:
-			values["warehouses"] = warehouses
+			values["warehouses"] = tuple(warehouses)
 			pos_clause = (
 				"("
 				+ pos_clause
@@ -408,7 +408,7 @@ def _payments_for_invoices(invoice_names: list[str]) -> dict[str, list]:
 		  AND per.reference_name IN %(names)s
 		ORDER BY pe.creation ASC
 		""",
-		{"names": invoice_names},
+		{"names": tuple(invoice_names)},
 		as_dict=True,
 	)
 	out: dict[str, list] = {}
