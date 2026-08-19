@@ -2089,12 +2089,17 @@ def list_employee_groups():
 
 
 @frappe.whitelist()
-def save_employee_group(name=None, employee_group_name=None, members=None):
+def save_employee_group(name=None, employee_group_name=None, members=None, permissions=None):
     from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
         save_employee_group as _impl,
     )
 
-    return _impl(name=name, employee_group_name=employee_group_name, members=members)
+    return _impl(
+        name=name,
+        employee_group_name=employee_group_name,
+        members=members,
+        permissions=permissions,
+    )
 
 
 @frappe.whitelist()
@@ -2113,6 +2118,33 @@ def list_employee_meta():
     )
 
     return _impl()
+
+
+@frappe.whitelist()
+def list_app_permissions():
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_app_permissions as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def get_user_app_permissions(username=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        get_user_app_permissions as _impl,
+    )
+
+    return _impl(username)
+
+
+@frappe.whitelist()
+def save_employee_group_permissions(name, permissions=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        save_employee_group_permissions as _impl,
+    )
+
+    return _impl(name, permissions=permissions)
 
 
 @frappe.whitelist()

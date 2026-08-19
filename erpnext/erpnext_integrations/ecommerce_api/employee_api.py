@@ -2,58 +2,419 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import string
 
 import frappe
 from frappe import _
 from frappe.utils import cint, flt, today
+from frappe.utils.password import update_password as _update_password
 
 from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
 
-# Roles commonly useful for store staff (filter assignable list)
-PREFERRED_ROLES = [
-	"Employee",
-	"Sales User",
-	"Stock User",
-	"Accounts User",
-	"Purchase User",
-	"HR User",
-	"Manufacturing User",
-	"Item Manager",
+# JSON map of Employee Group name -> permission ids (Table Extra Schema reuse; no migrate).
+PERM_STORE_SCOPE = "settings.staff_group_permissions"
+
+# App permissions that match the current Next.js UI (not ERPNext desk roles).
+APP_PERMISSIONS = [
+	{
+		"id": "ops.pos",
+		"group": "operaciones",
+		"label_en": "Point of Sale",
+		"label_es": "Punto de venta",
+		"label_zh": "收银台",
+		"desc_en": "Open the POS, add to cart, and checkout.",
+		"desc_es": "Abrir el POS, armar el carrito y cobrar.",
+		"desc_zh": "打开收银台、加购并结账。",
+	},
+	{
+		"id": "ops.catalog",
+		"group": "operaciones",
+		"label_en": "Catalog",
+		"label_es": "Catálogo",
+		"label_zh": "目录",
+		"desc_en": "Browse the public/internal catalog.",
+		"desc_es": "Ver el catálogo interno/público.",
+		"desc_zh": "浏览商品目录。",
+	},
+	{
+		"id": "ops.receiving",
+		"group": "operaciones",
+		"label_en": "Receiving",
+		"label_es": "Recepción",
+		"label_zh": "收货",
+		"desc_en": "Record inbound stock and create draft products.",
+		"desc_es": "Registrar mercadería entrante y productos borrador.",
+		"desc_zh": "录入进货并创建草稿商品。",
+	},
+	{
+		"id": "log.reports",
+		"group": "logistica",
+		"label_en": "Reports",
+		"label_es": "Reportes",
+		"label_zh": "报表",
+		"desc_en": "Logistics reports placeholder.",
+		"desc_es": "Reportes de logística.",
+		"desc_zh": "物流报表。",
+	},
+	{
+		"id": "log.accounting",
+		"group": "logistica",
+		"label_en": "Accounting sheet",
+		"label_es": "Hoja contable",
+		"label_zh": "会计表",
+		"desc_en": "Spreadsheet of daily figures and cash totals.",
+		"desc_es": "Planilla de cifras diarias y totales de caja.",
+		"desc_zh": "每日数字与收银合计表。",
+	},
+	{
+		"id": "log.sections",
+		"group": "logistica",
+		"label_en": "Store sections map",
+		"label_es": "Mapa de secciones",
+		"label_zh": "店内分区图",
+		"desc_en": "Draw and edit floor sections and SKU placement.",
+		"desc_es": "Dibujar y editar secciones del piso y ubicación de SKUs.",
+		"desc_zh": "绘制并编辑楼层分区与 SKU 摆放。",
+	},
+	{
+		"id": "tables.products",
+		"group": "tablas",
+		"label_en": "Products",
+		"label_es": "Productos",
+		"label_zh": "商品",
+		"desc_en": "Product master: prices, barcodes, images, bulk edits.",
+		"desc_es": "Maestro de productos: precios, códigos, imágenes, edición masiva.",
+		"desc_zh": "商品主数据：价格、条码、图片、批量编辑。",
+	},
+	{
+		"id": "tables.rentability",
+		"group": "tablas",
+		"label_en": "Rentability",
+		"label_es": "Rentabilidad",
+		"label_zh": "利润",
+		"desc_en": "Margins, cost %, and price simulation.",
+		"desc_es": "Márgenes, cost % y simulación de precios.",
+		"desc_zh": "毛利、成本占比与价格模拟。",
+	},
+	{
+		"id": "tables.promotions",
+		"group": "tablas",
+		"label_en": "Promotions",
+		"label_es": "Promociones",
+		"label_zh": "促销",
+		"desc_en": "Pricing rules, bundles, and combos.",
+		"desc_es": "Pricing rules, packs y combos.",
+		"desc_zh": "定价规则、套装与组合。",
+	},
+	{
+		"id": "tables.review",
+		"group": "tablas",
+		"label_en": "Review / approvals",
+		"label_es": "Review / aprobaciones",
+		"label_zh": "审核",
+		"desc_en": "Approve or reject new products from receiving.",
+		"desc_es": "Aprobar o rechazar productos nuevos de recepción.",
+		"desc_zh": "批准或拒绝收货产生的新商品。",
+	},
+	{
+		"id": "tables.variants",
+		"group": "tablas",
+		"label_en": "Variants",
+		"label_es": "Variaciones",
+		"label_zh": "变体",
+		"desc_en": "Product families grouped by unit/pack.",
+		"desc_es": "Familias de producto (unidad/pack).",
+		"desc_zh": "按单品/包装分组的商品家族。",
+	},
+	{
+		"id": "tables.crm",
+		"group": "tablas",
+		"label_en": "CRM",
+		"label_es": "CRM",
+		"label_zh": "客户",
+		"desc_en": "Customers from orders and suppliers from receiving.",
+		"desc_es": "Clientes (pedidos) y proveedores (recepción).",
+		"desc_zh": "订单客户与收货供应商。",
+	},
+	{
+		"id": "tables.employees",
+		"group": "tablas",
+		"label_en": "Employees",
+		"label_es": "Empleados",
+		"label_zh": "员工",
+		"desc_en": "Staff roster, branches, and group assignment.",
+		"desc_es": "Plantilla, sucursales y asignación de grupos.",
+		"desc_zh": "员工名册、门店与组分配。",
+	},
+	{
+		"id": "tables.cajas",
+		"group": "tablas",
+		"label_en": "Cash registers",
+		"label_es": "Cajas",
+		"label_zh": "收银机",
+		"desc_en": "POS profiles, sessions, and register totals.",
+		"desc_es": "Perfiles POS, sesiones y totales de caja.",
+		"desc_zh": "POS 配置、班次与收银合计。",
+	},
+	{
+		"id": "tables.orders",
+		"group": "tablas",
+		"label_en": "Orders",
+		"label_es": "Pedidos",
+		"label_zh": "订单",
+		"desc_en": "Guest preorders: confirm, prepare, collect.",
+		"desc_es": "Pedidos de invitados: confirmar, preparar, cobrar.",
+		"desc_zh": "访客预订单：确认、备货、收款。",
+	},
+	{
+		"id": "tools.sync",
+		"group": "herramientas",
+		"label_en": "Sync",
+		"label_es": "Sincronizar",
+		"label_zh": "同步",
+		"desc_en": "Push local receiving/POS queues to ERPNext.",
+		"desc_es": "Enviar colas locales de recepción/POS a ERPNext.",
+		"desc_zh": "将本地收货/POS 队列推送到 ERPNext。",
+	},
+	{
+		"id": "tools.labels",
+		"group": "herramientas",
+		"label_en": "Labels / barcodes",
+		"label_es": "Etiquetas / códigos",
+		"label_zh": "标签 / 条码",
+		"desc_en": "Print barcode and price labels.",
+		"desc_es": "Imprimir etiquetas de código de barras y precio.",
+		"desc_zh": "打印条码与价格标签。",
+	},
+	{
+		"id": "tools.migrate",
+		"group": "herramientas",
+		"label_en": "Migrate / CSV",
+		"label_es": "Migrar / CSV",
+		"label_zh": "迁移 / CSV",
+		"desc_en": "Import catalog CSV and images.",
+		"desc_es": "Importar catálogo CSV e imágenes.",
+		"desc_zh": "导入商品 CSV 与图片。",
+	},
+	{
+		"id": "tools.settings",
+		"group": "herramientas",
+		"label_en": "Settings",
+		"label_es": "Ajustes",
+		"label_zh": "设置",
+		"desc_en": "Open Tools > Settings (POS, catalog, automation).",
+		"desc_es": "Abrir Herramientas > Ajustes (POS, catálogo, automatización).",
+		"desc_zh": "打开工具 > 设置（POS、目录、自动化）。",
+	},
+	{
+		"id": "employees.create_user",
+		"group": "empleados",
+		"label_en": "Create staff login",
+		"label_es": "Crear usuario de staff",
+		"label_zh": "创建员工登录",
+		"desc_en": "Create or link a User and generate a one-time password.",
+		"desc_es": "Crear o vincular un User y generar una contraseña de un solo uso.",
+		"desc_zh": "创建或关联用户并生成一次性密码。",
+	},
+	{
+		"id": "employees.reset_password",
+		"group": "empleados",
+		"label_en": "Reset staff password",
+		"label_es": "Resetear contraseña",
+		"label_zh": "重置员工密码",
+		"desc_en": "Generate a new random password for a linked user.",
+		"desc_es": "Generar una nueva contraseña aleatoria para el usuario vinculado.",
+		"desc_zh": "为已关联用户生成新随机密码。",
+	},
+	{
+		"id": "employees.view_salary",
+		"group": "empleados",
+		"label_en": "View salary (CTC)",
+		"label_es": "Ver sueldo (CTC)",
+		"label_zh": "查看薪资",
+		"desc_en": "See monthly CTC on the employees table.",
+		"desc_es": "Ver el CTC mensual en la tabla de empleados.",
+		"desc_zh": "在员工表中查看月薪 CTC。",
+	},
+	{
+		"id": "employees.edit",
+		"group": "empleados",
+		"label_en": "Edit employees",
+		"label_es": "Editar empleados",
+		"label_zh": "编辑员工",
+		"desc_en": "Change name, branch, contact, status, and group membership.",
+		"desc_es": "Cambiar nombre, sucursal, contacto, estado y grupos.",
+		"desc_zh": "修改姓名、门店、联系方式、状态与分组。",
+	},
+	{
+		"id": "settings.manage_groups",
+		"group": "empleados",
+		"label_en": "Manage groups & permissions",
+		"label_es": "Administrar grupos y permisos",
+		"label_zh": "管理组与权限",
+		"desc_en": "Create groups and attach/detach permissions (Settings).",
+		"desc_es": "Crear grupos y agregar/quitar permisos (Ajustes).",
+		"desc_zh": "在设置中创建组并附加/移除权限。",
+	},
 ]
 
+KNOWN_PERMISSION_IDS = {p["id"] for p in APP_PERMISSIONS}
 
-def _rand_password(length: int = 12) -> str:
-	alphabet = string.ascii_letters + string.digits
-	# Ensure mixed classes
+PERMISSION_TO_ROLES = {
+	"ops.pos": ["Sales User"],
+	"ops.catalog": ["Sales User"],
+	"ops.receiving": ["Stock User", "Purchase User"],
+	"log.reports": ["Accounts User"],
+	"log.accounting": ["Accounts User"],
+	"log.sections": ["Stock User"],
+	"tables.products": ["Stock User", "Item Manager"],
+	"tables.rentability": ["Stock User"],
+	"tables.promotions": ["Sales Manager"],
+	"tables.review": ["Stock User", "Purchase User"],
+	"tables.variants": ["Item Manager"],
+	"tables.crm": ["Sales User"],
+	"tables.employees": ["HR User"],
+	"tables.cajas": ["Accounts User"],
+	"tables.orders": ["Sales User"],
+	"tools.sync": ["Stock Manager"],
+	"tools.labels": ["Stock User"],
+	"tools.migrate": ["Stock Manager"],
+	"tools.settings": ["HR User"],
+	"employees.create_user": ["HR Manager"],
+	"employees.reset_password": ["HR Manager"],
+	"employees.view_salary": ["HR Manager"],
+	"employees.edit": ["HR User"],
+	"settings.manage_groups": ["HR Manager"],
+}
+
+PROTECTED_ROLES = {"All", "Guest", "Administrator"}
+
+
+def _parse_json(raw, default):
+	if raw is None or raw == "":
+		return default
+	if isinstance(raw, (dict, list)):
+		return raw
+	try:
+		return json.loads(raw)
+	except Exception:
+		return default
+
+
+def _rand_password(length: int = 16) -> str:
+	"""Password that satisfies typical Frappe zxcvbn minimum_password_score=2/3."""
+	specials = "!@#$%^*?"
+	alphabet = string.ascii_letters + string.digits + specials
 	chars = [
 		secrets.choice(string.ascii_uppercase),
 		secrets.choice(string.ascii_lowercase),
 		secrets.choice(string.digits),
+		secrets.choice(specials),
 	]
-	chars += [secrets.choice(alphabet) for _ in range(max(0, length - 3))]
+	chars += [secrets.choice(alphabet) for _ in range(max(0, length - 4))]
 	secrets.SystemRandom().shuffle(chars)
 	return "".join(chars)
 
 
+def _set_user_password(user_name: str, password: str) -> None:
+	_update_password(user=user_name, pwd=password, logout_all_sessions=False)
+
+
+def _load_perm_store() -> dict:
+	if not frappe.db.exists("Table Extra Schema", PERM_STORE_SCOPE):
+		return {}
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Table Extra Schema", PERM_STORE_SCOPE)
+	data = _parse_json(doc.columns_json, {})
+	return data if isinstance(data, dict) else {}
+
+
+def _save_perm_store(data: dict) -> None:
+	payload = json.dumps(data or {}, ensure_ascii=False)
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", PERM_STORE_SCOPE):
+		doc = frappe.get_doc("Table Extra Schema", PERM_STORE_SCOPE)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc(
+			{"doctype": "Table Extra Schema", "scope": PERM_STORE_SCOPE, "columns_json": payload}
+		)
+		doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def _normalize_permission_ids(raw) -> list[str]:
+	if isinstance(raw, str):
+		raw = _parse_json(raw, [])
+	if not isinstance(raw, list):
+		return []
+	out = []
+	seen = set()
+	for item in raw:
+		key = str(item or "").strip()
+		if key in KNOWN_PERMISSION_IDS and key not in seen:
+			seen.add(key)
+			out.append(key)
+	return out
+
+
+def _permissions_for_group(group_name: str) -> list[str]:
+	store = _load_perm_store()
+	return _normalize_permission_ids(store.get(group_name) or [])
+
+
+def _roles_from_permission_ids(permission_ids: list[str]) -> list[str]:
+	roles = {"Employee"}
+	for pid in permission_ids:
+		for role in PERMISSION_TO_ROLES.get(pid, []):
+			roles.add(role)
+	return sorted(roles)
+
+
+def _permission_ids_for_employee(employee: str) -> list[str]:
+	groups = frappe.get_all(
+		"Employee Group Table",
+		filters={"employee": employee},
+		pluck="parent",
+		ignore_permissions=True,
+	)
+	store = _load_perm_store()
+	seen = set()
+	out = []
+	for g in groups:
+		for pid in _normalize_permission_ids(store.get(g) or []):
+			if pid not in seen:
+				seen.add(pid)
+				out.append(pid)
+	return out
+
+
+def _apply_group_roles_to_user(user_id: str, employee: str) -> None:
+	if not user_id:
+		return
+	perms = _permission_ids_for_employee(employee)
+	if not perms:
+		return
+	_set_user_roles(user_id, _roles_from_permission_ids(perms))
+
+
 def _serialize_employee(name: str) -> dict:
+	frappe.flags.ignore_permissions = True
 	emp = frappe.get_doc("Employee", name)
-	groups = frappe.db.sql(
-		"""
-		SELECT parent AS group_name
-		FROM `tabEmployee Group Table`
-		WHERE employee = %s
-		ORDER BY parent
-		""",
-		name,
-		as_dict=True,
+	groups = frappe.get_all(
+		"Employee Group Table",
+		filters={"employee": name},
+		pluck="parent",
+		order_by="parent",
+		ignore_permissions=True,
 	)
 	roles: list[str] = []
 	user_enabled = None
 	if emp.user_id and frappe.db.exists("User", emp.user_id):
-		roles = frappe.get_roles(emp.user_id)
-		roles = [r for r in roles if r not in ("All", "Guest", "Desk User")]
+		roles = [r for r in frappe.get_roles(emp.user_id) if r not in ("All", "Guest", "Desk User")]
 		user_enabled = cint(frappe.db.get_value("User", emp.user_id, "enabled"))
 	return {
 		"name": emp.name,
@@ -76,9 +437,53 @@ def _serialize_employee(name: str) -> dict:
 		"has_user": bool(emp.user_id),
 		"user_enabled": user_enabled,
 		"roles": roles,
-		"groups": [g.group_name for g in groups],
+		"permissions": _permission_ids_for_employee(emp.name),
+		"groups": groups,
 		"date_of_joining": str(emp.date_of_joining) if emp.date_of_joining else None,
 		"modified": str(emp.modified) if emp.modified else None,
+	}
+
+
+@frappe.whitelist()
+def list_app_permissions():
+	"""Catalog of app permissions for Settings / employee group editors."""
+	return {
+		"permissions": APP_PERMISSIONS,
+		"groups": [
+			{"id": "operaciones", "label_en": "Operations", "label_es": "Operaciones", "label_zh": "运营"},
+			{"id": "logistica", "label_en": "Logistics", "label_es": "Logística", "label_zh": "物流"},
+			{"id": "tablas", "label_en": "Tables", "label_es": "Tablas", "label_zh": "表格"},
+			{"id": "herramientas", "label_en": "Tools", "label_es": "Herramientas", "label_zh": "工具"},
+			{"id": "empleados", "label_en": "Staff", "label_es": "Personal", "label_zh": "员工管理"},
+		],
+	}
+
+
+@frappe.whitelist()
+def get_user_app_permissions(username=None):
+	"""Union of group permissions for a User (used at login)."""
+	username = (username or frappe.session.user or "").strip()
+	if not username:
+		frappe.throw(_("username is required"))
+	if not frappe.db.exists("User", username):
+		frappe.throw(_("User {0} not found").format(username))
+	roles = frappe.get_roles(username)
+	if "Administrator" in roles or "System Manager" in roles:
+		return {"permissions": ["*"], "groups": [], "source": "admin"}
+	emp = frappe.db.get_value("Employee", {"user_id": username}, "name")
+	if not emp:
+		return {"permissions": [], "groups": [], "source": "roles"}
+	groups = frappe.get_all(
+		"Employee Group Table",
+		filters={"employee": emp},
+		pluck="parent",
+		ignore_permissions=True,
+	)
+	perms = _permission_ids_for_employee(emp)
+	return {
+		"permissions": perms,
+		"groups": groups,
+		"source": "groups" if perms else "roles",
 	}
 
 
@@ -107,6 +512,7 @@ def list_employees(search=None, status=None, page=1, page_length=100):
 		order_by="employee_name asc",
 		limit_start=(page - 1) * page_length,
 		limit_page_length=page_length,
+		ignore_permissions=True,
 	)
 	total = frappe.db.count("Employee", filters=filters)
 	return {"rows": [_serialize_employee(n) for n in names], "total": total}
@@ -143,6 +549,7 @@ def save_employee(name=None, data=None):
 		"date_of_joining",
 	]
 
+	frappe.flags.ignore_permissions = True
 	if is_new:
 		company = data.get("company") or frappe.defaults.get_user_default("Company")
 		if not company:
@@ -176,7 +583,9 @@ def save_employee(name=None, data=None):
 				doc.set(key, data[key])
 		if "ctc" in data:
 			doc.ctc = flt(data.get("ctc"))
-		doc.insert()
+		if data.get("company_email") or data.get("prefered_email"):
+			doc.prefered_contact_email = "Company Email"
+		doc.insert(ignore_permissions=True)
 		log_field_changes(
 			"Employee",
 			doc.name,
@@ -197,7 +606,6 @@ def save_employee(name=None, data=None):
 			if str(old_val or "") != str(new_val or ""):
 				changes.append((key, old_val, new_val))
 				doc.set(key, new_val)
-		# Keep employee_name in sync
 		if data.get("first_name") or data.get("last_name") or data.get("employee_name"):
 			first = (data.get("first_name") or doc.first_name or "").strip()
 			last = (data.get("last_name") or doc.last_name or "").strip()
@@ -209,16 +617,18 @@ def save_employee(name=None, data=None):
 				doc.first_name = first
 			if last is not None:
 				doc.last_name = last or None
-		doc.save()
+		if data.get("company_email") or data.get("prefered_email"):
+			doc.prefered_contact_email = "Company Email"
+		doc.save(ignore_permissions=True)
 		if changes:
 			log_field_changes("Employee", doc.name, changes)
 
-	# Groups membership
 	if "groups" in data:
 		_set_employee_groups(doc.name, data.get("groups") or [])
 
-	# Roles on linked user
-	if "roles" in data and doc.user_id:
+	if doc.user_id:
+		_apply_group_roles_to_user(doc.user_id, doc.name)
+	elif "roles" in data and doc.user_id:
 		_set_user_roles(doc.user_id, data.get("roles") or [])
 
 	frappe.db.commit()
@@ -227,26 +637,26 @@ def save_employee(name=None, data=None):
 
 def _set_employee_groups(employee: str, group_names: list[str]) -> None:
 	wanted = set(g for g in group_names if g)
-	current = {
-		r.parent
-		for r in frappe.get_all(
+	current = set(
+		frappe.get_all(
 			"Employee Group Table",
 			filters={"employee": employee},
-			fields=["parent", "name"],
+			pluck="parent",
+			ignore_permissions=True,
 		)
-	}
-	# Remove from groups not wanted
+	)
 	for g in current - wanted:
 		rows = frappe.get_all(
 			"Employee Group Table",
 			filters={"parent": g, "employee": employee},
 			pluck="name",
+			ignore_permissions=True,
 		)
 		for row_name in rows:
 			frappe.delete_doc("Employee Group Table", row_name, ignore_permissions=True)
-	# Add to missing groups
 	emp_name = frappe.db.get_value("Employee", employee, "employee_name")
 	user_id = frappe.db.get_value("Employee", employee, "user_id")
+	frappe.flags.ignore_permissions = True
 	for g in wanted - current:
 		if not frappe.db.exists("Employee Group", g):
 			continue
@@ -259,70 +669,121 @@ def _set_employee_groups(employee: str, group_names: list[str]) -> None:
 
 
 def _set_user_roles(user: str, roles: list[str]) -> None:
+	frappe.flags.ignore_permissions = True
 	user_doc = frappe.get_doc("User", user)
-	# Keep system roles intact; replace assignable set
-	protected = {"All", "Guest", "Administrator"}
 	current = {d.role for d in user_doc.roles}
-	desired = set(roles) | (current & protected)
-	# Always keep Desk User if they have any desk role
+	desired = set(roles) | (current & PROTECTED_ROLES)
 	if desired - {"All", "Guest"}:
 		desired.add("Desk User")
+		desired.add("Employee")
 	user_doc.set("roles", [])
 	for r in sorted(desired):
 		if frappe.db.exists("Role", r):
 			user_doc.append("roles", {"role": r})
+	user_doc.flags.ignore_permissions = True
 	user_doc.save(ignore_permissions=True)
+
+
+def _unique_staff_email(base_email: str, employee_name: str) -> str:
+	email = (base_email or "").strip().lower()
+	if email and not frappe.db.exists("User", email):
+		return email
+	slug = "".join(ch for ch in (employee_name or "staff").lower() if ch.isalnum())[:18] or "staff"
+	for i in range(0, 40):
+		candidate = f"{slug}{i or ''}@employees.local"
+		if not frappe.db.exists("User", candidate):
+			return candidate
+	return f"{slug}{secrets.token_hex(3)}@employees.local"
 
 
 @frappe.whitelist()
 def create_employee_user(employee, email=None, roles=None):
-	"""Create User for employee with a random password (returned once)."""
+	"""Create or link a User for the employee and return a one-time random password."""
 	if isinstance(roles, str):
 		roles = frappe.parse_json(roles)
-	roles = roles or ["Employee"]
+
+	frappe.flags.ignore_permissions = True
+	if not frappe.db.exists("Employee", employee):
+		frappe.throw(_("Employee {0} not found").format(employee))
 	emp = frappe.get_doc("Employee", employee)
 	if emp.user_id and frappe.db.exists("User", emp.user_id):
 		frappe.throw(_("Employee already has user {0}").format(emp.user_id))
 
-	email = (email or emp.prefered_email or emp.company_email or emp.personal_email or "").strip()
-	if not email:
-		# Synthetic email so User can be created
-		slug = "".join(ch for ch in (emp.employee_name or emp.name).lower() if ch.isalnum())[:20]
-		email = f"{slug or emp.name.lower()}@employees.local"
-	emp.prefered_email = email
-	emp.company_email = emp.company_email or email
+	requested_email = (email or emp.prefered_email or emp.company_email or emp.personal_email or "").strip()
+	linked_existing = False
+	user_name = None
+
+	if requested_email and frappe.db.exists("User", requested_email):
+		if requested_email in ("Administrator", "Guest"):
+			frappe.throw(
+				_("Email {0} belongs to a system account. Use a different email.").format(requested_email)
+			)
+		other = frappe.db.get_value(
+			"Employee", {"user_id": requested_email, "name": ["!=", emp.name]}, "name"
+		)
+		if other:
+			frappe.throw(_("User {0} is already linked to employee {1}").format(requested_email, other))
+		user_name = requested_email
+		linked_existing = True
+
+	login_email = requested_email if linked_existing else _unique_staff_email(
+		requested_email, emp.employee_name or emp.name
+	)
+	emp.prefered_contact_email = "Company Email"
+	emp.company_email = emp.company_email or login_email
+	emp.prefered_email = login_email
 	emp.save(ignore_permissions=True)
 
 	password = _rand_password()
 	parts = (emp.employee_name or emp.first_name or "User").split()
 	first = parts[0]
-	last = " ".join(parts[1:]) if len(parts) > 1 else ""
+	last = " ".join(parts[1:]) if len(parts) > 1 else first
 
-	user = frappe.get_doc(
-		{
-			"doctype": "User",
-			"email": email,
-			"first_name": first,
-			"last_name": last or None,
-			"enabled": 1,
-			"send_welcome_email": 0,
-			"user_type": "System User",
-			"new_password": password,
-		}
-	)
-	user.insert(ignore_permissions=True)
-	_set_user_roles(user.name, list(roles) if "Employee" in roles else list(roles) + ["Employee"])
+	if linked_existing:
+		user_name = login_email
+		user = frappe.get_doc("User", user_name)
+		user.flags.ignore_password_policy = True
+		user.flags.no_welcome_mail = True
+		user.enabled = 1
+		user.save(ignore_permissions=True)
+		_set_user_password(user_name, password)
+	else:
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": login_email,
+				"first_name": first,
+				"last_name": last,
+				"enabled": 1,
+				"send_welcome_email": 0,
+				"user_type": "System User",
+			}
+		)
+		user.flags.ignore_password_policy = True
+		user.flags.no_welcome_mail = True
+		user.insert(ignore_permissions=True)
+		user_name = user.name
+		_set_user_password(user_name, password)
 
-	emp.user_id = user.name
-	emp.create_user_permission = 1
+	group_roles = _roles_from_permission_ids(_permission_ids_for_employee(emp.name))
+	if not group_roles or group_roles == ["Employee"]:
+		fallback = list(roles) if roles else ["Employee", "Sales User"]
+		if "Employee" not in fallback:
+			fallback.append("Employee")
+		group_roles = fallback
+	_set_user_roles(user_name, group_roles)
+
+	emp.user_id = user_name
+	emp.create_user_permission = 0
 	emp.save(ignore_permissions=True)
-	log_field_changes("Employee", emp.name, [("user_id", None, user.name)])
+	log_field_changes("Employee", emp.name, [("user_id", None, user_name)])
 	frappe.db.commit()
 	return {
 		"ok": True,
-		"user_id": user.name,
-		"email": email,
+		"user_id": user_name,
+		"email": login_email,
 		"password": password,
+		"linked_existing": linked_existing,
 		"employee": _serialize_employee(emp.name),
 	}
 
@@ -330,20 +791,25 @@ def create_employee_user(employee, email=None, roles=None):
 @frappe.whitelist()
 def reset_employee_user_password(employee):
 	"""Generate a new random password for the linked user (returned once)."""
+	frappe.flags.ignore_permissions = True
 	emp = frappe.get_doc("Employee", employee)
 	if not emp.user_id or not frappe.db.exists("User", emp.user_id):
 		frappe.throw(_("Employee has no user"))
 	password = _rand_password()
 	user = frappe.get_doc("User", emp.user_id)
-	user.new_password = password
+	user.flags.ignore_password_policy = True
+	user.flags.no_welcome_mail = True
 	user.save(ignore_permissions=True)
+	_set_user_password(user.name, password)
 	frappe.db.commit()
 	return {"ok": True, "user_id": user.name, "email": user.email, "password": password}
 
 
 @frappe.whitelist()
 def list_employee_groups():
-	names = frappe.get_all("Employee Group", pluck="name", order_by="name asc")
+	frappe.flags.ignore_permissions = True
+	names = frappe.get_all("Employee Group", pluck="name", order_by="name asc", ignore_permissions=True)
+	store = _load_perm_store()
 	out = []
 	for n in names:
 		doc = frappe.get_doc("Employee Group", n)
@@ -351,6 +817,7 @@ def list_employee_groups():
 			{
 				"name": doc.name,
 				"employee_group_name": doc.employee_group_name,
+				"permissions": _normalize_permission_ids(store.get(doc.name) or []),
 				"members": [
 					{
 						"employee": r.employee,
@@ -365,7 +832,7 @@ def list_employee_groups():
 
 
 @frappe.whitelist()
-def save_employee_group(name=None, employee_group_name=None, members=None):
+def save_employee_group(name=None, employee_group_name=None, members=None, permissions=None):
 	if isinstance(members, str):
 		members = frappe.parse_json(members)
 	members = members or []
@@ -373,11 +840,11 @@ def save_employee_group(name=None, employee_group_name=None, members=None):
 	if not title:
 		frappe.throw(_("Group name is required"))
 
+	frappe.flags.ignore_permissions = True
 	if name and frappe.db.exists("Employee Group", name):
 		doc = frappe.get_doc("Employee Group", name)
-		if title != doc.employee_group_name:
-			# Employee Group name is typically the title
-			pass
+		if title and title != doc.employee_group_name:
+			doc.employee_group_name = title
 		doc.set("employee_list", [])
 	else:
 		if frappe.db.exists("Employee Group", title):
@@ -395,38 +862,74 @@ def save_employee_group(name=None, employee_group_name=None, members=None):
 			{"employee": emp, "employee_name": emp_name, "user_id": user_id},
 		)
 	if name and frappe.db.exists("Employee Group", name):
-		doc.save()
+		doc.save(ignore_permissions=True)
 	else:
-		doc.insert()
+		doc.insert(ignore_permissions=True)
+
+	if permissions is not None:
+		store = _load_perm_store()
+		store[doc.name] = _normalize_permission_ids(permissions)
+		_save_perm_store(store)
+		for m in doc.employee_list or []:
+			if m.user_id:
+				_apply_group_roles_to_user(m.user_id, m.employee)
+
 	frappe.db.commit()
-	return {"ok": True, "group": {"name": doc.name, "employee_group_name": doc.employee_group_name}}
+	return {
+		"ok": True,
+		"group": {
+			"name": doc.name,
+			"employee_group_name": doc.employee_group_name,
+			"permissions": _permissions_for_group(doc.name),
+		},
+	}
+
+
+@frappe.whitelist()
+def save_employee_group_permissions(name, permissions=None):
+	"""Attach/detach app permissions on an Employee Group (AWS-style)."""
+	if not name or not frappe.db.exists("Employee Group", name):
+		frappe.throw(_("Group {0} not found").format(name))
+	ids = _normalize_permission_ids(permissions)
+	store = _load_perm_store()
+	store[name] = ids
+	_save_perm_store(store)
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Employee Group", name)
+	for m in doc.employee_list or []:
+		if m.user_id:
+			_apply_group_roles_to_user(m.user_id, m.employee)
+	frappe.db.commit()
+	return {"ok": True, "name": name, "permissions": ids}
 
 
 @frappe.whitelist()
 def delete_employee_group(name):
 	if not frappe.db.exists("Employee Group", name):
 		frappe.throw(_("Group {0} not found").format(name))
-	frappe.delete_doc("Employee Group", name)
+	frappe.delete_doc("Employee Group", name, ignore_permissions=True)
+	store = _load_perm_store()
+	if name in store:
+		store.pop(name, None)
+		_save_perm_store(store)
 	frappe.db.commit()
 	return {"ok": True}
 
 
 @frappe.whitelist()
 def list_employee_meta():
-	"""Branches, companies, assignable roles for the editor UI."""
+	"""Branches, companies, and the app permission catalog for the editor UI."""
 	company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
-	branches = frappe.get_all("Branch", pluck="name", order_by="name asc") if frappe.db.exists("DocType", "Branch") else []
-	roles = frappe.get_all(
-		"Role",
-		filters={"disabled": 0},
-		pluck="name",
-		order_by="name asc",
+	branches = (
+		frappe.get_all("Branch", pluck="name", order_by="name asc", ignore_permissions=True)
+		if frappe.db.exists("DocType", "Branch")
+		else []
 	)
-	# Prefer common roles first
-	pref = [r for r in PREFERRED_ROLES if r in roles]
-	rest = [r for r in roles if r not in pref and r not in ("Administrator", "Guest", "All")]
+	catalog = list_app_permissions()
 	return {
 		"company": company,
 		"branches": branches or [],
-		"roles": pref + rest[:40],
+		"roles": [],
+		"permissions": catalog["permissions"],
+		"permission_groups": catalog["groups"],
 	}
