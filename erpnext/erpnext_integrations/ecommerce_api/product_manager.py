@@ -2148,6 +2148,15 @@ def save_employee_group_permissions(name, permissions=None):
 
 
 @frappe.whitelist()
+def ensure_starter_staff_groups():
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        ensure_starter_staff_groups as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
 def get_extra_fields_bundle(scope, row_keys=None):
     from erpnext.erpnext_integrations.ecommerce_api.extra_fields import (
         get_extra_fields_bundle as _impl,

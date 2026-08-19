@@ -258,6 +258,16 @@ APP_PERMISSIONS = [
 		"desc_es": "Crear grupos y agregar/quitar permisos (Ajustes).",
 		"desc_zh": "在设置中创建组并附加/移除权限。",
 	},
+	{
+		"id": "settings.view_link_key",
+		"group": "empleados",
+		"label_en": "View app link key & devices",
+		"label_es": "Ver clave de app y dispositivos",
+		"label_zh": "查看应用密钥与设备",
+		"desc_en": "See the permanent API link token and every connected mobile/desktop device.",
+		"desc_es": "Ver la clave permanente de la API y todos los dispositivos móviles/escritorio conectados.",
+		"desc_zh": "查看永久 API 连接密钥以及已连接的手机/电脑设备。",
+	},
 ]
 
 KNOWN_PERMISSION_IDS = {p["id"] for p in APP_PERMISSIONS}
@@ -287,9 +297,72 @@ PERMISSION_TO_ROLES = {
 	"employees.view_salary": ["HR Manager"],
 	"employees.edit": ["HR User"],
 	"settings.manage_groups": ["HR Manager"],
+	"settings.view_link_key": ["System Manager"],
 }
 
 PROTECTED_ROLES = {"All", "Guest", "Administrator"}
+
+# Suggested starter groups from i031. Created on demand (Settings button), never overwritten.
+_STARTER_CAJERO = ["ops.pos", "ops.catalog", "tables.orders", "tools.labels"]
+_STARTER_DEPOSITO = [
+	"ops.receiving",
+	"tables.products",
+	"tables.review",
+	"tables.variants",
+	"log.sections",
+	"tools.labels",
+	"tools.sync",
+]
+_STARTER_VENTAS = [
+	"ops.pos",
+	"ops.catalog",
+	"tables.promotions",
+	"tables.crm",
+	"tables.orders",
+	"tools.labels",
+]
+_STARTER_CAJAS = ["tables.cajas", "log.accounting", "ops.pos"]
+_STARTER_GERENCIA_EXTRA = [
+	"tables.rentability",
+	"tables.employees",
+	"employees.edit",
+	"employees.create_user",
+	"employees.reset_password",
+	"employees.view_salary",
+	"tools.migrate",
+	"tools.settings",
+	"settings.manage_groups",
+	"settings.view_link_key",
+]
+
+
+def _unique_perm_ids(*groups: list[str]) -> list[str]:
+	seen = set()
+	out = []
+	for g in groups:
+		for pid in g:
+			if pid in KNOWN_PERMISSION_IDS and pid not in seen:
+				seen.add(pid)
+				out.append(pid)
+	return out
+
+
+STARTER_STAFF_GROUPS = [
+	{"employee_group_name": "Cajero", "permissions": list(_STARTER_CAJERO)},
+	{"employee_group_name": "Depósito", "permissions": list(_STARTER_DEPOSITO)},
+	{"employee_group_name": "Ventas", "permissions": list(_STARTER_VENTAS)},
+	{"employee_group_name": "Cajas / cobros", "permissions": list(_STARTER_CAJAS)},
+	{
+		"employee_group_name": "Gerencia",
+		"permissions": _unique_perm_ids(
+			_STARTER_CAJERO,
+			_STARTER_DEPOSITO,
+			_STARTER_VENTAS,
+			_STARTER_CAJAS,
+			_STARTER_GERENCIA_EXTRA,
+		),
+	},
+]
 
 
 def _parse_json(raw, default):
@@ -366,6 +439,116 @@ def _permissions_for_group(group_name: str) -> list[str]:
 	return _normalize_permission_ids(store.get(group_name) or [])
 
 
+def _acting_username() -> str:
+	req = getattr(frappe.local, "request", None)
+	if req is not None:
+		val = req.headers.get("X-ERP-Acting-User") or ""
+		if val:
+			return str(val).strip()
+	return (frappe.get_request_header("X-ERP-Acting-User") or "").strip()
+
+
+def _acting_perm_info() -> dict | None:
+	cached = getattr(frappe.local, "_staff_acting_perm_info", "missing")
+	if cached != "missing":
+		return cached
+	user = _acting_username()
+	info = None
+	if user and frappe.db.exists("User", user):
+		info = get_user_app_permissions(user)
+	frappe.local._staff_acting_perm_info = info
+	return info
+
+
+def _can_app(pid: str) -> bool:
+	info = _acting_perm_info()
+	if not info:
+		return True
+	if info.get("source") == "admin" or "*" in (info.get("permissions") or []):
+		return True
+	if info.get("source") == "groups":
+		return pid in (info.get("permissions") or [])
+	user = _acting_username()
+	return _coarse_allows(user, pid) if user else True
+
+
+def _require_app_permission(pid: str) -> None:
+	if not _can_app(pid):
+		frappe.throw(_("Not permitted ({0})").format(pid))
+
+
+_POS_ROLES = {
+	"Administrator",
+	"System Manager",
+	"Sales User",
+	"Sales Manager",
+	"Accounts User",
+	"Accounts Manager",
+	"Stock User",
+	"Stock Manager",
+}
+_PAYMENT_ROLES = {
+	"Administrator",
+	"System Manager",
+	"Accounts User",
+	"Accounts Manager",
+	"Sales Manager",
+}
+_RECEIVING_ROLES = {
+	"Administrator",
+	"System Manager",
+	"Purchase User",
+	"Purchase Manager",
+	"Stock User",
+	"Stock Manager",
+}
+_SYNC_ROLES = {"Administrator", "System Manager"}
+
+# Same mapping as erpnext-ecommerce/lib/staff-permissions.ts COARSE_KEYS.
+_COARSE_FLAG = {
+	"ops.pos": "pos",
+	"ops.catalog": "pos",
+	"tables.orders": "pos",
+	"tools.labels": "pos",
+	"log.accounting": "payments",
+	"tables.cajas": "payments",
+	"log.reports": "payments",
+	"ops.receiving": "receiving",
+	"tables.products": "receiving",
+	"tables.rentability": "receiving",
+	"tables.promotions": "receiving",
+	"tables.review": "receiving",
+	"tables.variants": "receiving",
+	"tables.crm": "receiving",
+	"tables.employees": "receiving",
+	"log.sections": "receiving",
+	"tools.migrate": "receiving",
+	"tools.settings": "receiving",
+	"employees.create_user": "receiving",
+	"employees.reset_password": "receiving",
+	"employees.view_salary": "receiving",
+	"employees.edit": "receiving",
+	"settings.manage_groups": "receiving",
+	"tools.sync": "sync",
+}
+
+
+def _coarse_allows(username: str, pid: str) -> bool:
+	flag = _COARSE_FLAG.get(pid)
+	if not flag:
+		return False
+	roles = set(frappe.get_roles(username))
+	if flag == "pos":
+		return bool(roles & _POS_ROLES)
+	if flag == "payments":
+		return bool(roles & _PAYMENT_ROLES)
+	if flag == "receiving":
+		return bool(roles & _RECEIVING_ROLES)
+	if flag == "sync":
+		return bool(roles & _SYNC_ROLES)
+	return False
+
+
 def _roles_from_permission_ids(permission_ids: list[str]) -> list[str]:
 	roles = {"Employee"}
 	for pid in permission_ids:
@@ -416,7 +599,7 @@ def _serialize_employee(name: str) -> dict:
 	if emp.user_id and frappe.db.exists("User", emp.user_id):
 		roles = [r for r in frappe.get_roles(emp.user_id) if r not in ("All", "Guest", "Desk User")]
 		user_enabled = cint(frappe.db.get_value("User", emp.user_id, "enabled"))
-	return {
+	row = {
 		"name": emp.name,
 		"employee_name": emp.employee_name,
 		"first_name": emp.first_name,
@@ -442,6 +625,11 @@ def _serialize_employee(name: str) -> dict:
 		"date_of_joining": str(emp.date_of_joining) if emp.date_of_joining else None,
 		"modified": str(emp.modified) if emp.modified else None,
 	}
+	if not _can_app("employees.view_salary"):
+		row["ctc"] = None
+		row["salary_currency"] = None
+		row["salary_hidden"] = True
+	return row
 
 
 @frappe.whitelist()
@@ -461,7 +649,12 @@ def list_app_permissions():
 
 @frappe.whitelist()
 def get_user_app_permissions(username=None):
-	"""Union of group permissions for a User (used at login)."""
+	"""Union of group permissions for a User (used at login).
+
+	If the employee is in one or more groups, the union of those groups is the
+	entire grant — even when the lists are empty (IAM restriction). Ungrouped
+	users keep the previous ERPNext-role mapping (source=roles).
+	"""
 	username = (username or frappe.session.user or "").strip()
 	if not username:
 		frappe.throw(_("username is required"))
@@ -480,15 +673,14 @@ def get_user_app_permissions(username=None):
 		ignore_permissions=True,
 	)
 	perms = _permission_ids_for_employee(emp)
-	return {
-		"permissions": perms,
-		"groups": groups,
-		"source": "groups" if perms else "roles",
-	}
+	if groups:
+		return {"permissions": perms, "groups": groups, "source": "groups"}
+	return {"permissions": [], "groups": [], "source": "roles"}
 
 
 @frappe.whitelist()
 def list_employees(search=None, status=None, page=1, page_length=100):
+	_require_app_permission("tables.employees")
 	page = max(1, cint(page) or 1)
 	page_length = max(1, min(500, cint(page_length) or 100))
 	filters = {}
@@ -520,6 +712,7 @@ def list_employees(search=None, status=None, page=1, page_length=100):
 
 @frappe.whitelist()
 def get_employee(name):
+	_require_app_permission("tables.employees")
 	if not frappe.db.exists("Employee", name):
 		frappe.throw(_("Employee {0} not found").format(name))
 	return _serialize_employee(name)
@@ -528,9 +721,12 @@ def get_employee(name):
 @frappe.whitelist()
 def save_employee(name=None, data=None):
 	"""Create or update Employee. data: JSON/dict of fields."""
+	_require_app_permission("employees.edit")
 	if isinstance(data, str):
 		data = frappe.parse_json(data) or {}
 	data = data or {}
+	if not _can_app("employees.view_salary"):
+		data.pop("ctc", None)
 	is_new = not name
 	tracked = [
 		"employee_name",
@@ -699,6 +895,7 @@ def _unique_staff_email(base_email: str, employee_name: str) -> str:
 @frappe.whitelist()
 def create_employee_user(employee, email=None, roles=None):
 	"""Create or link a User for the employee and return a one-time random password."""
+	_require_app_permission("employees.create_user")
 	if isinstance(roles, str):
 		roles = frappe.parse_json(roles)
 
@@ -714,17 +911,17 @@ def create_employee_user(employee, email=None, roles=None):
 	user_name = None
 
 	if requested_email and frappe.db.exists("User", requested_email):
-		if requested_email in ("Administrator", "Guest"):
-			frappe.throw(
-				_("Email {0} belongs to a system account. Use a different email.").format(requested_email)
-			)
+		existing_roles = set(frappe.get_roles(requested_email))
 		other = frappe.db.get_value(
 			"Employee", {"user_id": requested_email, "name": ["!=", emp.name]}, "name"
 		)
-		if other:
+		if requested_email in ("Administrator", "Guest") or "Administrator" in existing_roles:
+			requested_email = ""
+		elif other:
 			frappe.throw(_("User {0} is already linked to employee {1}").format(requested_email, other))
-		user_name = requested_email
-		linked_existing = True
+		else:
+			user_name = requested_email
+			linked_existing = True
 
 	login_email = requested_email if linked_existing else _unique_staff_email(
 		requested_email, emp.employee_name or emp.name
@@ -791,6 +988,7 @@ def create_employee_user(employee, email=None, roles=None):
 @frappe.whitelist()
 def reset_employee_user_password(employee):
 	"""Generate a new random password for the linked user (returned once)."""
+	_require_app_permission("employees.reset_password")
 	frappe.flags.ignore_permissions = True
 	emp = frappe.get_doc("Employee", employee)
 	if not emp.user_id or not frappe.db.exists("User", emp.user_id):
@@ -807,6 +1005,8 @@ def reset_employee_user_password(employee):
 
 @frappe.whitelist()
 def list_employee_groups():
+	if not (_can_app("tables.employees") or _can_app("settings.manage_groups")):
+		frappe.throw(_("Not permitted ({0})").format("tables.employees"))
 	frappe.flags.ignore_permissions = True
 	names = frappe.get_all("Employee Group", pluck="name", order_by="name asc", ignore_permissions=True)
 	store = _load_perm_store()
@@ -833,6 +1033,7 @@ def list_employee_groups():
 
 @frappe.whitelist()
 def save_employee_group(name=None, employee_group_name=None, members=None, permissions=None):
+	_require_app_permission("settings.manage_groups")
 	if isinstance(members, str):
 		members = frappe.parse_json(members)
 	members = members or []
@@ -888,6 +1089,7 @@ def save_employee_group(name=None, employee_group_name=None, members=None, permi
 @frappe.whitelist()
 def save_employee_group_permissions(name, permissions=None):
 	"""Attach/detach app permissions on an Employee Group (AWS-style)."""
+	_require_app_permission("settings.manage_groups")
 	if not name or not frappe.db.exists("Employee Group", name):
 		frappe.throw(_("Group {0} not found").format(name))
 	ids = _normalize_permission_ids(permissions)
@@ -905,6 +1107,7 @@ def save_employee_group_permissions(name, permissions=None):
 
 @frappe.whitelist()
 def delete_employee_group(name):
+	_require_app_permission("settings.manage_groups")
 	if not frappe.db.exists("Employee Group", name):
 		frappe.throw(_("Group {0} not found").format(name))
 	frappe.delete_doc("Employee Group", name, ignore_permissions=True)
@@ -916,9 +1119,54 @@ def delete_employee_group(name):
 	return {"ok": True}
 
 
+def _find_employee_group_by_title(title: str) -> str | None:
+	if frappe.db.exists("Employee Group", title):
+		return title
+	return frappe.db.get_value("Employee Group", {"employee_group_name": title}, "name")
+
+
+@frappe.whitelist()
+def ensure_starter_staff_groups():
+	"""Create the i031 suggested groups if missing. Does not overwrite existing permissions."""
+	_require_app_permission("settings.manage_groups")
+	frappe.flags.ignore_permissions = True
+	store = _load_perm_store()
+	created = []
+	attached = []
+	skipped = []
+	for spec in STARTER_STAFF_GROUPS:
+		title = spec["employee_group_name"]
+		perms = _normalize_permission_ids(spec["permissions"])
+		existing = _find_employee_group_by_title(title)
+		if existing:
+			current = _normalize_permission_ids(store.get(existing) or [])
+			if not current:
+				store[existing] = perms
+				attached.append({"name": existing, "employee_group_name": title, "permissions": perms})
+			else:
+				skipped.append({"name": existing, "employee_group_name": title, "permissions": current})
+			continue
+		doc = frappe.new_doc("Employee Group")
+		doc.employee_group_name = title
+		doc.insert(ignore_permissions=True)
+		store[doc.name] = perms
+		created.append({"name": doc.name, "employee_group_name": title, "permissions": perms})
+	if created or attached:
+		_save_perm_store(store)
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"created": created,
+		"attached": attached,
+		"skipped": skipped,
+		"groups": list_employee_groups().get("groups") or [],
+	}
+
+
 @frappe.whitelist()
 def list_employee_meta():
 	"""Branches, companies, and the app permission catalog for the editor UI."""
+	_require_app_permission("tables.employees")
 	company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
 	branches = (
 		frappe.get_all("Branch", pluck="name", order_by="name asc", ignore_permissions=True)
