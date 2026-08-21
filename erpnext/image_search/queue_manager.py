@@ -166,6 +166,10 @@ class ImageSearchQueueManager:
         # Check API rate limits first (if using paid APIs)
         # DuckDuckGo is free so we skip this for now
 
+        # Reclaim orphaned Queued / stale In Progress so a crashed worker
+        # cannot leave the queue permanently stuck.
+        self.reclaim_stuck_jobs(queued_after_minutes=10, in_progress_after_minutes=30)
+
         raw_jobs = frappe.get_all(
             "Product Image Search Job",
             filters={"status": ["in", ["Pending", "Retrying"]]},
@@ -200,18 +204,82 @@ class ImageSearchQueueManager:
             if len(jobs) >= batch_size:
                 break
 
-        # Mark as queued
-        for job in jobs:
+        # Do not pre-flip the whole batch to Queued — that orphans jobs if the
+        # worker dies mid-batch. Status moves Pending → In Progress per job.
+        return jobs
+
+    def reclaim_stuck_jobs(
+        self,
+        queued_after_minutes: int = 0,
+        in_progress_after_minutes: int = 30,
+        product_type: Optional[str] = None,
+    ) -> dict:
+        """
+        Reset orphaned Queued / stale In Progress jobs back to Pending.
+
+        queued_after_minutes=0 reclaims all Queued (used by Recover Stuck).
+        get_next_batch uses a short grace window so an active claim is not stolen.
+        """
+        now_dt = frappe.utils.now_datetime()
+        filters_base = {}
+        if product_type:
+            filters_base["product_type"] = product_type
+
+        reclaimed = {"queued": 0, "in_progress": 0}
+
+        queued_jobs = frappe.get_all(
+            "Product Image Search Job",
+            filters={**filters_base, "status": "Queued"},
+            fields=["name", "modified"],
+            limit_page_length=0,
+        )
+        queued_cutoff = (
+            frappe.utils.add_to_date(now_dt, minutes=-int(queued_after_minutes))
+            if queued_after_minutes and queued_after_minutes > 0
+            else None
+        )
+        for job in queued_jobs:
+            if queued_cutoff is not None:
+                modified = frappe.utils.get_datetime(job.get("modified"))
+                if modified and modified > queued_cutoff:
+                    continue
             frappe.db.set_value(
                 "Product Image Search Job",
                 job.name,
                 "status",
-                "Queued"
+                "Pending",
+                update_modified=False,
             )
+            reclaimed["queued"] += 1
 
-        frappe.db.commit()
+        ip_jobs = frappe.get_all(
+            "Product Image Search Job",
+            filters={**filters_base, "status": "In Progress"},
+            fields=["name", "started_at", "modified"],
+            limit_page_length=0,
+        )
+        ip_cutoff = frappe.utils.add_to_date(
+            now_dt, minutes=-max(1, int(in_progress_after_minutes or 30))
+        )
+        for job in ip_jobs:
+            started = frappe.utils.get_datetime(job.get("started_at") or job.get("modified"))
+            if started and started > ip_cutoff:
+                continue
+            frappe.db.set_value(
+                "Product Image Search Job",
+                job.name,
+                {
+                    "status": "Pending",
+                    "error_message": "Reclaimed after stale In Progress",
+                },
+                update_modified=False,
+            )
+            reclaimed["in_progress"] += 1
 
-        return jobs
+        if reclaimed["queued"] or reclaimed["in_progress"]:
+            frappe.db.commit()
+
+        return reclaimed
 
     def mark_job_started(self, job_name: str):
         """Mark job as in progress"""

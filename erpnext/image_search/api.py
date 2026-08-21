@@ -354,21 +354,16 @@ def get_product_jobs_ui(product_type, status_group="running", limit=100):
     }
 
 
-@frappe.whitelist()
-def clear_product_jobs_ui(product_type, include_failed=0):
-    """
-    Clear finalized image-search jobs for one product type.
-
-    Args:
-        product_type: "Item" or "Product Approval Queue"
-        include_failed: truthy value to also clear Failed jobs
-
-    Returns:
-        Dict with deleted count and statuses removed
-    """
-    statuses = ["Completed"]
-    if frappe.utils.cint(include_failed):
-        statuses.append("Failed")
+def _delete_image_jobs_chunked(product_type, statuses, limit=5000, chunk_size=200):
+    """Delete jobs in chunks to avoid request timeouts on large histories."""
+    try:
+        row_limit = max(1, min(int(limit), 20000))
+    except (TypeError, ValueError):
+        row_limit = 5000
+    try:
+        batch = max(50, min(int(chunk_size), 500))
+    except (TypeError, ValueError):
+        batch = 200
 
     names = frappe.get_all(
         "Product Image Search Job",
@@ -377,30 +372,104 @@ def clear_product_jobs_ui(product_type, include_failed=0):
             "status": ["in", statuses],
         },
         pluck="name",
-        limit_page_length=0,
+        limit_page_length=row_limit,
     )
 
-    if not names:
-        return {
-            "deleted_count": 0,
-            "statuses": statuses,
-            "product_type": product_type,
-        }
+    deleted = 0
+    for i in range(0, len(names), batch):
+        chunk = names[i : i + batch]
+        frappe.db.delete("Product Image Search Job", {"name": ["in", chunk]})
+        frappe.db.commit()
+        deleted += len(chunk)
 
-    for name in names:
-        frappe.delete_doc(
-            "Product Image Search Job",
-            name,
-            ignore_permissions=True,
-            delete_permanently=True,
-        )
-
-    frappe.db.commit()
-
+    remaining = frappe.db.count(
+        "Product Image Search Job",
+        {"product_type": product_type, "status": ["in", statuses]},
+    )
     return {
-        "deleted_count": len(names),
+        "deleted_count": deleted,
+        "remaining": remaining,
         "statuses": statuses,
         "product_type": product_type,
+    }
+
+
+@frappe.whitelist()
+def clear_product_jobs_ui(product_type, include_failed=0, limit=5000):
+    """
+    Clear finalized image-search jobs for one product type (chunked).
+
+    Args:
+        product_type: "Item" or "Product Approval Queue"
+        include_failed: truthy value to also clear Failed jobs
+        limit: max rows to delete in this call (caller may loop)
+
+    Returns:
+        Dict with deleted count, remaining, and statuses removed
+    """
+    statuses = ["Completed"]
+    if frappe.utils.cint(include_failed):
+        statuses.append("Failed")
+
+    return _delete_image_jobs_chunked(product_type, statuses, limit=limit)
+
+
+@frappe.whitelist()
+def clear_product_queue_ui(product_type, limit=5000):
+    """
+    Clear active (not finalized) image-search jobs for one product type.
+
+    Deletes Pending, Queued, In Progress, and Retrying rows.
+    """
+    statuses = ["Pending", "Queued", "In Progress", "Retrying"]
+    return _delete_image_jobs_chunked(product_type, statuses, limit=limit)
+
+
+@frappe.whitelist()
+def recover_stuck_product_jobs_ui(product_type, start_worker_after=1):
+    """
+    Reset orphaned Queued + stale In Progress jobs back to Pending and optionally
+    kick the background worker.
+    """
+    from erpnext.image_search.queue_manager import ImageSearchQueueManager
+
+    queue_manager = ImageSearchQueueManager()
+    reclaimed = queue_manager.reclaim_stuck_jobs(
+        queued_after_minutes=0,
+        in_progress_after_minutes=15,
+        product_type=product_type,
+    )
+    total = int(reclaimed.get("queued") or 0) + int(reclaimed.get("in_progress") or 0)
+
+    worker_started = False
+    if frappe.utils.cint(start_worker_after) and total > 0:
+        from erpnext.image_search.worker import start_worker
+
+        start_worker()
+        worker_started = True
+
+    stats = {
+        "pending": frappe.db.count(
+            "Product Image Search Job",
+            {"product_type": product_type, "status": "Pending"},
+        ),
+        "queued": frappe.db.count(
+            "Product Image Search Job",
+            {"product_type": product_type, "status": "Queued"},
+        ),
+        "in_progress": frappe.db.count(
+            "Product Image Search Job",
+            {"product_type": product_type, "status": "In Progress"},
+        ),
+    }
+
+    return {
+        "reclaimed_queued": reclaimed.get("queued", 0),
+        "reclaimed_in_progress": reclaimed.get("in_progress", 0),
+        "reclaimed_total": total,
+        "worker_started": worker_started,
+        "product_type": product_type,
+        "stats": stats,
     }
 
 

@@ -1514,12 +1514,30 @@ def auto_apply_first_image_for_missing_items(priority="Low", limit=None, dry_run
 
 
 @frappe.whitelist()
-def clear_item_completed_image_jobs(include_failed=0):
+def clear_item_completed_image_jobs(include_failed=0, limit=5000):
     """Clear completed Item image-search jobs for the POS jobs modal."""
     frappe.has_permission("Item", "write", throw=True)
     from erpnext.image_search.api import clear_product_jobs_ui
 
-    return clear_product_jobs_ui("Item", include_failed=include_failed)
+    return clear_product_jobs_ui("Item", include_failed=include_failed, limit=limit)
+
+
+@frappe.whitelist()
+def clear_item_queued_image_jobs(limit=5000):
+    """Clear active (Pending/Queued/In Progress/Retrying) Item image-search jobs."""
+    frappe.has_permission("Item", "write", throw=True)
+    from erpnext.image_search.api import clear_product_queue_ui
+
+    return clear_product_queue_ui("Item", limit=limit)
+
+
+@frappe.whitelist()
+def recover_stuck_item_image_jobs(start_worker_after=1):
+    """Reset orphaned Queued / stale In Progress Item jobs to Pending and start worker."""
+    frappe.has_permission("Item", "write", throw=True)
+    from erpnext.image_search.api import recover_stuck_product_jobs_ui
+
+    return recover_stuck_product_jobs_ui("Item", start_worker_after=start_worker_after)
 
 
 # ---------------------------------------------------------------------------
