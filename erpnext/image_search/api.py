@@ -69,16 +69,17 @@ def get_product_image_candidates(product_type, product_id):
 @frappe.whitelist()
 def select_primary_image(product_type, product_id, candidate_name):
     """
-    Select a candidate as the primary product image
+    Select a candidate as the primary product image.
 
-    Args:
-        product_type: "Item" or "Product Approval Queue"
-        product_id: Product identifier
-        candidate_name: Name of the candidate to select
-
-    Returns:
-        Success response
+    For Item: downloads the remote candidate URL, writes a local 256×256 JPEG
+    File, and sets Item.image to that local path (never the hotlink).
     """
+    from erpnext.image_search.thumb import (
+        download_image_bytes,
+        mark_candidate_downloaded,
+        materialize_item_thumb,
+    )
+
     # Unselect all current selections for this product
     frappe.db.sql("""
         UPDATE `tabProduct Image Candidate`
@@ -94,21 +95,39 @@ def select_primary_image(product_type, product_id, candidate_name):
         1
     )
 
-    # Update product with image
-    candidate = frappe.get_doc("Product Image Candidate", candidate_name)
+    frappe.flags.ignore_permissions = True
+    try:
+        candidate = frappe.get_doc("Product Image Candidate", candidate_name)
+    finally:
+        frappe.flags.ignore_permissions = False
 
     if product_type == "Item":
-        frappe.db.set_value("Item", product_id, "image", candidate.image_url)
-    elif product_type == "Product Approval Queue":
+        image_bytes = download_image_bytes(candidate.image_url)
+        file_url = materialize_item_thumb(product_id, image_bytes, crop=None, commit=False)
+        mark_candidate_downloaded(candidate_name, file_url)
+        frappe.db.commit()
+        return {
+            "success": True,
+            "message": _("Primary image updated"),
+            "image_url": file_url,
+        }
+
+    if product_type == "Product Approval Queue":
         if frappe.db.exists("DocType", "Product Approval Queue"):
+            # PAQ still stores the source URL until Item materialize on approve
             frappe.db.set_value("Product Approval Queue", product_id, "image", candidate.image_url)
+            frappe.db.commit()
+            return {
+                "success": True,
+                "message": _("Primary image updated"),
+                "image_url": candidate.image_url,
+            }
 
     frappe.db.commit()
-
     return {
         "success": True,
         "message": _("Primary image updated"),
-        "image_url": candidate.image_url
+        "image_url": candidate.image_url,
     }
 
 

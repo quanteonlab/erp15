@@ -93,10 +93,10 @@ APP_PERMISSIONS = [
 		"group": "tablas",
 		"label_en": "Rentability",
 		"label_es": "Rentabilidad",
-		"label_zh": "利润",
-		"desc_en": "Margins, cost %, and price simulation.",
-		"desc_es": "Márgenes, cost % y simulación de precios.",
-		"desc_zh": "毛利、成本占比与价格模拟。",
+		"label_zh": "盈利",
+		"desc_en": "All price lists, cost, margin, and inflation simulation.",
+		"desc_es": "Todas las listas de precio, costo, margen y simulación de inflación.",
+		"desc_zh": "全部价目表、成本、毛利与通胀模拟。",
 	},
 	{
 		"id": "tables.promotions",
@@ -302,10 +302,11 @@ PERMISSION_TO_ROLES = {
 
 PROTECTED_ROLES = {"All", "Guest", "Administrator"}
 
-# Suggested starter groups from i031. Created on demand (Settings button), never overwritten.
-_STARTER_CAJERO = ["ops.pos", "ops.catalog", "tables.orders", "tools.labels"]
-_STARTER_DEPOSITO = [
+# Default groups: created automatically if missing. Existing non-empty permission
+# lists are never overwritten.
+_STARTER_REPOSITOR = [
 	"ops.receiving",
+	"ops.catalog",
 	"tables.products",
 	"tables.review",
 	"tables.variants",
@@ -313,54 +314,22 @@ _STARTER_DEPOSITO = [
 	"tools.labels",
 	"tools.sync",
 ]
-_STARTER_VENTAS = [
+_STARTER_CAJA = [
 	"ops.pos",
 	"ops.catalog",
-	"tables.promotions",
-	"tables.crm",
 	"tables.orders",
+	"tables.cajas",
+	"log.accounting",
 	"tools.labels",
 ]
-_STARTER_CAJAS = ["tables.cajas", "log.accounting", "ops.pos"]
-_STARTER_GERENCIA_EXTRA = [
-	"tables.rentability",
-	"tables.employees",
-	"employees.edit",
-	"employees.create_user",
-	"employees.reset_password",
-	"employees.view_salary",
-	"tools.migrate",
-	"tools.settings",
-	"settings.manage_groups",
-	"settings.view_link_key",
-]
-
-
-def _unique_perm_ids(*groups: list[str]) -> list[str]:
-	seen = set()
-	out = []
-	for g in groups:
-		for pid in g:
-			if pid in KNOWN_PERMISSION_IDS and pid not in seen:
-				seen.add(pid)
-				out.append(pid)
-	return out
 
 
 STARTER_STAFF_GROUPS = [
-	{"employee_group_name": "Cajero", "permissions": list(_STARTER_CAJERO)},
-	{"employee_group_name": "Depósito", "permissions": list(_STARTER_DEPOSITO)},
-	{"employee_group_name": "Ventas", "permissions": list(_STARTER_VENTAS)},
-	{"employee_group_name": "Cajas / cobros", "permissions": list(_STARTER_CAJAS)},
+	{"employee_group_name": "repositor", "permissions": list(_STARTER_REPOSITOR)},
+	{"employee_group_name": "caja", "permissions": list(_STARTER_CAJA)},
 	{
-		"employee_group_name": "Gerencia",
-		"permissions": _unique_perm_ids(
-			_STARTER_CAJERO,
-			_STARTER_DEPOSITO,
-			_STARTER_VENTAS,
-			_STARTER_CAJAS,
-			_STARTER_GERENCIA_EXTRA,
-		),
+		"employee_group_name": "admin",
+		"permissions": sorted(KNOWN_PERMISSION_IDS),
 	},
 ]
 
@@ -441,11 +410,12 @@ def _permissions_for_group(group_name: str) -> list[str]:
 
 def _acting_username() -> str:
 	req = getattr(frappe.local, "request", None)
-	if req is not None:
-		val = req.headers.get("X-ERP-Acting-User") or ""
-		if val:
-			return str(val).strip()
-	return (frappe.get_request_header("X-ERP-Acting-User") or "").strip()
+	if req is None:
+		return ""
+	try:
+		return str(req.headers.get("X-ERP-Acting-User") or "").strip()
+	except Exception:
+		return ""
 
 
 def _acting_perm_info() -> dict | None:
@@ -1005,8 +975,13 @@ def reset_employee_user_password(employee):
 
 @frappe.whitelist()
 def list_employee_groups():
-	if not (_can_app("tables.employees") or _can_app("settings.manage_groups")):
+	if not (
+		_can_app("tables.employees")
+		or _can_app("settings.manage_groups")
+		or _can_app("tools.settings")
+	):
 		frappe.throw(_("Not permitted ({0})").format("tables.employees"))
+	_ensure_starter_staff_groups()
 	frappe.flags.ignore_permissions = True
 	names = frappe.get_all("Employee Group", pluck="name", order_by="name asc", ignore_permissions=True)
 	store = _load_perm_store()
@@ -1120,20 +1095,38 @@ def delete_employee_group(name):
 
 
 def _find_employee_group_by_title(title: str) -> str | None:
-	if frappe.db.exists("Employee Group", title):
-		return title
-	return frappe.db.get_value("Employee Group", {"employee_group_name": title}, "name")
+	wanted = (title or "").strip()
+	if not wanted:
+		return None
+	if frappe.db.exists("Employee Group", wanted):
+		return wanted
+	exact = frappe.db.get_value("Employee Group", {"employee_group_name": wanted}, "name")
+	if exact:
+		return exact
+	# Case-insensitive match (repositor vs Repositor).
+	for row in frappe.get_all(
+		"Employee Group",
+		fields=["name", "employee_group_name"],
+		ignore_permissions=True,
+	):
+		if str(row.employee_group_name or "").strip().lower() == wanted.lower():
+			return row.name
+		if str(row.name or "").strip().lower() == wanted.lower():
+			return row.name
+	return None
 
 
-@frappe.whitelist()
-def ensure_starter_staff_groups():
-	"""Create the i031 suggested groups if missing. Does not overwrite existing permissions."""
-	_require_app_permission("settings.manage_groups")
+def _ensure_starter_staff_groups() -> dict:
+	"""Create repositor / caja / admin if missing. Do not overwrite non-empty permission lists."""
+	if getattr(frappe.local, "_staff_starter_ensured", False):
+		return {"created": [], "attached": [], "skipped": []}
+	frappe.local._staff_starter_ensured = True
 	frappe.flags.ignore_permissions = True
 	store = _load_perm_store()
 	created = []
 	attached = []
 	skipped = []
+	dirty = False
 	for spec in STARTER_STAFF_GROUPS:
 		title = spec["employee_group_name"]
 		perms = _normalize_permission_ids(spec["permissions"])
@@ -1143,6 +1136,7 @@ def ensure_starter_staff_groups():
 			if not current:
 				store[existing] = perms
 				attached.append({"name": existing, "employee_group_name": title, "permissions": perms})
+				dirty = True
 			else:
 				skipped.append({"name": existing, "employee_group_name": title, "permissions": current})
 			continue
@@ -1151,14 +1145,21 @@ def ensure_starter_staff_groups():
 		doc.insert(ignore_permissions=True)
 		store[doc.name] = perms
 		created.append({"name": doc.name, "employee_group_name": title, "permissions": perms})
-	if created or attached:
+		dirty = True
+	if dirty:
 		_save_perm_store(store)
-	frappe.db.commit()
+		frappe.db.commit()
+	return {"created": created, "attached": attached, "skipped": skipped}
+
+
+@frappe.whitelist()
+def ensure_starter_staff_groups():
+	"""Create the default groups (repositor, caja, admin) if missing."""
+	_require_app_permission("settings.manage_groups")
+	result = _ensure_starter_staff_groups()
 	return {
 		"ok": True,
-		"created": created,
-		"attached": attached,
-		"skipped": skipped,
+		**result,
 		"groups": list_employee_groups().get("groups") or [],
 	}
 
@@ -1167,6 +1168,7 @@ def ensure_starter_staff_groups():
 def list_employee_meta():
 	"""Branches, companies, and the app permission catalog for the editor UI."""
 	_require_app_permission("tables.employees")
+	_ensure_starter_staff_groups()
 	company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
 	branches = (
 		frappe.get_all("Branch", pluck="name", order_by="name asc", ignore_permissions=True)

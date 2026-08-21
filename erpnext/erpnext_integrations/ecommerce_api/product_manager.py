@@ -609,12 +609,43 @@ def ensure_product_manager_custom_fields() -> None:
     frappe.clear_cache(doctype="Item")
 
 
+def _selling_prices_map(item_codes: list) -> dict:
+    """Map item_code → { price_list_name → rate } for all selling Item Prices."""
+    if not item_codes:
+        return {}
+    # Use explicit placeholders — Frappe IN %(list)s is unreliable across MariaDB builds.
+    ph = ", ".join(["%s"] * len(item_codes))
+    rows = frappe.db.sql(
+        f"""
+        SELECT item_code, price_list, MAX(price_list_rate) AS rate
+        FROM `tabItem Price`
+        WHERE item_code IN ({ph})
+          AND selling = 1
+        GROUP BY item_code, price_list
+        """,
+        tuple(item_codes),
+        as_dict=True,
+    )
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r.item_code, {})[r.price_list] = flt(r.rate)
+    return out
+
+
 @frappe.whitelist()
-def get_product_rows(filters=None, page=1, page_length=100, price_list=None, warehouse=None):
+def get_product_rows(
+    filters=None,
+    page=1,
+    page_length=100,
+    price_list=None,
+    warehouse=None,
+    include_all_prices=0,
+):
     """
     Returns a joined view of Item + Item Price + Item Barcode + tags.
     price_list: selling price list; defaults to POS / Selling Settings.
     warehouse: if set, includes stock_qty from tabBin.
+    include_all_prices: when truthy, each row gets `prices` {list → rate} for all selling lists.
     """
     filters = _parse_filters(filters)
     if isinstance(price_list, str) and not price_list.strip():
@@ -847,16 +878,22 @@ def get_product_rows(filters=None, page=1, page_length=100, price_list=None, war
         row["tags"] = [t.strip() for t in raw.split(",") if t.strip()] if raw else []
         row["is_active"] = 0 if row.pop("_disabled", 0) else 1
         row.pop("_raw_norm", None)
+        row.pop("last_purchase_rate", None)
+        row.pop("valuation_rate", None)
         buying = flt(row.pop("buying_price", None) or 0)
-        last_purchase = flt(row.pop("last_purchase_rate", None) or 0)
-        valuation = flt(row.pop("valuation_rate", None) or 0)
-        fallback = last_purchase if last_purchase > 0 else valuation
+        # Buying/cost: only show when a buying price list rate exists (else blank).
         if buying > 0:
             row["cost_price"] = buying
             row["cost_from_buying"] = 1
         else:
-            row["cost_price"] = fallback if fallback > 0 else None
+            row["cost_price"] = None
             row["cost_from_buying"] = 0
+
+    # Always attach selling prices by list so the grid can show one column per list.
+    if rows:
+        by_item = _selling_prices_map([r["client_sku"] for r in rows])
+        for row in rows:
+            row["prices"] = by_item.get(row["client_sku"], {})
 
     count_vals = {k: v for k, v in values.items() if k not in ("page_length", "offset")}
     total = frappe.db.sql(
@@ -925,6 +962,16 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
 
         if "cost_price" in changes and changes["cost_price"] not in (None, ""):
             _upsert_item_price_buying(item_code, flt(changes["cost_price"]))
+
+        extra_prices = changes.get("extra_prices")
+        if isinstance(extra_prices, dict):
+            for list_name, rate in extra_prices.items():
+                name = (list_name or "").strip()
+                if not name or name == pl:
+                    continue
+                if rate in (None, ""):
+                    continue
+                _upsert_item_price(item_code, flt(rate), name)
 
         if "barcode" in changes:
             _upsert_barcode(item_code, changes["barcode"])
@@ -1130,7 +1177,7 @@ def set_active_bulk(item_codes, is_active):
 
 
 # ---------------------------------------------------------------------------
-# upload_item_image — base64 from canvas (200x200)
+# upload_item_image — base64; server re-encodes to 256×256 JPEG
 # ---------------------------------------------------------------------------
 
 
@@ -1142,21 +1189,135 @@ def upload_item_image(item_code, filedata, filename="image.jpg"):
 
     raw = filedata.split(",", 1)[1] if "," in filedata else filedata
     content = base64.b64decode(raw)
-    fname = filename or "image.jpg"
 
-    from frappe.utils.file_manager import save_file
+    from erpnext.image_search.thumb import materialize_item_thumb
 
-    ret = save_file(fname, content, "Item", item_code, is_private=0)
-    file_url = getattr(ret, "file_url", None)
-    if not file_url and isinstance(ret, dict):
-        file_url = ret.get("file_url")
-    if not file_url and getattr(ret, "name", None):
-        file_url = frappe.db.get_value("File", ret.name, "file_url")
-    if not file_url:
-        frappe.throw(_("Could not store image file"))
-    frappe.db.set_value("Item", item_code, "image", file_url)
+    file_url = materialize_item_thumb(item_code, content, crop=None, commit=True)
+    return {"ok": True, "image": file_url}
+
+
+@frappe.whitelist()
+def crop_item_image(item_code, crop, candidate_name=None, filedata=None):
+    """
+    Apply a relative 0–1 crop box and save a local 256×256 Item thumb.
+
+    Prefer candidate_name (re-download remote) or filedata (upload).
+    If both empty, recrop from current local Item.image (/files/ only).
+    """
+    frappe.has_permission("Item", "write", throw=True)
+    if isinstance(crop, str):
+        crop = json.loads(crop) if crop else None
+    if not crop or not isinstance(crop, dict):
+        frappe.throw(_("Crop box required"))
+
+    from erpnext.image_search.thumb import (
+        download_image_bytes,
+        mark_candidate_downloaded,
+        materialize_item_thumb,
+        read_local_file_bytes,
+    )
+
+    image_bytes = None
+    selected_candidate = None
+
+    if candidate_name:
+        frappe.flags.ignore_permissions = True
+        try:
+            candidate = frappe.get_doc("Product Image Candidate", candidate_name)
+        finally:
+            frappe.flags.ignore_permissions = False
+        if candidate.product_type != "Item" or candidate.product_id != item_code:
+            frappe.throw(_("Candidate does not belong to this item"))
+        image_bytes = download_image_bytes(candidate.image_url)
+        selected_candidate = candidate_name
+    elif filedata:
+        raw = filedata.split(",", 1)[1] if "," in filedata else filedata
+        image_bytes = base64.b64decode(raw)
+    else:
+        current = frappe.db.get_value("Item", item_code, "image")
+        if not current:
+            frappe.throw(_("No image to recrop; pick a candidate or upload a file"))
+        current = str(current)
+        if current.startswith("http://") or current.startswith("https://"):
+            image_bytes = download_image_bytes(current)
+        elif current.startswith("/"):
+            image_bytes = read_local_file_bytes(current)
+        else:
+            frappe.throw(_("Unsupported image URL for recrop"))
+
+    file_url = materialize_item_thumb(item_code, image_bytes, crop=crop, commit=False)
+
+    if selected_candidate:
+        frappe.db.sql(
+            """
+            UPDATE `tabProduct Image Candidate`
+            SET is_selected = 0
+            WHERE product_type = 'Item' AND product_id = %s
+            """,
+            (item_code,),
+        )
+        frappe.db.set_value("Product Image Candidate", selected_candidate, "is_selected", 1)
+        mark_candidate_downloaded(selected_candidate, file_url)
+
     frappe.db.commit()
     return {"ok": True, "image": file_url}
+
+
+@frappe.whitelist()
+def materialize_remote_item_images(limit=20, dry_run=0):
+    """
+    Backfill: Items whose image is still a remote http(s) URL get a local 256 thumb.
+    """
+    frappe.has_permission("Item", "write", throw=True)
+
+    from erpnext.image_search.thumb import download_image_bytes, materialize_item_thumb
+
+    limit_val = cint(limit) if limit not in (None, "", 0, "0") else 20
+    if limit_val <= 0:
+        limit_val = 20
+    dry = cint(dry_run) == 1
+
+    item_rows = frappe.db.sql(
+        """
+        SELECT name, image
+        FROM `tabItem`
+        WHERE IFNULL(image, '') LIKE 'http%%'
+        ORDER BY modified DESC
+        LIMIT %s
+        """,
+        (limit_val,),
+        as_dict=True,
+    )
+
+    total = len(item_rows)
+    converted = 0
+    errors = []
+
+    if dry:
+        return {
+            "ok": True,
+            "dry_run": 1,
+            "total": total,
+            "converted": 0,
+            "errors": [],
+        }
+
+    for row in item_rows:
+        item_code = row.name
+        try:
+            image_bytes = download_image_bytes(row.image)
+            materialize_item_thumb(item_code, image_bytes, crop=None, commit=True)
+            converted += 1
+        except Exception as exc:
+            errors.append({"item_code": item_code, "error": str(exc)})
+
+    return {
+        "ok": True,
+        "dry_run": 0,
+        "total": total,
+        "converted": converted,
+        "errors": errors[:50],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1234,20 +1395,21 @@ def auto_apply_first_image_for_missing_items(priority="Low", limit=None, dry_run
 
     from erpnext.image_search.api import enqueue_product_image_search, select_primary_image
 
-    limit_val = cint(limit) if limit not in (None, "", 0, "0") else None
+    # Downloads are slower than URL copies; default batch 20.
+    limit_val = cint(limit) if limit not in (None, "", 0, "0") else 20
+    if limit_val <= 0:
+        limit_val = 20
     dry = cint(dry_run) == 1
 
-    where_clause = "WHERE IFNULL(image, '') = ''"
-    limit_clause = f"LIMIT {limit_val}" if limit_val and limit_val > 0 else ""
-
     item_rows = frappe.db.sql(
-        f"""
+        """
         SELECT name
         FROM `tabItem`
-        {where_clause}
+        WHERE IFNULL(image, '') = ''
         ORDER BY modified DESC
-        {limit_clause}
+        LIMIT %s
         """,
+        (limit_val,),
         as_dict=True,
     )
 
@@ -1741,27 +1903,40 @@ def generate_barcodes_bulk(item_codes):
 
 
 @frappe.whitelist()
-def apply_interest_adjustment_bulk(item_codes, percent, price_list=None):
+def apply_interest_adjustment_bulk(item_codes, percent, price_list=None, price_lists=None):
+    """
+    Multiply selling list prices by (1 + percent/100).
+    price_lists: optional list of Price List names; when set, adjusts each.
+    Otherwise uses price_list or the default selling list.
+    """
     if isinstance(item_codes, str):
         item_codes = json.loads(item_codes)
+    if isinstance(price_lists, str):
+        price_lists = json.loads(price_lists)
 
     frappe.has_permission("Item", "write", throw=True)
-    pl = price_list or _default_price_list()
+
+    if isinstance(price_lists, list) and price_lists:
+        pls = [p for p in price_lists if p]
+    else:
+        pls = [price_list or _default_price_list()]
+
     factor = 1 + flt(percent) / 100.0
     updated = 0
-    for code in item_codes:
-        name = frappe.db.get_value(
-            "Item Price",
-            {"item_code": code, "price_list": pl, "selling": 1},
-            "name",
-        )
-        if not name:
-            continue
-        rate = frappe.db.get_value("Item Price", name, "price_list_rate")
-        if rate is None:
-            continue
-        frappe.db.set_value("Item Price", name, "price_list_rate", flt(rate) * factor)
-        updated += 1
+    for pl in pls:
+        for code in item_codes:
+            name = frappe.db.get_value(
+                "Item Price",
+                {"item_code": code, "price_list": pl, "selling": 1},
+                "name",
+            )
+            if not name:
+                continue
+            rate = frappe.db.get_value("Item Price", name, "price_list_rate")
+            if rate is None:
+                continue
+            frappe.db.set_value("Item Price", name, "price_list_rate", flt(rate) * factor)
+            updated += 1
 
     frappe.db.commit()
     return {"ok": True, "updated": updated}

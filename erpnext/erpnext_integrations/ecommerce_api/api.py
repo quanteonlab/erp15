@@ -2437,6 +2437,10 @@ def _is_guest_preorder_sales_order(so):
 	return False
 
 
+def _sanitize_guest_tag(value) -> str:
+	return str(value or "").replace("|", " ").strip()[:240]
+
+
 @frappe.whitelist(allow_guest=True)
 def create_guest_preorder(
 	items,
@@ -2446,6 +2450,11 @@ def create_guest_preorder(
 	delivery_date=None,
 	order_type="Sales",
 	company=None,
+	guest_address=None,
+	guest_notes=None,
+	is_delivery=0,
+	paid_amount=None,
+	mode_of_payment=None,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -2485,9 +2494,17 @@ def create_guest_preorder(
 
 	remarks_parts = [GUEST_PREORDER_REMARKS_TAG, f"customer:{customer}"]
 	if guest_phone:
-		remarks_parts.append(f"guest_phone:{guest_phone}")
+		remarks_parts.append(f"guest_phone:{_sanitize_guest_tag(guest_phone)}")
 	if guest_name:
-		remarks_parts.append(f"guest_name:{guest_name}")
+		remarks_parts.append(f"guest_name:{_sanitize_guest_tag(guest_name)}")
+	if cint(is_delivery):
+		remarks_parts.append("delivery:1")
+	if guest_address:
+		remarks_parts.append(f"guest_address:{_sanitize_guest_tag(guest_address)}")
+	if guest_notes:
+		remarks_parts.append(f"guest_notes:{_sanitize_guest_tag(guest_notes)}")
+	if mode_of_payment:
+		remarks_parts.append(f"guest_pay_method:{_sanitize_guest_tag(mode_of_payment)}")
 	tag_text = " | ".join(remarks_parts)
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -2529,14 +2546,20 @@ def create_guest_preorder(
 	# Calculate totals
 	so.run_method("calculate_taxes_and_totals")
 
-	# Save as Draft
+	# Save as Draft (Consulta)
 	so.insert(ignore_permissions=True)
+
+	paid = flt(paid_amount)
+	if paid > 0:
+		cap = flt(so.grand_total)
+		so.db_set("advance_paid", min(paid, cap) if cap > 0 else paid)
 
 	return {
 		"preorder_name": so.name,
 		"estimated_total": flt(so.grand_total),
 		"currency": so.currency,
 		"status": so.status,
+		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
 	}
 
 
@@ -2650,11 +2673,24 @@ def get_guest_preorder(preorder_name):
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
 
+	tag_raw = getattr(so, "remarks", None) or getattr(so, "terms", None) or ""
+	tags = {}
+	for part in str(tag_raw).split("|"):
+		part = part.strip()
+		if ":" in part:
+			key, val = part.split(":", 1)
+			tags[key.strip()] = val.strip()
+
 	return {
 		"name": so.name,
 		"order_type": so.order_type,
 		"customer": so.customer,
 		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
+		"guest_name": tags.get("guest_name") or None,
+		"guest_phone": tags.get("guest_phone") or None,
+		"guest_address": tags.get("guest_address") or None,
+		"guest_notes": tags.get("guest_notes") or None,
+		"is_delivery": tags.get("delivery") == "1",
 		"transaction_date": so.transaction_date,
 		"delivery_date": so.delivery_date,
 		"docstatus": so.docstatus,
