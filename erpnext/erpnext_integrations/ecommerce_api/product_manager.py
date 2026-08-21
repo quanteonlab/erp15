@@ -555,12 +555,8 @@ def clone_warehouse(source_warehouse, new_name):
 
 def ensure_product_manager_custom_fields() -> None:
     """
-    Ensure the pack/normalization custom fields used throughout Product Manager
+    Ensure the pack/normalization/unit-sku custom fields used throughout Product Manager
     (get/save/create rows, description generation) exist on Item.
-    These are unconditionally referenced in raw SQL below, unlike custom_unit_sku
-    which has an explicit legacy-site fallback — so a missing field here is a
-    schema bug, not an expected variant, and must be self-healed rather than
-    silently degraded.
 
     Wired into hooks.after_migrate so every `bench migrate` (fresh site or
     existing) guarantees these fields exist, instead of relying on each
@@ -597,10 +593,17 @@ def ensure_product_manager_custom_fields() -> None:
                     "insert_after": "custom_pack_size",
                 },
                 {
+                    "fieldname": "custom_unit_sku",
+                    "fieldtype": "Data",
+                    "label": "Unit SKU",
+                    "insert_after": "custom_pack_unit",
+                    "description": "Item code of the base/unit SKU this pack or variant decomposes into.",
+                },
+                {
                     "fieldname": "custom_review_notes",
                     "fieldtype": "Small Text",
                     "label": "Review Notes",
-                    "insert_after": "custom_pack_unit",
+                    "insert_after": "custom_unit_sku",
                 },
             ]
         },
@@ -608,6 +611,13 @@ def ensure_product_manager_custom_fields() -> None:
     )
     frappe.clear_cache(doctype="Item")
 
+
+def _ensure_unit_sku_column() -> bool:
+    """Create custom_unit_sku if missing. Returns True when the column is available."""
+    if frappe.db.has_column("Item", "custom_unit_sku"):
+        return True
+    ensure_product_manager_custom_fields()
+    return bool(frappe.db.has_column("Item", "custom_unit_sku"))
 
 def _selling_prices_map(item_codes: list) -> dict:
     """Map item_code → { price_list_name → rate } for all selling Item Prices."""
@@ -934,7 +944,13 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             "image": "image",
             "source_category": "item_group",
         }
-        if frappe.db.has_column("Item", "custom_unit_sku"):
+        if "unit_sku" in changes:
+            if not _ensure_unit_sku_column():
+                frappe.throw(
+                    _("Item field custom_unit_sku is missing; cannot save Unit SKU. Run bench migrate.")
+                )
+            direct_field_map["unit_sku"] = "custom_unit_sku"
+        elif frappe.db.has_column("Item", "custom_unit_sku"):
             direct_field_map["unit_sku"] = "custom_unit_sku"
 
         updates: dict = {}
@@ -1109,7 +1125,11 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
         }
     )
 
-    if frappe.db.has_column("Item", "custom_unit_sku"):
+    if "unit_sku" in changes:
+        if not _ensure_unit_sku_column():
+            frappe.throw(
+                _("Item field custom_unit_sku is missing; cannot save Unit SKU. Run bench migrate.")
+            )
         unit_sku = (changes.get("unit_sku") or "").strip()
         item_doc.custom_unit_sku = unit_sku or None
 
@@ -2006,12 +2026,293 @@ def get_category_list():
 
 
 # ---------------------------------------------------------------------------
+# Share view / column-aware export
+# ---------------------------------------------------------------------------
+
+_SHARE_UI_COL_IDS = frozenset(
+    {
+        "sku",
+        "unit_sku",
+        "img",
+        "title",
+        "brand",
+        "cat",
+        "price",
+        "cost",
+        "norm",
+        "barcode",
+        "uom",
+        "qty",
+        "pack",
+        "size",
+        "unit",
+        "on",
+        "tags",
+        "notes",
+        "synced",
+    }
+)
+
+_SHARE_DEFAULT_LABELS = {
+    "sku": "SKU",
+    "unit_sku": "Unit SKU",
+    "img": "Img",
+    "title": "Title",
+    "brand": "Brand",
+    "cat": "Category",
+    "price": "Price",
+    "cost": "Cost",
+    "norm": "Norm. Title",
+    "barcode": "Barcode",
+    "uom": "UOM",
+    "qty": "Qty",
+    "pack": "Pack",
+    "size": "Size",
+    "unit": "Unit",
+    "on": "On",
+    "tags": "Tags",
+    "notes": "Notes",
+    "synced": "Synced",
+}
+
+
+def _is_price_list_col(col_id: str) -> bool:
+    return isinstance(col_id, str) and col_id.startswith("pl:")
+
+
+def _normalize_share_columns(columns) -> list[dict]:
+    """Return ordered [{id, label}] for allowed UI columns only."""
+    if isinstance(columns, str):
+        columns = json.loads(columns)
+    if not isinstance(columns, list):
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in columns:
+        if isinstance(raw, str):
+            col_id = raw.strip()
+            label = ""
+        elif isinstance(raw, dict):
+            col_id = str(raw.get("id") or "").strip()
+            label = str(raw.get("label") or "").strip()
+        else:
+            continue
+        if not col_id or col_id == "sel" or col_id in seen:
+            continue
+        if col_id not in _SHARE_UI_COL_IDS and not _is_price_list_col(col_id):
+            continue
+        seen.add(col_id)
+        if not label:
+            if _is_price_list_col(col_id):
+                label = col_id[3:]
+            else:
+                label = _SHARE_DEFAULT_LABELS.get(col_id, col_id)
+        out.append({"id": col_id, "label": label})
+    return out
+
+
+def _cell_for_share_col(row: dict, col_id: str):
+    """Project a single display cell. Never returns unrelated fields."""
+    if _is_price_list_col(col_id):
+        prices = row.get("prices") or {}
+        if not isinstance(prices, dict):
+            return None
+        return prices.get(col_id[3:])
+
+    if col_id == "sku":
+        return row.get("client_sku")
+    if col_id == "unit_sku":
+        return row.get("unit_sku")
+    if col_id == "img":
+        return row.get("image")
+    if col_id == "title":
+        return row.get("source_title")
+    if col_id == "brand":
+        return row.get("brand")
+    if col_id == "cat":
+        return row.get("source_category")
+    if col_id == "price":
+        return row.get("list_price")
+    if col_id == "cost":
+        return row.get("cost_price")
+    if col_id == "norm":
+        return row.get("normalized_title")
+    if col_id == "barcode":
+        return row.get("barcode")
+    if col_id == "uom":
+        return row.get("stock_uom")
+    if col_id == "qty":
+        if row.get("stock_qty") is not None:
+            return row.get("stock_qty")
+        pq = row.get("pack_qty")
+        try:
+            if pq is not None and float(pq) > 0:
+                return pq
+        except (TypeError, ValueError):
+            pass
+        return 1
+    if col_id == "pack":
+        return row.get("pack_qty")
+    if col_id == "size":
+        return row.get("pack_size")
+    if col_id == "unit":
+        return row.get("unit")
+    if col_id == "on":
+        return row.get("is_active")
+    if col_id == "tags":
+        tags = row.get("tags")
+        if isinstance(tags, list):
+            return "|".join(str(t) for t in tags if t)
+        return tags or ""
+    if col_id == "notes":
+        return row.get("review_notes")
+    if col_id == "synced":
+        return row.get("last_synced")
+    return None
+
+
+def _project_share_rows(rows: list, columns: list[dict]) -> list[dict]:
+    """Return rows keyed only by allowed column ids (no backend field leakage)."""
+    projected = []
+    for row in rows or []:
+        cell = {}
+        for col in columns:
+            cid = col["id"]
+            cell[cid] = _cell_for_share_col(row, cid)
+        projected.append(cell)
+    return projected
+
+
+def _new_view_sku() -> str:
+    # URL-safe, unguessable token (≈ 16 bytes entropy).
+    return f"PV-{secrets.token_urlsafe(16)}"
+
+
+@frappe.whitelist()
+def create_product_share_view(
+    columns=None,
+    filters=None,
+    price_list=None,
+    warehouse=None,
+    title=None,
+):
+    """Persist a locked column + filter snapshot for a live share link."""
+    cols = _normalize_share_columns(columns)
+    if not cols:
+        frappe.throw(_("Select at least one visible column to share"))
+
+    if isinstance(filters, str):
+        filters = json.loads(filters)
+    if not isinstance(filters, dict):
+        filters = {}
+
+    if isinstance(price_list, str) and not price_list.strip():
+        price_list = None
+    if warehouse in ("", None, "null"):
+        warehouse = None
+
+    view_sku = _new_view_sku()
+    # Extremely unlikely collision; retry a few times.
+    for _ in range(5):
+        if not frappe.db.exists("Product Share View", view_sku):
+            break
+        view_sku = _new_view_sku()
+
+    acting = (frappe.get_request_header("X-ERP-Acting-User") or "").strip() or frappe.session.user
+    doc = frappe.get_doc(
+        {
+            "doctype": "Product Share View",
+            "view_sku": view_sku,
+            "title": (title or "").strip() or "Shared products",
+            "columns_json": json.dumps(cols),
+            "filters_json": json.dumps(filters),
+            "price_list": price_list or "",
+            "warehouse": warehouse or "",
+            "created_by_user": acting,
+            "disabled": 0,
+        }
+    )
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+
+    return {
+        "view_sku": view_sku,
+        "title": doc.title,
+        "columns": cols,
+    }
+
+
+@frappe.whitelist(allow_guest=True)
+def get_product_share_view(view_sku, page=1, page_length=5000):
+    """
+    Serve a live shared product view.
+
+    Response rows are projected to the saved column allowlist only — capturing
+    the network payload cannot reveal other product fields.
+    """
+    view_sku = (view_sku or "").strip()
+    if not view_sku:
+        frappe.throw(_("Missing view SKU"))
+
+    frappe.flags.ignore_permissions = True
+    try:
+        if not frappe.db.exists("Product Share View", view_sku):
+            frappe.throw(_("Share view not found"), frappe.DoesNotExistError)
+        doc = frappe.get_doc("Product Share View", view_sku)
+    finally:
+        frappe.flags.ignore_permissions = False
+
+    if cint(doc.disabled):
+        frappe.throw(_("This share link is disabled"))
+
+    try:
+        columns = _normalize_share_columns(json.loads(doc.columns_json or "[]"))
+    except Exception:
+        columns = []
+    if not columns:
+        frappe.throw(_("Share view has no columns"))
+
+    try:
+        filters = json.loads(doc.filters_json or "{}")
+    except Exception:
+        filters = {}
+    if not isinstance(filters, dict):
+        filters = {}
+
+    page = cint(page) or 1
+    page_length = min(max(cint(page_length) or 5000, 1), 10000)
+
+    data = get_product_rows(
+        filters=filters,
+        page=page,
+        page_length=page_length,
+        price_list=doc.price_list or None,
+        warehouse=doc.warehouse or None,
+    )
+    rows = _project_share_rows(data.get("rows") or [], columns)
+
+    return {
+        "view_sku": view_sku,
+        "title": doc.title or "Shared products",
+        "columns": columns,
+        "rows": rows,
+        "total": cint(data.get("total") or 0),
+        "page": page,
+        "page_length": page_length,
+        # Metadata only — never echo raw filters that could hint at hidden fields.
+        "price_list": doc.price_list or None,
+        "warehouse": doc.warehouse or None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # export_rows
 # ---------------------------------------------------------------------------
 
 
 @frappe.whitelist()
-def export_rows(filters=None, price_list=None, warehouse=None):
+def export_rows(filters=None, price_list=None, warehouse=None, columns=None):
     if isinstance(filters, str):
         filters = json.loads(filters)
 
@@ -2025,6 +2326,18 @@ def export_rows(filters=None, price_list=None, warehouse=None):
     rows = data.get("rows", [])
     if not rows:
         return {"csv": ""}
+
+    share_cols = _normalize_share_columns(columns) if columns not in (None, "", "null") else []
+    if share_cols:
+        projected = _project_share_rows(rows, share_cols)
+        headers = [c["id"] for c in share_cols]
+        labels = {c["id"]: c["label"] for c in share_cols}
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=headers, extrasaction="ignore")
+        writer.writerow(labels)
+        for row in projected:
+            writer.writerow(row)
+        return {"csv": output.getvalue()}
 
     headers = [
         "client_sku",
@@ -2055,6 +2368,10 @@ def export_rows(filters=None, price_list=None, warehouse=None):
         if isinstance(row.get("tags"), list):
             row = dict(row)
             row["tags"] = "|".join(row["tags"])
+        # Drop nested prices map from legacy full export (not in headers).
+        if "prices" in row:
+            row = dict(row)
+            row.pop("prices", None)
         writer.writerow(row)
 
     return {"csv": output.getvalue()}
@@ -2500,6 +2817,24 @@ def remove_note_block(scope, block_id):
     from erpnext.erpnext_integrations.ecommerce_api.screen_notes import remove_note_block as _impl
 
     return _impl(scope, block_id)
+
+
+@frappe.whitelist()
+def get_shop_ui_settings():
+    from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+        get_shop_ui_settings as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def save_shop_ui_settings(settings=None):
+    from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+        save_shop_ui_settings as _impl,
+    )
+
+    return _impl(settings=settings)
 
 
 @frappe.whitelist()

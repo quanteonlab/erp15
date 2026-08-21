@@ -42,6 +42,7 @@ def get_products(
 	item_group=None,
 	price_list=None,
 	in_stock_only=0,
+	include_disabled=0,
 ):
 	"""
 	Get list of products with pagination and filtering
@@ -55,6 +56,7 @@ def get_products(
 		search_term (str): Search in item_code, item_name, description
 		item_group (str): Filter by item group
 		price_list (str): Price list to fetch prices from
+		include_disabled (int): When 1, also return inactive (disabled) Items
 
 	Returns:
 		dict: {
@@ -97,8 +99,11 @@ def get_products(
 	start = cint(start)
 	page_length = cint(page_length)
 
-	# Default filter: only enabled items
-	filters["disabled"] = 0
+	# Default: only enabled items (POS can opt into disabled via include_disabled)
+	if not cint(include_disabled):
+		filters["disabled"] = 0
+	else:
+		filters.pop("disabled", None)
 
 	# Item group filter
 	if item_group:
@@ -449,12 +454,15 @@ def assign_barcodes_to_all_items():
 
 
 @frappe.whitelist(allow_guest=True)
-def search_by_barcode(barcode, price_list=None):
+def search_by_barcode(barcode, price_list=None, allow_disabled=0):
 	"""
 	Find a product by barcode value.
 	Falls back to matching item_code directly if no Item Barcode record exists.
 
 	Returns the same structure as get_product().
+	When allow_disabled=0 (default), disabled Items raise DoesNotExistError so
+	cashiers do not silently sell inactive SKUs — POS can pass allow_disabled=1
+	to surface them and show its own alert.
 	"""
 	item_code = frappe.db.get_value("Item Barcode", {"barcode": barcode}, "parent")
 	if not item_code:
@@ -463,6 +471,11 @@ def search_by_barcode(barcode, price_list=None):
 			item_code = barcode
 	if not item_code:
 		frappe.throw(_("No item found for barcode: {0}").format(barcode), frappe.DoesNotExistError)
+	if not cint(allow_disabled) and cint(frappe.db.get_value("Item", item_code, "disabled")):
+		frappe.throw(
+			_("Item {0} is disabled").format(item_code),
+			frappe.DoesNotExistError,
+		)
 	return get_product(item_code, price_list=price_list)
 
 
@@ -1008,14 +1021,18 @@ def _serialize_product_bundle(name, price_list=None):
 		qty = flt(row.qty)
 		amount = rate * qty
 		components_total += amount
+		comp_meta = frappe.db.get_value(
+			"Item", row.item_code, ["item_name", "disabled"], as_dict=True
+		) or {}
 		components.append(
 			{
 				"item_code": row.item_code,
 				"qty": qty,
-				"item_name": frappe.db.get_value("Item", row.item_code, "item_name") or row.item_code,
+				"item_name": comp_meta.get("item_name") or row.item_code,
 				"uom": row.uom,
 				"rate": rate,
 				"amount": amount,
+				"disabled": cint(comp_meta.get("disabled")),
 			}
 		)
 	bundle_price = flt(_bundle_price(doc.new_item_code, pl))
@@ -1440,6 +1457,9 @@ def _compute_cart_promotions_local(items, price_list=None):
 			continue
 		if any(flt(c.get("qty") or 0) <= 0 for c in components):
 			continue
+		# Pack cannot be applied when a component Item is disabled (SI submit fails).
+		if any(cint(c.get("disabled")) for c in components):
+			continue
 		packs = min(int(remaining.get(c["item_code"], 0) // flt(c["qty"])) for c in components)
 		if packs < 1:
 			continue
@@ -1657,11 +1677,14 @@ def _get_bundles_containing_item(item_code, price_list=None):
 			continue
 		if not _price_list_applies(row.get("for_price_list"), price_list):
 			continue
+		components = row.get("components") or []
+		if any(cint(c.get("disabled")) for c in components):
+			continue
 		result.append({
 			"bundle_item_code": row["new_item_code"],
 			"bundle_name": row.get("bundle_name") or row["new_item_code"],
 			"bundle_price": flt(row.get("bundle_price") or 0),
-			"components": row.get("components") or [],
+			"components": components,
 		})
 
 	return result
@@ -4152,6 +4175,88 @@ def _submit_pos_payments(invoice, payments, receipt_number, remarks_tag, cash_re
 	return ids
 
 
+def _pos_sale_required_item_codes(items: list) -> list[str]:
+	"""Line SKUs plus Product Bundle components (stock moves use components)."""
+	codes = []
+	seen = set()
+	for item in items or []:
+		code = (item.get("item_code") if isinstance(item, dict) else None) or ""
+		code = str(code).strip()
+		if not code or code in seen:
+			continue
+		seen.add(code)
+		codes.append(code)
+	if not codes:
+		return codes
+	# Expand active packs to their components — SI validates those on submit.
+	bundle_parents = frappe.get_all(
+		"Product Bundle",
+		filters={"new_item_code": ("in", codes), "disabled": 0},
+		pluck="new_item_code",
+		ignore_permissions=True,
+	)
+	if bundle_parents:
+		for row in frappe.get_all(
+			"Product Bundle Item",
+			filters={"parent": ("in", bundle_parents)},
+			fields=["item_code"],
+			ignore_permissions=True,
+		):
+			c = str(row.item_code or "").strip()
+			if c and c not in seen:
+				seen.add(c)
+				codes.append(c)
+	return codes
+
+
+def _resolve_pos_income_account(company: str) -> str | None:
+	"""Company default income account, else first non-group Income account."""
+	acc = frappe.db.get_value("Company", company, "default_income_account")
+	if acc and frappe.db.exists("Account", acc):
+		return acc
+	# Prefer a typical sales income account if present.
+	for name in frappe.get_all(
+		"Account",
+		filters={
+			"company": company,
+			"root_type": "Income",
+			"is_group": 0,
+			"disabled": 0,
+		},
+		pluck="name",
+		order_by="name asc",
+		limit=20,
+		ignore_permissions=True,
+	):
+		lower = name.lower()
+		if "venta" in lower or "sales" in lower or "income" in lower:
+			return name
+	return frappe.db.get_value(
+		"Account",
+		{"company": company, "root_type": "Income", "is_group": 0, "disabled": 0},
+		"name",
+	)
+
+
+def _ensure_pos_sale_items_enabled(item_codes: list[str]) -> list[str]:
+	"""Re-enable Items needed to submit a POS sale that already happened offline.
+
+	ERPNext refuses Sales Invoice lines / packed components when Item.disabled=1.
+	Cash was already taken at the register, so we reactivate those SKUs for sync.
+	"""
+	reactivated = []
+	for code in item_codes or []:
+		if not code or not frappe.db.exists("Item", code):
+			continue
+		if not cint(frappe.db.get_value("Item", code, "disabled")):
+			continue
+		frappe.db.set_value("Item", code, "disabled", 0, update_modified=False)
+		reactivated.append(code)
+	if reactivated:
+		frappe.db.commit()
+	return reactivated
+
+
 @frappe.whitelist()
 def create_pos_sale(
 	offline_order_uuid,
@@ -4225,6 +4330,14 @@ def create_pos_sale(
 			"status": "already_exists",
 		}
 
+	# POS may sell an active pack whose component was later disabled (or a
+	# cached inactive SKU). Re-enable so Sales Invoice submit can succeed.
+	required_codes = _pos_sale_required_item_codes(items)
+	missing = [c for c in required_codes if not frappe.db.exists("Item", c)]
+	if missing:
+		frappe.throw(_("Item(s) not found: {0}").format(", ".join(missing)))
+	reactivated = _ensure_pos_sale_items_enabled(required_codes)
+
 	# ── Resolve defaults ──────────────────────────────────────────────────────
 	company = frappe.defaults.get_user_default("Company") or frappe.db.get_single_value(
 		"Global Defaults", "default_company"
@@ -4238,6 +4351,15 @@ def create_pos_sale(
 		"Warehouse", {"is_group": 0, "company": company}, "name"
 	)
 
+	income_account = _resolve_pos_income_account(company)
+	if not income_account:
+		frappe.throw(
+			_(
+				"Company {0} has no Default Income Account, and no Income Account "
+				"was found for POS sales. Set Company → Default Income Account."
+			).format(company)
+		)
+
 	pay_summary = " + ".join(p["mode_of_payment"] for p in pay_rows) or (payment_method or "Cash")
 
 	# ── Build Sales Invoice ───────────────────────────────────────────────────
@@ -4250,6 +4372,8 @@ def create_pos_sale(
 	)
 	if cash_received:
 		remarks_tag += f" | cash_received:{cash_received}"
+	if reactivated:
+		remarks_tag += f" | reenabled_items:{','.join(reactivated)}"
 
 	invoice = frappe.get_doc(
 		{
@@ -4267,6 +4391,7 @@ def create_pos_sale(
 					"qty": flt(item["qty"]),
 					"rate": flt(item["rate"]),
 					"warehouse": warehouse,
+					"income_account": income_account,
 				}
 				for item in items
 			],

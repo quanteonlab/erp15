@@ -1,0 +1,104 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:view_sku",
+ "creation": "2026-08-21 17:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "view_sku",
+  "title",
+  "disabled",
+  "column_break_1",
+  "price_list",
+  "warehouse",
+  "created_by_user",
+  "section_break_1",
+  "columns_json",
+  "filters_json"
+ ],
+ "fields": [
+  {
+   "fieldname": "view_sku",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "View SKU",
+   "reqd": 1,
+   "unique": 1,
+   "description": "Unguessable share token used in the live link URL"
+  },
+  {
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Title"
+  },
+  {
+   "default": "0",
+   "fieldname": "disabled",
+   "fieldtype": "Check",
+   "label": "Disabled"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "price_list",
+   "fieldtype": "Data",
+   "label": "Price List"
+  },
+  {
+   "fieldname": "warehouse",
+   "fieldtype": "Data",
+   "label": "Warehouse"
+  },
+  {
+   "fieldname": "created_by_user",
+   "fieldtype": "Data",
+   "label": "Created By User"
+  },
+  {
+   "fieldname": "section_break_1",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "columns_json",
+   "fieldtype": "Long Text",
+   "label": "Columns JSON",
+   "reqd": 1,
+   "description": "Ordered array of {id, label} for visible columns only"
+  },
+  {
+   "fieldname": "filters_json",
+   "fieldtype": "Long Text",
+   "label": "Filters JSON",
+   "description": "Locked product filters applied when serving the live view"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-21 17:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "Product Share View",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}
