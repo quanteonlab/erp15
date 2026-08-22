@@ -8,6 +8,47 @@ from datetime import datetime
 from typing import List, Dict
 
 
+def _ddg_images_subprocess(query: str, num_results: int, result_queue) -> None:
+	"""Runs in a child process so a hung DDGS call can be killed."""
+	try:
+		from ddgs import DDGS
+
+		with DDGS(timeout=8) as ddgs:
+			rows = list(
+				ddgs.images(
+					query=query,
+					max_results=num_results,
+					size="Medium",
+					type_image=None,
+					layout=None,
+					license_image=None,
+				)
+			)
+		result_queue.put(("ok", rows))
+	except Exception as exc:
+		result_queue.put(("err", f"{type(exc).__name__}: {exc}"))
+
+
+def _ddg_images_with_timeout(query: str, num_results: int, timeout_sec: int = 20) -> list:
+	import multiprocessing as mp
+
+	ctx = mp.get_context("spawn")
+	result_queue = ctx.Queue()
+	proc = ctx.Process(target=_ddg_images_subprocess, args=(query, num_results, result_queue))
+	proc.start()
+	proc.join(timeout_sec)
+	if proc.is_alive():
+		proc.terminate()
+		proc.join(3)
+		raise TimeoutError(f"DuckDuckGo search timed out after {timeout_sec}s for '{query}'")
+	if result_queue.empty():
+		raise TimeoutError(f"DuckDuckGo search returned no result for '{query}'")
+	status, payload = result_queue.get_nowait()
+	if status == "err":
+		raise RuntimeError(payload)
+	return payload
+
+
 class ImageSearchService:
     """Handles image search across multiple providers"""
 
@@ -73,17 +114,7 @@ class ImageSearchService:
         start_time = datetime.now()
 
         try:
-            from ddgs import DDGS
-
-            with DDGS() as ddgs:
-                results = list(ddgs.images(
-                    query=query,
-                    max_results=num_results,
-                    size="Medium",  # Medium = 200-500px
-                    type_image=None,
-                    layout=None,
-                    license_image=None
-                ))
+            results = _ddg_images_with_timeout(query, num_results, timeout_sec=20)
 
             response_time = (datetime.now() - start_time).total_seconds() * 1000
 

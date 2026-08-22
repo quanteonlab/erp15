@@ -47,6 +47,137 @@ def _default_mode_of_payment() -> str | None:
 	return frappe.db.get_value("Mode of Payment", {"enabled": 1}, "name")
 
 
+WEB_POS_PROFILE_NAME = "Caja Web"
+
+
+def _resolve_cash_bank_account(company: str) -> str | None:
+	for filters in (
+		{"company": company, "account_type": "Cash", "is_group": 0, "disabled": 0},
+		{"company": company, "account_type": "Bank", "is_group": 0, "disabled": 0},
+	):
+		acc = frappe.db.get_value("Account", filters, "name")
+		if acc:
+			return acc
+	# Argentine chart: Caja is often untyped Asset.
+	for like in ("%Caja - %", "%Cash%", "%Bank Account%"):
+		acc = frappe.db.get_value(
+			"Account",
+			{"company": company, "root_type": "Asset", "is_group": 0, "disabled": 0, "name": ("like", like)},
+			"name",
+		)
+		if acc:
+			return acc
+	return None
+
+
+def _ensure_mode_of_payment_account(company: str, mop: str = "Cash") -> None:
+	"""POS Profile validate requires Cash/Bank default account on the Mode of Payment."""
+	if not mop or not frappe.db.exists("Mode of Payment", mop):
+		return
+	already = frappe.db.get_value(
+		"Mode of Payment Account",
+		{"parent": mop, "company": company},
+		"default_account",
+	)
+	if already:
+		return
+	acc = _resolve_cash_bank_account(company)
+	if not acc:
+		frappe.throw(
+			_(
+				"No Cash/Bank account found for company {0}. Cannot auto-create a cash register."
+			).format(company)
+		)
+	doc = frappe.get_doc("Mode of Payment", mop)
+	doc.append("accounts", {"company": company, "default_account": acc})
+	doc.save(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def _resolve_write_off_account(company: str) -> str | None:
+	defaults = _company_defaults(company)
+	acc = defaults.get("write_off_account")
+	if acc and frappe.db.exists("Account", acc):
+		return acc
+	acc = frappe.db.get_value(
+		"Account",
+		{"company": company, "account_type": "Write Off", "is_group": 0, "disabled": 0},
+		"name",
+	)
+	if acc:
+		return acc
+	return frappe.db.get_value(
+		"Account",
+		{"company": company, "root_type": "Expense", "is_group": 0, "disabled": 0},
+		"name",
+	)
+
+
+def ensure_default_web_pos_profile() -> str:
+	"""Create a web-client POS Profile when the site has none.
+
+	Used by cash-session start so the first web POS visit is not blocked.
+	"""
+	existing = frappe.db.get_value("POS Profile", {"disabled": 0}, "name")
+	if existing:
+		return existing
+	if frappe.db.exists("POS Profile", WEB_POS_PROFILE_NAME):
+		frappe.db.set_value("POS Profile", WEB_POS_PROFILE_NAME, "disabled", 0)
+		frappe.db.commit()
+		return WEB_POS_PROFILE_NAME
+
+	company = (
+		frappe.defaults.get_user_default("Company")
+		or frappe.db.get_single_value("Global Defaults", "default_company")
+		or frappe.db.get_value("Company", {}, "name")
+	)
+	if not company:
+		frappe.throw(_("Company is required to auto-create a cash register."))
+	warehouse = frappe.db.get_value(
+		"Warehouse", {"is_group": 0, "company": company}, "name"
+	)
+	if not warehouse:
+		frappe.throw(_("Warehouse is required to auto-create a cash register."))
+	_ensure_mode_of_payment_account(company, "Cash")
+	defaults = _company_defaults(company)
+	currency = defaults.get("default_currency") or frappe.db.get_value(
+		"Company", company, "default_currency"
+	)
+	write_off_account = _resolve_write_off_account(company)
+	cost_center = defaults.get("cost_center") or frappe.db.get_value(
+		"Cost Center", {"company": company, "is_group": 0}, "name"
+	)
+	if not (currency and write_off_account and cost_center):
+		frappe.throw(
+			_(
+				"Company {0} is missing currency, an expense/write-off account, or a cost "
+				"center — cannot auto-create a cash register."
+			).format(company)
+		)
+
+	price_list = (
+		frappe.db.get_single_value("Selling Settings", "selling_price_list")
+		or (frappe.db.exists("Price List", "Standard Selling") and "Standard Selling")
+		or frappe.db.get_value("Price List", {"selling": 1, "enabled": 1}, "name")
+	)
+
+	doc = frappe.new_doc("POS Profile")
+	doc.name = WEB_POS_PROFILE_NAME
+	doc.company = company
+	doc.warehouse = warehouse
+	doc.currency = currency
+	doc.write_off_account = write_off_account
+	doc.write_off_cost_center = cost_center
+	doc.write_off_limit = 0
+	doc.disabled = 0
+	if price_list:
+		doc.selling_price_list = price_list
+	_set_payments(doc, [{"mode_of_payment": "Cash", "default": 1}])
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return doc.name
+
+
 def _revenue_for_warehouse(warehouse: str, start_date, end_date) -> float:
 	"""Sum submitted Sales Invoice Item amounts for a warehouse in a date range."""
 	if not warehouse:

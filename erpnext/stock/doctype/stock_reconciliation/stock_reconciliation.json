@@ -10,6 +10,8 @@
   "naming_series",
   "company",
   "purpose",
+  "purpose_note",
+  "traceability_json",
   "col1",
   "posting_date",
   "posting_time",
@@ -56,6 +58,18 @@
    "label": "Purpose",
    "options": "\nOpening Stock\nStock Reconciliation",
    "reqd": 1
+  },
+  {
+   "fieldname": "purpose_note",
+   "fieldtype": "Small Text",
+   "label": "Purpose Note",
+   "description": "Why this reconciliation was created (e.g. POS sale cancel or edit)."
+  },
+  {
+   "fieldname": "traceability_json",
+   "fieldtype": "Long Text",
+   "label": "Traceability JSON",
+   "description": "POS / cashier / admin PIN audit payload for this remediation."
   },
   {
    "fieldname": "col1",

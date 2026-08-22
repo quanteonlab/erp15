@@ -77,7 +77,7 @@ def _normalize_pos_display(raw) -> dict:
 	return {
 		"showDiscountName": _as_bool(src.get("showDiscountName"), True),
 		"productLayout": layout,
-		"showDiscountsTab": _as_bool(src.get("showDiscountsTab"), True),
+		"showSessionsTab": _as_bool(src.get("showSessionsTab"), True),
 		"showOrdersTab": _as_bool(src.get("showOrdersTab"), True),
 		"showDisabledProducts": _as_bool(src.get("showDisabledProducts"), False),
 		"showNegativeStockProducts": _as_bool(src.get("showNegativeStockProducts"), True),
@@ -112,11 +112,37 @@ def _normalize_stock_warning(raw) -> dict:
 	}
 
 
+def _as_hex(val, default: str) -> str:
+	s = str(val or "").strip()
+	if s in ("", "transparent", "none"):
+		return ""
+	if s.startswith("#") and len(s) == 7:
+		try:
+			int(s[1:], 16)
+			return s.lower()
+		except Exception:
+			pass
+	return default
+
+
+def _normalize_catalog_display(raw) -> dict:
+	src = raw if isinstance(raw, dict) else {}
+	return {
+		"pageBackgroundColor": _as_hex(src.get("pageBackgroundColor"), ""),
+		"cardBackgroundColor": _as_hex(src.get("cardBackgroundColor"), "#ffffff"),
+		"cardBorderColor": _as_hex(src.get("cardBorderColor"), "#e5e7eb"),
+		"showCardBorder": _as_bool(src.get("showCardBorder"), True),
+		"cardBorderRadius": _as_int(src.get("cardBorderRadius"), 8, 0, 32),
+		"noImageTilesAtEnd": _as_bool(src.get("noImageTilesAtEnd"), True),
+	}
+
+
 def _normalize_bundle(data: dict | None) -> dict:
 	src = data if isinstance(data, dict) else {}
 	return {
 		"posDisplay": _normalize_pos_display(src.get("posDisplay")),
 		"stockWarning": _normalize_stock_warning(src.get("stockWarning")),
+		"catalogDisplay": _normalize_catalog_display(src.get("catalogDisplay")),
 	}
 
 
@@ -151,6 +177,9 @@ def save_shop_ui_settings(settings=None):
 		),
 		"stockWarning": _normalize_stock_warning(
 			{**(current.get("stockWarning") or {}), **(incoming.get("stockWarning") or {})}
+		),
+		"catalogDisplay": _normalize_catalog_display(
+			{**(current.get("catalogDisplay") or {}), **(incoming.get("catalogDisplay") or {})}
 		),
 	}
 	_save_raw(merged)

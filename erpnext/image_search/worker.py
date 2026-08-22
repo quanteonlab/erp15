@@ -22,53 +22,44 @@ class ImageSearchWorker:
         self.search_service = ImageSearchService()
 
     def start_worker(self):
-        """Start processing jobs from the queue"""
-        enqueue(
-            'erpnext.image_search.worker.process_job_batch',
-            queue='default',
-            timeout=600,
-            is_async=True
-        )
+        """Start processing jobs from the queue (one RQ job at a time)."""
+        enqueue_image_search_batch()
 
-    def process_job_batch(self, batch_size: int = 10):
-        """Process a batch of image search jobs"""
+    def process_job_batch(self, batch_size: int = 1):
+        """Process a small batch so one hung search cannot stall the queue."""
+        try:
+            batch_size = max(1, min(int(batch_size or 1), 3))
+        except (TypeError, ValueError):
+            batch_size = 1
+
         jobs = self.queue_manager.get_next_batch(batch_size)
+        print(f"image_search: picked {len(jobs)} job(s)", flush=True)
+        frappe.logger().info(f"image_search: picked {len(jobs)} job(s)")
 
         if not jobs:
-            frappe.logger().info("No image search jobs in queue")
             return
 
-        frappe.logger().info(f"Processing {len(jobs)} image search jobs")
-
-        for job in jobs:
+        for i, job in enumerate(jobs):
             try:
                 self.process_single_job(job)
-                # Rate limiting: 2 seconds between requests (DuckDuckGo)
-                time.sleep(2)
             except Exception as e:
+                print(f"image_search: job {job.get('name')} failed: {e}", flush=True)
                 frappe.log_error(
                     title="Image Search Worker Error",
                     message=f"Error processing job {job.name}: {str(e)}"
                 )
                 self.queue_manager.mark_job_failed(job.name, str(e))
+            if i < len(jobs) - 1:
+                time.sleep(1)
 
-        # Schedule next batch if there are more jobs
         pending_count = frappe.db.count(
             "Product Image Search Job",
             {"status": ["in", ["Pending", "Retrying"]]}
         )
+        print(f"image_search: {pending_count} remaining after batch", flush=True)
 
         if pending_count > 0:
-            frappe.logger().info(
-                f"{pending_count} jobs remaining, scheduling next batch"
-            )
-            enqueue(
-                'erpnext.image_search.worker.process_job_batch',
-                queue='default',
-                timeout=600,
-                is_async=True,
-                batch_size=batch_size
-            )
+            enqueue_image_search_batch(batch_size=batch_size)
 
     def process_single_job(self, job: Dict):
         """Process a single image search job"""
@@ -115,6 +106,10 @@ class ImageSearchWorker:
                     product_id=job['product_id'],
                 )
 
+            print(
+                f"image_search: completed {job_name} ({job.get('product_name')}): {saved_count} images",
+                flush=True,
+            )
             frappe.logger().info(
                 f"Completed job {job_name} for {job['product_name']}: {saved_count} images found"
             )
@@ -204,7 +199,23 @@ class ImageSearchWorker:
 
 # Module-level functions for enqueue
 
-def process_job_batch(batch_size=10):
+IMAGE_SEARCH_RQ_JOB_ID = "image_search_process_job_batch"
+
+
+def enqueue_image_search_batch(batch_size: int = 1):
+    """Enqueue at most one in-flight image-search RQ job."""
+    enqueue(
+        "erpnext.image_search.worker.process_job_batch",
+        queue="default",
+        timeout=120,
+        is_async=True,
+        job_id=IMAGE_SEARCH_RQ_JOB_ID,
+        deduplicate=True,
+        batch_size=batch_size,
+    )
+
+
+def process_job_batch(batch_size=1):
     """Process a batch of image search jobs - callable by enqueue"""
     worker = ImageSearchWorker()
     worker.process_job_batch(batch_size)

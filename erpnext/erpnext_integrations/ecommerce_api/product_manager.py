@@ -793,6 +793,34 @@ def get_product_rows(
         )
         values["list_price_lt"] = flt(list_price_lt)
 
+    # Displayed cost is blank when buying rate is missing or <= 0.
+    buying_rate_sql = (
+        "IFNULL(("
+        " SELECT ipx.price_list_rate FROM `tabItem Price` ipx"
+        " WHERE ipx.item_code = i.item_code AND ipx.price_list = %(buying_price_list)s AND ipx.buying = 1"
+        " LIMIT 1"
+        "), 0)"
+    )
+    missing_cost_sql = f"({buying_rate_sql} <= 0)"
+
+    cost_price_gt = filters.get("cost_price_gt")
+    if cost_price_gt is not None and str(cost_price_gt).strip() != "":
+        values["cost_price_gt"] = flt(cost_price_gt)
+        conditions.append(f"{buying_rate_sql} > %(cost_price_gt)s")
+
+    cost_price_lt = filters.get("cost_price_lt")
+    if cost_price_lt is not None and str(cost_price_lt).strip() != "":
+        values["cost_price_lt"] = flt(cost_price_lt)
+        if flt(cost_price_lt) <= 0:
+            # Cost < 0 / < -1 / < 0 includes rows with no buying cost.
+            conditions.append(
+                f"({missing_cost_sql} OR {buying_rate_sql} < %(cost_price_lt)s)"
+            )
+        else:
+            conditions.append(
+                f"({buying_rate_sql} > 0 AND {buying_rate_sql} < %(cost_price_lt)s)"
+            )
+
     modified_after = filters.get("modified_after")
     if modified_after not in (None, "", "null"):
         conditions.append("i.modified >= %(modified_after)s")
@@ -2741,6 +2769,136 @@ def get_cash_register_session(session_id):
     )
 
     return _impl(session_id)
+
+
+@frappe.whitelist()
+def get_pos_admin_settings():
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        get_pos_admin_settings as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def save_pos_admin_settings(pin=None, amendment_note_required=None, clear_pin=0, session_mode=None, start_requires_pin=None, default_pos_profile=None):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        save_pos_admin_settings as _impl,
+    )
+
+    return _impl(
+        pin=pin,
+        amendment_note_required=amendment_note_required,
+        clear_pin=clear_pin,
+        session_mode=session_mode,
+        start_requires_pin=start_requires_pin,
+        default_pos_profile=default_pos_profile,
+    )
+
+
+@frappe.whitelist()
+def validate_admin_pin(pin=None):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        validate_admin_pin as _impl,
+    )
+
+    return _impl(pin=pin)
+
+
+@frappe.whitelist()
+def list_pos_cash_sessions(pos_profile=None, status=None, page=1, page_length=50):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        list_pos_cash_sessions as _impl,
+    )
+
+    return _impl(pos_profile=pos_profile, status=status, page=page, page_length=page_length)
+
+
+@frappe.whitelist()
+def get_pos_cash_session(session_id=None, pos_profile=None):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        get_pos_cash_session as _impl,
+    )
+
+    return _impl(session_id=session_id, pos_profile=pos_profile)
+
+
+@frappe.whitelist()
+def start_pos_cash_session(pos_profile, cashier_user=None, opening_cash=0, pin=None, close_existing=0):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        start_pos_cash_session as _impl,
+    )
+
+    return _impl(
+        pos_profile=pos_profile,
+        cashier_user=cashier_user,
+        opening_cash=opening_cash,
+        pin=pin,
+        close_existing=close_existing,
+    )
+
+
+@frappe.whitelist()
+def ensure_pos_cash_session(pos_profile=None, cashier_user=None, pin=None, opening_cash=0):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        ensure_pos_cash_session as _impl,
+    )
+
+    return _impl(
+        pos_profile=pos_profile,
+        cashier_user=cashier_user,
+        pin=pin,
+        opening_cash=opening_cash,
+    )
+
+
+@frappe.whitelist()
+def close_pos_cash_session(session_id, pin=None, note=None):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        close_pos_cash_session as _impl,
+    )
+
+    return _impl(session_id=session_id, pin=pin, note=note)
+
+
+@frappe.whitelist()
+def update_pos_cash_session(session_id, pin=None, cashier_user=None, opening_cash=None, note=None):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        update_pos_cash_session as _impl,
+    )
+
+    return _impl(
+        session_id=session_id,
+        pin=pin,
+        cashier_user=cashier_user,
+        opening_cash=opening_cash,
+        note=note,
+    )
+
+
+@frappe.whitelist()
+def preview_pos_sale_amendment(invoice_name, action="cancel", items=None):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        preview_pos_sale_amendment as _impl,
+    )
+
+    return _impl(invoice_name=invoice_name, action=action, items=items)
+
+
+@frappe.whitelist()
+def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=None, session_id=None):
+    from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+        amend_pos_sale as _impl,
+    )
+
+    return _impl(
+        invoice_name=invoice_name,
+        action=action,
+        pin=pin,
+        note=note,
+        items=items,
+        session_id=session_id,
+    )
 
 
 @frappe.whitelist()

@@ -168,7 +168,8 @@ class ImageSearchQueueManager:
 
         # Reclaim orphaned Queued / stale In Progress so a crashed worker
         # cannot leave the queue permanently stuck.
-        self.reclaim_stuck_jobs(queued_after_minutes=10, in_progress_after_minutes=30)
+        # Queued is always reclaimable. In Progress older than 2 min is a hung search.
+        self.reclaim_stuck_jobs(queued_after_minutes=0, in_progress_after_minutes=2)
 
         raw_jobs = frappe.get_all(
             "Product Image Search Job",

@@ -1744,20 +1744,15 @@ def validate_coupon_code(coupon_code):
 
 @frappe.whitelist(allow_guest=True)
 def validate_discount_pin(pin):
-	"""
-	Validate a manager PIN for authorising above-threshold cashier discounts.
-	The PIN is stored in site_config.json under the key 'pos_manager_pin'.
-	Returns {authorized: true/false}.
-	"""
-	if not pin:
-		return {"authorized": False}
+	"""Manager PIN for cashier discounts. If no PIN is set, discounts stay open."""
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+		_pin_configured,
+		validate_admin_pin,
+	)
 
-	expected = frappe.conf.get("pos_manager_pin")
-	if not expected:
-		# No PIN configured — all discounts allowed (open mode)
-		return {"authorized": True}
-
-	return {"authorized": str(pin) == str(expected)}
+	if not _pin_configured():
+		return {"authorized": True, "pin_configured": False}
+	return validate_admin_pin(pin=pin)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -4076,6 +4071,23 @@ def ping():
 	}
 
 
+@frappe.whitelist(allow_guest=True)
+def get_deploy_info():
+	"""Last backend deploy time (ERP_DEPLOY_AT env, else this module's mtime)."""
+	from datetime import datetime, timezone
+
+	raw = (os.environ.get("ERP_DEPLOY_AT") or os.environ.get("DEPLOY_AT") or "").strip()
+	source = "env"
+	if not raw:
+		source = "module_mtime"
+		try:
+			mtime = os.path.getmtime(os.path.abspath(__file__))
+			raw = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+		except OSError:
+			raw = ""
+	return {"deployed_at": raw, "source": source}
+
+
 @frappe.whitelist()
 def get_user_roles_for_auth(username):
 	"""
@@ -4257,6 +4269,46 @@ def _ensure_pos_sale_items_enabled(item_codes: list[str]) -> list[str]:
 	return reactivated
 
 
+def _ensure_pos_sale_item_groups(item_codes: list[str]) -> None:
+	"""Create missing Item Groups referenced by sale SKUs.
+
+	Offline POS already took the money; SI submit looks up Item.item_group and
+	raises DoesNotExistError (HTTP 404) if the group was deleted.
+	"""
+	if not item_codes:
+		return
+	groups = frappe.get_all(
+		"Item",
+		filters={"name": ("in", item_codes)},
+		pluck="item_group",
+		ignore_permissions=True,
+	)
+	needed = sorted({g for g in groups if g})
+	if not needed:
+		return
+	parent = (
+		(frappe.db.exists("Item Group", "All Item Groups") and "All Item Groups")
+		or frappe.db.get_value("Item Group", {"is_group": 1}, "name")
+	)
+	created = False
+	for name in needed:
+		if frappe.db.exists("Item Group", name):
+			continue
+		if not parent:
+			frappe.throw(_("Item Group {0} not found and no parent group exists.").format(name))
+		frappe.get_doc(
+			{
+				"doctype": "Item Group",
+				"item_group_name": name,
+				"parent_item_group": parent,
+				"is_group": 0,
+			}
+		).insert(ignore_permissions=True)
+		created = True
+	if created:
+		frappe.db.commit()
+
+
 @frappe.whitelist()
 def create_pos_sale(
 	offline_order_uuid,
@@ -4270,6 +4322,7 @@ def create_pos_sale(
 	sale_mode="WHITE",
 	payments=None,
 	cash_received=None,
+	pos_session_id=None,
 ):
 	"""
 	Create a POS sale as a submitted Sales Invoice + Payment Entry.
@@ -4337,6 +4390,7 @@ def create_pos_sale(
 	if missing:
 		frappe.throw(_("Item(s) not found: {0}").format(", ".join(missing)))
 	reactivated = _ensure_pos_sale_items_enabled(required_codes)
+	_ensure_pos_sale_item_groups(required_codes)
 
 	# ── Resolve defaults ──────────────────────────────────────────────────────
 	company = frappe.defaults.get_user_default("Company") or frappe.db.get_single_value(
@@ -4374,6 +4428,13 @@ def create_pos_sale(
 		remarks_tag += f" | cash_received:{cash_received}"
 	if reactivated:
 		remarks_tag += f" | reenabled_items:{','.join(reactivated)}"
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+		attach_session_to_sale_remarks,
+	)
+
+	remarks_tag = attach_session_to_sale_remarks(
+		remarks_tag, warehouse=warehouse, pos_session_id=pos_session_id
+	)
 
 	invoice = frappe.get_doc(
 		{
@@ -4435,6 +4496,62 @@ def create_pos_sale(
 		"sale_mode": sale_mode,
 		"is_borrador": is_borrador,
 		"status": "created",
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_pos_sale(offline_order_uuid=None, invoice_id=None):
+	"""Look up a POS invoice without creating one. Used to recheck local 'synced' rows."""
+	uuid = (offline_order_uuid or "").strip()
+	name = (invoice_id or "").strip()
+	filters = None
+	if uuid:
+		filters = {"remarks": ("like", f"%offline_order_uuid:{uuid}%")}
+	elif name:
+		filters = {"name": name}
+	else:
+		return {"found": 0, "invoice_id": None, "offline_order_uuid": uuid}
+
+	rows = frappe.get_all(
+		"Sales Invoice",
+		filters=filters,
+		fields=["name", "docstatus", "grand_total", "status"],
+		ignore_permissions=True,
+		limit=1,
+	)
+	if not rows:
+		return {"found": 0, "invoice_id": None, "docstatus": None, "offline_order_uuid": uuid}
+	row = rows[0]
+	return {
+		"found": 1,
+		"invoice_id": row.get("name"),
+		"docstatus": row.get("docstatus"),
+		"grand_total": row.get("grand_total"),
+		"status": row.get("status"),
+		"offline_order_uuid": uuid,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_stock_entry_status(stock_entry_id=None):
+	"""Confirm a receiving Stock Entry still exists on the backend."""
+	name = (stock_entry_id or "").strip()
+	if not name:
+		return {"found": 0, "stock_entry_id": None}
+	rows = frappe.get_all(
+		"Stock Entry",
+		filters={"name": name},
+		fields=["name", "docstatus"],
+		ignore_permissions=True,
+		limit=1,
+	)
+	if not rows:
+		return {"found": 0, "stock_entry_id": name, "docstatus": None}
+	row = rows[0]
+	return {
+		"found": 1,
+		"stock_entry_id": row.get("name"),
+		"docstatus": row.get("docstatus"),
 	}
 
 
