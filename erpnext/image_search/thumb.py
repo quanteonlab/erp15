@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import glob
 import io
+import os
 from typing import Any, Dict, Optional
 
 import frappe
 import requests
 from frappe import _
-from frappe.utils.file_manager import save_file
+from frappe.utils import get_files_path
+from frappe.utils.file_manager import get_content_hash
 
 THUMB_SIZE = 256
 JPEG_QUALITY = 85
@@ -19,9 +22,12 @@ USER_AGENT = (
 )
 
 
+def sku_image_stem(item_code: str) -> str:
+	return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(item_code))
+
+
 def thumb_filename(item_code: str) -> str:
-	safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(item_code))
-	return f"{safe}-thumb.jpg"
+	return f"{sku_image_stem(item_code)}.jpg"
 
 
 def download_image_bytes(url: str) -> bytes:
@@ -131,23 +137,48 @@ def encode_thumb_jpeg(image_bytes: bytes, crop: Optional[Dict[str, Any]] = None)
 	return buf.getvalue()
 
 
-def _delete_existing_thumb_files(item_code: str, fname: str) -> None:
-	"""Remove prior thumb File rows for this Item so names do not pile up."""
+def _delete_item_image_files(item_code: str, fname: str) -> None:
+	"""Remove prior Item image File rows and leftover sku / sku-thumb disk files."""
+	stem = sku_image_stem(item_code)
 	existing = frappe.get_all(
 		"File",
-		filters={
-			"attached_to_doctype": "Item",
-			"attached_to_name": item_code,
-			"file_name": fname,
-		},
-		pluck="name",
+		filters={"attached_to_doctype": "Item", "attached_to_name": item_code},
+		fields=["name", "file_name", "file_url"],
 		ignore_permissions=True,
 	)
-	for name in existing:
+	for row in existing:
+		fn = str(row.file_name or "")
+		fu = str(row.file_url or "")
+		is_sku_image = (
+			fn == fname
+			or fn.startswith(f"{stem}-thumb")
+			or (fn.startswith(stem) and fn.lower().endswith((".jpg", ".jpeg", ".png", ".webp")))
+			or fu.startswith(f"/files/{stem}")
+		)
+		if not is_sku_image:
+			continue
 		try:
-			frappe.delete_doc("File", name, ignore_permissions=True, force=True)
+			frappe.delete_doc("File", row.name, ignore_permissions=True, force=True)
 		except Exception:
-			frappe.log_error(title="Thumb file delete failed", message=f"{item_code} {name}")
+			frappe.log_error(title="Item image file delete failed", message=f"{item_code} {row.name}")
+
+	folder = get_files_path(is_private=False)
+	patterns = [
+		os.path.join(folder, fname),
+		os.path.join(folder, f"{stem}-thumb.jpg"),
+		*glob.glob(os.path.join(folder, f"{stem}-thumb*.jpg")),
+		*glob.glob(os.path.join(folder, f"{stem}.jpg")),
+	]
+	seen = set()
+	for path in patterns:
+		if path in seen:
+			continue
+		seen.add(path)
+		if os.path.isfile(path):
+			try:
+				os.remove(path)
+			except OSError:
+				frappe.log_error(title="Item image disk delete failed", message=path)
 
 
 def materialize_item_thumb(
@@ -158,8 +189,7 @@ def materialize_item_thumb(
 	commit: bool = True,
 ) -> str:
 	"""
-	Encode a 256×256 JPEG, attach as public File on Item, set Item.image.
-	Returns the local file_url (/files/...).
+	Encode a 256×256 JPEG as /files/{sku}.jpg, overwriting any previous SKU image.
 	"""
 	if not item_code:
 		frappe.throw(_("Item code required"))
@@ -168,16 +198,31 @@ def materialize_item_thumb(
 
 	jpeg = encode_thumb_jpeg(image_bytes, crop)
 	fname = thumb_filename(item_code)
-	_delete_existing_thumb_files(item_code, fname)
+	file_url = f"/files/{fname}"
+	_delete_item_image_files(item_code, fname)
 
-	ret = save_file(fname, jpeg, "Item", item_code, is_private=0)
-	file_url = getattr(ret, "file_url", None)
-	if not file_url and isinstance(ret, dict):
-		file_url = ret.get("file_url")
-	if not file_url and getattr(ret, "name", None):
-		file_url = frappe.db.get_value("File", ret.name, "file_url")
-	if not file_url:
-		frappe.throw(_("Could not store image file"))
+	folder = get_files_path(is_private=False)
+	frappe.create_folder(folder)
+	disk_path = os.path.join(folder, fname)
+	with open(disk_path, "wb") as out:
+		out.write(jpeg)
+
+	file_doc = frappe.get_doc(
+		{
+			"doctype": "File",
+			"file_name": fname,
+			"file_url": file_url,
+			"attached_to_doctype": "Item",
+			"attached_to_name": item_code,
+			"is_private": 0,
+			"file_size": len(jpeg),
+			"content_hash": get_content_hash(jpeg),
+		}
+	)
+	file_doc.flags.ignore_permissions = True
+	file_doc.flags.copy_from_existing_file = True
+	file_doc.flags.ignore_duplicate_entry_error = True
+	file_doc.insert(ignore_permissions=True)
 
 	frappe.db.set_value("Item", item_code, "image", file_url)
 	if commit:
@@ -185,39 +230,72 @@ def materialize_item_thumb(
 	return file_url
 
 
+def _normalize_file_url(file_url: str) -> str:
+	from urllib.parse import unquote, urlparse
+
+	raw = str(file_url or "").strip()
+	if not raw:
+		return ""
+	if raw.startswith("http://") or raw.startswith("https://"):
+		parsed = urlparse(raw)
+		raw = parsed.path or ""
+	else:
+		raw = raw.split("?", 1)[0].split("#", 1)[0]
+	raw = unquote(raw).strip()
+	if raw and not raw.startswith("/"):
+		raw = "/" + raw
+	return raw
+
+
 def read_local_file_bytes(file_url: str) -> bytes:
 	"""Read bytes for a site-relative /files/ or /private/files/ URL."""
-	if not file_url or not str(file_url).startswith("/"):
-		frappe.throw(_("Not a local file URL"))
-	file_doc = frappe.db.get_value("File", {"file_url": file_url}, "name")
-	if not file_doc:
-		# Fallback: path under sites
-		from frappe.utils import get_files_path
-		import os
+	import os
+	from urllib.parse import unquote
 
-		rel = str(file_url).lstrip("/")
-		if rel.startswith("files/"):
-			path = get_files_path(rel[len("files/") :], is_private=False)
-		elif rel.startswith("private/files/"):
-			path = get_files_path(rel[len("private/files/") :], is_private=True)
-		else:
-			frappe.throw(_("Unsupported local file path"))
-		if not os.path.isfile(path):
-			frappe.throw(_("Local image file not found"))
+	from frappe.utils import get_files_path
+
+	url = _normalize_file_url(file_url)
+	if not url.startswith("/"):
+		frappe.throw(_("Not a local file URL"))
+
+	file_doc = frappe.db.get_value("File", {"file_url": url}, "name")
+	if not file_doc:
+		fname = unquote(url.rsplit("/", 1)[-1])
+		matches = frappe.get_all(
+			"File",
+			filters={"file_name": fname},
+			pluck="name",
+			limit=5,
+			ignore_permissions=True,
+		)
+		file_doc = matches[0] if matches else None
+
+	if file_doc:
+		frappe.flags.ignore_permissions = True
+		try:
+			doc = frappe.get_doc("File", file_doc)
+			content = doc.get_content()
+		finally:
+			frappe.flags.ignore_permissions = False
+		if isinstance(content, str):
+			content = content.encode("utf-8")
+		if content:
+			return content
+
+	rel = url.lstrip("/")
+	path = None
+	if rel.startswith("files/"):
+		path = get_files_path(rel[len("files/") :], is_private=False)
+	elif rel.startswith("private/files/"):
+		path = get_files_path(rel[len("private/files/") :], is_private=True)
+	else:
+		frappe.throw(_("Unsupported local file path"))
+
+	if path and os.path.isfile(path):
 		with open(path, "rb") as f:
 			return f.read()
 
-	frappe.flags.ignore_permissions = True
-	try:
-		doc = frappe.get_doc("File", file_doc)
-		content = doc.get_content()
-	finally:
-		frappe.flags.ignore_permissions = False
-	if isinstance(content, str):
-		content = content.encode("utf-8")
-	if not content:
-		frappe.throw(_("Empty local image file"))
-	return content
+	frappe.throw(_("Local image file not found"))
 
 
 def mark_candidate_downloaded(candidate_name: str, file_url: str) -> None:

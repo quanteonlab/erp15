@@ -1401,6 +1401,53 @@ def select_item_image_candidate(item_code, candidate_name):
 
 
 @frappe.whitelist()
+def apply_item_image_from_url(item_code, image_url):
+    """Download a remote (or local File) URL and save it as the Item thumb."""
+    frappe.has_permission("Item", "write", throw=True)
+    url = (image_url or "").strip()
+    if not url:
+        frappe.throw(_("Image URL required"))
+
+    from erpnext.image_search.thumb import (
+        download_image_bytes,
+        materialize_item_thumb,
+        read_local_file_bytes,
+        _normalize_file_url,
+    )
+
+    if url.startswith("http://") or url.startswith("https://"):
+        parsed_path = _normalize_file_url(url)
+        if parsed_path.startswith("/files/") or parsed_path.startswith("/private/files/"):
+            try:
+                image_bytes = read_local_file_bytes(parsed_path)
+            except Exception:
+                image_bytes = download_image_bytes(url.split("?", 1)[0])
+        else:
+            image_bytes = download_image_bytes(url)
+    elif url.startswith("/"):
+        try:
+            image_bytes = read_local_file_bytes(url)
+        except Exception:
+            from frappe.utils import get_url
+
+            image_bytes = download_image_bytes(get_url(_normalize_file_url(url)))
+    else:
+        frappe.throw(_("Unsupported image URL"))
+
+    file_url = materialize_item_thumb(item_code, image_bytes, crop=None, commit=False)
+    frappe.db.sql(
+        """
+        UPDATE `tabProduct Image Candidate`
+        SET is_selected = 0
+        WHERE product_type = 'Item' AND product_id = %s
+        """,
+        (item_code,),
+    )
+    frappe.db.commit()
+    return {"ok": True, "success": True, "image_url": file_url}
+
+
+@frappe.whitelist()
 def get_item_image_jobs(status_group="running", limit=100):
     """Return item image-search jobs for the POS jobs modal."""
     frappe.has_permission("Item", "read", throw=True)
