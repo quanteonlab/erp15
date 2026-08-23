@@ -18,7 +18,8 @@ JPEG_QUALITY = 85
 MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
 DOWNLOAD_TIMEOUT_S = 12
 USER_AGENT = (
-	"Mozilla/5.0 (compatible; ERPNextImageThumb/1.0; +https://frappeframework.com)"
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+	"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 
@@ -26,22 +27,76 @@ def sku_image_stem(item_code: str) -> str:
 	return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(item_code))
 
 
-def thumb_filename(item_code: str) -> str:
-	return f"{sku_image_stem(item_code)}.jpg"
+def thumb_filename(item_code: str, variant: str = "final") -> str:
+	stem = sku_image_stem(item_code)
+	kind = (variant or "final").strip().lower()
+	if kind == "temp":
+		return f"{stem}_temp.jpg"
+	if kind in ("temp_crop", "crop"):
+		return f"{stem}_temp_crop.jpg"
+	return f"{stem}.jpg"
+
+
+def unwrap_image_url(url: str) -> str:
+	"""Accept page-wrapper URLs (Google imgurl=, etc.) and return the inner image URL."""
+	from urllib.parse import parse_qs, unquote, urlparse
+
+	raw = str(url or "").strip()
+	if not raw:
+		return ""
+	if raw.startswith("data:image/"):
+		return raw
+	parsed = urlparse(raw)
+	qs = parse_qs(parsed.query)
+	for key in ("imgurl", "mediaurl", "image", "imgrefurl", "url", "src"):
+		vals = qs.get(key)
+		if not vals:
+			continue
+		inner = unquote(vals[0]).strip()
+		if inner.startswith("data:image/") or inner.startswith("http://") or inner.startswith("https://"):
+			if key == "url" and "google." in (parsed.netloc or "").lower() and "imgurl" in qs:
+				continue
+			if inner.startswith("http") and any(
+				inner.lower().endswith(ext) or f"{ext}?" in inner.lower()
+				for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff")
+			):
+				return inner
+			if key in ("imgurl", "mediaurl", "image", "src"):
+				return inner
+	return raw
+
+
+def _decode_data_image(url: str) -> bytes:
+	import base64
+
+	header, _, payload = url.partition(",")
+	if not payload:
+		frappe.throw(_("Invalid data image URL"))
+	try:
+		return base64.b64decode(payload)
+	except Exception:
+		frappe.throw(_("Invalid data image URL"))
 
 
 def download_image_bytes(url: str) -> bytes:
 	if not url or not str(url).strip():
 		frappe.throw(_("Empty image URL"))
-	url = str(url).strip()
+	url = unwrap_image_url(str(url).strip())
+	if url.startswith("data:image/"):
+		return _decode_data_image(url)
 	try:
 		resp = requests.get(
 			url,
 			timeout=DOWNLOAD_TIMEOUT_S,
-			headers={"User-Agent": USER_AGENT},
+			headers={
+				"User-Agent": USER_AGENT,
+				"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+			},
 			stream=True,
+			allow_redirects=True,
 		)
 		resp.raise_for_status()
+		ctype = (resp.headers.get("content-type") or "").lower()
 		chunks = []
 		total = 0
 		for chunk in resp.iter_content(chunk_size=64 * 1024):
@@ -54,6 +109,8 @@ def download_image_bytes(url: str) -> bytes:
 		data = b"".join(chunks)
 		if not data:
 			frappe.throw(_("Empty image download"))
+		if "text/html" in ctype and not data[:16].startswith((b"\x89PNG", b"\xff\xd8", b"RIFF", b"GIF")):
+			frappe.throw(_("URL did not return an image (html page). Use a direct png/jpg/webp link."))
 		return data
 	except frappe.ValidationError:
 		raise
@@ -67,8 +124,13 @@ def _open_rgb(image_bytes: bytes):
 	except ImportError:
 		frappe.throw(_("Pillow is required for product thumbnails"))
 
-	img = Image.open(io.BytesIO(image_bytes))
-	img.load()
+	try:
+		img = Image.open(io.BytesIO(image_bytes))
+		if getattr(img, "n_frames", 1) > 1:
+			img.seek(0)
+		img.load()
+	except Exception:
+		frappe.throw(_("Could not decode image (use png, jpg, webp, gif, or similar)"))
 	if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
 		rgba = img.convert("RGBA")
 		bg = Image.new("RGB", rgba.size, (255, 255, 255))
@@ -137,9 +199,9 @@ def encode_thumb_jpeg(image_bytes: bytes, crop: Optional[Dict[str, Any]] = None)
 	return buf.getvalue()
 
 
-def _delete_item_image_files(item_code: str, fname: str) -> None:
-	"""Remove prior Item image File rows and leftover sku / sku-thumb disk files."""
-	stem = sku_image_stem(item_code)
+def _delete_named_image_file(item_code: str, fname: str) -> None:
+	"""Remove one SKU image filename (File rows + disk), nothing else."""
+	file_url = f"/files/{fname}"
 	existing = frappe.get_all(
 		"File",
 		filters={"attached_to_doctype": "Item", "attached_to_name": item_code},
@@ -147,64 +209,46 @@ def _delete_item_image_files(item_code: str, fname: str) -> None:
 		ignore_permissions=True,
 	)
 	for row in existing:
-		fn = str(row.file_name or "")
-		fu = str(row.file_url or "")
-		is_sku_image = (
-			fn == fname
-			or fn.startswith(f"{stem}-thumb")
-			or (fn.startswith(stem) and fn.lower().endswith((".jpg", ".jpeg", ".png", ".webp")))
-			or fu.startswith(f"/files/{stem}")
-		)
-		if not is_sku_image:
-			continue
-		try:
-			frappe.delete_doc("File", row.name, ignore_permissions=True, force=True)
-		except Exception:
-			frappe.log_error(title="Item image file delete failed", message=f"{item_code} {row.name}")
+		if str(row.file_name or "") == fname or str(row.file_url or "").split("?")[0] == file_url:
+			try:
+				frappe.delete_doc("File", row.name, ignore_permissions=True, force=True)
+			except Exception:
+				frappe.log_error(title="Item image file delete failed", message=f"{item_code} {row.name}")
 
 	folder = get_files_path(is_private=False)
-	patterns = [
-		os.path.join(folder, fname),
-		os.path.join(folder, f"{stem}-thumb.jpg"),
-		*glob.glob(os.path.join(folder, f"{stem}-thumb*.jpg")),
-		*glob.glob(os.path.join(folder, f"{stem}.jpg")),
-	]
-	seen = set()
-	for path in patterns:
-		if path in seen:
-			continue
-		seen.add(path)
-		if os.path.isfile(path):
+	path = os.path.join(folder, fname)
+	if os.path.isfile(path):
+		try:
+			os.remove(path)
+		except OSError:
+			frappe.log_error(title="Item image disk delete failed", message=path)
+
+
+def _write_item_jpeg(
+	item_code: str,
+	jpeg: bytes,
+	variant: str = "final",
+	*,
+	set_item_image: bool = True,
+	commit: bool = True,
+) -> str:
+	fname = thumb_filename(item_code, variant)
+	file_url = f"/files/{fname}"
+	_delete_named_image_file(item_code, fname)
+	if variant == "final":
+		_delete_named_image_file(item_code, thumb_filename(item_code, "temp"))
+		_delete_named_image_file(item_code, thumb_filename(item_code, "temp_crop"))
+		stem = sku_image_stem(item_code)
+		folder = get_files_path(is_private=False)
+		for path in glob.glob(os.path.join(folder, f"{stem}-thumb*.jpg")):
 			try:
 				os.remove(path)
 			except OSError:
-				frappe.log_error(title="Item image disk delete failed", message=path)
-
-
-def materialize_item_thumb(
-	item_code: str,
-	image_bytes: bytes,
-	crop: Optional[Dict[str, Any]] = None,
-	*,
-	commit: bool = True,
-) -> str:
-	"""
-	Encode a 256×256 JPEG as /files/{sku}.jpg, overwriting any previous SKU image.
-	"""
-	if not item_code:
-		frappe.throw(_("Item code required"))
-	if not image_bytes:
-		frappe.throw(_("No image data"))
-
-	jpeg = encode_thumb_jpeg(image_bytes, crop)
-	fname = thumb_filename(item_code)
-	file_url = f"/files/{fname}"
-	_delete_item_image_files(item_code, fname)
+				pass
 
 	folder = get_files_path(is_private=False)
 	frappe.create_folder(folder)
-	disk_path = os.path.join(folder, fname)
-	with open(disk_path, "wb") as out:
+	with open(os.path.join(folder, fname), "wb") as out:
 		out.write(jpeg)
 
 	file_doc = frappe.get_doc(
@@ -224,10 +268,56 @@ def materialize_item_thumb(
 	file_doc.flags.ignore_duplicate_entry_error = True
 	file_doc.insert(ignore_permissions=True)
 
-	frappe.db.set_value("Item", item_code, "image", file_url)
+	if set_item_image:
+		frappe.db.set_value("Item", item_code, "image", file_url)
 	if commit:
 		frappe.db.commit()
 	return file_url
+
+
+def materialize_item_thumb(
+	item_code: str,
+	image_bytes: bytes,
+	crop: Optional[Dict[str, Any]] = None,
+	*,
+	commit: bool = True,
+	variant: str = "final",
+	set_item_image: bool = True,
+) -> str:
+	"""Encode a 256×256 JPEG as /files/{sku}.jpg, _temp.jpg, or _temp_crop.jpg."""
+	if not item_code:
+		frappe.throw(_("Item code required"))
+	if not image_bytes:
+		frappe.throw(_("No image data"))
+
+	jpeg = encode_thumb_jpeg(image_bytes, crop)
+	return _write_item_jpeg(
+		item_code,
+		jpeg,
+		variant=variant,
+		set_item_image=set_item_image,
+		commit=commit,
+	)
+
+
+def promote_item_image_to_final(item_code: str, source_variant: str = "temp_crop", *, commit: bool = True) -> str:
+	"""Copy {sku}_temp_crop.jpg or {sku}_temp.jpg onto {sku}.jpg."""
+	folder = get_files_path(is_private=False)
+	order = [source_variant]
+	if source_variant != "temp_crop":
+		order.append("temp_crop")
+	if source_variant != "temp":
+		order.append("temp")
+	jpeg = None
+	for kind in order:
+		path = os.path.join(folder, thumb_filename(item_code, kind))
+		if os.path.isfile(path):
+			with open(path, "rb") as f:
+				jpeg = f.read()
+			break
+	if not jpeg:
+		frappe.throw(_("No temporary image to apply"))
+	return _write_item_jpeg(item_code, jpeg, variant="final", set_item_image=True, commit=commit)
 
 
 def _normalize_file_url(file_url: str) -> str:

@@ -1240,7 +1240,9 @@ def upload_item_image(item_code, filedata, filename="image.jpg"):
 
     from erpnext.image_search.thumb import materialize_item_thumb
 
-    file_url = materialize_item_thumb(item_code, content, crop=None, commit=True)
+    file_url = materialize_item_thumb(
+        item_code, content, crop=None, commit=True, variant="temp", set_item_image=True
+    )
     return {"ok": True, "image": file_url}
 
 
@@ -1262,6 +1264,7 @@ def crop_item_image(item_code, crop, candidate_name=None, filedata=None):
         download_image_bytes,
         mark_candidate_downloaded,
         materialize_item_thumb,
+        promote_item_image_to_final,
         read_local_file_bytes,
     )
 
@@ -1293,7 +1296,15 @@ def crop_item_image(item_code, crop, candidate_name=None, filedata=None):
         else:
             frappe.throw(_("Unsupported image URL for recrop"))
 
-    file_url = materialize_item_thumb(item_code, image_bytes, crop=crop, commit=False)
+    materialize_item_thumb(
+        item_code,
+        image_bytes,
+        crop=crop,
+        commit=False,
+        variant="temp_crop",
+        set_item_image=False,
+    )
+    file_url = promote_item_image_to_final(item_code, "temp_crop", commit=False)
 
     if selected_candidate:
         frappe.db.sql(
@@ -1392,17 +1403,17 @@ def enqueue_item_image_search(item_code, priority="High"):
 
 
 @frappe.whitelist()
-def select_item_image_candidate(item_code, candidate_name):
-    """Set one candidate as primary Item image."""
+def select_item_image_candidate(item_code, candidate_name, stage="temp"):
+    """Set one candidate as the working image (temp file until crop Apply)."""
     frappe.has_permission("Item", "write", throw=True)
     from erpnext.image_search.api import select_primary_image
 
-    return select_primary_image("Item", item_code, candidate_name)
+    return select_primary_image("Item", item_code, candidate_name, stage=stage)
 
 
 @frappe.whitelist()
-def apply_item_image_from_url(item_code, image_url):
-    """Download a remote (or local File) URL and save it as the Item thumb."""
+def apply_item_image_from_url(item_code, image_url, stage="temp"):
+    """Download a remote/local/data URL (png/webp/jpg/…) into {sku}_temp.jpg until Apply."""
     frappe.has_permission("Item", "write", throw=True)
     url = (image_url or "").strip()
     if not url:
@@ -1413,15 +1424,21 @@ def apply_item_image_from_url(item_code, image_url):
         materialize_item_thumb,
         read_local_file_bytes,
         _normalize_file_url,
+        unwrap_image_url,
     )
 
-    if url.startswith("http://") or url.startswith("https://"):
+    url = unwrap_image_url(url)
+    variant = "temp" if str(stage).strip().lower() != "final" else "final"
+
+    if url.startswith("data:image/"):
+        image_bytes = download_image_bytes(url)
+    elif url.startswith("http://") or url.startswith("https://"):
         parsed_path = _normalize_file_url(url)
         if parsed_path.startswith("/files/") or parsed_path.startswith("/private/files/"):
             try:
                 image_bytes = read_local_file_bytes(parsed_path)
             except Exception:
-                image_bytes = download_image_bytes(url.split("?", 1)[0])
+                image_bytes = download_image_bytes(url)
         else:
             image_bytes = download_image_bytes(url)
     elif url.startswith("/"):
@@ -1434,7 +1451,9 @@ def apply_item_image_from_url(item_code, image_url):
     else:
         frappe.throw(_("Unsupported image URL"))
 
-    file_url = materialize_item_thumb(item_code, image_bytes, crop=None, commit=False)
+    file_url = materialize_item_thumb(
+        item_code, image_bytes, crop=None, commit=False, variant=variant, set_item_image=True
+    )
     frappe.db.sql(
         """
         UPDATE `tabProduct Image Candidate`
@@ -1556,7 +1575,7 @@ def auto_apply_first_image_for_missing_items(priority="Low", limit=None, dry_run
                 continue
 
             try:
-                select_primary_image("Item", item_code, first_candidate.name)
+                select_primary_image("Item", item_code, first_candidate.name, stage="final")
                 applied_count += 1
             except Exception as exc:
                 errors.append({"item_code": item_code, "error": str(exc)})

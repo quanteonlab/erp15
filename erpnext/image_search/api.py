@@ -67,7 +67,7 @@ def get_product_image_candidates(product_type, product_id):
 
 
 @frappe.whitelist()
-def select_primary_image(product_type, product_id, candidate_name):
+def select_primary_image(product_type, product_id, candidate_name, stage="temp"):
     """
     Select a candidate as the primary product image.
 
@@ -103,7 +103,10 @@ def select_primary_image(product_type, product_id, candidate_name):
 
     if product_type == "Item":
         image_bytes = download_image_bytes(candidate.image_url)
-        file_url = materialize_item_thumb(product_id, image_bytes, crop=None, commit=False)
+        variant = "final" if str(stage).strip().lower() == "final" else "temp"
+        file_url = materialize_item_thumb(
+            product_id, image_bytes, crop=None, commit=False, variant=variant, set_item_image=True
+        )
         mark_candidate_downloaded(candidate_name, file_url)
         frappe.db.commit()
         return {
