@@ -469,14 +469,22 @@ def _maybe_require_start_pin(pin: str | None) -> None:
 
 
 def _resolve_start_pos_profile(pos_profile) -> str:
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import company_scope
+
 	name = (pos_profile or "").strip()
+	company = company_scope()
 	if name and frappe.db.exists("POS Profile", name):
-		return name
+		if not company or frappe.db.get_value("POS Profile", name, "company") == company:
+			return name
 	cfg = get_pos_admin_settings()
 	fallback = (cfg.get("default_pos_profile") or "").strip()
 	if fallback and frappe.db.exists("POS Profile", fallback):
-		return fallback
-	any_open = frappe.db.get_value("POS Profile", {"disabled": 0}, "name") or ""
+		if not company or frappe.db.get_value("POS Profile", fallback, "company") == company:
+			return fallback
+	filters = {"disabled": 0}
+	if company:
+		filters["company"] = company
+	any_open = frappe.db.get_value("POS Profile", filters, "name") or ""
 	if any_open:
 		return any_open
 	from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
@@ -529,10 +537,19 @@ def ensure_pos_cash_session(pos_profile=None, cashier_user=None, pin=None, openi
 	"""Reuse an open session, or autostart when settings allow (no PIN)."""
 	cfg = get_pos_admin_settings()
 	profile = (pos_profile or cfg.get("default_pos_profile") or "").strip()
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import company_scope
+
+	company = company_scope()
+	if profile and frappe.db.exists("POS Profile", profile):
+		if company and frappe.db.get_value("POS Profile", profile, "company") != company:
+			profile = ""
 	if profile and not frappe.db.exists("POS Profile", profile):
 		profile = ""
 	if not profile:
-		profile = frappe.db.get_value("POS Profile", {"disabled": 0}, "name") or ""
+		filters = {"disabled": 0}
+		if company:
+			filters["company"] = company
+		profile = frappe.db.get_value("POS Profile", filters, "name") or ""
 	if not profile:
 		from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
 			ensure_default_web_pos_profile,

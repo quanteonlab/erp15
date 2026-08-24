@@ -137,12 +137,18 @@ def _normalize_catalog_display(raw) -> dict:
 	}
 
 
+def _normalize_companies(raw) -> dict:
+	src = raw if isinstance(raw, dict) else {}
+	return {"enabled": _as_bool(src.get("enabled"), False)}
+
+
 def _normalize_bundle(data: dict | None) -> dict:
 	src = data if isinstance(data, dict) else {}
 	return {
 		"posDisplay": _normalize_pos_display(src.get("posDisplay")),
 		"stockWarning": _normalize_stock_warning(src.get("stockWarning")),
 		"catalogDisplay": _normalize_catalog_display(src.get("catalogDisplay")),
+		"companies": _normalize_companies(src.get("companies")),
 	}
 
 
@@ -180,6 +186,9 @@ def save_shop_ui_settings(settings=None):
 		),
 		"catalogDisplay": _normalize_catalog_display(
 			{**(current.get("catalogDisplay") or {}), **(incoming.get("catalogDisplay") or {})}
+		),
+		"companies": _normalize_companies(
+			{**(current.get("companies") or {}), **(incoming.get("companies") or {})}
 		),
 	}
 	_save_raw(merged)

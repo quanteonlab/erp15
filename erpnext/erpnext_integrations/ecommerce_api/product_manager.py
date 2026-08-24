@@ -376,9 +376,20 @@ def _generate_unique_item_code(exclude_codes=None) -> str:
 
 
 @frappe.whitelist()
-def get_pm_context():
+def get_pm_context(company=None):
+    from erpnext.erpnext_integrations.ecommerce_api.company_context import (
+        company_payload,
+        company_scope,
+        resolve_company,
+    )
+
     default_pl = _default_price_list()
-    default_company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
+    payload = company_payload(company)
+    default_company = payload.get("default_company") or resolve_company(company)
+    scoped = company_scope(company)
+    wh_filters = {"disabled": 0, "is_group": 0}
+    if scoped:
+        wh_filters["company"] = scoped
     price_lists = frappe.get_all(
         "Price List",
         filters={"selling": 1},
@@ -388,7 +399,7 @@ def get_pm_context():
     )
     warehouses = frappe.get_all(
         "Warehouse",
-        filters={"disabled": 0, "is_group": 0},
+        filters=wh_filters,
         pluck="name",
         order_by="name asc",
         limit=200,
@@ -401,13 +412,26 @@ def get_pm_context():
         order_by="name asc",
         ignore_permissions=True,
     )
+    pos_filters = {"disabled": 0}
+    if scoped:
+        pos_filters["company"] = scoped
+    pos_profiles = frappe.get_all(
+        "POS Profile",
+        filters=pos_filters,
+        pluck="name",
+        order_by="name asc",
+        ignore_permissions=True,
+    )
     return {
         "default_price_list": default_pl,
         "default_buying_price_list": _default_buying_price_list(),
         "default_company": default_company,
+        "multi_company_enabled": 1 if payload.get("enabled") else 0,
+        "companies": payload.get("companies") or [],
         "price_lists": price_lists or [],
         "buying_price_lists": buying_price_lists or [],
         "warehouses": warehouses or [],
+        "pos_profiles": pos_profiles or [],
     }
 
 
@@ -2502,9 +2526,7 @@ def _floor_map_api_module():
 
 @frappe.whitelist()
 def get_floors(company=None):
-    # `company` is accepted for API compatibility but unused: ECommerce Floor Map
-    # has no company field and the underlying implementation doesn't filter by it.
-    return _floor_map_api_module().get_floors()
+    return _floor_map_api_module().get_floors(company=company)
 
 
 @frappe.whitelist()
@@ -2530,6 +2552,7 @@ def save_floor_map(location_name, floor_name, sections_data=None, notes_data=Non
         notes_data or "[]",
         canvas_width,
         canvas_height,
+        company=company,
     )
 
 
@@ -2645,10 +2668,28 @@ def revert_field_change(doctype, name, field, value):
 
 
 @frappe.whitelist()
-def list_employees(search=None, status=None, page=1, page_length=100):
+def get_user_companies():
+    from erpnext.erpnext_integrations.ecommerce_api.company_context import (
+        get_user_companies as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def set_user_company(company):
+    from erpnext.erpnext_integrations.ecommerce_api.company_context import (
+        set_user_company as _impl,
+    )
+
+    return _impl(company)
+
+
+@frappe.whitelist()
+def list_employees(search=None, status=None, page=1, page_length=100, company=None):
     from erpnext.erpnext_integrations.ecommerce_api.employee_api import list_employees as _impl
 
-    return _impl(search=search, status=status, page=page, page_length=page_length)
+    return _impl(search=search, status=status, page=page, page_length=page_length, company=company)
 
 
 @frappe.whitelist()
@@ -2784,12 +2825,12 @@ def save_extra_row(scope, row_key, values=None):
 
 
 @frappe.whitelist()
-def list_pos_profiles(search=None):
+def list_pos_profiles(search=None, company=None):
     from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
         list_pos_profiles as _impl,
     )
 
-    return _impl(search=search)
+    return _impl(search=search, company=company)
 
 
 @frappe.whitelist()
@@ -2820,12 +2861,14 @@ def save_pos_profile(name=None, data=None):
 
 
 @frappe.whitelist()
-def list_cash_register_sessions(warehouse=None, search=None, page=1, page_length=200):
+def list_cash_register_sessions(warehouse=None, search=None, page=1, page_length=200, company=None):
     from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
         list_cash_register_sessions as _impl,
     )
 
-    return _impl(warehouse=warehouse, search=search, page=page, page_length=page_length)
+    return _impl(
+        warehouse=warehouse, search=search, page=page, page_length=page_length, company=company
+    )
 
 
 @frappe.whitelist()
@@ -2967,7 +3010,7 @@ def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=Non
     )
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def get_accounting_constants(as_of_date=None):
     from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
         get_accounting_constants as _impl,
@@ -2976,7 +3019,7 @@ def get_accounting_constants(as_of_date=None):
     return _impl(as_of_date=as_of_date)
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def get_accounting_sheet(scope=None):
     from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
         get_accounting_sheet as _impl,
@@ -2985,13 +3028,55 @@ def get_accounting_sheet(scope=None):
     return _impl(scope=scope)
 
 
-@frappe.whitelist()
-def save_accounting_sheet(scope=None, sheets=None, active_sheet_id=None):
+@frappe.whitelist(allow_guest=True)
+def save_accounting_sheet(
+    scope=None,
+    sheets=None,
+    active_sheet_id=None,
+    variables=None,
+    notes=None,
+    code=None,
+    conditional_formats=None,
+    notebooks=None,
+    active_notebook_id=None,
+    reports=None,
+    tables=None,
+):
     from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
         save_accounting_sheet as _impl,
     )
 
-    return _impl(scope=scope, sheets=sheets, active_sheet_id=active_sheet_id)
+    return _impl(
+        scope=scope,
+        sheets=sheets,
+        active_sheet_id=active_sheet_id,
+        variables=variables,
+        notes=notes,
+        code=code,
+        conditional_formats=conditional_formats,
+        notebooks=notebooks,
+        active_notebook_id=active_notebook_id,
+        reports=reports,
+        tables=tables,
+    )
+
+
+@frappe.whitelist(allow_guest=True)
+def run_accounting_snippets(scope=None, namespace=None, background=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        run_accounting_snippets as _impl,
+    )
+
+    return _impl(scope=scope, namespace=namespace, background=background)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_accounting_snippet_outputs(scope=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        get_accounting_snippet_outputs as _impl,
+    )
+
+    return _impl(scope=scope)
 
 
 @frappe.whitelist()

@@ -126,11 +126,9 @@ def ensure_default_web_pos_profile() -> str:
 		frappe.db.commit()
 		return WEB_POS_PROFILE_NAME
 
-	company = (
-		frappe.defaults.get_user_default("Company")
-		or frappe.db.get_single_value("Global Defaults", "default_company")
-		or frappe.db.get_value("Company", {}, "name")
-	)
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+	company = resolve_company() or frappe.db.get_value("Company", {}, "name")
 	if not company:
 		frappe.throw(_("Company is required to auto-create a cash register."))
 	warehouse = frappe.db.get_value(
@@ -258,8 +256,13 @@ def _serialize_pos_profile(name: str) -> dict:
 
 
 @frappe.whitelist()
-def list_pos_profiles(search=None):
+def list_pos_profiles(search=None, company=None):
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import company_scope
+
 	filters = {}
+	active = company_scope(company)
+	if active:
+		filters["company"] = active
 	or_filters = None
 	if search and str(search).strip():
 		q = f"%{str(search).strip()}%"
@@ -274,6 +277,7 @@ def list_pos_profiles(search=None):
 		or_filters=or_filters,
 		pluck="name",
 		order_by="name asc",
+		ignore_permissions=True,
 	)
 	rows = [_serialize_pos_profile(n) for n in names]
 	return {"rows": rows, "total": len(rows)}
@@ -288,10 +292,24 @@ def get_pos_profile(name):
 
 @frappe.whitelist()
 def list_pos_profile_meta():
-	company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
-	companies = frappe.get_all("Company", pluck="name", order_by="name asc")
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import (
+		allowed_company_names,
+		company_scope,
+		resolve_company,
+	)
+
+	company = resolve_company() or frappe.db.get_value("Company", {}, "name")
+	companies = allowed_company_names()
+	wh_filters = {"is_group": 0}
+	scoped = company_scope()
+	if scoped:
+		wh_filters["company"] = scoped
 	warehouses = frappe.get_all(
-		"Warehouse", filters={"is_group": 0}, pluck="name", order_by="name asc"
+		"Warehouse",
+		filters=wh_filters,
+		pluck="name",
+		order_by="name asc",
+		ignore_permissions=True,
 	)
 	currencies = frappe.get_all(
 		"Currency", filters={"enabled": 1}, pluck="name", order_by="name asc"
@@ -331,11 +349,9 @@ def save_pos_profile(name=None, data=None):
 		if frappe.db.exists("POS Profile", title):
 			frappe.throw(_("Cash register {0} already exists").format(title))
 
-		company = (
-			data.get("company")
-			or frappe.defaults.get_user_default("Company")
-			or frappe.db.get_value("Company", {}, "name")
-		)
+		from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+		company = data.get("company") or resolve_company() or frappe.db.get_value("Company", {}, "name")
 		if not company:
 			frappe.throw(_("Company is required"))
 		warehouse = data.get("warehouse") or frappe.db.get_value(
@@ -482,11 +498,14 @@ def _split_session_id(session_id: str) -> tuple[str, str]:
 	return warehouse, posting_date
 
 
-def _pos_invoice_where(values: dict, warehouse=None, posting_date=None):
+def _pos_invoice_where(values: dict, warehouse=None, posting_date=None, company=None):
 	"""WHERE clause for submitted POS sales (uuid tag or item warehouse in a POS Profile)."""
 	wh_map = _warehouse_register_map()
 	warehouses = list(wh_map.keys())
 	clauses = ["si.docstatus = 1"]
+	if company:
+		clauses.append("si.company = %(company)s")
+		values["company"] = company
 	if posting_date:
 		clauses.append("si.posting_date = %(posting_date)s")
 		values["posting_date"] = posting_date
@@ -580,10 +599,15 @@ def _items_for_invoices(invoice_names: list[str]) -> dict[str, list]:
 
 
 @frappe.whitelist()
-def list_cash_register_sessions(warehouse=None, search=None, page=1, page_length=200):
+def list_cash_register_sessions(warehouse=None, search=None, page=1, page_length=200, company=None):
 	"""List POS sale sessions (one row per cash register + day)."""
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import company_scope
+
 	values: dict = {}
-	where_sql, wh_map = _pos_invoice_where(values, warehouse=warehouse or None)
+	active = company_scope(company)
+	where_sql, wh_map = _pos_invoice_where(
+		values, warehouse=warehouse or None, company=active
+	)
 	page = max(cint(page) or 1, 1)
 	page_length = min(max(cint(page_length) or 200, 1), 500)
 	offset = (page - 1) * page_length

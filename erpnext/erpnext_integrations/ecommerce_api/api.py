@@ -2296,10 +2296,11 @@ def create_order(
 		frappe.throw(_("Customer {0} not found").format(customer))
 
 	# Get default company if not provided
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
 	if not company:
-		company = frappe.defaults.get_user_default("Company")
+		company = resolve_company()
 		if not company:
-			# Get first available company if no default is set
 			company = frappe.db.get_value("Company", {}, "name")
 
 	# Create Sales Order
@@ -2494,7 +2495,9 @@ def create_guest_preorder(
 
 	# Resolve defaults
 	if not company:
-		company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
+		from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+		company = resolve_company() or frappe.db.get_value("Company", {}, "name")
 	if not company:
 		frappe.throw(_("No Company configured"))
 
@@ -3303,7 +3306,9 @@ def create_payment(
 	from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
 	if not company:
-		company = frappe.defaults.get_user_default("Company")
+		from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+		company = resolve_company()
 
 	# If reference provided, use get_payment_entry
 	if reference_doctype and reference_name:
@@ -4323,6 +4328,7 @@ def create_pos_sale(
 	payments=None,
 	cash_received=None,
 	pos_session_id=None,
+	company=None,
 ):
 	"""
 	Create a POS sale as a submitted Sales Invoice + Payment Entry.
@@ -4393,17 +4399,31 @@ def create_pos_sale(
 	_ensure_pos_sale_item_groups(required_codes)
 
 	# ── Resolve defaults ──────────────────────────────────────────────────────
-	company = frappe.defaults.get_user_default("Company") or frappe.db.get_single_value(
-		"Global Defaults", "default_company"
-	)
-	pos_customer = _get_or_create_consumidor_final()
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
 
-	# Resolve warehouse: prefer branch_id as warehouse name, fall back to default
+	session_company = None
+	if pos_session_id:
+		session_company = frappe.db.get_value("POS Cash Session", pos_session_id, "company")
 	warehouse = (
 		frappe.db.get_value("Warehouse", branch_id, "name") if branch_id else None
-	) or frappe.db.get_value(
-		"Warehouse", {"is_group": 0, "company": company}, "name"
 	)
+	warehouse_company = (
+		frappe.db.get_value("Warehouse", warehouse, "company") if warehouse else None
+	)
+	company = (
+		(company or "").strip()
+		or session_company
+		or warehouse_company
+		or resolve_company()
+		or frappe.db.get_single_value("Global Defaults", "default_company")
+	)
+
+	pos_customer = _get_or_create_consumidor_final()
+
+	if not warehouse:
+		warehouse = frappe.db.get_value(
+			"Warehouse", {"is_group": 0, "company": company}, "name"
+		)
 
 	income_account = _resolve_pos_income_account(company)
 	if not income_account:

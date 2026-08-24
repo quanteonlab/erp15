@@ -649,11 +649,16 @@ def get_user_app_permissions(username=None):
 
 
 @frappe.whitelist()
-def list_employees(search=None, status=None, page=1, page_length=100):
+def list_employees(search=None, status=None, page=1, page_length=100, company=None):
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import company_scope
+
 	_require_app_permission("tables.employees")
 	page = max(1, cint(page) or 1)
 	page_length = max(1, min(500, cint(page_length) or 100))
 	filters = {}
+	active = company_scope(company)
+	if active:
+		filters["company"] = active
 	if status:
 		filters["status"] = status
 	or_filters = None
@@ -717,7 +722,9 @@ def save_employee(name=None, data=None):
 
 	frappe.flags.ignore_permissions = True
 	if is_new:
-		company = data.get("company") or frappe.defaults.get_user_default("Company")
+		from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+		company = data.get("company") or resolve_company()
 		if not company:
 			company = frappe.db.get_value("Company", {}, "name")
 		first = (data.get("first_name") or "").strip()
@@ -1169,7 +1176,12 @@ def list_employee_meta():
 	"""Branches, companies, and the app permission catalog for the editor UI."""
 	_require_app_permission("tables.employees")
 	_ensure_starter_staff_groups()
-	company = frappe.defaults.get_user_default("Company") or frappe.db.get_value("Company", {}, "name")
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import (
+		allowed_company_names,
+		resolve_company,
+	)
+
+	company = resolve_company() or frappe.db.get_value("Company", {}, "name")
 	branches = (
 		frappe.get_all("Branch", pluck="name", order_by="name asc", ignore_permissions=True)
 		if frappe.db.exists("DocType", "Branch")
@@ -1178,6 +1190,7 @@ def list_employee_meta():
 	catalog = list_app_permissions()
 	return {
 		"company": company,
+		"companies": allowed_company_names(),
 		"branches": branches or [],
 		"roles": [],
 		"permissions": catalog["permissions"],

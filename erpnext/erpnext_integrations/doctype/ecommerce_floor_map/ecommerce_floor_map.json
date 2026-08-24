@@ -7,6 +7,7 @@
  "engine": "InnoDB",
  "field_order": [
   "location_name",
+  "company",
   "floor_name",
   "column_break_1",
   "canvas_width",
@@ -17,13 +18,20 @@
   "notes_data"
  ],
  "fields": [
-  {
-   "fieldname": "location_name",
-   "fieldtype": "Data",
-   "in_list_view": 1,
-   "label": "Location Name",
-   "reqd": 1
-  },
+	{
+		"fieldname": "location_name",
+		"fieldtype": "Data",
+		"in_list_view": 1,
+		"label": "Location Name",
+		"reqd": 1
+	},
+	{
+		"fieldname": "company",
+		"fieldtype": "Link",
+		"in_list_view": 1,
+		"label": "Company",
+		"options": "Company"
+	},
   {
    "fieldname": "floor_name",
    "fieldtype": "Data",
