@@ -953,9 +953,12 @@ def get_product_rows(
 
     # Always attach selling prices by list so the grid can show one column per list.
     if rows:
-        by_item = _selling_prices_map([r["client_sku"] for r in rows])
+        codes = [r["client_sku"] for r in rows]
+        by_item = _selling_prices_map(codes)
+        attr_by_item = _item_attributes_map(codes)
         for row in rows:
             row["prices"] = by_item.get(row["client_sku"], {})
+            row["attributes"] = attr_by_item.get(row["client_sku"], {})
 
     count_vals = {k: v for k, v in values.items() if k not in ("page_length", "offset")}
     total = frappe.db.sql(
@@ -965,6 +968,43 @@ def get_product_rows(
     )[0]["c"]
 
     return {"rows": rows, "total": total}
+
+
+def _item_attributes_map(item_codes: list) -> dict:
+    if not item_codes:
+        return {}
+    ph = ", ".join(["%s"] * len(item_codes))
+    try:
+        rows = frappe.db.sql(
+            f"""
+            SELECT parent, attribute, attribute_value
+            FROM `tabItem Variant Attribute`
+            WHERE parent IN ({ph})
+            """,
+            tuple(item_codes),
+            as_dict=True,
+        )
+    except Exception:
+        return {}
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r.parent, {})[r.attribute] = r.attribute_value or ""
+    return out
+
+
+@frappe.whitelist()
+def list_item_attribute_names():
+    """Names of Item Attribute docs — used as optional product-table columns."""
+    try:
+        names = frappe.get_all(
+            "Item Attribute",
+            fields=["name"],
+            order_by="name",
+            ignore_permissions=True,
+        )
+    except Exception:
+        return []
+    return [n.name for n in names if n.get("name")]
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,135 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:PRTPL-{####}",
+ "creation": "2026-08-24 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "template_name",
+  "source_doctype",
+  "paper_kind",
+  "column_break_1",
+  "status",
+  "is_default",
+  "company",
+  "section_break_2",
+  "canvas_width_mm",
+  "canvas_height_mm",
+  "margin_mm",
+  "column_break_3",
+  "elements_data",
+  "notes_data"
+ ],
+ "fields": [
+  {
+   "fieldname": "template_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Template Name",
+   "reqd": 1
+  },
+  {
+   "fieldname": "source_doctype",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Source Doctype",
+   "options": "Sales Invoice\nPurchase Receipt\nItem",
+   "reqd": 1
+  },
+  {
+   "fieldname": "paper_kind",
+   "fieldtype": "Select",
+   "default": "A4",
+   "in_list_view": 1,
+   "label": "Paper Kind",
+   "options": "A4\nThermal 58mm\nThermal 80mm",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "default": "Draft",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Draft\nProduction"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_default",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Is Default"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company"
+  },
+  {
+   "fieldname": "section_break_2",
+   "fieldtype": "Section Break"
+  },
+  {
+   "default": "210",
+   "fieldname": "canvas_width_mm",
+   "fieldtype": "Float",
+   "label": "Canvas Width (mm)"
+  },
+  {
+   "default": "297",
+   "fieldname": "canvas_height_mm",
+   "fieldtype": "Float",
+   "label": "Canvas Height (mm)"
+  },
+  {
+   "default": "[10, 10, 10, 10]",
+   "fieldname": "margin_mm",
+   "fieldtype": "Data",
+   "label": "Margin mm (JSON [top,right,bottom,left])"
+  },
+  {
+   "fieldname": "column_break_3",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "elements_data",
+   "fieldtype": "Long Text",
+   "label": "Elements Data (JSON)"
+  },
+  {
+   "fieldname": "notes_data",
+   "fieldtype": "Long Text",
+   "label": "Notes Data (JSON)"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-24 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "ECommerce Print Template",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 0
+}
