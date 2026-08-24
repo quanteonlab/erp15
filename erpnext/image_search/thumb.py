@@ -224,6 +224,36 @@ def _delete_named_image_file(item_code: str, fname: str) -> None:
 			frappe.log_error(title="Item image disk delete failed", message=path)
 
 
+def _delete_other_item_images(item_code: str, keep_fname: str) -> None:
+	"""Drop leftover image attachments so Item.image is only /files/{sku}.jpg."""
+	image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif")
+	existing = frappe.get_all(
+		"File",
+		filters={"attached_to_doctype": "Item", "attached_to_name": item_code},
+		fields=["name", "file_name", "file_url"],
+		ignore_permissions=True,
+	)
+	folder = get_files_path(is_private=False)
+	for row in existing:
+		fn = str(row.file_name or "")
+		fu = str(row.file_url or "").split("?")[0]
+		if fn == keep_fname or fu.endswith("/" + keep_fname):
+			continue
+		looks_image = fn.lower().endswith(image_exts) or fu.lower().endswith(image_exts)
+		if not looks_image:
+			continue
+		try:
+			frappe.delete_doc("File", row.name, ignore_permissions=True, force=True)
+		except Exception:
+			frappe.log_error(title="Item image cleanup failed", message=f"{item_code} {row.name}")
+		disk = os.path.join(folder, fn) if fn else ""
+		if disk and os.path.isfile(disk) and os.path.basename(disk) != keep_fname:
+			try:
+				os.remove(disk)
+			except OSError:
+				pass
+
+
 def _write_item_jpeg(
 	item_code: str,
 	jpeg: bytes,
@@ -245,6 +275,7 @@ def _write_item_jpeg(
 				os.remove(path)
 			except OSError:
 				pass
+		_delete_other_item_images(item_code, fname)
 
 	folder = get_files_path(is_private=False)
 	frappe.create_folder(folder)
