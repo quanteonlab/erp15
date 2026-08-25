@@ -12,7 +12,7 @@ background-color map:
     {"sheets": [{"id": "...", "name": "Sheet1", "cells": {...}, "styles": {...}}],
      "active_sheet_id": "...",
      "variables": [{"id": "_a01", "name": "total_cost", "expr": "0.1", "notes": ""}],
-     "notes": "", "code": "", "conditional_formats": []}
+     "notes": "", "code": "", "script": "", "conditional_formats": []}
 
 Constants are NOT auto-refreshed — the frontend only calls
 `get_accounting_constants` on an explicit user refresh, optionally pinned to
@@ -566,6 +566,7 @@ def _default_workbook() -> dict:
 		"variables": [],
 		"notes": "",
 		"code": "",
+		"script": "",
 		"conditional_formats": [],
 		"notebooks": notebooks,
 		"active_notebook_id": notebooks[0]["id"],
@@ -634,6 +635,7 @@ def _normalize_workbook(raw) -> dict:
 		"variables": _normalize_variables(raw.get("variables")),
 		"notes": str(raw.get("notes") or ""),
 		"code": str(raw.get("code") or ""),
+		"script": str(raw.get("script") or raw.get("code") or "")[:20000],
 		"conditional_formats": _normalize_formats(raw.get("conditional_formats")),
 		"notebooks": notebooks,
 		"active_notebook_id": active_nb,
@@ -689,6 +691,7 @@ def save_accounting_sheet(
 	variables=None,
 	notes=None,
 	code=None,
+	script=None,
 	conditional_formats=None,
 	notebooks=None,
 	active_notebook_id=None,
@@ -731,6 +734,7 @@ def save_accounting_sheet(
 			"variables": variables if variables is not None else existing["variables"],
 			"notes": notes if notes is not None else existing["notes"],
 			"code": code if code is not None else existing["code"],
+			"script": script if script is not None else existing.get("script", existing.get("code", "")),
 			"conditional_formats": (
 				conditional_formats if conditional_formats is not None else existing["conditional_formats"]
 			),
@@ -866,6 +870,31 @@ def run_accounting_snippets(scope=None, namespace=None, background=None):
 		except Exception:
 			pass
 	return _execute_snippets(scope=scope, namespace=ns_payload)
+
+
+@frappe.whitelist()
+def run_accounting_sheet_script(code=None, grids_json=None, constants_json=None):
+	from erpnext.erpnext_integrations.ecommerce_api.accounting_script_runtime import run_accounting_script
+
+	grid = None
+	sheets = None
+	if isinstance(grids_json, str):
+		try:
+			parsed = json.loads(grids_json)
+		except Exception:
+			parsed = {}
+	else:
+		parsed = grids_json if isinstance(grids_json, dict) else {}
+
+	if isinstance(parsed, dict):
+		if "grid" in parsed:
+			grid = parsed.get("grid")
+		if "sheets" in parsed:
+			sheets = parsed.get("sheets")
+		elif parsed and "grid" not in parsed:
+			sheets = parsed
+
+	return run_accounting_script(code=code, constants=constants_json, grid=grid, sheets=sheets)
 
 
 @frappe.whitelist(allow_guest=True)

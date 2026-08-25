@@ -3076,6 +3076,7 @@ def save_accounting_sheet(
     variables=None,
     notes=None,
     code=None,
+    script=None,
     conditional_formats=None,
     notebooks=None,
     active_notebook_id=None,
@@ -3093,12 +3094,22 @@ def save_accounting_sheet(
         variables=variables,
         notes=notes,
         code=code,
+        script=script,
         conditional_formats=conditional_formats,
         notebooks=notebooks,
         active_notebook_id=active_notebook_id,
         reports=reports,
         tables=tables,
     )
+
+
+@frappe.whitelist()
+def run_accounting_sheet_script(code=None, grids_json=None, constants_json=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        run_accounting_sheet_script as _impl,
+    )
+
+    return _impl(code=code, grids_json=grids_json, constants_json=constants_json)
 
 
 @frappe.whitelist(allow_guest=True)
