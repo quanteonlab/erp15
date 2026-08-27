@@ -269,11 +269,19 @@ def get_print_data(source_doctype, docname):
 	}
 
 
+_PAPER_SIZE_MM = {
+	"A4": (210, 297),
+	"Thermal 58mm": (58, 150),
+	"Thermal 80mm": (80, 150),
+}
+
 _STARTER_TEMPLATES = [
+	# ── Sales Invoice ──────────────────────────────────────────────────
 	{
 		"template_name": "Standard Invoice (A4)",
 		"source_doctype": "Sales Invoice",
 		"paper_kind": "A4",
+		"is_default": True,
 		"margin_mm": [15, 15, 15, 15],
 		"elements": [
 			{"id": "starter-inv-title", "kind": "text", "x": 15, "y": 15, "width": 110, "height": 12, "staticText": "INVOICE", "fontSize": 20, "bold": True, "align": "left"},
@@ -303,10 +311,12 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-inv-total", "kind": "field", "x": 160, "y": 155, "width": 35, "height": 10, "fieldPath": "grand_total", "label": "Total", "fontSize": 13, "bold": True, "align": "right"},
 		],
 	},
+	# ── Item · A4 (2) ──────────────────────────────────────────────────
 	{
 		"template_name": "Product Catalog (A4)",
 		"source_doctype": "Item",
 		"paper_kind": "A4",
+		"is_default": True,
 		"margin_mm": [15, 15, 15, 15],
 		"elements": [
 			{"id": "starter-cat-image", "kind": "image", "x": 15, "y": 15, "width": 70, "height": 70, "fieldPath": "image"},
@@ -316,6 +326,246 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-cat-price-label", "kind": "text", "x": 15, "y": 92, "width": 40, "height": 6, "staticText": "Price", "fontSize": 8, "bold": True, "align": "left"},
 			{"id": "starter-cat-price", "kind": "field", "x": 15, "y": 98, "width": 60, "height": 12, "fieldPath": "standard_rate", "label": "Price", "fontSize": 16, "bold": True, "align": "left"},
 			{"id": "starter-cat-barcode", "kind": "barcode", "x": 95, "y": 92, "width": 65, "height": 20, "fieldPath": "item_code"},
+		],
+	},
+	{
+		"template_name": "Item Spec Sheet (A4)",
+		"source_doctype": "Item",
+		"paper_kind": "A4",
+		"margin_mm": [15, 15, 15, 15],
+		"elements": [
+			{"id": "starter-ispec-title", "kind": "text", "x": 15, "y": 15, "width": 120, "height": 10, "staticText": "ITEM SPECIFICATION", "fontSize": 16, "bold": True, "align": "left"},
+			{"id": "starter-ispec-code-label", "kind": "text", "x": 140, "y": 15, "width": 55, "height": 6, "staticText": "Item Code", "fontSize": 8, "align": "right"},
+			{"id": "starter-ispec-code", "kind": "field", "x": 140, "y": 21, "width": 55, "height": 8, "fieldPath": "item_code", "label": "Code", "fontSize": 12, "bold": True, "align": "right"},
+			{"id": "starter-ispec-name", "kind": "field", "x": 15, "y": 40, "width": 180, "height": 12, "fieldPath": "item_name", "label": "Name", "fontSize": 18, "bold": True, "align": "left"},
+			{"id": "starter-ispec-desc", "kind": "field", "x": 15, "y": 56, "width": 180, "height": 40, "fieldPath": "description", "label": "Description", "fontSize": 10, "align": "left"},
+			{"id": "starter-ispec-uom-label", "kind": "text", "x": 15, "y": 105, "width": 40, "height": 6, "staticText": "UOM", "fontSize": 8, "bold": True, "align": "left"},
+			{"id": "starter-ispec-uom", "kind": "field", "x": 15, "y": 111, "width": 50, "height": 8, "fieldPath": "stock_uom", "label": "UOM", "fontSize": 11, "align": "left"},
+			{"id": "starter-ispec-price-label", "kind": "text", "x": 80, "y": 105, "width": 40, "height": 6, "staticText": "Standard Rate", "fontSize": 8, "bold": True, "align": "left"},
+			{"id": "starter-ispec-price", "kind": "field", "x": 80, "y": 111, "width": 50, "height": 8, "fieldPath": "standard_rate", "label": "Price", "fontSize": 11, "align": "left"},
+			{"id": "starter-ispec-qr", "kind": "qrcode", "x": 155, "y": 100, "width": 40, "height": 40, "fieldPath": "item_code"},
+			{"id": "starter-ispec-barcode", "kind": "barcode", "x": 15, "y": 130, "width": 120, "height": 25, "fieldPath": "item_code"},
+		],
+	},
+	# ── Item · Thermal 58mm (2) ────────────────────────────────────────
+	{
+		"template_name": "Item Price Tag (58mm)",
+		"source_doctype": "Item",
+		"paper_kind": "Thermal 58mm",
+		"is_default": True,
+		"margin_mm": [3, 3, 3, 3],
+		"elements": [
+			{"id": "starter-i58a-name", "kind": "field", "x": 3, "y": 3, "width": 52, "height": 10, "fieldPath": "item_name", "label": "Name", "fontSize": 10, "bold": True, "align": "center"},
+			{"id": "starter-i58a-code", "kind": "field", "x": 3, "y": 14, "width": 52, "height": 6, "fieldPath": "item_code", "label": "Code", "fontSize": 8, "align": "center"},
+			{"id": "starter-i58a-price", "kind": "field", "x": 3, "y": 22, "width": 52, "height": 12, "fieldPath": "standard_rate", "label": "Price", "fontSize": 16, "bold": True, "align": "center"},
+			{"id": "starter-i58a-barcode", "kind": "barcode", "x": 5, "y": 36, "width": 48, "height": 18, "fieldPath": "item_code"},
+		],
+	},
+	{
+		"template_name": "Item Shelf Label (58mm)",
+		"source_doctype": "Item",
+		"paper_kind": "Thermal 58mm",
+		"margin_mm": [3, 3, 3, 3],
+		"elements": [
+			{"id": "starter-i58b-code", "kind": "field", "x": 3, "y": 3, "width": 52, "height": 7, "fieldPath": "item_code", "label": "Code", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-i58b-name", "kind": "field", "x": 3, "y": 11, "width": 34, "height": 16, "fieldPath": "item_name", "label": "Name", "fontSize": 9, "align": "left"},
+			{"id": "starter-i58b-qr", "kind": "qrcode", "x": 38, "y": 11, "width": 17, "height": 17, "fieldPath": "item_code"},
+			{"id": "starter-i58b-uom-label", "kind": "text", "x": 3, "y": 30, "width": 20, "height": 5, "staticText": "UOM", "fontSize": 7, "align": "left"},
+			{"id": "starter-i58b-uom", "kind": "field", "x": 22, "y": 30, "width": 30, "height": 5, "fieldPath": "stock_uom", "label": "UOM", "fontSize": 8, "align": "left"},
+			{"id": "starter-i58b-barcode", "kind": "barcode", "x": 5, "y": 38, "width": 48, "height": 16, "fieldPath": "item_code"},
+		],
+	},
+	# ── Item · Thermal 80mm (2) ────────────────────────────────────────
+	{
+		"template_name": "Item Price Tag (80mm)",
+		"source_doctype": "Item",
+		"paper_kind": "Thermal 80mm",
+		"is_default": True,
+		"margin_mm": [4, 4, 4, 4],
+		"elements": [
+			{"id": "starter-i80a-name", "kind": "field", "x": 4, "y": 4, "width": 72, "height": 10, "fieldPath": "item_name", "label": "Name", "fontSize": 12, "bold": True, "align": "center"},
+			{"id": "starter-i80a-code", "kind": "field", "x": 4, "y": 15, "width": 72, "height": 7, "fieldPath": "item_code", "label": "Code", "fontSize": 9, "align": "center"},
+			{"id": "starter-i80a-price", "kind": "field", "x": 4, "y": 24, "width": 72, "height": 14, "fieldPath": "standard_rate", "label": "Price", "fontSize": 18, "bold": True, "align": "center"},
+			{"id": "starter-i80a-barcode", "kind": "barcode", "x": 8, "y": 40, "width": 64, "height": 20, "fieldPath": "item_code"},
+		],
+	},
+	{
+		"template_name": "Item Product Card (80mm)",
+		"source_doctype": "Item",
+		"paper_kind": "Thermal 80mm",
+		"margin_mm": [4, 4, 4, 4],
+		"elements": [
+			{"id": "starter-i80b-image", "kind": "image", "x": 4, "y": 4, "width": 28, "height": 28, "fieldPath": "image"},
+			{"id": "starter-i80b-name", "kind": "field", "x": 34, "y": 4, "width": 42, "height": 12, "fieldPath": "item_name", "label": "Name", "fontSize": 10, "bold": True, "align": "left"},
+			{"id": "starter-i80b-code", "kind": "field", "x": 34, "y": 17, "width": 42, "height": 6, "fieldPath": "item_code", "label": "Code", "fontSize": 8, "align": "left"},
+			{"id": "starter-i80b-price", "kind": "field", "x": 34, "y": 24, "width": 42, "height": 8, "fieldPath": "standard_rate", "label": "Price", "fontSize": 12, "bold": True, "align": "left"},
+			{"id": "starter-i80b-barcode", "kind": "barcode", "x": 8, "y": 36, "width": 64, "height": 18, "fieldPath": "item_code"},
+			{"id": "starter-i80b-qr", "kind": "qrcode", "x": 58, "y": 56, "width": 18, "height": 18, "fieldPath": "item_code"},
+		],
+	},
+	# ── Purchase Receipt · A4 (2) ──────────────────────────────────────
+	{
+		"template_name": "Goods Receipt (A4)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "A4",
+		"is_default": True,
+		"margin_mm": [15, 15, 15, 15],
+		"elements": [
+			{"id": "starter-pra4a-title", "kind": "text", "x": 15, "y": 15, "width": 120, "height": 12, "staticText": "PURCHASE RECEIPT", "fontSize": 18, "bold": True, "align": "left"},
+			{"id": "starter-pra4a-num-label", "kind": "text", "x": 140, "y": 15, "width": 55, "height": 6, "staticText": "Receipt #", "fontSize": 8, "align": "right"},
+			{"id": "starter-pra4a-num", "kind": "field", "x": 140, "y": 21, "width": 55, "height": 8, "fieldPath": "name", "label": "Receipt #", "fontSize": 11, "bold": True, "align": "right"},
+			{"id": "starter-pra4a-date-label", "kind": "text", "x": 140, "y": 31, "width": 55, "height": 6, "staticText": "Date", "fontSize": 8, "align": "right"},
+			{"id": "starter-pra4a-date", "kind": "field", "x": 140, "y": 37, "width": 55, "height": 8, "fieldPath": "posting_date", "label": "Date", "fontSize": 10, "align": "right"},
+			{"id": "starter-pra4a-sup-label", "kind": "text", "x": 15, "y": 32, "width": 90, "height": 6, "staticText": "Supplier", "fontSize": 8, "bold": True, "align": "left"},
+			{"id": "starter-pra4a-sup", "kind": "field", "x": 15, "y": 38, "width": 110, "height": 8, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 11, "align": "left"},
+			{"id": "starter-pra4a-wh-label", "kind": "text", "x": 15, "y": 48, "width": 40, "height": 6, "staticText": "Warehouse", "fontSize": 8, "bold": True, "align": "left"},
+			{"id": "starter-pra4a-wh", "kind": "field", "x": 55, "y": 48, "width": 80, "height": 6, "fieldPath": "set_warehouse", "label": "Warehouse", "fontSize": 10, "align": "left"},
+			{
+				"id": "starter-pra4a-items",
+				"kind": "line-items",
+				"x": 15,
+				"y": 60,
+				"width": 180,
+				"height": 100,
+				"childTableFieldname": "items",
+				"columns": [
+					{"fieldPath": "item_code", "label": "Item", "width": 35},
+					{"fieldPath": "item_name", "label": "Description", "width": 75},
+					{"fieldPath": "qty", "label": "Qty", "width": 20},
+					{"fieldPath": "uom", "label": "UOM", "width": 20},
+					{"fieldPath": "amount", "label": "Amount", "width": 30},
+				],
+			},
+			{"id": "starter-pra4a-total-label", "kind": "text", "x": 130, "y": 170, "width": 30, "height": 8, "staticText": "Total Qty", "fontSize": 10, "bold": True, "align": "right"},
+			{"id": "starter-pra4a-total", "kind": "field", "x": 160, "y": 170, "width": 35, "height": 10, "fieldPath": "total_qty", "label": "Total Qty", "fontSize": 13, "bold": True, "align": "right"},
+		],
+	},
+	{
+		"template_name": "Receiving Checklist (A4)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "A4",
+		"margin_mm": [12, 12, 12, 12],
+		"elements": [
+			{"id": "starter-pra4b-title", "kind": "text", "x": 12, "y": 12, "width": 140, "height": 10, "staticText": "RECEIVING CHECKLIST", "fontSize": 16, "bold": True, "align": "left"},
+			{"id": "starter-pra4b-num", "kind": "field", "x": 155, "y": 12, "width": 43, "height": 8, "fieldPath": "name", "label": "Receipt #", "fontSize": 10, "bold": True, "align": "right"},
+			{"id": "starter-pra4b-date", "kind": "field", "x": 155, "y": 22, "width": 43, "height": 7, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "right"},
+			{"id": "starter-pra4b-sup-label", "kind": "text", "x": 12, "y": 28, "width": 50, "height": 6, "staticText": "From", "fontSize": 8, "bold": True, "align": "left"},
+			{"id": "starter-pra4b-sup", "kind": "field", "x": 12, "y": 34, "width": 120, "height": 8, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 11, "align": "left"},
+			{"id": "starter-pra4b-line", "kind": "shape", "x": 12, "y": 46, "width": 186, "height": 1, "shapeType": "line", "color": "#0f172a"},
+			{
+				"id": "starter-pra4b-items",
+				"kind": "line-items",
+				"x": 12,
+				"y": 52,
+				"width": 186,
+				"height": 140,
+				"childTableFieldname": "items",
+				"columns": [
+					{"fieldPath": "item_code", "label": "Code", "width": 40},
+					{"fieldPath": "item_name", "label": "Item", "width": 90},
+					{"fieldPath": "qty", "label": "Expected", "width": 28},
+					{"fieldPath": "uom", "label": "UOM", "width": 28},
+				],
+			},
+			{"id": "starter-pra4b-sign-label", "kind": "text", "x": 12, "y": 210, "width": 80, "height": 6, "staticText": "Received by / Signature", "fontSize": 8, "align": "left"},
+			{"id": "starter-pra4b-sign-box", "kind": "shape", "x": 12, "y": 218, "width": 90, "height": 28, "shapeType": "rect", "color": "#94a3b8"},
+			{"id": "starter-pra4b-qr", "kind": "qrcode", "x": 160, "y": 210, "width": 38, "height": 38, "fieldPath": "name"},
+		],
+	},
+	# ── Purchase Receipt · Thermal 58mm (2) ────────────────────────────
+	{
+		"template_name": "PR Compact Ticket (58mm)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "Thermal 58mm",
+		"is_default": True,
+		"margin_mm": [3, 3, 3, 3],
+		"elements": [
+			{"id": "starter-pr58a-title", "kind": "text", "x": 3, "y": 3, "width": 52, "height": 7, "staticText": "GOODS IN", "fontSize": 11, "bold": True, "align": "center"},
+			{"id": "starter-pr58a-num", "kind": "field", "x": 3, "y": 11, "width": 52, "height": 6, "fieldPath": "name", "label": "Receipt #", "fontSize": 8, "bold": True, "align": "center"},
+			{"id": "starter-pr58a-date", "kind": "field", "x": 3, "y": 18, "width": 52, "height": 5, "fieldPath": "posting_date", "label": "Date", "fontSize": 7, "align": "center"},
+			{"id": "starter-pr58a-sup", "kind": "field", "x": 3, "y": 25, "width": 52, "height": 8, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 8, "align": "left"},
+			{
+				"id": "starter-pr58a-items",
+				"kind": "line-items",
+				"x": 3,
+				"y": 36,
+				"width": 52,
+				"height": 50,
+				"childTableFieldname": "items",
+				"columns": [
+					{"fieldPath": "item_code", "label": "Item", "width": 34},
+					{"fieldPath": "qty", "label": "Qty", "width": 18},
+				],
+			},
+			{"id": "starter-pr58a-qty-label", "kind": "text", "x": 3, "y": 90, "width": 28, "height": 5, "staticText": "Total Qty", "fontSize": 7, "bold": True, "align": "left"},
+			{"id": "starter-pr58a-qty", "kind": "field", "x": 30, "y": 90, "width": 25, "height": 5, "fieldPath": "total_qty", "label": "Qty", "fontSize": 8, "bold": True, "align": "right"},
+			{"id": "starter-pr58a-barcode", "kind": "barcode", "x": 5, "y": 98, "width": 48, "height": 14, "fieldPath": "name"},
+		],
+	},
+	{
+		"template_name": "PR Receiving Stub (58mm)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "Thermal 58mm",
+		"margin_mm": [3, 3, 3, 3],
+		"elements": [
+			{"id": "starter-pr58b-title", "kind": "text", "x": 3, "y": 3, "width": 52, "height": 6, "staticText": "RECEIVING", "fontSize": 10, "bold": True, "align": "left"},
+			{"id": "starter-pr58b-num", "kind": "field", "x": 3, "y": 10, "width": 34, "height": 6, "fieldPath": "name", "label": "Receipt #", "fontSize": 8, "bold": True, "align": "left"},
+			{"id": "starter-pr58b-qr", "kind": "qrcode", "x": 38, "y": 10, "width": 17, "height": 17, "fieldPath": "name"},
+			{"id": "starter-pr58b-date", "kind": "field", "x": 3, "y": 18, "width": 34, "height": 5, "fieldPath": "posting_date", "label": "Date", "fontSize": 7, "align": "left"},
+			{"id": "starter-pr58b-sup", "kind": "field", "x": 3, "y": 30, "width": 52, "height": 8, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 8, "align": "left"},
+			{"id": "starter-pr58b-wh", "kind": "field", "x": 3, "y": 40, "width": 52, "height": 6, "fieldPath": "set_warehouse", "label": "Warehouse", "fontSize": 7, "align": "left"},
+			{"id": "starter-pr58b-qty-label", "kind": "text", "x": 3, "y": 50, "width": 28, "height": 5, "staticText": "Total Qty", "fontSize": 7, "align": "left"},
+			{"id": "starter-pr58b-qty", "kind": "field", "x": 30, "y": 50, "width": 25, "height": 5, "fieldPath": "total_qty", "label": "Qty", "fontSize": 9, "bold": True, "align": "right"},
+		],
+	},
+	# ── Purchase Receipt · Thermal 80mm (2) ────────────────────────────
+	{
+		"template_name": "PR Receiving Ticket (80mm)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "Thermal 80mm",
+		"is_default": True,
+		"margin_mm": [4, 4, 4, 4],
+		"elements": [
+			{"id": "starter-pr80a-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "PURCHASE RECEIPT", "fontSize": 11, "bold": True, "align": "center"},
+			{"id": "starter-pr80a-num", "kind": "field", "x": 4, "y": 13, "width": 72, "height": 7, "fieldPath": "name", "label": "Receipt #", "fontSize": 10, "bold": True, "align": "center"},
+			{"id": "starter-pr80a-date", "kind": "field", "x": 4, "y": 21, "width": 72, "height": 5, "fieldPath": "posting_date", "label": "Date", "fontSize": 8, "align": "center"},
+			{"id": "starter-pr80a-sup-label", "kind": "text", "x": 4, "y": 29, "width": 72, "height": 5, "staticText": "Supplier", "fontSize": 7, "bold": True, "align": "left"},
+			{"id": "starter-pr80a-sup", "kind": "field", "x": 4, "y": 34, "width": 72, "height": 7, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 9, "align": "left"},
+			{
+				"id": "starter-pr80a-items",
+				"kind": "line-items",
+				"x": 4,
+				"y": 44,
+				"width": 72,
+				"height": 55,
+				"childTableFieldname": "items",
+				"columns": [
+					{"fieldPath": "item_code", "label": "Item", "width": 36},
+					{"fieldPath": "qty", "label": "Qty", "width": 18},
+					{"fieldPath": "uom", "label": "UOM", "width": 18},
+				],
+			},
+			{"id": "starter-pr80a-qty-label", "kind": "text", "x": 4, "y": 104, "width": 36, "height": 6, "staticText": "Total Qty", "fontSize": 8, "bold": True, "align": "left"},
+			{"id": "starter-pr80a-qty", "kind": "field", "x": 40, "y": 104, "width": 36, "height": 6, "fieldPath": "total_qty", "label": "Qty", "fontSize": 10, "bold": True, "align": "right"},
+			{"id": "starter-pr80a-barcode", "kind": "barcode", "x": 8, "y": 114, "width": 64, "height": 16, "fieldPath": "name"},
+		],
+	},
+	{
+		"template_name": "PR Warehouse Stub (80mm)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "Thermal 80mm",
+		"margin_mm": [4, 4, 4, 4],
+		"elements": [
+			{"id": "starter-pr80b-title", "kind": "text", "x": 4, "y": 4, "width": 50, "height": 7, "staticText": "WAREHOUSE IN", "fontSize": 11, "bold": True, "align": "left"},
+			{"id": "starter-pr80b-qr", "kind": "qrcode", "x": 56, "y": 4, "width": 20, "height": 20, "fieldPath": "name"},
+			{"id": "starter-pr80b-num", "kind": "field", "x": 4, "y": 13, "width": 50, "height": 6, "fieldPath": "name", "label": "Receipt #", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-pr80b-date", "kind": "field", "x": 4, "y": 20, "width": 50, "height": 5, "fieldPath": "posting_date", "label": "Date", "fontSize": 8, "align": "left"},
+			{"id": "starter-pr80b-wh-label", "kind": "text", "x": 4, "y": 28, "width": 72, "height": 5, "staticText": "Put-away warehouse", "fontSize": 7, "bold": True, "align": "left"},
+			{"id": "starter-pr80b-wh", "kind": "field", "x": 4, "y": 33, "width": 72, "height": 7, "fieldPath": "set_warehouse", "label": "Warehouse", "fontSize": 9, "align": "left"},
+			{"id": "starter-pr80b-sup", "kind": "field", "x": 4, "y": 42, "width": 72, "height": 7, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 8, "align": "left"},
+			{"id": "starter-pr80b-qty-label", "kind": "text", "x": 4, "y": 52, "width": 36, "height": 6, "staticText": "Total Qty", "fontSize": 8, "align": "left"},
+			{"id": "starter-pr80b-qty", "kind": "field", "x": 40, "y": 52, "width": 36, "height": 6, "fieldPath": "total_qty", "label": "Qty", "fontSize": 11, "bold": True, "align": "right"},
+			{"id": "starter-pr80b-barcode", "kind": "barcode", "x": 8, "y": 62, "width": 64, "height": 16, "fieldPath": "name"},
 		],
 	},
 ]
@@ -337,19 +587,34 @@ def ensure_starter_print_templates():
 		if exists:
 			continue
 
+		width_mm, height_mm = _PAPER_SIZE_MM.get(starter["paper_kind"], (210, 297))
+		want_default = bool(starter.get("is_default"))
+		already_has_default = bool(
+			frappe.db.exists(
+				"ECommerce Print Template",
+				{
+					"source_doctype": starter["source_doctype"],
+					"paper_kind": starter["paper_kind"],
+					"is_default": 1,
+				},
+			)
+		)
+		make_default = want_default and not already_has_default
+
 		doc = frappe.new_doc("ECommerce Print Template")
 		doc.template_name = starter["template_name"]
 		doc.source_doctype = starter["source_doctype"]
 		doc.paper_kind = starter["paper_kind"]
 		doc.status = "Production"
-		doc.is_default = 1
+		doc.is_default = 1 if make_default else 0
 		doc.margin_mm = json.dumps(starter["margin_mm"])
 		doc.elements_data = json.dumps(starter["elements"])
 		doc.notes_data = "[]"
-		doc.canvas_width_mm = 210
-		doc.canvas_height_mm = 297
+		doc.canvas_width_mm = width_mm
+		doc.canvas_height_mm = height_mm
 		doc.insert(ignore_permissions=True)
-		_apply_default(doc.name, doc.source_doctype, doc.paper_kind)
+		if make_default:
+			_apply_default(doc.name, doc.source_doctype, doc.paper_kind)
 		created.append(doc.name)
 
 	if created:

@@ -2031,6 +2031,24 @@ def get_customer(customer_name=None, email=None):
 CONSUMIDOR_FINAL_NAME = "Consumidor Final"
 
 
+def _resolve_pos_sale_customer(pos_session_id=None, warehouse=None):
+	"""Prefer the cash register (POS Profile) default customer; else Consumidor Final."""
+	profile = None
+	if pos_session_id:
+		profile = frappe.db.get_value("POS Cash Session", pos_session_id, "pos_profile")
+	if not profile and warehouse:
+		profile = frappe.db.get_value(
+			"POS Profile",
+			{"warehouse": warehouse, "disabled": 0},
+			"name",
+		)
+	if profile:
+		cust = frappe.db.get_value("POS Profile", profile, "customer")
+		if cust and frappe.db.exists("Customer", cust):
+			return cust
+	return _get_or_create_consumidor_final()
+
+
 def _get_or_create_consumidor_final():
 	"""Return the walk-in Customer used for POS / guest preorders.
 
@@ -2098,8 +2116,25 @@ def create_customer(
 		dict: Created or existing customer details
 	"""
 	# Check if customer already exists - if so, return it
+	existing_name = None
 	if frappe.db.exists("Customer", customer_name):
-		customer = frappe.get_doc("Customer", customer_name)
+		existing_name = customer_name
+	else:
+		found = frappe.db.sql(
+			"""
+			SELECT name FROM `tabCustomer`
+			WHERE LOWER(TRIM(customer_name)) = %s
+			LIMIT 1
+			""",
+			(str(customer_name).strip().lower(),),
+		)
+		if found:
+			existing_name = found[0][0]
+
+	if existing_name:
+		frappe.flags.ignore_permissions = True
+		customer = frappe.get_doc("Customer", existing_name)
+		frappe.flags.ignore_permissions = False
 		return customer.as_dict()
 
 	customer = frappe.new_doc("Customer")
@@ -2107,8 +2142,13 @@ def create_customer(
 	customer.customer_group = customer_group
 	customer.territory = territory
 	customer.customer_type = customer_type
+	if phone:
+		customer.mobile_no = phone
+	if email:
+		customer.email_id = email
 
 	customer.insert(ignore_permissions=True)
+	frappe.db.commit()
 
 	# Create contact if email or phone provided
 	if email or phone:
@@ -2125,8 +2165,232 @@ def create_customer(
 		})
 
 		contact.insert(ignore_permissions=True)
+		frappe.db.commit()
 
 	return customer.as_dict()
+
+
+UNCATEGORIZED_CUSTOMER_NAME = "Uncategorized"
+UNCATEGORIZED_SUPPLIER_NAME = "Uncategorized"
+
+
+def _default_customer_group_and_territory():
+	customer_group = (
+		frappe.db.get_single_value("Selling Settings", "customer_group")
+		or (frappe.db.exists("Customer Group", "Individual") and "Individual")
+		or frappe.db.get_value("Customer Group", {"is_group": 0}, "name")
+	)
+	territory = (
+		frappe.db.get_single_value("Selling Settings", "territory")
+		or (frappe.db.exists("Territory", "All Territories") and "All Territories")
+		or frappe.db.get_value("Territory", {"is_group": 0}, "name")
+	)
+	return customer_group, territory
+
+
+def _get_or_create_named_customer(display_name: str) -> str:
+	"""Return Customer.name for a known display name; create if missing."""
+	label = (display_name or "").strip()
+	if not label:
+		frappe.throw(_("Customer name is required"))
+	existing = frappe.db.sql(
+		"""
+		SELECT name FROM `tabCustomer`
+		WHERE LOWER(TRIM(customer_name)) = %s OR LOWER(TRIM(name)) = %s
+		LIMIT 1
+		""",
+		(label.lower(), label.lower()),
+	)
+	if existing:
+		return existing[0][0]
+
+	customer_group, territory = _default_customer_group_and_territory()
+	if not customer_group or not territory:
+		frappe.throw(_("Cannot create customer: Customer Group or Territory is missing."))
+
+	doc = frappe.get_doc(
+		{
+			"doctype": "Customer",
+			"customer_name": label,
+			"customer_type": "Individual",
+			"customer_group": customer_group,
+			"territory": territory,
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return doc.name
+
+
+def _get_or_create_uncategorized_customer():
+	return _get_or_create_named_customer(UNCATEGORIZED_CUSTOMER_NAME)
+
+
+def _default_supplier_group():
+	return (
+		(frappe.db.exists("Supplier Group", "All Supplier Groups") and "All Supplier Groups")
+		or frappe.db.get_value("Supplier Group", {"is_group": 0}, "name")
+		or "All Supplier Groups"
+	)
+
+
+def _get_or_create_named_supplier(display_name: str) -> str:
+	label = (display_name or "").strip()
+	if not label:
+		frappe.throw(_("Supplier name is required"))
+	existing = frappe.db.sql(
+		"""
+		SELECT name FROM `tabSupplier`
+		WHERE LOWER(TRIM(supplier_name)) = %s OR LOWER(TRIM(name)) = %s
+		LIMIT 1
+		""",
+		(label.lower(), label.lower()),
+	)
+	if existing:
+		return existing[0][0]
+
+	doc = frappe.get_doc(
+		{
+			"doctype": "Supplier",
+			"supplier_name": label,
+			"supplier_group": _default_supplier_group(),
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return doc.name
+
+
+@frappe.whitelist(allow_guest=True)
+def ensure_crm_party_buckets():
+	"""Ensure catch-all Customer/Supplier rows used by CRM and POS."""
+	consumidor = _get_or_create_consumidor_final()
+	uncat_customer = _get_or_create_uncategorized_customer()
+	uncat_supplier = _get_or_create_named_supplier(UNCATEGORIZED_SUPPLIER_NAME)
+	return {
+		"consumidor_final": consumidor,
+		"uncategorized_customer": uncat_customer,
+		"uncategorized_supplier": uncat_supplier,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def search_customers(search_term="", page_length=20, ensure_buckets=0):
+	"""Typeahead / CRM list for Customer (name + customer_name + mobile)."""
+	if cint(ensure_buckets):
+		ensure_crm_party_buckets()
+
+	term = (search_term or "").strip()
+	limit = max(1, min(cint(page_length) or 20, 100))
+	filters = {"disabled": 0}
+	or_filters = None
+	if term:
+		like = f"%{term}%"
+		or_filters = [
+			["name", "like", like],
+			["customer_name", "like", like],
+			["mobile_no", "like", like],
+		]
+
+	rows = frappe.get_all(
+		"Customer",
+		filters=filters,
+		or_filters=or_filters,
+		fields=["name", "customer_name", "mobile_no", "email_id", "customer_group", "territory"],
+		order_by="customer_name asc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	return {
+		"customers": [
+			{
+				"name": r.name,
+				"customer_name": r.customer_name,
+				"phone": r.mobile_no,
+				"email": r.email_id,
+				"customer_group": r.customer_group,
+				"territory": r.territory,
+				"is_bucket": (r.customer_name or r.name or "")
+				in (CONSUMIDOR_FINAL_NAME, UNCATEGORIZED_CUSTOMER_NAME),
+			}
+			for r in rows
+		]
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def create_supplier(supplier_name, supplier_group=None):
+	"""Create a Supplier or return the existing one (by name / supplier_name)."""
+	label = (supplier_name or "").strip()
+	if not label:
+		frappe.throw(_("Supplier name is required"))
+
+	existing = frappe.db.sql(
+		"""
+		SELECT name FROM `tabSupplier`
+		WHERE LOWER(TRIM(supplier_name)) = %s OR LOWER(TRIM(name)) = %s
+		LIMIT 1
+		""",
+		(label.lower(), label.lower()),
+	)
+	if existing:
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Supplier", existing[0][0])
+		frappe.flags.ignore_permissions = False
+		return doc.as_dict()
+
+	doc = frappe.get_doc(
+		{
+			"doctype": "Supplier",
+			"supplier_name": label,
+			"supplier_group": supplier_group or _default_supplier_group(),
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return doc.as_dict()
+
+
+@frappe.whitelist(allow_guest=True)
+def search_suppliers(search_term="", page_length=20, ensure_buckets=0):
+	"""Typeahead / CRM list for Supplier."""
+	if cint(ensure_buckets):
+		_get_or_create_named_supplier(UNCATEGORIZED_SUPPLIER_NAME)
+
+	term = (search_term or "").strip()
+	limit = max(1, min(cint(page_length) or 20, 100))
+	filters = {"disabled": 0}
+	or_filters = None
+	if term:
+		like = f"%{term}%"
+		or_filters = [
+			["name", "like", like],
+			["supplier_name", "like", like],
+			["mobile_no", "like", like],
+		]
+
+	rows = frappe.get_all(
+		"Supplier",
+		filters=filters,
+		or_filters=or_filters,
+		fields=["name", "supplier_name", "mobile_no", "email_id", "supplier_group"],
+		order_by="supplier_name asc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	return {
+		"suppliers": [
+			{
+				"name": r.name,
+				"supplier_name": r.supplier_name,
+				"phone": r.mobile_no,
+				"email": r.email_id,
+				"supplier_group": r.supplier_group,
+				"is_bucket": (r.supplier_name or r.name or "") == UNCATEGORIZED_SUPPLIER_NAME,
+			}
+			for r in rows
+		]
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -2144,12 +2408,15 @@ def update_customer(customer_name, **kwargs):
 	if not frappe.db.exists("Customer", customer_name):
 		frappe.throw(_("Customer {0} not found").format(customer_name))
 
+	frappe.flags.ignore_permissions = True
 	customer = frappe.get_doc("Customer", customer_name)
+	frappe.flags.ignore_permissions = False
 
 	# Update allowed fields
 	allowed_fields = [
 		"customer_name", "customer_group", "territory", "customer_type",
 		"default_currency", "default_price_list", "default_sales_partner",
+		"mobile_no", "email_id",
 	]
 
 	for field, value in kwargs.items():
@@ -2157,6 +2424,7 @@ def update_customer(customer_name, **kwargs):
 			customer.set(field, value)
 
 	customer.save(ignore_permissions=True)
+	frappe.db.commit()
 
 	return customer.as_dict()
 
@@ -2611,6 +2879,8 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 		filters=filters,
 		fields=[
 			"name",
+			"customer",
+			"customer_name",
 			"transaction_date",
 			"delivery_date",
 			"grand_total",
@@ -2622,6 +2892,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 		start=start,
 		limit_page_length=int(page_length) + 50,  # fetch extra to account for filtering
 		order_by="transaction_date desc, creation desc",
+		ignore_permissions=True,
 	)
 
 	# Find cancelled orders that have been replaced by an amendment
@@ -4418,12 +4689,12 @@ def create_pos_sale(
 		or frappe.db.get_single_value("Global Defaults", "default_company")
 	)
 
-	pos_customer = _get_or_create_consumidor_final()
-
 	if not warehouse:
 		warehouse = frappe.db.get_value(
 			"Warehouse", {"is_group": 0, "company": company}, "name"
 		)
+
+	pos_customer = _resolve_pos_sale_customer(pos_session_id=pos_session_id, warehouse=warehouse)
 
 	income_account = _resolve_pos_income_account(company)
 	if not income_account:

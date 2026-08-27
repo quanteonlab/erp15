@@ -24,6 +24,7 @@ TRACKED_FIELDS = [
 	"disabled",
 	"write_off_limit",
 	"selling_price_list",
+	"customer",
 ]
 
 
@@ -170,6 +171,7 @@ def ensure_default_web_pos_profile() -> str:
 	doc.disabled = 0
 	if price_list:
 		doc.selling_price_list = price_list
+	doc.customer = _default_pos_customer()
 	_set_payments(doc, [{"mode_of_payment": "Cash", "default": 1}])
 	doc.insert(ignore_permissions=True)
 	frappe.db.commit()
@@ -223,11 +225,26 @@ def _set_applicable_users(doc, users: list) -> None:
 			doc.append("applicable_for_users", {"user": user})
 
 
+def _default_pos_customer() -> str:
+	from erpnext.erpnext_integrations.ecommerce_api.api import _get_or_create_consumidor_final
+
+	return _get_or_create_consumidor_final()
+
+
+def _resolve_customer_for_profile(data_customer) -> str:
+	raw = (data_customer or "").strip() if isinstance(data_customer, str) else ""
+	if raw and frappe.db.exists("Customer", raw):
+		return raw
+	return _default_pos_customer()
+
+
 def _serialize_pos_profile(name: str) -> dict:
 	"""Full row shape — list and single-get return the same thing, no separate
 	'summary vs detail' split, since a Tables-style screen renders the detail
 	panel straight from the row the user clicked."""
+	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc("POS Profile", name)
+	frappe.flags.ignore_permissions = False
 	today = nowdate()
 	days = []
 	for i in range(6, -1, -1):
@@ -235,6 +252,10 @@ def _serialize_pos_profile(name: str) -> dict:
 		days.append({"date": str(d), "amount": _revenue_for_warehouse(doc.warehouse, d, d)})
 	made_today = days[-1]["amount"]
 	made_this_week = flt(sum(d["amount"] for d in days))
+	customer = doc.customer or None
+	customer_name = None
+	if customer:
+		customer_name = frappe.db.get_value("Customer", customer, "customer_name") or customer
 	return {
 		"name": doc.name,
 		"company": doc.company,
@@ -243,6 +264,8 @@ def _serialize_pos_profile(name: str) -> dict:
 		"disabled": cint(doc.disabled),
 		"write_off_limit": flt(doc.write_off_limit),
 		"selling_price_list": doc.selling_price_list,
+		"customer": customer,
+		"customer_name": customer_name,
 		"payments": [
 			{"mode_of_payment": p.mode_of_payment, "default": cint(p.default)}
 			for p in (doc.payments or [])
@@ -387,6 +410,7 @@ def save_pos_profile(name=None, data=None):
 		doc.disabled = cint(data.get("disabled") or 0)
 		if data.get("selling_price_list"):
 			doc.selling_price_list = data.get("selling_price_list")
+		doc.customer = _resolve_customer_for_profile(data.get("customer"))
 
 		_set_payments(doc, data.get("payments") or [{"mode_of_payment": "Cash", "default": 1}])
 		_set_applicable_users(doc, data.get("applicable_for_users") or [])
@@ -395,7 +419,11 @@ def save_pos_profile(name=None, data=None):
 		log_field_changes(
 			"POS Profile",
 			doc.name,
-			[("company", None, doc.company), ("warehouse", None, doc.warehouse)],
+			[
+				("company", None, doc.company),
+				("warehouse", None, doc.warehouse),
+				("customer", None, doc.customer),
+			],
 		)
 	else:
 		if not frappe.db.exists("POS Profile", name):
@@ -410,6 +438,8 @@ def save_pos_profile(name=None, data=None):
 				new_val = cint(new_val)
 			if key == "write_off_limit":
 				new_val = flt(new_val)
+			if key == "customer":
+				new_val = _resolve_customer_for_profile(new_val)
 			old_val = doc.get(key)
 			if str(old_val or "") != str(new_val or ""):
 				changes.append((key, old_val, new_val))
