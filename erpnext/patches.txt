@@ -421,3 +421,4 @@ erpnext.patches.v15_0.add_keyboard_shortcuts_to_settings_dropdown
 erpnext.patches.v15_0.add_dual_language_fields_to_system_settings
 erpnext.patches.v15_0.add_toggle_language_navbar_item
 execute:frappe.db.get_single_value("System Settings", "app_name") == "ERPNext" and frappe.db.set_single_value("System Settings", "app_name", "SilkOS")
+erpnext.patches.v15_0.add_tms_custom_fields
