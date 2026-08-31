@@ -1,21 +1,21 @@
-# Quick Start Guide - ERPNext E-Commerce Integration
+# Quick Start Guide - SilkOS E-Commerce Integration
 
-Get started with the ERPNext E-Commerce Integration API in 15 minutes.
+Get started with the SilkOS E-Commerce Integration API in 15 minutes.
 
 ## Prerequisites
 
-- ERPNext instance (v14 or higher)
+- SilkOS instance (v14 or higher)
 - E-commerce website or application
 - Basic knowledge of REST APIs
 
 ---
 
-## Step 1: Setup ERPNext (5 minutes)
+## Step 1: Setup SilkOS (5 minutes)
 
 ### 1.1 Create API User
 
 ```bash
-# Login to ERPNext
+# Login to SilkOS
 # Navigate to: User List > New User
 ```
 
@@ -55,19 +55,19 @@ Expected response:
 {
   "message": {
     "status": "ok",
-    "message": "ERPNext WordPress WooCommerce API is running"
+    "message": "SilkOS WordPress WooCommerce API is running"
   }
 }
 ```
 
 ---
 
-## Step 2: Setup Sample Data in ERPNext (5 minutes)
+## Step 2: Setup Sample Data in SilkOS (5 minutes)
 
 ### 2.1 Create Test Items
 
 ```bash
-# Via ERPNext UI:
+# Via SilkOS UI:
 # Stock > Item > New Item
 ```
 
@@ -179,16 +179,16 @@ Create a simple WordPress plugin to test:
 ```php
 <?php
 /**
- * Plugin Name: ERPNext Integration
- * Description: Simple ERPNext API integration
+ * Plugin Name: SilkOS Integration
+ * Description: Simple SilkOS API integration
  * Version: 1.0
  */
 
 // Add settings page
 add_action('admin_menu', function() {
     add_options_page(
-        'ERPNext Settings',
-        'ERPNext',
+        'SilkOS Settings',
+        'SilkOS',
         'manage_options',
         'erpnext-settings',
         'erpnext_settings_page'
@@ -198,7 +198,7 @@ add_action('admin_menu', function() {
 function erpnext_settings_page() {
     ?>
     <div class="wrap">
-        <h1>ERPNext Integration Settings</h1>
+        <h1>SilkOS Integration Settings</h1>
         <form method="post" action="options.php">
             <?php
             settings_fields('erpnext_settings');
@@ -206,7 +206,7 @@ function erpnext_settings_page() {
             ?>
             <table class="form-table">
                 <tr>
-                    <th>ERPNext URL</th>
+                    <th>SilkOS URL</th>
                     <td><input type="text" name="erpnext_url" value="<?php echo get_option('erpnext_url'); ?>" class="regular-text"></td>
                 </tr>
                 <tr>
@@ -231,7 +231,7 @@ add_action('admin_init', function() {
     register_setting('erpnext_settings', 'erpnext_api_secret');
 });
 
-// Helper function to call ERPNext API
+// Helper function to call SilkOS API
 function erpnext_api_call($endpoint, $method = 'GET', $data = []) {
     $url = get_option('erpnext_url') . '/api/method/' . $endpoint;
     $api_key = get_option('erpnext_api_key');
@@ -261,7 +261,7 @@ function erpnext_api_call($endpoint, $method = 'GET', $data = []) {
     return json_decode(wp_remote_retrieve_body($response), true);
 }
 
-// Sync order to ERPNext when created in WooCommerce
+// Sync order to SilkOS when created in WooCommerce
 add_action('woocommerce_thankyou', function($order_id) {
     $order = wc_get_order($order_id);
 
@@ -276,7 +276,7 @@ add_action('woocommerce_thankyou', function($order_id) {
         ];
     }
 
-    // Create order in ERPNext
+    // Create order in SilkOS
     $result = erpnext_api_call(
         'erpnext.erpnext_integrations.ecommerce_api.api.create_order',
         'POST',
@@ -289,7 +289,7 @@ add_action('woocommerce_thankyou', function($order_id) {
 
     if (isset($result['message']['name'])) {
         update_post_meta($order_id, '_erpnext_order_id', $result['message']['name']);
-        $order->add_order_note('Synced to ERPNext: ' . $result['message']['name']);
+        $order->add_order_note('Synced to SilkOS: ' . $result['message']['name']);
     }
 });
 ```
@@ -297,15 +297,15 @@ add_action('woocommerce_thankyou', function($order_id) {
 ### 4.2 Configure Plugin
 
 1. Activate the plugin in WordPress
-2. Go to **Settings > ERPNext**
-3. Enter your ERPNext URL, API Key, and API Secret
+2. Go to **Settings > SilkOS**
+3. Enter your SilkOS URL, API Key, and API Secret
 4. Save settings
 
 ### 4.3 Test Integration
 
-1. Create a test product in WooCommerce with SKU matching ERPNext item code
+1. Create a test product in WooCommerce with SKU matching SilkOS item code
 2. Place a test order
-3. Check ERPNext for the new Sales Order
+3. Check SilkOS for the new Sales Order
 4. Verify order details match
 
 ---
@@ -324,7 +324,7 @@ curl -X GET \
 
 ### Issue: Item not found
 
-**Solution**: Ensure SKUs match between WooCommerce and ERPNext
+**Solution**: Ensure SKUs match between WooCommerce and SilkOS
 ```bash
 # List all items
 curl -X GET \
@@ -346,9 +346,9 @@ curl -X GET \
 
 ## Next Steps
 
-1. **Sync Products**: Implement product sync from ERPNext to WooCommerce
+1. **Sync Products**: Implement product sync from SilkOS to WooCommerce
 2. **Real-time Stock**: Set up stock level synchronization
-3. **Webhooks**: Configure ERPNext webhooks for real-time updates
+3. **Webhooks**: Configure SilkOS webhooks for real-time updates
 4. **Payment Integration**: Connect payment gateways
 5. **Order Status**: Sync order status changes bidirectionally
 
@@ -357,11 +357,11 @@ curl -X GET \
 ## Testing Checklist
 
 - [ ] API credentials work
-- [ ] Can fetch products from ERPNext
+- [ ] Can fetch products from SilkOS
 - [ ] Can check stock levels
-- [ ] Can create customer in ERPNext
+- [ ] Can create customer in SilkOS
 - [ ] Can create order from WordPress
-- [ ] Order appears in ERPNext
+- [ ] Order appears in SilkOS
 - [ ] Stock reduces after order
 - [ ] Can create delivery note
 - [ ] Can create invoice
@@ -380,7 +380,7 @@ Before going live:
 - [ ] Set up monitoring
 - [ ] Create backup strategy
 - [ ] Document custom configurations
-- [ ] Train staff on ERPNext
+- [ ] Train staff on SilkOS
 - [ ] Test order fulfillment workflow
 
 ---
@@ -388,8 +388,8 @@ Before going live:
 ## Need Help?
 
 - Read the full [README.md](README.md)
-- Check [ERPNext Documentation](https://docs.erpnext.com)
-- Visit [ERPNext Forum](https://discuss.erpnext.com)
+- Check [SilkOS Documentation](https://docs.erpnext.com)
+- Visit [SilkOS Forum](https://discuss.erpnext.com)
 - Review API examples in documentation
 
 ---

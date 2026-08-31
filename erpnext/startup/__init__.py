@@ -16,5 +16,5 @@
 
 # default settings that can be made for a user.
 
-product_name = "ERPNext"
+product_name = "SilkOS"
 user_defaults = {"Company": "company", "Territory": "territory"}

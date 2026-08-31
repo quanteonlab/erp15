@@ -4,7 +4,7 @@
  "callback_message": "You can continue with the onboarding after exploring this page",
  "callback_title": "Explore Chart of Accounts",
  "creation": "2020-05-13 19:58:20.928127",
- "description": "# Chart Of Accounts\n\nERPNext sets up a simple chart of accounts for each Company you create, but you can modify it according to business and legal requirements.",
+ "description": "# Chart Of Accounts\n\nSilkOS sets up a simple chart of accounts for each Company you create, but you can modify it according to business and legal requirements.",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,

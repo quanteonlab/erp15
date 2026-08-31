@@ -1,8 +1,8 @@
 {
 	"info": {
 		"_postman_id": "erpnext-ecommerce-integration",
-		"name": "ERPNext E-Commerce API",
-		"description": "Complete API collection for e-commerce integration with ERPNext",
+		"name": "SilkOS E-Commerce API",
+		"description": "Complete API collection for e-commerce integration with SilkOS",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
 	"auth": {

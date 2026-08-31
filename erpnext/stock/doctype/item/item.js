@@ -951,7 +951,7 @@ frappe.tour["Item"] = [
 		fieldname: "is_stock_item",
 		title: "Maintain Stock",
 		description: __(
-			"If you are maintaining stock of this Item in your Inventory, ERPNext will make a stock ledger entry for each transaction of this item."
+			"If you are maintaining stock of this Item in your Inventory, SilkOS will make a stock ledger entry for each transaction of this item."
 		),
 	},
 	{

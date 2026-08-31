@@ -1,6 +1,6 @@
-# E-Commerce Integration API for ERPNext
+# E-Commerce Integration API for SilkOS
 
-Complete REST API integration layer for connecting e-commerce sites with ERPNext ERP system.
+Complete REST API integration layer for connecting e-commerce sites with SilkOS ERP system.
 
 ## Table of Contents
 
@@ -27,7 +27,7 @@ Complete REST API integration layer for connecting e-commerce sites with ERPNext
 
 ## Overview
 
-This integration provides a comprehensive set of REST API endpoints that allow e-commerce websites to seamlessly integrate with ERPNext for:
+This integration provides a comprehensive set of REST API endpoints that allow e-commerce websites to seamlessly integrate with SilkOS for:
 
 - Product catalog synchronization
 - Real-time inventory management
@@ -53,7 +53,7 @@ This integration provides a comprehensive set of REST API endpoints that allow e
 
 ## Installation
 
-### 1. Enable API Access in ERPNext
+### 1. Enable API Access in SilkOS
 
 ```bash
 # Navigate to your bench directory
@@ -66,7 +66,7 @@ bench --site your-site-name migrate
 
 ### 2. Create API User and Generate API Keys
 
-1. Go to **User** in ERPNext
+1. Go to **User** in SilkOS
 2. Create a new user (e.g., "wordpress_api")
 3. Assign appropriate roles:
    - Sales User
@@ -79,13 +79,13 @@ bench --site your-site-name migrate
 
 ### 3. Configure WordPress Plugin
 
-Install a WordPress REST API client or create custom integration code to call ERPNext APIs.
+Install a WordPress REST API client or create custom integration code to call SilkOS APIs.
 
 ---
 
 ## Authentication
 
-All API endpoints require authentication using ERPNext's token-based authentication.
+All API endpoints require authentication using SilkOS's token-based authentication.
 
 ### Using API Key and Secret
 
@@ -1145,7 +1145,7 @@ console.log(`Available stock: ${stock}`);
 {
   "message": {
     "status": "ok",
-    "message": "ERPNext WordPress WooCommerce API is running",
+    "message": "SilkOS WordPress WooCommerce API is running",
     "frappe_version": "15.0.0",
     "site": "your-site.com"
   }
@@ -1158,17 +1158,17 @@ console.log(`Available stock: ${stock}`);
 
 ### WordPress Plugin Development
 
-Here's a sample WordPress plugin structure for integrating with ERPNext:
+Here's a sample WordPress plugin structure for integrating with SilkOS:
 
 ```php
 <?php
 /**
- * Plugin Name: ERPNext WooCommerce Integration
- * Description: Integrates WooCommerce with ERPNext ERP
+ * Plugin Name: SilkOS WooCommerce Integration
+ * Description: Integrates WooCommerce with SilkOS ERP
  * Version: 1.0.0
  */
 
-class ERPNext_Integration {
+class SilkOS_Integration {
 
     private $api_url;
     private $api_key;
@@ -1185,7 +1185,7 @@ class ERPNext_Integration {
     }
 
     /**
-     * Make API request to ERPNext
+     * Make API request to SilkOS
      */
     private function api_request($endpoint, $method = 'GET', $data = array()) {
         $url = $this->api_url . '/' . $endpoint;
@@ -1207,7 +1207,7 @@ class ERPNext_Integration {
         $response = wp_remote_request($url, $args);
 
         if (is_wp_error($response)) {
-            error_log('ERPNext API Error: ' . $response->get_error_message());
+            error_log('SilkOS API Error: ' . $response->get_error_message());
             return false;
         }
 
@@ -1216,7 +1216,7 @@ class ERPNext_Integration {
     }
 
     /**
-     * Sync WooCommerce order to ERPNext
+     * Sync WooCommerce order to SilkOS
      */
     public function sync_order_to_erp($order_id) {
         $order = wc_get_order($order_id);
@@ -1240,7 +1240,7 @@ class ERPNext_Integration {
             'price_list' => 'Standard Selling'
         );
 
-        // Create order in ERPNext
+        // Create order in SilkOS
         $result = $this->api_request(
             'erpnext.erpnext_integrations.ecommerce_api.api.create_order',
             'POST',
@@ -1248,14 +1248,14 @@ class ERPNext_Integration {
         );
 
         if ($result && isset($result['message']['name'])) {
-            // Save ERPNext order ID in WooCommerce
+            // Save SilkOS order ID in WooCommerce
             update_post_meta($order_id, '_erpnext_order_id', $result['message']['name']);
-            $order->add_order_note('Order synced to ERPNext: ' . $result['message']['name']);
+            $order->add_order_note('Order synced to SilkOS: ' . $result['message']['name']);
         }
     }
 
     /**
-     * Get or create customer in ERPNext
+     * Get or create customer in SilkOS
      */
     private function get_or_create_customer($order) {
         $email = $order->get_billing_email();
@@ -1288,7 +1288,7 @@ class ERPNext_Integration {
     }
 
     /**
-     * Check stock from ERPNext
+     * Check stock from SilkOS
      */
     public function check_stock($product_sku) {
         $result = $this->api_request(
@@ -1302,16 +1302,16 @@ class ERPNext_Integration {
 }
 
 // Initialize the plugin
-new ERPNext_Integration();
+new SilkOS_Integration();
 ```
 
 ---
 
 ## Webhooks
 
-To receive real-time updates from ERPNext, you can set up webhooks in ERPNext:
+To receive real-time updates from SilkOS, you can set up webhooks in SilkOS:
 
-1. Go to **Webhook** in ERPNext
+1. Go to **Webhook** in SilkOS
 2. Create new Webhook
 3. Select DocType (e.g., "Sales Order")
 4. Set Webhook URL (your WordPress endpoint)
@@ -1349,7 +1349,7 @@ function handle_erpnext_webhook(WP_REST_Request $request) {
 
 ## Error Handling
 
-All API endpoints return standard ERPNext error responses:
+All API endpoints return standard SilkOS error responses:
 
 ### Success Response
 
@@ -1538,15 +1538,15 @@ print(f"Invoice created: {invoice['name']}")
 
 For issues or questions:
 
-1. Check ERPNext documentation: https://docs.erpnext.com
-2. ERPNext Forum: https://discuss.erpnext.com
+1. Check SilkOS documentation: https://docs.erpnext.com
+2. SilkOS Forum: https://discuss.erpnext.com
 3. GitHub Issues: https://github.com/frappe/erpnext
 
 ---
 
 ## License
 
-This integration is part of ERPNext and follows the same license (GNU GPL v3).
+This integration is part of SilkOS and follows the same license (GNU GPL v3).
 
 ---
 

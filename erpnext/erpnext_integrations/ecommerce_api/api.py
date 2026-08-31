@@ -1,6 +1,6 @@
 """
 E-Commerce Integration API
-Provides comprehensive REST API endpoints for e-commerce integration with ERPNext
+Provides comprehensive REST API endpoints for e-commerce integration with SilkOS
 
 All endpoints are whitelisted and can be accessed via:
 - REST API: /api/method/erpnext.erpnext_integrations.ecommerce_api.api.<method_name>
@@ -1523,10 +1523,14 @@ def _compute_cart_promotions_local(items, price_list=None):
 def apply_cart_promotions(items, price_list=None):
 	"""
 	Given cart items [{item_code, qty, rate, amount}], return computed discounts
+<<<<<<< Updated upstream
 	and upsell hints using ERPNext Pricing Rules and Product Bundles.
 
 	3x2 (same_item Product discount) is applied as "Llevá N, pagás N-free":
 	adding min_qty units grants free_qty free units.
+=======
+	and upsell hints using SilkOS Pricing Rules.
+>>>>>>> Stashed changes
 
 	Returns:
 		{
@@ -2688,7 +2692,7 @@ def update_order_status(order_name, status):
 # GUEST PREORDER (S019)
 # ========================================
 
-# ERPNext Sales Order `order_type` only allows a small set (e.g. Sales, Shopping Cart).
+# SilkOS Sales Order `order_type` only allows a small set (e.g. Sales, Shopping Cart).
 # We tag guest catalog consultations in `remarks` or `terms` (some sites have no `remarks` DB column).
 GUEST_PREORDER_REMARKS_TAG = "guest_preorder=1"
 
@@ -2749,7 +2753,7 @@ def create_guest_preorder(
 	This is intentionally implemented as a normal Sales Order left in Draft
 	docstatus so the owner can later confirm/prepare it.
 
-	Uses a valid ERPNext ``order_type`` (default ``Sales``). The flow is identified
+	Uses a valid SilkOS ``order_type`` (default ``Sales``). The flow is identified
 	via ``remarks`` containing ``guest_preorder=1``.
 
 	Returns: { preorder_name, estimated_total, currency, status }
@@ -3072,7 +3076,7 @@ def get_guest_preorder_history(preorder_name):
 
 # ── Custom workflow status helpers ────────────────────────────────────────────
 # Display statuses: Consulta → Orden → Preparado → En Delivery → Completado
-# Mapping to ERPNext:
+# Mapping to SilkOS:
 #   Consulta   = docstatus 0 (Draft)
 #   Orden      = docstatus 1, status "To Deliver and Bill"
 #   Preparado  = docstatus 1, status "Preparado"   (custom via db_set)
@@ -3099,7 +3103,7 @@ def _display_status(so):
 
 
 def _erp_status_for_display(display_status):
-	"""Map display status → ERPNext status string."""
+	"""Map display status → SilkOS status string."""
 	return {
 		"Orden": "To Deliver and Bill",
 		"Preparado": "Preparado",
@@ -3153,7 +3157,7 @@ def set_guest_preorder_status(preorder_name, target_status):
 	if not erp_status:
 		frappe.throw(_("Invalid target status"))
 
-	# For standard ERPNext statuses, use update_status; for custom ones, db_set
+	# For standard SilkOS statuses, use update_status; for custom ones, db_set
 	if erp_status in ("To Deliver and Bill", "Completed"):
 		so.update_status(erp_status)
 	else:
@@ -4341,7 +4345,7 @@ def ping():
 	"""
 	return {
 		"status": "ok",
-		"message": "ERPNext E-Commerce Integration API is running",
+		"message": "SilkOS E-Commerce Integration API is running",
 		"frappe_version": frappe.__version__,
 		"site": frappe.local.site,
 	}
@@ -5110,8 +5114,12 @@ def search_items_for_receiving(search_term=None, page_length=8):
 def commit_receiving_session(session_id, reference, supplier, warehouse, lines, draft_items):
 	"""
 	Atomically:
+<<<<<<< Updated upstream
 	1. Create new ERPNext Items for draft items (disabled/inactive until Review
 	   approves them — unless draft already has approved_at)
+=======
+	1. Create new SilkOS Items for draft items
+>>>>>>> Stashed changes
 	2. Create a submitted Stock Entry (Material Receipt)
 	Returns { stock_entry_id, new_item_codes }
 	"""
@@ -5185,7 +5193,7 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 		if frappe.db.exists("Item", d.get("item_code") or ""):
 			new_item_codes[d["draft_id"]] = d["item_code"]
 			continue
-		# item_code is mandatory in ERPNext — generate a unique one if not provided
+		# item_code is mandatory in SilkOS — generate a unique one if not provided
 		item_code_val = (d.get("item_code") or "").strip() or str(_uuid.uuid4())
 		# Already approved in IndexedDB before commit → create active; otherwise disabled
 		is_approved = bool(d.get("approved_at"))
@@ -5221,7 +5229,7 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			item_fields["image"] = d.get("image")
 		item_doc = frappe.get_doc(item_fields)
 		item_doc.insert(ignore_permissions=True)
-		# Add barcode if provided — skip silently if ERPNext rejects the format
+		# Add barcode if provided — skip silently if SilkOS rejects the format
 		if d.get("barcode"):
 			try:
 				item_doc.append("barcodes", {"barcode": d["barcode"], "barcode_type": "EAN"})

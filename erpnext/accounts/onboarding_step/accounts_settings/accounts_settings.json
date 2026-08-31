@@ -2,7 +2,7 @@
  "action": "Show Form Tour",
  "action_label": "Take a quick walk-through of Accounts Settings",
  "creation": "2021-06-29 16:42:03.400731",
- "description": "# Account Settings\n\nIn ERPNext, Accounting features are configurable as per your business needs. Accounts Settings is the place to define some of your accounting preferences like:\n\n - Credit Limit and over billing settings\n - Taxation preferences\n - Deferred accounting preferences\n",
+ "description": "# Account Settings\n\nIn SilkOS, Accounting features are configurable as per your business needs. Accounts Settings is the place to define some of your accounting preferences like:\n\n - Credit Limit and over billing settings\n - Taxation preferences\n - Deferred accounting preferences\n",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,

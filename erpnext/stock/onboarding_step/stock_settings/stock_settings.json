@@ -2,7 +2,7 @@
  "action": "Show Form Tour",
  "action_label": "Take a walk through Stock Settings",
  "creation": "2020-05-15 02:53:57.209967",
- "description": "# Review Stock Settings\n\nIn ERPNext, the Stock module\u2019s features are configurable as per your business needs. Stock Settings is the place where you can set your preferences for:\n- Default values for Item and Pricing\n- Default valuation method for inventory valuation\n- Set preference for serialization and batching of item\n- Set tolerance for over-receipt and delivery of items",
+ "description": "# Review Stock Settings\n\nIn SilkOS, the Stock module\u2019s features are configurable as per your business needs. Stock Settings is the place where you can set your preferences for:\n- Default values for Item and Pricing\n- Default valuation method for inventory valuation\n- Set preference for serialization and batching of item\n- Set tolerance for over-receipt and delivery of items",
  "docstatus": 0,
  "doctype": "Onboarding Step",
  "idx": 0,

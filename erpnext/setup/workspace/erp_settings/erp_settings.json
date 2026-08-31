@@ -10,7 +10,7 @@
    "icon": "setting",
    "idx": 0,
    "is_hidden": 0,
-   "label": "ERPNext Settings",
+   "label": "ERP Settings",
    "links": [
     {
      "dependencies": "",
@@ -440,7 +440,7 @@
    "modified": "2023-05-24 14:47:25.356531",
    "modified_by": "Administrator",
    "module": "Setup",
-   "name": "ERPNext Settings",
+   "name": "ERP Settings",
    "number_cards": [],
    "owner": "Administrator",
    "parent_page": "",
@@ -496,5 +496,5 @@
      "type": "DocType"
     }
    ],
-   "title": "ERPNext Settings"
+   "title": "ERP Settings"
   }

@@ -1,6 +1,6 @@
 """Cash register (POS Profile) APIs for Logistica > Cajas.
 
-A "cash register" maps to a standard ERPNext POS Profile. Revenue attribution
+A "cash register" maps to a standard SilkOS POS Profile. Revenue attribution
 uses the profile's configured warehouse against submitted Sales Invoice Item
 rows (the same warehouse already stamped on every POS sale in
 `ecommerce_api.api.create_pos_sale`), so figures are accurate without any

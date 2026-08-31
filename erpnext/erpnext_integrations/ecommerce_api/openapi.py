@@ -84,7 +84,7 @@ def _summary_from_function_name(name: str) -> str:
 
 def _ops_for_method(dotted_method: str, fn, tag: str) -> dict:
     signature = inspect.signature(fn)
-    description = (fn.__doc__ or "").strip() or "ERPNext ecommerce integration endpoint."
+    description = (fn.__doc__ or "").strip() or "SilkOS ecommerce integration endpoint."
     common = {
         "operationId": _operation_id_for(dotted_method),
         "summary": _summary_from_function_name(fn.__name__),
@@ -141,7 +141,7 @@ def _post_op(summary: str, description: str, tags: list[str]) -> dict:
 
 @frappe.whitelist(allow_guest=True)
 def get_openapi_spec():
-    """Return OpenAPI 3.0 spec for ERPNext ecommerce integration endpoints."""
+    """Return OpenAPI 3.0 spec for SilkOS ecommerce integration endpoints."""
     origin = frappe.utils.get_url()
 
     api_ns = "erpnext.erpnext_integrations.ecommerce_api.api"
@@ -160,9 +160,9 @@ def get_openapi_spec():
     return {
         "openapi": "3.0.3",
         "info": {
-            "title": "ERPNext Ecommerce Integration API",
+            "title": "SilkOS Ecommerce Integration API",
             "version": "1.0.0",
-            "description": "OpenAPI index for custom ERPNext ecommerce integration methods.",
+            "description": "OpenAPI index for custom SilkOS ecommerce integration methods.",
         },
         "servers": [{"url": origin}],
         "paths": paths,

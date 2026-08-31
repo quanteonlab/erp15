@@ -549,7 +549,7 @@ def clone_warehouse(source_warehouse, new_name):
     if frappe.db.exists("Warehouse", expected) or frappe.db.exists("Warehouse", new_name):
         frappe.throw(_("Warehouse {0} already exists").format(expected or new_name))
 
-    # warehouse_name without company suffix (ERPNext autoname appends abbr)
+    # warehouse_name without company suffix (SilkOS autoname appends abbr)
     warehouse_name = new_name[: -len(suffix)] if suffix and new_name.endswith(suffix) else new_name
 
     doc = frappe.new_doc("Warehouse")

@@ -25,7 +25,7 @@ def validate_ecommerce_request(required_fields=None):
 
 def format_item_for_ecommerce_client(item_doc, include_stock=True, price_list=None):
 	"""
-	Format ERPNext item document for e-commerce client
+	Format SilkOS item document for e-commerce client
 
 	Args:
 		item_doc: Item document object
@@ -115,13 +115,13 @@ def format_item_for_ecommerce_client(item_doc, include_stock=True, price_list=No
 
 def format_order_for_erp(ecommerce_order):
 	"""
-	Convert e-commerce order format to ERPNext Sales Order format
+	Convert e-commerce order format to SilkOS Sales Order format
 
 	Args:
 		ecommerce_order (dict): E-commerce order data
 
 	Returns:
-		dict: ERPNext-compatible order data
+		dict: SilkOS-compatible order data
 	"""
 	# Extract customer info
 	customer_email = ecommerce_order.get("billing", {}).get("email")
@@ -166,10 +166,10 @@ def format_order_for_erp(ecommerce_order):
 
 def sync_stock_to_ecommerce(item_code, ecommerce_product_id, api_credentials):
 	"""
-	Sync stock quantity from ERPNext to e-commerce platform
+	Sync stock quantity from SilkOS to e-commerce platform
 
 	Args:
-		item_code (str): ERPNext item code
+		item_code (str): SilkOS item code
 		ecommerce_product_id: E-commerce product ID
 		api_credentials (dict): E-commerce API credentials
 
@@ -257,13 +257,13 @@ def get_or_create_customer_from_ecommerce(ecommerce_customer):
 
 def map_ecommerce_payment_status_to_erp(ecommerce_status):
 	"""
-	Map e-commerce payment status to ERPNext
+	Map e-commerce payment status to SilkOS
 
 	Args:
 		ecommerce_status (str): E-commerce order status
 
 	Returns:
-		str: ERPNext payment status
+		str: SilkOS payment status
 	"""
 	status_map = {
 		"pending": "Draft",
@@ -290,7 +290,7 @@ def calculate_shipping_cost(items, shipping_address, shipping_rule=None):
 	Returns:
 		float: Shipping cost
 	"""
-	# This is a placeholder - actual implementation would use ERPNext Shipping Rule
+	# This is a placeholder - actual implementation would use SilkOS Shipping Rule
 	# or custom shipping calculation logic
 
 	total_weight = 0

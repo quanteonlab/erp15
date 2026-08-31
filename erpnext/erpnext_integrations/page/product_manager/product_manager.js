@@ -1,5 +1,5 @@
 /* Product Manager Page — i016
- * Inline Excel-style editor for ERPNext Items.
+ * Inline Excel-style editor for SilkOS Items.
  * Depends on: AG Grid Community v31 (loaded from CDN)
  *             Cropper.js v1 (loaded from CDN, for image modal)
  */

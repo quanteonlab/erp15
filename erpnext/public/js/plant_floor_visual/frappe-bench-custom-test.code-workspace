@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../.."
+		},
+		{
+			"path": "../../../.."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/home/newang/frappe-bench-custom-test/env/bin/python": true
+		}
+	}
+}

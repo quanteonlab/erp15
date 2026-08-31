@@ -263,6 +263,7 @@ execute:frappe.rename_doc("Report", "TDS Payable Monthly", "Tax Withholding Deta
 erpnext.patches.v14_0.update_proprietorship_to_individual
 erpnext.patches.v15_0.rename_subcontracting_fields
 erpnext.patches.v15_0.unset_incorrect_additional_discount_percentage
+execute:frappe.db.exists("Workspace", "ERPNext Settings") and frappe.rename_doc("Workspace", "ERPNext Settings", "ERP Settings", force=True, ignore_permissions=True)
 
 [post_model_sync]
 erpnext.patches.v15_0.create_asset_depreciation_schedules_from_assets
@@ -419,3 +420,4 @@ erpnext.patches.v15_0.add_toggle_dev_mode_navbar_item
 erpnext.patches.v15_0.add_keyboard_shortcuts_to_settings_dropdown
 erpnext.patches.v15_0.add_dual_language_fields_to_system_settings
 erpnext.patches.v15_0.add_toggle_language_navbar_item
+execute:frappe.db.get_single_value("System Settings", "app_name") == "ERPNext" and frappe.db.set_single_value("System Settings", "app_name", "SilkOS")

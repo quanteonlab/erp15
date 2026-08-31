@@ -717,6 +717,6 @@ def run():
 	print("5/5  Workspace…")
 	create_workspace()
 
-	print("\nDone. Open ERPNext → Bazar Intelligence workspace.")
+	print("\nDone. Open SilkOS → Bazar Intelligence workspace.")
 	print("Run: bench --site dev_site_a execute "
 		  "erpnext.erpnext_integrations.ecommerce_api.setup_i013.run\n")

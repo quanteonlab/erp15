@@ -1,8 +1,8 @@
-# ERPNext E-Commerce Integration API - File Index
+# SilkOS E-Commerce Integration API - File Index
 
 ## Overview
 
-This directory contains a complete e-commerce integration module for ERPNext, providing REST API endpoints and documentation for seamless integration.
+This directory contains a complete e-commerce integration module for SilkOS, providing REST API endpoints and documentation for seamless integration.
 
 ---
 
@@ -41,8 +41,8 @@ This directory contains a complete e-commerce integration module for ERPNext, pr
 
 **Contains:**
 - `validate_wordpress_request()` - Request validation
-- `format_item_for_wordpress()` - Convert ERPNext item to WooCommerce format
-- `format_order_for_erp()` - Convert WooCommerce order to ERPNext format
+- `format_item_for_wordpress()` - Convert SilkOS item to WooCommerce format
+- `format_order_for_erp()` - Convert WooCommerce order to SilkOS format
 - `sync_stock_to_wordpress()` - Stock synchronization helper
 - `create_webhook_log()` - Webhook activity logging
 - `get_or_create_customer_from_wordpress()` - Customer sync helper
@@ -74,7 +74,7 @@ This directory contains a complete e-commerce integration module for ERPNext, pr
 **Purpose**: Get started in 15 minutes
 
 **Sections:**
-- Step-by-step ERPNext setup (5 min)
+- Step-by-step SilkOS setup (5 min)
 - Sample data creation (5 min)
 - API endpoint testing (5 min)
 - WordPress integration setup
@@ -91,7 +91,7 @@ This directory contains a complete e-commerce integration module for ERPNext, pr
 
 **Features:**
 - Settings page for API configuration
-- Automatic order synchronization to ERPNext
+- Automatic order synchronization to SilkOS
 - Real-time stock level sync
 - Customer creation and address management
 - Payment recording
@@ -104,7 +104,7 @@ This directory contains a complete e-commerce integration module for ERPNext, pr
 
 ---
 
-### 6. **ERPNext_WooCommerce_API.postman_collection.json** - Postman Collection
+### 6. **SilkOS_WooCommerce_API.postman_collection.json** - Postman Collection
 **Purpose**: Ready-to-import API testing collection
 
 **Contains:**
@@ -150,26 +150,26 @@ curl -X GET \
 
 ## Integration Workflow
 
-### Typical WordPress → ERPNext Flow
+### Typical WordPress → SilkOS Flow
 
 1. **Customer places order on WordPress/WooCommerce**
    ↓
-2. **WordPress plugin creates/updates customer in ERPNext**
+2. **WordPress plugin creates/updates customer in SilkOS**
    `POST /api.create_customer`
    ↓
-3. **WordPress plugin creates order in ERPNext**
+3. **WordPress plugin creates order in SilkOS**
    `POST /api.create_order`
    ↓
 4. **Payment is processed**
    `POST /api.create_payment`
    ↓
-5. **ERPNext creates delivery note**
+5. **SilkOS creates delivery note**
    `POST /api.create_delivery_note`
    ↓
 6. **Tracking info synced back to WordPress**
    `POST /api.update_tracking_info`
    ↓
-7. **Invoice generated in ERPNext**
+7. **Invoice generated in SilkOS**
    `POST /api.create_invoice`
 
 ---
@@ -177,7 +177,7 @@ curl -X GET \
 ## Key Features
 
 ### ✅ Product Management
-- Sync products from ERPNext to WordPress
+- Sync products from SilkOS to WordPress
 - Support for variants and attributes
 - Dynamic pricing with price lists
 - Product images and descriptions
@@ -302,7 +302,7 @@ curl -X GET \
 
 ## Technology Stack
 
-### Backend (ERPNext)
+### Backend (SilkOS)
 - **Language**: Python 3
 - **Framework**: Frappe Framework
 - **Database**: MariaDB/PostgreSQL
@@ -327,7 +327,7 @@ curl -X GET \
 - **Postman Collection** - API testing toolkit
 - **Example Requests** - Sample API calls in documentation
 
-### ERPNext Resources
+### SilkOS Resources
 - Official Docs: https://docs.erpnext.com
 - Forum: https://discuss.erpnext.com
 - GitHub: https://github.com/frappe/erpnext
@@ -353,13 +353,13 @@ curl -X GET \
 
 ## License
 
-This integration is part of ERPNext and follows the GNU General Public License v3.0.
+This integration is part of SilkOS and follows the GNU General Public License v3.0.
 
 ---
 
 ## Contributors
 
-Developed as part of the ERPNext ecosystem by Frappe Technologies.
+Developed as part of the SilkOS ecosystem by Frappe Technologies.
 
 ---
 

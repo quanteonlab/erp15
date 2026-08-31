@@ -69,7 +69,7 @@ class ERPNext_WooCommerce_Integration {
 
         add_submenu_page(
             'erpnext-integration',
-            'ERPNext Settings',
+            'SilkOS Settings',
             'Settings',
             'manage_options',
             'erpnext-integration',

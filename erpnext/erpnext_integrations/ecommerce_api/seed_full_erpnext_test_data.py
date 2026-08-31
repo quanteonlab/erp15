@@ -1,5 +1,5 @@
 """
-Seed a broader ERPNext test dataset from CSV files.
+Seed a broader SilkOS test dataset from CSV files.
 
 Run with:
 bench --site dev_site_a execute erpnext.erpnext_integrations.ecommerce_api.seed_full_erpnext_test_data.run
@@ -1091,7 +1091,7 @@ def _seed_tasks(base_dir, warnings):
 def _seed_journal_entries(company, warnings):
 	"""Seed GL journal entries covering income recognition, cash movement, and AR/AP.
 
-	Receivable/Payable accounts in ERPNext require party_type + party on each row.
+	Receivable/Payable accounts in SilkOS require party_type + party on each row.
 	We resolve all accounts dynamically from the live CoA so this works regardless
 	of which Chart of Accounts the company uses.
 	"""
@@ -1174,7 +1174,7 @@ def _seed_journal_entries(company, warnings):
 		if not entry:
 			continue
 		seed_key = entry["seed_key"]
-		# user_remark is a stable text field ERPNext never auto-overwrites (unlike title)
+		# user_remark is a stable text field SilkOS never auto-overwrites (unlike title)
 		if frappe.db.exists("Journal Entry", {"user_remark": seed_key}):
 			continue
 		try:
