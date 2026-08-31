@@ -3216,6 +3216,33 @@ def save_shop_ui_settings(settings=None):
 
 
 @frappe.whitelist()
+def get_inquiry_automation_settings():
+    from erpnext.erpnext_integrations.ecommerce_api.inquiry_automation_settings import (
+        get_inquiry_automation_settings as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
+def save_inquiry_automation_settings(settings=None):
+    from erpnext.erpnext_integrations.ecommerce_api.inquiry_automation_settings import (
+        save_inquiry_automation_settings as _impl,
+    )
+
+    return _impl(settings=settings)
+
+
+@frappe.whitelist()
+def send_test_inquiry_email():
+    from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import (
+        send_test_inquiry_email as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist()
 def export_floor_map_png(floor_id, width=1400, height=900, company=None):
     try:
         from PIL import Image, ImageDraw

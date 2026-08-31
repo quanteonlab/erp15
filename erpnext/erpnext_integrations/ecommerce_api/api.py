@@ -2847,6 +2847,10 @@ def create_guest_preorder(
 		cap = flt(so.grand_total)
 		so.db_set("advance_paid", min(paid, cap) if cap > 0 else paid)
 
+	from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import send_consulta_notification
+
+	send_consulta_notification(so.name, guest_name=guest_name, guest_phone=guest_phone)
+
 	return {
 		"preorder_name": so.name,
 		"estimated_total": flt(so.grand_total),

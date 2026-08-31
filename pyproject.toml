@@ -26,6 +26,7 @@ dependencies = [
 
     # Image search (free provider)
     "ddgs>=7.0.0",
+    "python-barcode~=0.15.1",
 ]
 
 [build-system]
