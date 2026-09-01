@@ -76,6 +76,75 @@ def _require_owned_trip(trip_name, driver):
 	return trip
 
 
+def _active_trip_names(exclude_trip=None):
+	filters = {"docstatus": ["!=", 2]}
+	if exclude_trip:
+		filters["name"] = ["!=", exclude_trip]
+	return frappe.get_all("Delivery Trip", filters=filters, pluck="name", ignore_permissions=True)
+
+
+def _assigned_delivery_note_names(trip_names=None):
+	"""Delivery Notes already used as a stop on any active (docstatus != 2)
+	trip - same definition `get_pending_deliveries` needs, factored out so
+	`create_trip`/`add_stops_to_trip` can reuse it instead of re-deriving it."""
+	if trip_names is None:
+		trip_names = _active_trip_names()
+	return set(
+		frappe.get_all(
+			"Delivery Stop",
+			filters={"parent": ["in", trip_names or [""]], "delivery_note": ["is", "set"]},
+			pluck="delivery_note",
+			ignore_permissions=True,
+		)
+	)
+
+
+def _load_delivery_notes_for_stops(delivery_note_names):
+	"""Fetch DN fields + resolved address-display text needed to build
+	Delivery Stop rows. Shared by create_trip and add_stops_to_trip."""
+	notes = frappe.get_all(
+		"Delivery Note",
+		filters={"name": ["in", delivery_note_names]},
+		fields=["name", "customer", "shipping_address_name", "customer_address", "grand_total", "contact_person"],
+		ignore_permissions=True,
+	)
+	notes_by_name = {n.name: n for n in notes}
+
+	missing = [n for n in delivery_note_names if n not in notes_by_name]
+	if missing:
+		frappe.throw(_("Delivery Note(s) not found: {0}").format(", ".join(missing)), frappe.DoesNotExistError)
+
+	address_names = list({(n.shipping_address_name or n.customer_address) for n in notes if (n.shipping_address_name or n.customer_address)})
+	address_display_by_name = {}
+	if address_names:
+		for row in frappe.get_all(
+			"Address", filters={"name": ["in", address_names]}, fields=["*"], ignore_permissions=True
+		):
+			# Passing a dict (not a name string) to get_address_display skips
+			# its internal doc.check_permission() call - required here since
+			# the API-key session may not hold read access on Address.
+			address_display_by_name[row.name] = get_address_display(row)
+
+	return notes_by_name, address_display_by_name
+
+
+def _append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name):
+	for dn_name in delivery_note_names:
+		dn = notes_by_name[dn_name]
+		address_name = dn.shipping_address_name or dn.customer_address
+		trip.append(
+			"delivery_stops",
+			{
+				"customer": dn.customer,
+				"address": address_name,
+				"customer_address": address_display_by_name.get(address_name),
+				"delivery_note": dn.name,
+				"grand_total": dn.grand_total,
+				"contact": dn.contact_person,
+			},
+		)
+
+
 def _stop_out(stop, address_geo=None):
 	address_geo = address_geo or {}
 	geo = address_geo.get(stop.address) or {}
@@ -134,15 +203,7 @@ def get_planner_context():
 
 @frappe.whitelist(allow_guest=True)
 def get_pending_deliveries(date=None, company=None):
-	active_trips = frappe.get_all(
-		"Delivery Trip", filters={"docstatus": ["!=", 2]}, pluck="name", ignore_permissions=True
-	)
-	assigned_notes = frappe.get_all(
-		"Delivery Stop",
-		filters={"parent": ["in", active_trips or [""]], "delivery_note": ["is", "set"]},
-		pluck="delivery_note",
-		ignore_permissions=True,
-	)
+	assigned_notes = _assigned_delivery_note_names()
 
 	filters = {"docstatus": 1, "is_return": 0}
 	if assigned_notes:
@@ -270,6 +331,10 @@ def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, compa
 	if not delivery_note_names:
 		frappe.throw(_("Select at least one order to plan a route."))
 
+	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
+	if conflicts:
+		frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+
 	company = company or frappe.defaults.get_user_default("Company")
 
 	if not driver:
@@ -306,41 +371,8 @@ def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, compa
 		}
 	)
 
-	notes = frappe.get_all(
-		"Delivery Note",
-		filters={"name": ["in", delivery_note_names]},
-		fields=["name", "customer", "shipping_address_name", "customer_address", "grand_total", "contact_person"],
-		ignore_permissions=True,
-	)
-	notes_by_name = {n.name: n for n in notes}
-
-	address_names = list({(n.shipping_address_name or n.customer_address) for n in notes if (n.shipping_address_name or n.customer_address)})
-	address_display_by_name = {}
-	if address_names:
-		for row in frappe.get_all(
-			"Address", filters={"name": ["in", address_names]}, fields=["*"], ignore_permissions=True
-		):
-			# Passing a dict (not a name string) to get_address_display skips
-			# its internal doc.check_permission() call - required here since
-			# the API-key session may not hold read access on Address.
-			address_display_by_name[row.name] = get_address_display(row)
-
-	for dn_name in delivery_note_names:
-		dn = notes_by_name.get(dn_name)
-		if not dn:
-			frappe.throw(_("Delivery Note {0} not found").format(dn_name), frappe.DoesNotExistError)
-		address_name = dn.shipping_address_name or dn.customer_address
-		trip.append(
-			"delivery_stops",
-			{
-				"customer": dn.customer,
-				"address": address_name,
-				"customer_address": address_display_by_name.get(address_name),
-				"delivery_note": dn.name,
-				"grand_total": dn.grand_total,
-				"contact": dn.contact_person,
-			},
-		)
+	notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(delivery_note_names)
+	_append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name)
 
 	trip.insert(ignore_permissions=True)
 	frappe.db.commit()
@@ -413,6 +445,388 @@ def publish_trip(trip_name):
 	frappe.db.commit()
 
 	return {"trip": trip.name, "status": trip.status}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_trips_for_date(date, company=None):
+	if not date:
+		frappe.throw(_("Date is required."))
+	day = getdate(date)
+
+	filters = {
+		"docstatus": ["!=", 2],
+		"departure_time": ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]],
+	}
+	if company:
+		filters["company"] = company
+
+	trips = frappe.get_all(
+		"Delivery Trip",
+		filters=filters,
+		fields=["name", "status", "docstatus", "driver", "driver_name", "vehicle", "departure_time", "total_distance", "uom"],
+		order_by="departure_time asc",
+		ignore_permissions=True,
+	)
+
+	trip_names = [t.name for t in trips]
+	stop_counts = {}
+	if trip_names:
+		for row in frappe.db.sql(
+			"""select parent, count(*) as stop_count
+			from `tabDelivery Stop` where parent in %(names)s group by parent""",
+			{"names": trip_names},
+			as_dict=True,
+		):
+			stop_counts[row.parent] = row.stop_count
+
+	for t in trips:
+		t["stop_count"] = stop_counts.get(t.name, 0)
+
+	return {"date": str(day), "trips": trips}
+
+
+@frappe.whitelist(allow_guest=True)
+def add_stops_to_trip(trip_name, delivery_note_names):
+	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
+	if not delivery_note_names:
+		frappe.throw(_("Select at least one order to add."))
+
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+	if trip.docstatus != 0:
+		frappe.throw(_("Stops can only be added to a Draft trip."))
+
+	already_on_trip = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
+	dupes = [n for n in delivery_note_names if n in already_on_trip]
+	if dupes:
+		frappe.throw(_("Already on this trip: {0}").format(", ".join(dupes)))
+
+	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
+	if conflicts:
+		frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+
+	notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(delivery_note_names)
+	_append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name)
+
+	trip.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return get_trip_map_data(trip_name)
+
+
+@frappe.whitelist(allow_guest=True)
+def remove_stops_from_trip(trip_name, delivery_note_names):
+	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
+	if not delivery_note_names:
+		frappe.throw(_("Select at least one stop to remove."))
+
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+	if trip.docstatus != 0:
+		frappe.throw(_("Stops can only be removed from a Draft trip. Cancel the trip to free all its stops."))
+
+	names = set(delivery_note_names)
+	rows_to_remove = [s for s in trip.delivery_stops if s.delivery_note in names]
+	if not rows_to_remove:
+		frappe.throw(_("None of the given delivery notes are on this trip."))
+
+	# Snapshot list - trip.remove() mutates trip.delivery_stops in place and
+	# renumbers idx for the remaining rows, so iterate the snapshot, not the
+	# live list.
+	for row in rows_to_remove:
+		trip.remove(row)
+
+	trip.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return get_trip_map_data(trip_name)
+
+
+@frappe.whitelist(allow_guest=True)
+def update_trip_assignment(trip_name, driver=None, vehicle=None):
+	if not driver and not vehicle:
+		frappe.throw(_("Provide a driver or vehicle to update."))
+
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+	if trip.docstatus != 0:
+		frappe.throw(_("Only a Draft trip can be reassigned. Cancel a published trip and create a new one instead."))
+
+	if driver:
+		driver_doc = frappe.db.get_value("Driver", driver, ["full_name", "address"], as_dict=True)
+		if not driver_doc:
+			frappe.throw(_("Driver {0} not found").format(driver), frappe.DoesNotExistError)
+		trip.driver = driver
+		trip.driver_name = driver_doc.full_name
+		trip.driver_address = driver_doc.address or _default_address("Company", trip.company)
+
+	if vehicle:
+		if not frappe.db.exists("Vehicle", vehicle):
+			frappe.throw(_("Vehicle {0} not found").format(vehicle), frappe.DoesNotExistError)
+		trip.vehicle = vehicle
+
+	trip.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return get_trip_map_data(trip_name)
+
+
+@frappe.whitelist(allow_guest=True)
+def cancel_trip(trip_name):
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+
+	if trip.docstatus == 2:
+		frappe.throw(_("Trip {0} is already cancelled.").format(trip_name))
+
+	if trip.docstatus == 0:
+		# Draft was never submitted - core Frappe disallows a 0->2 docstatus
+		# transition (DocstatusTransitionError). Deleting removes the trip
+		# and its Delivery Stop rows in one call, which is exactly what frees
+		# the linked Delivery Notes back into get_pending_deliveries' pool (a
+		# stop only "counts" while its parent trip exists with docstatus != 2).
+		# Nothing else needs cleanup: update_delivery_notes() only ever runs
+		# from on_submit/on_cancel, neither of which a Draft trip has been
+		# through, so the DNs were never touched.
+		frappe.delete_doc("Delivery Trip", trip_name, ignore_permissions=True)
+		frappe.db.commit()
+		return {"trip": trip_name, "status": "Deleted"}
+
+	# Submitted: DeliveryTrip.on_cancel() -> update_delivery_notes(delete=True)
+	# loads each linked Delivery Note as a *fresh* Document instance and calls
+	# note_doc.save() with no ignore_permissions kwarg. trip.flags.
+	# ignore_permissions only covers the trip document itself - Document.
+	# has_permission() only ever reads its own instance's flags, never a
+	# global - so on a session whose underlying user lacks Delivery Note
+	# write access, that inner save() raises frappe.PermissionError and the
+	# whole cancel rolls back uncommitted. Elevate the session for this call
+	# only, same idiom core uses in frappe/search/website_search.py.
+	previous_user = frappe.session.user
+	try:
+		frappe.set_user("Administrator")
+		trip.flags.ignore_permissions = True
+		trip.cancel()
+	finally:
+		frappe.set_user(previous_user)
+
+	frappe.db.commit()
+	return {"trip": trip.name, "status": trip.status}
+
+
+# ---------------------------------------------------------------------------
+# Dev seed data
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist(allow_guest=True)
+def seed_tms_demo(reset=False):
+	"""Create demo data for TMS dispatcher testing.
+
+	Idempotent by default — skips anything that already exists.
+	Pass reset=True to delete existing TMS demo docs first.
+
+	Creates:
+	  - 2 Drivers (each with Employee + geocoded home Address)
+	  - 2 Vehicles
+	  - 4 Customers with geocoded shipping Addresses
+	  - 4 submitted Delivery Notes (one per customer)
+	"""
+	reset = frappe.parse_json(reset) if isinstance(reset, str) else bool(reset)
+	company = "library"
+	warehouse = "POSNET Stores - L"
+	item_code = "24755"
+	item_name = "WHISKY MACALLAN ERATH ESTUCHE 1*700ML"
+	today = frappe.utils.today()
+
+	created = []
+	skipped = []
+
+	def _ex(doctype, name):
+		return bool(frappe.db.exists(doctype, name))
+
+	if reset:
+		# Delete existing demo DNs and trips that use them, then customers/drivers/vehicles
+		for dn in frappe.get_all("Delivery Note", filters={"customer": ["like", "TMS Demo Cliente%"]}, ignore_permissions=True):
+			if frappe.db.get_value("Delivery Note", dn.name, "docstatus") == 1:
+				frappe.db.set_value("Delivery Note", dn.name, "docstatus", 2)
+			frappe.delete_doc("Delivery Note", dn.name, force=True, ignore_permissions=True)
+		for dr in frappe.get_all("Driver", filters={"full_name": ["like", "TMS Demo%"]}, ignore_permissions=True):
+			frappe.delete_doc("Driver", dr.name, force=True, ignore_permissions=True)
+		for v in frappe.get_all("Vehicle", filters={"license_plate": ["like", "TMS-%"]}, ignore_permissions=True):
+			frappe.delete_doc("Vehicle", v.name, force=True, ignore_permissions=True)
+		for c in frappe.get_all("Customer", filters={"customer_name": ["like", "TMS Demo Cliente%"]}, ignore_permissions=True):
+			frappe.delete_doc("Customer", c.name, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+	# ── 1. Drivers (Employee → Driver → home Address) ─────────────────────────
+	drivers_seed = [
+		{"full_name": "TMS Demo Carlos Ramírez", "cell": "011-4444-0001", "lat": -34.6100, "lng": -58.4200, "addr_line": "Av. Rivadavia 5000, Flores"},
+		{"full_name": "TMS Demo María González", "cell": "011-4444-0002", "lat": -34.5900, "lng": -58.4500, "addr_line": "Triunvirato 3200, Villa del Parque"},
+	]
+	for d in drivers_seed:
+		exists = frappe.get_all("Driver", filters={"full_name": d["full_name"]}, ignore_permissions=True)
+		if exists:
+			skipped.append(f"Driver: {d['full_name']}")
+			continue
+
+		home_addr = frappe.get_doc({
+			"doctype": "Address",
+			"address_title": f"{d['full_name']} - Casa",
+			"address_type": "Personal",
+			"address_line1": d["addr_line"],
+			"city": "Buenos Aires",
+			"country": "Argentina",
+			"custom_latitude": d["lat"],
+			"custom_longitude": d["lng"],
+		})
+		home_addr.insert(ignore_permissions=True)
+
+		first = d["full_name"].split()[2]
+		last = " ".join(d["full_name"].split()[3:])
+		emp = frappe.get_doc({
+			"doctype": "Employee",
+			"first_name": first,
+			"last_name": last,
+			"employee_name": d["full_name"],
+			"company": company,
+			"date_of_birth": "1990-01-01",
+			"date_of_joining": "2024-01-01",
+			"gender": "Male",
+			"status": "Active",
+		})
+		emp.flags.ignore_mandatory = True
+		emp.insert(ignore_permissions=True)
+
+		driver = frappe.get_doc({
+			"doctype": "Driver",
+			"full_name": d["full_name"],
+			"employee": emp.name,
+			"status": "Active",
+			"cell_number": d["cell"],
+			"address": home_addr.name,
+		})
+		driver.insert(ignore_permissions=True)
+		created.append(f"Driver: {driver.name}")
+
+	# ── 2. Vehicles ────────────────────────────────────────────────────────────
+	vehicles_seed = [
+		{"plate": "TMS-001-AA", "make": "Ford", "model": "Transit", "fuel": "Diesel"},
+		{"plate": "TMS-002-BB", "make": "Volkswagen", "model": "Caddy", "fuel": "Diesel"},
+	]
+	for v in vehicles_seed:
+		if frappe.db.exists("Vehicle", {"license_plate": v["plate"]}):
+			skipped.append(f"Vehicle: {v['plate']}")
+			continue
+		veh = frappe.get_doc({
+			"doctype": "Vehicle",
+			"license_plate": v["plate"],
+			"make": v["make"],
+			"model": v["model"],
+			"fuel_type": v["fuel"],
+			"last_odometer": 0,
+			"uom": "Unit",
+		})
+		veh.insert(ignore_permissions=True)
+		created.append(f"Vehicle: {veh.name}")
+
+	# ── 3. Customers + geocoded shipping addresses ─────────────────────────────
+	customers_seed = [
+		{"name": "TMS Demo Cliente 1", "area": "Palermo", "addr": "Av. Santa Fe 3000", "lat": -34.5883, "lng": -58.4314},
+		{"name": "TMS Demo Cliente 2", "area": "San Telmo", "addr": "Defensa 500", "lat": -34.6217, "lng": -58.3731},
+		{"name": "TMS Demo Cliente 3", "area": "Belgrano", "addr": "Av. Cabildo 2000", "lat": -34.5537, "lng": -58.4560},
+		{"name": "TMS Demo Cliente 4", "area": "Recoleta", "addr": "Av. Alvear 1800", "lat": -34.5875, "lng": -58.3951},
+	]
+	for c in customers_seed:
+		if not frappe.db.exists("Customer", c["name"]):
+			cust = frappe.get_doc({
+				"doctype": "Customer",
+				"customer_name": c["name"],
+				"customer_type": "Individual",
+				"customer_group": "Retail",
+				"territory": "Argentina",
+			})
+			cust.insert(ignore_permissions=True)
+			created.append(f"Customer: {cust.name}")
+		else:
+			skipped.append(f"Customer: {c['name']}")
+
+		addr_title = f"{c['name']} - {c['area']}"
+		if not frappe.db.exists("Address", {"address_title": addr_title}):
+			addr = frappe.get_doc({
+				"doctype": "Address",
+				"address_title": addr_title,
+				"address_type": "Shipping",
+				"address_line1": c["addr"],
+				"city": f"Buenos Aires",
+				"country": "Argentina",
+				"is_shipping_address": 1,
+				"custom_latitude": c["lat"],
+				"custom_longitude": c["lng"],
+				"links": [{"link_doctype": "Customer", "link_name": c["name"]}],
+			})
+			addr.insert(ignore_permissions=True)
+			created.append(f"Address: {addr.name}")
+
+	# ── 4. Delivery Notes (force-submitted for demo) ───────────────────────────
+	for i, c in enumerate(customers_seed, 1):
+		existing_dn = frappe.get_all(
+			"Delivery Note",
+			filters={"customer": c["name"], "docstatus": 1},
+			ignore_permissions=True,
+		)
+		if existing_dn:
+			skipped.append(f"Delivery Note for {c['name']}")
+			continue
+
+		ship_addr = frappe.db.get_value(
+			"Address",
+			{"address_title": f"{c['name']} - {c['area']}", "address_type": "Shipping"},
+			"name",
+		)
+		qty = float(i + 1)
+		dn = frappe.get_doc({
+			"doctype": "Delivery Note",
+			"company": company,
+			"customer": c["name"],
+			"posting_date": today,
+			"set_warehouse": warehouse,
+			"shipping_address_name": ship_addr,
+			"selling_price_list": "Standard Selling",
+			"currency": "ARS",
+			"conversion_rate": 1.0,
+			"plc_conversion_rate": 1.0,
+			"items": [{
+				"item_code": item_code,
+				"item_name": item_name,
+				"qty": qty,
+				"stock_qty": qty,
+				"uom": "Nos",
+				"stock_uom": "Nos",
+				"conversion_factor": 1.0,
+				"warehouse": warehouse,
+				"rate": 5000.0,
+				"amount": 5000.0 * qty,
+			}],
+		})
+		dn.flags.ignore_permissions = True
+		dn.flags.ignore_validate = True
+		dn.flags.ignore_mandatory = True
+		dn.flags.ignore_links = True
+		dn.insert(ignore_permissions=True)
+		# Force-submit for demo: bypass accounting/stock movements
+		frappe.db.sql(
+			"UPDATE `tabDelivery Note` SET docstatus=1, status='To Deliver', customer_name=%s WHERE name=%s",
+			(c["name"], dn.name),
+		)
+		frappe.db.commit()
+		created.append(f"Delivery Note: {dn.name} (force-submitted)")
+
+	frappe.db.commit()
+	return {"created": created, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
