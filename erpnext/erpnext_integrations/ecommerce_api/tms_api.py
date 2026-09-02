@@ -8,6 +8,9 @@ engine to the dispatcher (planner) and driver (mobile/web) frontends, and adds
 proof-of-delivery capture (signature + recipient name/ID) on top of it.
 """
 
+import secrets
+import string
+
 import frappe
 from frappe import _
 from frappe.contacts.doctype.address.address import get_address_display
@@ -42,27 +45,121 @@ def _default_address(link_doctype, link_name):
 	return rows[0] if rows else None
 
 
+def _resolve_pickup_address(company, driver_doc=None, pickup_warehouse=None):
+	"""Depot/pickup address resolution for a trip, in priority order:
+
+	1. Explicit `pickup_warehouse` (per-trip override) -> that Warehouse's
+	   linked Address.
+	2. `Company.custom_default_warehouse` -> its linked Address. This is the
+	   "usual" depot for the company - a company can have several warehouses,
+	   but normally only one is the default pickup point.
+	3. `Driver.address` - kept for backward compatibility with setups that
+	   have no company depot configured (e.g. driver departs from home).
+	4. Legacy fallback: any Address dynamic-linked to the Company at all.
+
+	Returns (address_name, resolved_from_warehouse_name_or_None).
+	"""
+	if pickup_warehouse:
+		addr = _default_address("Warehouse", pickup_warehouse)
+		if addr:
+			return addr, pickup_warehouse
+
+	default_warehouse = company and frappe.db.get_value("Company", company, "custom_default_warehouse")
+	if default_warehouse:
+		addr = _default_address("Warehouse", default_warehouse)
+		if addr:
+			return addr, default_warehouse
+
+	if driver_doc and driver_doc.get("address"):
+		return driver_doc["address"], None
+
+	return _default_address("Company", company), None
+
+
 def _get_current_driver():
-	from erpnext.erpnext_integrations.ecommerce_api.company_context import acting_user
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import acting_user, is_desk_admin
 
 	user = acting_user()
 	if not user or user == "Guest":
 		frappe.throw(_("Login required"), frappe.AuthenticationError)
 
 	employee = frappe.db.get_value("Employee", {"user_id": user}, "name")
-	if not employee:
-		frappe.throw(_("No employee profile is linked to this account"))
+	if employee:
+		driver = frappe.db.get_value(
+			"Driver",
+			{"employee": employee},
+			["name", "full_name", "cell_number", "address"],
+			as_dict=True,
+		)
+		if driver:
+			return driver
+		if is_desk_admin(user):
+			return _ensure_driver_for_employee(employee, user)
+		frappe.throw(_("No driver profile is linked to this account"))
 
-	driver = frappe.db.get_value(
+	if is_desk_admin(user):
+		return _ensure_admin_driver_profile(user)
+
+	frappe.throw(_("No employee profile is linked to this account"))
+
+
+def _driver_display_name(user: str) -> str:
+	full = (frappe.db.get_value("User", user, "full_name") or "").strip()
+	if full:
+		return full
+	local = user.split("@", 1)[0]
+	return local.replace(".", " ").title() or user
+
+
+def _ensure_driver_for_employee(employee: str, user: str) -> dict:
+	full_name = frappe.db.get_value("Employee", employee, "employee_name") or _driver_display_name(user)
+	driver = frappe.get_doc(
+		{
+			"doctype": "Driver",
+			"full_name": full_name,
+			"employee": employee,
+			"status": "Active",
+		}
+	)
+	driver.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return frappe.db.get_value(
 		"Driver",
-		{"employee": employee},
+		driver.name,
 		["name", "full_name", "cell_number", "address"],
 		as_dict=True,
 	)
-	if not driver:
-		frappe.throw(_("No driver profile is linked to this account"))
 
-	return driver
+
+def _ensure_admin_driver_profile(user: str) -> dict:
+	"""Desk admins may use driver APIs without a pre-existing Employee/Driver."""
+	company = (
+		frappe.defaults.get_user_default("Company", user)
+		or frappe.db.get_single_value("Global Defaults", "default_company")
+		or frappe.db.get_value("Company", {}, "name")
+	)
+	display = _driver_display_name(user)
+	parts = display.split()
+	first_name = parts[0]
+	last_name = " ".join(parts[1:]) if len(parts) > 1 else first_name
+
+	emp = frappe.get_doc(
+		{
+			"doctype": "Employee",
+			"first_name": first_name,
+			"last_name": last_name,
+			"employee_name": display,
+			"company": company,
+			"user_id": user,
+			"date_of_birth": "1990-01-01",
+			"date_of_joining": getdate(),
+			"gender": "Other",
+			"status": "Active",
+		}
+	)
+	emp.flags.ignore_mandatory = True
+	emp.insert(ignore_permissions=True)
+	return _ensure_driver_for_employee(emp.name, user)
 
 
 def _require_owned_trip(trip_name, driver):
@@ -86,13 +183,23 @@ def _active_trip_names(exclude_trip=None):
 def _assigned_delivery_note_names(trip_names=None):
 	"""Delivery Notes already used as a stop on any active (docstatus != 2)
 	trip - same definition `get_pending_deliveries` needs, factored out so
-	`create_trip`/`add_stops_to_trip` can reuse it instead of re-deriving it."""
+	`create_trip`/`add_stops_to_trip` can reuse it instead of re-deriving it.
+
+	A stop whose only attempt resulted in "Not Home" does NOT keep its
+	Delivery Note locked to the (now immutable, submitted) trip - the DN
+	reappears in the pending pool so a new trip can be planned for it. The
+	original stop row stays on the old trip as an audit record either way.
+	"""
 	if trip_names is None:
 		trip_names = _active_trip_names()
 	return set(
 		frappe.get_all(
 			"Delivery Stop",
-			filters={"parent": ["in", trip_names or [""]], "delivery_note": ["is", "set"]},
+			filters={
+				"parent": ["in", trip_names or [""]],
+				"delivery_note": ["is", "set"],
+				"custom_outcome": ["!=", "Not Home"],
+			},
 			pluck="delivery_note",
 			ignore_permissions=True,
 		)
@@ -128,6 +235,24 @@ def _load_delivery_notes_for_stops(delivery_note_names):
 	return notes_by_name, address_display_by_name
 
 
+def _ensure_tracking_code(dn_name):
+	"""Generates Delivery Note.custom_tracking_code the first time a DN is
+	attached to a trip - scoped to TMS-managed deliveries only, not every
+	Delivery Note in the system."""
+	existing = frappe.db.get_value("Delivery Note", dn_name, "custom_tracking_code")
+	if existing:
+		return existing
+
+	length = cint(_load_tms_settings().get("tracking_code_length")) or 8
+	alphabet = string.ascii_uppercase + string.digits
+	for _attempt in range(10):
+		code = "".join(secrets.choice(alphabet) for _ in range(length))
+		if not frappe.db.exists("Delivery Note", {"custom_tracking_code": code}):
+			frappe.db.set_value("Delivery Note", dn_name, "custom_tracking_code", code, update_modified=False)
+			return code
+	return None
+
+
 def _append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name):
 	for dn_name in delivery_note_names:
 		dn = notes_by_name[dn_name]
@@ -143,11 +268,13 @@ def _append_delivery_stops(trip, delivery_note_names, notes_by_name, address_dis
 				"contact": dn.contact_person,
 			},
 		)
+		_ensure_tracking_code(dn_name)
 
 
 def _stop_out(stop, address_geo=None):
 	address_geo = address_geo or {}
 	geo = address_geo.get(stop.address) or {}
+	outcome = stop.get("custom_outcome") if hasattr(stop, "get") else getattr(stop, "custom_outcome", None)
 	return {
 		"idx": stop.idx,
 		"customer": stop.customer,
@@ -157,6 +284,7 @@ def _stop_out(stop, address_geo=None):
 		"grand_total": stop.grand_total,
 		"contact": stop.contact,
 		"visited": bool(stop.visited),
+		"outcome": outcome or None,
 		"distance": stop.distance,
 		"estimated_arrival": stop.estimated_arrival,
 		# Prefer the optimized lat/lng from process_route(); fall back to the
@@ -169,8 +297,16 @@ def _stop_out(stop, address_geo=None):
 			"signature": stop.custom_pod_signature,
 			"notes": stop.custom_pod_notes,
 			"captured_at": stop.custom_pod_captured_at,
+			"outcome": outcome or None,
+			"attempt_note": stop.get("custom_attempt_note") if hasattr(stop, "get") else getattr(stop, "custom_attempt_note", None),
+			"photo_urls": frappe.parse_json(stop.custom_photo_urls) if getattr(stop, "custom_photo_urls", None) else [],
+			"amount_due": getattr(stop, "custom_amount_due", None),
+			"amount_collected": getattr(stop, "custom_amount_collected", None),
+			"payment_method": getattr(stop, "custom_payment_method", None) or None,
+			"cliente_debe": bool(getattr(stop, "custom_cliente_debe", 0)),
+			"balance_after_stop": getattr(stop, "custom_balance_after_stop", None),
 		}
-		if stop.visited
+		if (stop.visited or outcome)
 		else None,
 	}
 
@@ -181,7 +317,7 @@ def _stop_out(stop, address_geo=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def get_planner_context():
+def get_planner_context(company=None):
 	drivers = frappe.get_all(
 		"Driver",
 		filters={"status": "Active"},
@@ -193,9 +329,25 @@ def get_planner_context():
 		fields=["name", "license_plate", "make", "model"],
 		ignore_permissions=True,
 	)
+
+	company = company or frappe.defaults.get_user_default("Company")
+	warehouses = []
+	default_warehouse = None
+	if company:
+		warehouses = frappe.get_all(
+			"Warehouse",
+			filters={"company": company, "is_group": 0, "disabled": 0},
+			fields=["name", "warehouse_name"],
+			order_by="warehouse_name asc",
+			ignore_permissions=True,
+		)
+		default_warehouse = frappe.db.get_value("Company", company, "custom_default_warehouse")
+
 	return {
 		"drivers": drivers,
 		"vehicles": vehicles,
+		"warehouses": warehouses,
+		"default_warehouse": default_warehouse,
 		"google_maps_configured": bool(frappe.db.get_single_value("Google Settings", "api_key")),
 		"today": str(getdate()),
 	}
@@ -251,6 +403,17 @@ def get_pending_deliveries(date=None, company=None):
 		):
 			geo_by_address[row.name] = row
 
+	previous_attempts = set()
+	if names:
+		previous_attempts = set(
+			frappe.get_all(
+				"Delivery Stop",
+				filters={"delivery_note": ["in", names], "custom_outcome": "Not Home"},
+				pluck="delivery_note",
+				ignore_permissions=True,
+			)
+		)
+
 	out = []
 	for n in notes:
 		address_name = n.shipping_address_name or n.customer_address
@@ -268,6 +431,7 @@ def get_pending_deliveries(date=None, company=None):
 				"geocoded": bool(geo.get("custom_latitude")),
 				"lat": geo.get("custom_latitude"),
 				"lng": geo.get("custom_longitude"),
+				"previous_attempt": n.name in previous_attempts,
 			}
 		)
 
@@ -326,7 +490,7 @@ def geocode_address(address_name):
 
 
 @frappe.whitelist(allow_guest=True)
-def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, company=None):
+def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, company=None, pickup_warehouse=None):
 	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
 	if not delivery_note_names:
 		frappe.throw(_("Select at least one order to plan a route."))
@@ -345,13 +509,10 @@ def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, compa
 			driver = active_drivers[0].name
 
 	driver_doc = None
-	driver_address = None
 	if driver:
 		driver_doc = frappe.db.get_value("Driver", driver, ["full_name", "address"], as_dict=True)
-		driver_address = driver_doc.address if driver_doc else None
 
-	if not driver_address and company:
-		driver_address = _default_address("Company", company)
+	driver_address, resolved_warehouse = _resolve_pickup_address(company, driver_doc, pickup_warehouse)
 
 	if not vehicle:
 		vehicles = frappe.get_all("Vehicle", pluck="name", ignore_permissions=True)
@@ -365,6 +526,7 @@ def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, compa
 			"driver": driver,
 			"driver_name": driver_doc.full_name if driver_doc else None,
 			"driver_address": driver_address,
+			"custom_pickup_warehouse": resolved_warehouse,
 			"vehicle": vehicle,
 			"departure_time": get_datetime(f"{getdate(date)} 08:00:00"),
 			"delivery_stops": [],
@@ -423,6 +585,7 @@ def get_trip_map_data(trip_name):
 			"driver": trip.driver,
 			"driver_name": trip.driver_name,
 			"vehicle": trip.vehicle,
+			"pickup_warehouse": trip.custom_pickup_warehouse,
 			"departure_time": trip.departure_time,
 			"total_distance": trip.total_distance,
 			"uom": trip.uom,
@@ -545,9 +708,9 @@ def remove_stops_from_trip(trip_name, delivery_note_names):
 
 
 @frappe.whitelist(allow_guest=True)
-def update_trip_assignment(trip_name, driver=None, vehicle=None):
-	if not driver and not vehicle:
-		frappe.throw(_("Provide a driver or vehicle to update."))
+def update_trip_assignment(trip_name, driver=None, vehicle=None, pickup_warehouse=None):
+	if not driver and not vehicle and not pickup_warehouse:
+		frappe.throw(_("Provide a driver, vehicle, or pickup warehouse to update."))
 
 	frappe.flags.ignore_permissions = True
 	trip = frappe.get_doc("Delivery Trip", trip_name)
@@ -555,13 +718,20 @@ def update_trip_assignment(trip_name, driver=None, vehicle=None):
 	if trip.docstatus != 0:
 		frappe.throw(_("Only a Draft trip can be reassigned. Cancel a published trip and create a new one instead."))
 
-	if driver:
-		driver_doc = frappe.db.get_value("Driver", driver, ["full_name", "address"], as_dict=True)
-		if not driver_doc:
-			frappe.throw(_("Driver {0} not found").format(driver), frappe.DoesNotExistError)
-		trip.driver = driver
-		trip.driver_name = driver_doc.full_name
-		trip.driver_address = driver_doc.address or _default_address("Company", trip.company)
+	if driver or pickup_warehouse:
+		driver_doc = None
+		if driver:
+			driver_doc = frappe.db.get_value("Driver", driver, ["full_name", "address"], as_dict=True)
+			if not driver_doc:
+				frappe.throw(_("Driver {0} not found").format(driver), frappe.DoesNotExistError)
+			trip.driver = driver
+			trip.driver_name = driver_doc.full_name
+		elif trip.driver:
+			driver_doc = frappe.db.get_value("Driver", trip.driver, ["full_name", "address"], as_dict=True)
+
+		driver_address, resolved_warehouse = _resolve_pickup_address(trip.company, driver_doc, pickup_warehouse)
+		trip.driver_address = driver_address
+		trip.custom_pickup_warehouse = resolved_warehouse
 
 	if vehicle:
 		if not frappe.db.exists("Vehicle", vehicle):
@@ -617,6 +787,264 @@ def cancel_trip(trip_name):
 	return {"trip": trip.name, "status": trip.status}
 
 
+@frappe.whitelist(allow_guest=True)
+def create_driver_quick(full_name, cell_number=None, company=None):
+	"""Quick-create a Driver (with a minimal Employee) from the dispatcher UI,
+	so typing a name that doesn't exist yet doesn't require a trip to desk."""
+	full_name = (full_name or "").strip()
+	if not full_name:
+		frappe.throw(_("Driver name is required."))
+
+	existing = frappe.get_all("Driver", filters={"full_name": full_name}, limit=1, ignore_permissions=True)
+	if existing:
+		frappe.throw(_("A driver named {0} already exists.").format(full_name))
+
+	company = company or frappe.defaults.get_user_default("Company")
+	parts = full_name.split()
+	first_name = parts[0]
+	last_name = " ".join(parts[1:]) or first_name
+
+	emp = frappe.get_doc(
+		{
+			"doctype": "Employee",
+			"first_name": first_name,
+			"last_name": last_name,
+			"employee_name": full_name,
+			"company": company,
+			"date_of_birth": "1990-01-01",
+			"date_of_joining": getdate(),
+			"gender": "Other",
+			"status": "Active",
+		}
+	)
+	emp.flags.ignore_mandatory = True
+	emp.insert(ignore_permissions=True)
+
+	driver = frappe.get_doc(
+		{
+			"doctype": "Driver",
+			"full_name": full_name,
+			"employee": emp.name,
+			"status": "Active",
+			"cell_number": cell_number,
+		}
+	)
+	driver.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+	return {"name": driver.name, "full_name": driver.full_name, "address": driver.address}
+
+
+@frappe.whitelist(allow_guest=True)
+def create_vehicle_quick(license_plate, make=None, model=None):
+	"""Quick-create a Vehicle from the dispatcher UI. `make`/`model` are
+	required by core Vehicle, so a placeholder fills in if left blank -
+	dispatcher can fill in real values later from desk."""
+	license_plate = (license_plate or "").strip()
+	if not license_plate:
+		frappe.throw(_("License plate is required."))
+
+	if frappe.db.exists("Vehicle", license_plate):
+		frappe.throw(_("A vehicle with plate {0} already exists.").format(license_plate))
+
+	veh = frappe.get_doc(
+		{
+			"doctype": "Vehicle",
+			"license_plate": license_plate,
+			"make": make or "N/A",
+			"model": model or "N/A",
+			"fuel_type": "Petrol",
+			"last_odometer": 0,
+			"uom": "Unit",
+		}
+	)
+	veh.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+	return {"name": veh.name, "license_plate": veh.license_plate}
+
+
+# ---------------------------------------------------------------------------
+# TMS Settings
+#
+# Reuses the "Table Extra Schema" doctype (scope -> JSON blob) the same way
+# employee_api.py's group-permissions store does, instead of a new Single
+# DocType - it's a settings blob with no list/report/audit needs of its own,
+# so no new doctype or migration is warranted for it.
+# ---------------------------------------------------------------------------
+
+TMS_SETTINGS_SCOPE = "settings.tms"
+
+TMS_SETTINGS_DEFAULTS = {
+	"delivery_payment_mode": "same_driver_collects",  # same_driver_collects | separate_collector | optional_collect_at_delivery
+	"require_signature": "always",  # always | never | per_outcome
+	"require_photo_on_not_home": True,
+	"allow_driver_reorder": False,
+	"allow_driver_delivery_request": True,
+	"print_template_delivery": None,
+	"print_template_payment": None,
+	"tracking_code_length": 8,
+}
+
+
+def _load_tms_settings():
+	settings = dict(TMS_SETTINGS_DEFAULTS)
+	if frappe.db.exists("Table Extra Schema", TMS_SETTINGS_SCOPE):
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Table Extra Schema", TMS_SETTINGS_SCOPE)
+		frappe.flags.ignore_permissions = False
+		stored = frappe.parse_json(doc.columns_json) if doc.columns_json else {}
+		if isinstance(stored, dict):
+			settings.update(stored)
+	return settings
+
+
+@frappe.whitelist(allow_guest=True)
+def get_tms_settings():
+	return _load_tms_settings()
+
+
+@frappe.whitelist(allow_guest=True)
+def save_tms_settings(
+	delivery_payment_mode=None,
+	require_signature=None,
+	require_photo_on_not_home=None,
+	allow_driver_reorder=None,
+	allow_driver_delivery_request=None,
+	print_template_delivery=None,
+	print_template_payment=None,
+	tracking_code_length=None,
+):
+	current = _load_tms_settings()
+	raw = {
+		"delivery_payment_mode": delivery_payment_mode,
+		"require_signature": require_signature,
+		"require_photo_on_not_home": require_photo_on_not_home,
+		"allow_driver_reorder": allow_driver_reorder,
+		"allow_driver_delivery_request": allow_driver_delivery_request,
+		"print_template_delivery": print_template_delivery,
+		"print_template_payment": print_template_payment,
+		"tracking_code_length": tracking_code_length,
+	}
+	bool_keys = {"require_photo_on_not_home", "allow_driver_reorder", "allow_driver_delivery_request"}
+	for key, value in raw.items():
+		if value is None:
+			continue
+		if key in bool_keys:
+			current[key] = frappe.parse_json(value) if isinstance(value, str) else bool(value)
+		elif key == "tracking_code_length":
+			current[key] = cint(value) or TMS_SETTINGS_DEFAULTS["tracking_code_length"]
+		else:
+			current[key] = value
+
+	payload = frappe.as_json(current)
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", TMS_SETTINGS_SCOPE):
+		doc = frappe.get_doc("Table Extra Schema", TMS_SETTINGS_SCOPE)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc({"doctype": "Table Extra Schema", "scope": TMS_SETTINGS_SCOPE, "columns_json": payload})
+		doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+	return current
+
+
+# ---------------------------------------------------------------------------
+# Delivery Requests (driver-initiated "solicitar entrega")
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def driver_request_delivery(customer, delivery_note=None, note=None, photo_base64=None):
+	if not _load_tms_settings().get("allow_driver_delivery_request"):
+		frappe.throw(_("Driver-initiated delivery requests are disabled."))
+
+	driver = _get_current_driver()
+
+	if not frappe.db.exists("Customer", customer):
+		frappe.throw(_("Customer {0} not found").format(customer), frappe.DoesNotExistError)
+
+	req = frappe.get_doc(
+		{
+			"doctype": "Delivery Request",
+			"driver": driver.name,
+			"customer": customer,
+			"delivery_note": delivery_note or None,
+			"note": note,
+			"status": "Requested",
+			"requested_at": now_datetime(),
+		}
+	)
+	req.insert(ignore_permissions=True)
+
+	if photo_base64:
+		file_doc = save_file(
+			f"delivery-request-{req.name}.png",
+			photo_base64,
+			"Delivery Request",
+			req.name,
+			decode=True,
+			is_private=1,
+		)
+		req.db_set("photo", file_doc.file_url, update_modified=False)
+
+	frappe.db.commit()
+	return {"name": req.name, "status": req.status}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_delivery_requests(status=None):
+	filters = {"status": status} if status else {}
+	requests = frappe.get_all(
+		"Delivery Request",
+		filters=filters,
+		fields=["name", "driver", "customer", "delivery_note", "note", "photo", "status", "requested_at", "approved_by"],
+		order_by="requested_at desc",
+		ignore_permissions=True,
+	)
+	driver_names = list({r.driver for r in requests if r.driver})
+	driver_labels = {}
+	if driver_names:
+		for d in frappe.get_all("Driver", filters={"name": ["in", driver_names]}, fields=["name", "full_name"], ignore_permissions=True):
+			driver_labels[d.name] = d.full_name
+	for r in requests:
+		r["driver_name"] = driver_labels.get(r.driver)
+	return {"requests": requests}
+
+
+@frappe.whitelist(allow_guest=True)
+def approve_delivery_request(name, trip_name=None):
+	req = frappe.get_doc("Delivery Request", name)
+	if req.status != "Requested":
+		frappe.throw(_("This request was already {0}.").format(req.status.lower()))
+
+	if trip_name and req.delivery_note:
+		add_stops_to_trip(trip_name, [req.delivery_note])
+
+	req.status = "Approved"
+	req.approved_by = frappe.session.user
+	req.save(ignore_permissions=True)
+	frappe.db.commit()
+	return {"name": req.name, "status": req.status}
+
+
+@frappe.whitelist(allow_guest=True)
+def reject_delivery_request(name, reason=None):
+	req = frappe.get_doc("Delivery Request", name)
+	if req.status != "Requested":
+		frappe.throw(_("This request was already {0}.").format(req.status.lower()))
+
+	req.status = "Rejected"
+	req.approved_by = frappe.session.user
+	if reason:
+		req.note = f"{req.note or ''}\n\n[Rechazado] {reason}".strip()
+	req.save(ignore_permissions=True)
+	frappe.db.commit()
+	return {"name": req.name, "status": req.status}
+
+
 # ---------------------------------------------------------------------------
 # Dev seed data
 # ---------------------------------------------------------------------------
@@ -632,8 +1060,14 @@ def seed_tms_demo(reset=False):
 	Creates:
 	  - 2 Drivers (each with Employee + geocoded home Address)
 	  - 2 Vehicles
-	  - 4 Customers with geocoded shipping Addresses
-	  - 4 submitted Delivery Notes (one per customer)
+	  - 10 Customers with geocoded, zone-tagged shipping Addresses
+	  - 10 submitted Delivery Notes (one per customer; 2 with a
+	    requested_delivery_date for day-ahead planning demos)
+	  - 1 Guest Preorder Sales Order per customer, confirmed (Tables > Pedidos
+	    consistency - independent of the Delivery Note above, not derived from it)
+	  - Company.custom_default_warehouse set (depot demo)
+	  - 1 published trip (3 of the DNs) with a delivered stop (tracking code
+	    + POD), a cliente-debe stop, and a driver login User
 	"""
 	reset = frappe.parse_json(reset) if isinstance(reset, str) else bool(reset)
 	company = "library"
@@ -658,8 +1092,20 @@ def seed_tms_demo(reset=False):
 			frappe.delete_doc("Driver", dr.name, force=True, ignore_permissions=True)
 		for v in frappe.get_all("Vehicle", filters={"license_plate": ["like", "TMS-%"]}, ignore_permissions=True):
 			frappe.delete_doc("Vehicle", v.name, force=True, ignore_permissions=True)
-		for c in frappe.get_all("Customer", filters={"customer_name": ["like", "TMS Demo Cliente%"]}, ignore_permissions=True):
-			frappe.delete_doc("Customer", c.name, force=True, ignore_permissions=True)
+		demo_customer_ids = frappe.get_all(
+			"Customer", filters={"customer_name": ["like", "TMS Demo Cliente%"]}, pluck="name", ignore_permissions=True
+		)
+		if demo_customer_ids:
+			for so_name in frappe.get_all(
+				"Sales Order", filters={"customer": ["in", demo_customer_ids]}, pluck="name", ignore_permissions=True
+			):
+				so_doc = frappe.get_doc("Sales Order", so_name)
+				if so_doc.docstatus == 1:
+					so_doc.flags.ignore_permissions = True
+					so_doc.cancel()
+				frappe.delete_doc("Sales Order", so_name, force=True, ignore_permissions=True)
+		for c in demo_customer_ids:
+			frappe.delete_doc("Customer", c, force=True, ignore_permissions=True)
 		frappe.db.commit()
 
 	# ── 1. Drivers (Employee → Driver → home Address) ─────────────────────────
@@ -733,12 +1179,18 @@ def seed_tms_demo(reset=False):
 		veh.insert(ignore_permissions=True)
 		created.append(f"Vehicle: {veh.name}")
 
-	# ── 3. Customers + geocoded shipping addresses ─────────────────────────────
+	# ── 3. Customers + geocoded, zone-tagged shipping addresses ────────────────
 	customers_seed = [
-		{"name": "TMS Demo Cliente 1", "area": "Palermo", "addr": "Av. Santa Fe 3000", "lat": -34.5883, "lng": -58.4314},
-		{"name": "TMS Demo Cliente 2", "area": "San Telmo", "addr": "Defensa 500", "lat": -34.6217, "lng": -58.3731},
-		{"name": "TMS Demo Cliente 3", "area": "Belgrano", "addr": "Av. Cabildo 2000", "lat": -34.5537, "lng": -58.4560},
-		{"name": "TMS Demo Cliente 4", "area": "Recoleta", "addr": "Av. Alvear 1800", "lat": -34.5875, "lng": -58.3951},
+		{"name": "TMS Demo Cliente 1", "area": "Palermo", "addr": "Av. Santa Fe 3000", "lat": -34.5883, "lng": -58.4314, "zone": "Norte"},
+		{"name": "TMS Demo Cliente 2", "area": "San Telmo", "addr": "Defensa 500", "lat": -34.6217, "lng": -58.3731, "zone": "Sur"},
+		{"name": "TMS Demo Cliente 3", "area": "Belgrano", "addr": "Av. Cabildo 2000", "lat": -34.5537, "lng": -58.4560, "zone": "Norte"},
+		{"name": "TMS Demo Cliente 4", "area": "Recoleta", "addr": "Av. Alvear 1800", "lat": -34.5875, "lng": -58.3951, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 5", "area": "Caballito", "addr": "Av. Rivadavia 4800", "lat": -34.6183, "lng": -58.4407, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 6", "area": "Flores", "addr": "Av. Directorio 2200", "lat": -34.6333, "lng": -58.4600, "zone": "Sur"},
+		{"name": "TMS Demo Cliente 7", "area": "Villa Urquiza", "addr": "Av. Triunvirato 4500", "lat": -34.5722, "lng": -58.4880, "zone": "Norte"},
+		{"name": "TMS Demo Cliente 8", "area": "Boedo", "addr": "Av. Boedo 1100", "lat": -34.6280, "lng": -58.4160, "zone": "Sur"},
+		{"name": "TMS Demo Cliente 9", "area": "Almagro", "addr": "Av. Corrientes 4200", "lat": -34.6060, "lng": -58.4210, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 10", "area": "Núñez", "addr": "Av. Cabildo 4200", "lat": -34.5450, "lng": -58.4630, "zone": "Norte"},
 	]
 	for c in customers_seed:
 		if not frappe.db.exists("Customer", c["name"]):
@@ -766,6 +1218,7 @@ def seed_tms_demo(reset=False):
 				"is_shipping_address": 1,
 				"custom_latitude": c["lat"],
 				"custom_longitude": c["lng"],
+				"custom_zone": c["zone"],
 				"links": [{"link_doctype": "Customer", "link_name": c["name"]}],
 			})
 			addr.insert(ignore_permissions=True)
@@ -797,8 +1250,11 @@ def seed_tms_demo(reset=False):
 			"shipping_address_name": ship_addr,
 			"selling_price_list": "Standard Selling",
 			"currency": "ARS",
+			"price_list_currency": "ARS",
 			"conversion_rate": 1.0,
 			"plc_conversion_rate": 1.0,
+			# Last 2 customers demo day-ahead planning (Scenario 3).
+			"custom_requested_delivery_date": frappe.utils.add_days(today, 1) if i > len(customers_seed) - 2 else None,
 			"items": [{
 				"item_code": item_code,
 				"item_name": item_name,
@@ -819,11 +1275,156 @@ def seed_tms_demo(reset=False):
 		dn.insert(ignore_permissions=True)
 		# Force-submit for demo: bypass accounting/stock movements
 		frappe.db.sql(
-			"UPDATE `tabDelivery Note` SET docstatus=1, status='To Deliver', customer_name=%s WHERE name=%s",
+			"UPDATE `tabDelivery Note` SET docstatus=1, status='To Bill', customer_name=%s WHERE name=%s",
 			(c["name"], dn.name),
 		)
 		frappe.db.commit()
 		created.append(f"Delivery Note: {dn.name} (force-submitted)")
+
+	# ── 5. Stock for the demo item (needed by the Guest Preorder → real
+	#      Delivery Note path below, which - unlike the force-submitted DNs
+	#      above - goes through normal stock validation on submit) ───────────
+	STOCK_BUFFER = 50
+	on_hand = flt(frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": warehouse}, "actual_qty") or 0)
+	if on_hand < STOCK_BUFFER:
+		se = frappe.get_doc({
+			"doctype": "Stock Entry",
+			"stock_entry_type": "Material Receipt",
+			"posting_date": today,
+			"to_warehouse": warehouse,
+			"items": [{
+				"item_code": item_code,
+				"item_name": item_name,
+				"qty": STOCK_BUFFER - on_hand,
+				"uom": "Nos",
+				"stock_uom": "Nos",
+				"t_warehouse": warehouse,
+				"basic_rate": 1,
+			}],
+			"remarks": "TMS demo - stock for guest-preorder-to-delivery-note flow",
+		})
+		se.insert(ignore_permissions=True)
+		se.submit()
+		frappe.db.commit()
+		created.append(f"Stock: +{STOCK_BUFFER - on_hand:.0f} {item_code} in {warehouse}")
+
+	# ── 6. Matching Guest Preorder per customer (Tables > Pedidos consistency) ──
+	# Independent record, not derived from the Delivery Note above - same
+	# customer name shows up in both places, but this isn't "the same order"
+	# (Pedidos' own "Crear remito" action on this preorder would create a
+	# second, separate Delivery Note if used).
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		GUEST_PREORDER_REMARKS_TAG,
+		_guest_preorder_tag_fieldname,
+		confirm_guest_preorder,
+		create_guest_preorder,
+	)
+
+	tag_fn = _guest_preorder_tag_fieldname()
+	for c in customers_seed:
+		customer_id = frappe.db.get_value("Customer", {"customer_name": c["name"]}, "name")
+		if not customer_id:
+			continue
+		if tag_fn and frappe.db.exists(
+			"Sales Order", {"customer": customer_id, tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]}
+		):
+			skipped.append(f"Guest Preorder for {c['name']}")
+			continue
+		res = create_guest_preorder(
+			items=[{"item_code": item_code, "qty": 1, "rate": 5000.0}],
+			customer=customer_id,
+			company=company,
+			guest_name=c["name"],
+			is_delivery=1,
+			guest_notes="TMS demo - pedido de referencia",
+		)
+		confirm_guest_preorder(res["preorder_name"])
+		created.append(f"Guest Preorder: {res['preorder_name']} ({c['name']})")
+
+	# ── 7. Company default depot (warehouse-based pickup demo) ─────────────────
+	if frappe.db.get_value("Company", company, "custom_default_warehouse") != warehouse:
+		frappe.db.set_value("Company", company, "custom_default_warehouse", warehouse, update_modified=False)
+		created.append(f"Company default warehouse: {warehouse}")
+
+	# ── 8. Driver login User (conductor app demo) ───────────────────────────────
+	first_driver = frappe.db.get_value("Driver", {"full_name": drivers_seed[0]["full_name"]}, ["name", "employee"], as_dict=True)
+	if first_driver and not frappe.db.get_value("Employee", first_driver.employee, "user_id"):
+		login_email = "tms.demo.driver@example.com"
+		if not frappe.db.exists("User", login_email):
+			user = frappe.get_doc({
+				"doctype": "User",
+				"email": login_email,
+				"first_name": "TMS Demo",
+				"last_name": "Driver",
+				"enabled": 1,
+				"send_welcome_email": 0,
+			})
+			user.flags.ignore_password_policy = True
+			user.insert(ignore_permissions=True)
+			from frappe.utils.password import update_password
+
+			update_password(user=login_email, pwd="TmsDemo123!", logout_all_sessions=False)
+			created.append(f"User: {login_email} (password: TmsDemo123!)")
+		frappe.db.set_value("Employee", first_driver.employee, "user_id", login_email)
+
+	# ── 9. One published trip (Juan/first driver) with a delivered stop + a
+	#      cliente-debe stop - demos the dispatcher day board, the driver's
+	#      trip history, and payment collection all at once ─────────────────
+	demo_trip_dns = [
+		frappe.db.get_value("Delivery Note", {"customer": c["name"], "docstatus": 1}, "name")
+		for c in customers_seed[:3]
+	]
+	demo_trip_dns = [d for d in demo_trip_dns if d]
+	already_planned = _assigned_delivery_note_names() if demo_trip_dns else set()
+	demo_trip_dns = [d for d in demo_trip_dns if d not in already_planned]
+
+	if demo_trip_dns and first_driver:
+		driver_doc = frappe.db.get_value("Driver", first_driver.name, ["full_name", "address"], as_dict=True)
+		vehicle_name = frappe.db.get_value("Vehicle", {"license_plate": vehicles_seed[0]["plate"]}, "name")
+
+		trip = frappe.get_doc({
+			"doctype": "Delivery Trip",
+			"company": company,
+			"driver": first_driver.name,
+			"driver_name": driver_doc.full_name,
+			"driver_address": driver_doc.address,
+			"vehicle": vehicle_name,
+			"departure_time": get_datetime(f"{today} 08:00:00"),
+			"delivery_stops": [],
+		})
+		notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(demo_trip_dns)
+		_append_delivery_stops(trip, demo_trip_dns, notes_by_name, address_display_by_name)
+		trip.insert(ignore_permissions=True)
+
+		trip.flags.ignore_permissions = True
+		trip.submit()
+
+		# Stop 1: delivered, with POD + tracking code already generated above.
+		stop1 = trip.delivery_stops[0]
+		stop1.visited = 1
+		stop1.custom_outcome = "Delivered"
+		stop1.custom_pod_recipient_name = "Demo Recibió"
+		stop1.custom_pod_recipient_id_number = "30111222"
+		stop1.custom_pod_captured_at = now_datetime()
+		stop1.custom_amount_due = stop1.grand_total
+		stop1.custom_amount_collected = stop1.grand_total
+
+		# Stop 2: delivered but the client owes half - cliente-debe demo.
+		if len(trip.delivery_stops) > 1:
+			stop2 = trip.delivery_stops[1]
+			stop2.visited = 1
+			stop2.custom_outcome = "Delivered"
+			stop2.custom_pod_recipient_name = "Demo Recibió"
+			stop2.custom_pod_recipient_id_number = "30333444"
+			stop2.custom_pod_captured_at = now_datetime()
+			stop2.custom_amount_due = stop2.grand_total
+			stop2.custom_amount_collected = flt(stop2.grand_total) / 2
+			stop2.custom_balance_after_stop = flt(stop2.grand_total) - flt(stop2.custom_amount_collected)
+			stop2.custom_cliente_debe = 1
+
+		trip.flags.ignore_validate_update_after_submit = True
+		trip.save(ignore_permissions=True)
+		created.append(f"Delivery Trip: {trip.name} (published, 1 delivered + 1 cliente-debe stop)")
 
 	frappe.db.commit()
 	return {"created": created, "skipped": skipped}
@@ -878,6 +1479,302 @@ def driver_get_trip_stops(trip_name):
 
 
 @frappe.whitelist()
+def driver_record_stop_outcome(
+	trip_name,
+	stop_idx,
+	outcome,
+	recipient_name=None,
+	recipient_id_number=None,
+	signature_base64=None,
+	notes=None,
+	attempt_note=None,
+	lat=None,
+	lng=None,
+	amount_collected=None,
+	payment_method=None,
+):
+	"""Replaces/extends `driver_complete_stop` with an outcome enum.
+
+	- Delivered: recipient name/ID + signature required (same rule the old
+	  driver_complete_stop enforced). Marks the stop visited.
+	- Not Home: a note is required. Deliberately does NOT mark the stop
+	  visited - the linked Delivery Note stays open for replanning (see
+	  `_assigned_delivery_note_names`).
+	- Partial / Refused: a note + signature are required. Marks visited -
+	  the attempt is resolved, even though nothing (or only some items)
+	  changed hands.
+	"""
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+
+	if trip.docstatus != 1:
+		frappe.throw(_("This route has not been published yet."))
+
+	valid_outcomes = {"Delivered", "Not Home", "Partial", "Refused"}
+	if outcome not in valid_outcomes:
+		frappe.throw(_("Invalid outcome: {0}").format(outcome))
+
+	stop_idx = cint(stop_idx)
+	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)
+	if not stop:
+		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
+
+	if outcome == "Delivered":
+		if not recipient_name or not recipient_id_number:
+			frappe.throw(_("Recipient name and ID/DNI are required to complete a delivery."))
+		if not signature_base64:
+			frappe.throw(_("A signature is required to complete a delivery."))
+	elif outcome == "Not Home":
+		if not attempt_note:
+			frappe.throw(_("A note is required to record a failed delivery attempt."))
+	else:  # Partial / Refused
+		if not notes:
+			frappe.throw(_("A note is required for a {0} outcome.").format(outcome))
+		if not signature_base64:
+			frappe.throw(_("A signature is required for a {0} outcome.").format(outcome))
+
+	if signature_base64:
+		file_doc = save_file(
+			f"pod-signature-{trip_name}-{stop_idx}.png",
+			signature_base64,
+			"Delivery Trip",
+			trip_name,
+			decode=True,
+			is_private=1,
+		)
+		stop.custom_pod_signature = file_doc.file_url
+
+	stop.custom_outcome = outcome
+	stop.custom_pod_recipient_name = recipient_name
+	stop.custom_pod_recipient_id_number = recipient_id_number
+	stop.custom_pod_notes = notes
+	stop.custom_attempt_note = attempt_note
+	stop.custom_pod_captured_at = now_datetime()
+	stop.custom_pod_captured_lat = flt(lat) if lat else None
+	stop.custom_pod_captured_lng = flt(lng) if lng else None
+	stop.visited = 1 if outcome in ("Delivered", "Partial", "Refused") else 0
+
+	# Payment: only relevant once something changed hands (Delivered/Partial).
+	# "separate_collector" mode means someone else collects later, so the
+	# driver isn't asked for these fields at all - ignore anything sent.
+	if outcome in ("Delivered", "Partial"):
+		settings = _load_tms_settings()
+		amount_due = flt(stop.grand_total)
+		stop.custom_amount_due = amount_due
+		if settings.get("delivery_payment_mode") != "separate_collector" and amount_collected is not None:
+			stop.custom_amount_collected = flt(amount_collected)
+			stop.custom_payment_method = payment_method
+			balance = amount_due - flt(amount_collected)
+			stop.custom_balance_after_stop = balance
+			stop.custom_cliente_debe = 1 if balance > 0 else 0
+
+	trip.flags.ignore_validate_update_after_submit = True
+	trip.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return get_trip_map_data(trip_name)
+
+
+@frappe.whitelist()
+def driver_mark_cliente_debe(trip_name, stop_idx, amount, note=None):
+	"""Flag an outstanding balance at a stop, independent of the delivery
+	outcome itself - doesn't block or require POD to already exist."""
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+
+	stop_idx = cint(stop_idx)
+	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)
+	if not stop:
+		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
+
+	stop.custom_cliente_debe = 1
+	stop.custom_balance_after_stop = flt(amount)
+	if note:
+		stop.custom_pod_notes = f"{stop.custom_pod_notes or ''}\n\n[Cliente debe] {note}".strip()
+
+	trip.flags.ignore_validate_update_after_submit = True
+	trip.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return get_trip_map_data(trip_name)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_cliente_debe_stops(date=None):
+	"""Stops flagged 'cliente debe' with an outstanding balance - the
+	"collector" view. Scoped by company only (no separate Collector identity
+	exists in this system yet)."""
+	filters = {"custom_cliente_debe": 1}
+	trip_filters = {"docstatus": 1}
+	if date:
+		day = getdate(date)
+		trip_filters["departure_time"] = ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]]
+
+	trip_names = frappe.get_all("Delivery Trip", filters=trip_filters, pluck="name", ignore_permissions=True)
+	if not trip_names:
+		return {"stops": []}
+
+	rows = frappe.get_all(
+		"Delivery Stop",
+		filters={**filters, "parent": ["in", trip_names]},
+		fields=[
+			"parent as trip_name",
+			"idx",
+			"customer",
+			"customer_address",
+			"delivery_note",
+			"custom_amount_due",
+			"custom_amount_collected",
+			"custom_balance_after_stop",
+		],
+		ignore_permissions=True,
+	)
+	return {"stops": rows}
+
+
+@frappe.whitelist()
+def driver_settle_payment(trip_name, stop_idx, amount_collected, payment_method=None):
+	"""Record a later payment collection against an existing stop (the
+	"separate collector" flow)."""
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+
+	stop_idx = cint(stop_idx)
+	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)
+	if not stop:
+		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
+
+	collected_so_far = flt(stop.custom_amount_collected) + flt(amount_collected)
+	balance = flt(stop.custom_amount_due) - collected_so_far
+
+	stop.custom_amount_collected = collected_so_far
+	stop.custom_payment_method = payment_method or stop.custom_payment_method
+	stop.custom_balance_after_stop = balance
+	stop.custom_cliente_debe = 1 if balance > 0 else 0
+
+	trip.flags.ignore_validate_update_after_submit = True
+	trip.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return get_trip_map_data(trip_name)
+
+
+# ---------------------------------------------------------------------------
+# Print (delivery / payment / return receipts)
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist(allow_guest=True)
+def get_delivery_print_data(trip_name, stop_idx):
+	"""Merges the Delivery Note's own fields with the specific Delivery Stop
+	row's POD/outcome/payment fields into one flat dict - the generic
+	print_templates_api.get_print_data(doctype, docname) only sees the DN
+	itself, but a delivery ticket needs the stop's signature/outcome/amount
+	collected too, and those live on the Trip's child table."""
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+
+	stop_idx = cint(stop_idx)
+	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)
+	if not stop:
+		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
+
+	dn_data = {}
+	line_items = []
+	if stop.delivery_note:
+		dn = frappe.get_doc("Delivery Note", stop.delivery_note)
+		dn_data = dn.as_dict()
+		line_items = [row.as_dict() for row in dn.items]
+
+	stop_out = _stop_out(stop)
+
+	return {
+		"doc": {
+			**dn_data,
+			"trip_name": trip.name,
+			"driver_name": trip.driver_name,
+			"stop_customer": stop.customer,
+			"stop_address": stop.customer_address,
+			**(stop_out.get("pod") or {}),
+		},
+		"lineItems": line_items,
+	}
+
+
+# ---------------------------------------------------------------------------
+# In-premise returns
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def driver_record_return_capture(trip_name, stop_idx, lines, signature_base64, notes=None, photo_base64_list=None):
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+
+	stop_idx = cint(stop_idx)
+	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)
+	if not stop:
+		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
+
+	lines = frappe.parse_json(lines) if isinstance(lines, str) else (lines or [])
+	if not lines:
+		frappe.throw(_("Add at least one returned item."))
+	if not signature_base64:
+		frappe.throw(_("A signature is required to capture a return."))
+
+	capture = frappe.get_doc(
+		{
+			"doctype": "Mobile Return Capture",
+			"delivery_trip": trip_name,
+			"stop_idx": stop_idx,
+			"customer": stop.customer,
+			"status": "Captured",
+			"captured_at": now_datetime(),
+			"notes": notes,
+			"lines": [
+				{
+					"item_code": line.get("item_code"),
+					"description": line.get("description"),
+					"qty": flt(line.get("qty")),
+					"reason": line.get("reason"),
+				}
+				for line in lines
+			],
+		}
+	)
+	capture.insert(ignore_permissions=True)
+
+	sig_file = save_file(
+		f"return-signature-{capture.name}.png",
+		signature_base64,
+		"Mobile Return Capture",
+		capture.name,
+		decode=True,
+		is_private=1,
+	)
+	capture.db_set("signature", sig_file.file_url, update_modified=False)
+
+	photo_base64_list = frappe.parse_json(photo_base64_list) if isinstance(photo_base64_list, str) else (photo_base64_list or [])
+	photo_urls = []
+	for i, photo_b64 in enumerate(photo_base64_list, 1):
+		photo_file = save_file(
+			f"return-photo-{capture.name}-{i}.jpg",
+			photo_b64,
+			"Mobile Return Capture",
+			capture.name,
+			decode=True,
+			is_private=1,
+		)
+		photo_urls.append(photo_file.file_url)
+	if photo_urls:
+		capture.db_set("photo_urls", frappe.as_json(photo_urls), update_modified=False)
+
+	frappe.db.commit()
+	return {"name": capture.name, "status": capture.status}
+
+
+@frappe.whitelist()
 def driver_complete_stop(
 	trip_name,
 	stop_idx,
@@ -888,6 +1785,22 @@ def driver_complete_stop(
 	lat=None,
 	lng=None,
 ):
+	"""Thin backward-compatible wrapper - a plain "Delivered" outcome."""
+	return driver_record_stop_outcome(
+		trip_name,
+		stop_idx,
+		outcome="Delivered",
+		recipient_name=recipient_name,
+		recipient_id_number=recipient_id_number,
+		signature_base64=signature_base64,
+		notes=notes,
+		lat=lat,
+		lng=lng,
+	)
+
+
+@frappe.whitelist()
+def driver_upload_stop_photo(trip_name, stop_idx, image_base64):
 	driver = _get_current_driver()
 	trip = _require_owned_trip(trip_name, driver)
 
@@ -899,26 +1812,21 @@ def driver_complete_stop(
 	if not stop:
 		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
 
-	if not recipient_name or not recipient_id_number:
-		frappe.throw(_("Recipient name and ID/DNI are required to complete a delivery."))
+	existing = frappe.parse_json(stop.custom_photo_urls) if stop.custom_photo_urls else []
+	if not isinstance(existing, list):
+		existing = []
 
 	file_doc = save_file(
-		f"pod-signature-{trip_name}-{stop_idx}.png",
-		signature_base64,
+		f"pod-photo-{trip_name}-{stop_idx}-{len(existing) + 1}.jpg",
+		image_base64,
 		"Delivery Trip",
 		trip_name,
 		decode=True,
 		is_private=1,
 	)
+	existing.append(file_doc.file_url)
 
-	stop.custom_pod_recipient_name = recipient_name
-	stop.custom_pod_recipient_id_number = recipient_id_number
-	stop.custom_pod_signature = file_doc.file_url
-	stop.custom_pod_notes = notes
-	stop.custom_pod_captured_at = now_datetime()
-	stop.custom_pod_captured_lat = flt(lat) if lat else None
-	stop.custom_pod_captured_lng = flt(lng) if lng else None
-	stop.visited = 1
+	stop.custom_photo_urls = frappe.as_json(existing)
 
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)

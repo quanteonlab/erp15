@@ -59,6 +59,10 @@ def _unrestricted(user: str) -> bool:
 	return "Administrator" in roles or "System Manager" in roles
 
 
+def is_desk_admin(user: str | None = None) -> bool:
+	return _unrestricted(user or acting_user())
+
+
 def allowed_company_names(user: str | None = None) -> list[str]:
 	user = user or acting_user()
 	perm_rows = frappe.get_all(

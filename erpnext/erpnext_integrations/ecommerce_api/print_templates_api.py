@@ -8,8 +8,35 @@ from frappe import _
 _SOURCE_DOCTYPE_CHILD_TABLE = {
 	"Sales Invoice": "items",
 	"Purchase Receipt": "items",
+	"Delivery Note": "items",
 	"Item": None,
+	# Synthetic — not a real Frappe doctype. The catalog PDF binds these fields
+	# at export time from the current export settings (heading/phone/description),
+	# not from a stored document.
+	"Catalog Header": None,
 }
+
+# Field list for the synthetic "Catalog Header" source doctype (see above).
+_CATALOG_HEADER_FIELDS = [
+	{"fieldname": "heading", "label": "Heading", "fieldtype": "Data"},
+	{"fieldname": "description", "label": "Description", "fieldtype": "Small Text"},
+	{"fieldname": "phone", "label": "WhatsApp Phone", "fieldtype": "Data"},
+	{"fieldname": "qr_value", "label": "QR Value (wa.me link)", "fieldtype": "Data"},
+	{"fieldname": "company_name", "label": "Company Name", "fieldtype": "Data"},
+]
+
+# Extra synthetic fields available only when designing an Item template scoped to
+# paper_kind "Catalog Card" — computed by the catalog exporter per product, not
+# real Item columns (catalog price is price-list-resolved, not Item.standard_rate).
+_CATALOG_CARD_EXTRA_FIELDS = [
+	{"fieldname": "display_price", "label": "Catalog Price", "fieldtype": "Data"},
+	{"fieldname": "normalized_title", "label": "Normalized Title", "fieldtype": "Data"},
+	{"fieldname": "barcode", "label": "Barcode (first)", "fieldtype": "Data"},
+	# i030 A3 — set only when the exporter's "show promo variant" toggle is on and this
+	# product matches an active promotion; blank otherwise (renders blank on the card).
+	{"fieldname": "promo_label", "label": "Promo Label (e.g. 3x2, 20% OFF)", "fieldtype": "Data"},
+	{"fieldname": "promo_title", "label": "Promo Title", "fieldtype": "Data"},
+]
 
 _SKIP_FIELDTYPES = {
 	"Section Break",
@@ -221,7 +248,11 @@ def set_default_print_template(template_id):
 
 
 @frappe.whitelist(allow_guest=True)
-def get_doctype_fields(source_doctype):
+def get_doctype_fields(source_doctype, paper_kind=None):
+	if source_doctype == "Catalog Header":
+		# Synthetic doctype — no frappe.get_meta lookup, fields are fixed.
+		return {"fields": list(_CATALOG_HEADER_FIELDS), "childTableFieldname": None, "childTableFields": []}
+
 	meta = frappe.get_meta(source_doctype)
 
 	def field_list(doctype_meta):
@@ -233,6 +264,9 @@ def get_doctype_fields(source_doctype):
 		return out
 
 	fields = field_list(meta)
+	if source_doctype == "Item" and paper_kind == "Catalog Card":
+		fields = fields + list(_CATALOG_CARD_EXTRA_FIELDS)
+
 	child_table_fieldname = _SOURCE_DOCTYPE_CHILD_TABLE.get(source_doctype)
 	child_fields = []
 	if child_table_fieldname:
@@ -273,6 +307,8 @@ _PAPER_SIZE_MM = {
 	"A4": (210, 297),
 	"Thermal 58mm": (58, 150),
 	"Thermal 80mm": (80, 150),
+	# One catalog print-grid card cell (approximates today's hardcoded PrintCard aspect).
+	"Catalog Card": (48, 66),
 }
 
 _STARTER_TEMPLATES = [
@@ -568,6 +604,116 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-pr80b-barcode", "kind": "barcode", "x": 8, "y": 62, "width": 64, "height": 16, "fieldPath": "name"},
 		],
 	},
+	# ── Catalog Header (default banner, i030 A1) ───────────────────────
+	{
+		"template_name": "Default Catalog Header",
+		"source_doctype": "Catalog Header",
+		"paper_kind": "A4",
+		"is_default": True,
+		"canvas_width_mm": 190,
+		"canvas_height_mm": 80,
+		"margin_mm": [0, 0, 0, 0],
+		"elements": [
+			{"id": "starter-hdr-heading", "kind": "field", "x": 5, "y": 5, "width": 120, "height": 24, "fieldPath": "heading", "label": "Heading", "fontSize": 30, "bold": True, "align": "left"},
+			{"id": "starter-hdr-desc", "kind": "field", "x": 5, "y": 30, "width": 120, "height": 10, "fieldPath": "description", "label": "Description", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-hdr-wa-label", "kind": "text", "x": 5, "y": 42, "width": 24, "height": 8, "staticText": "WhatsApp:", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-hdr-wa-phone", "kind": "field", "x": 29, "y": 42, "width": 60, "height": 8, "fieldPath": "phone", "label": "Phone", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-hdr-qr-frame", "kind": "shape", "x": 150, "y": 8, "width": 36, "height": 36, "shapeType": "rect", "color": "#93c5fd"},
+			{"id": "starter-hdr-qr", "kind": "qrcode", "x": 152, "y": 10, "width": 32, "height": 32, "fieldPath": "qr_value"},
+		],
+	},
+	# ── Catalog Card (default product card, i030 A2) ───────────────────
+	{
+		"template_name": "Default Catalog Card",
+		"source_doctype": "Item",
+		"paper_kind": "Catalog Card",
+		"is_default": True,
+		"margin_mm": [0, 0, 0, 0],
+		"elements": [
+			{"id": "starter-card-image", "kind": "image", "x": 2, "y": 2, "width": 44, "height": 32, "fieldPath": "image"},
+			{"id": "starter-card-price-pill", "kind": "shape", "x": 9, "y": 30, "width": 30, "height": 9, "shapeType": "rect", "color": "#dbeafe", "filled": True, "bgColor": "#dbeafe"},
+			{"id": "starter-card-price", "kind": "field", "x": 9, "y": 31, "width": 30, "height": 7, "fieldPath": "display_price", "label": "Catalog Price", "fontSize": 13, "bold": True, "align": "center"},
+			{"id": "starter-card-title", "kind": "field", "x": 2, "y": 42, "width": 44, "height": 8, "fieldPath": "normalized_title", "label": "Normalized Title", "fontSize": 7, "bold": True, "align": "left"},
+			{"id": "starter-card-source-title", "kind": "field", "x": 2, "y": 49, "width": 44, "height": 6, "fieldPath": "item_name", "label": "Item Name", "fontSize": 6, "align": "left"},
+			{"id": "starter-card-brand", "kind": "field", "x": 2, "y": 54, "width": 44, "height": 5, "fieldPath": "brand", "label": "Brand", "fontSize": 6, "align": "left"},
+			{"id": "starter-card-barcode", "kind": "barcode", "x": 2, "y": 59, "width": 44, "height": 6, "fieldPath": "barcode"},
+		],
+	},
+	# ── TMS delivery tickets (Delivery Note · Thermal 80mm) ─────────────
+	{
+		"template_name": "Confirmación de Entrega (80mm)",
+		"source_doctype": "Delivery Note",
+		"paper_kind": "Thermal 80mm",
+		"is_default": True,
+		"margin_mm": [4, 4, 4, 4],
+		"elements": [
+			{"id": "starter-dnconf-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "Confirmación de Entrega", "fontSize": 12, "bold": True, "align": "center"},
+			{"id": "starter-dnconf-ref-label", "kind": "text", "x": 4, "y": 14, "width": 30, "height": 5, "staticText": "Comprobante", "fontSize": 7, "align": "left"},
+			{"id": "starter-dnconf-ref", "kind": "field", "x": 4, "y": 19, "width": 72, "height": 6, "fieldPath": "name", "label": "Delivery Note", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-dnconf-customer-label", "kind": "text", "x": 4, "y": 27, "width": 30, "height": 5, "staticText": "Cliente", "fontSize": 7, "align": "left"},
+			{"id": "starter-dnconf-customer", "kind": "field", "x": 4, "y": 32, "width": 72, "height": 6, "fieldPath": "customer_name", "label": "Customer", "fontSize": 9, "align": "left"},
+			{"id": "starter-dnconf-date-label", "kind": "text", "x": 4, "y": 40, "width": 30, "height": 5, "staticText": "Fecha", "fontSize": 7, "align": "left"},
+			{"id": "starter-dnconf-date", "kind": "field", "x": 4, "y": 45, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
+			{
+				"id": "starter-dnconf-items",
+				"kind": "line-items",
+				"x": 4,
+				"y": 53,
+				"width": 72,
+				"height": 40,
+				"childTableFieldname": "items",
+				"columns": [
+					{"fieldPath": "item_name", "label": "Item", "width": 44},
+					{"fieldPath": "qty", "label": "Cant", "width": 14},
+					{"fieldPath": "amount", "label": "Monto", "width": 14},
+				],
+			},
+			{"id": "starter-dnconf-total-label", "kind": "text", "x": 4, "y": 96, "width": 30, "height": 6, "staticText": "Total", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-dnconf-total", "kind": "field", "x": 34, "y": 96, "width": 42, "height": 8, "fieldPath": "grand_total", "label": "Total", "fontSize": 11, "bold": True, "align": "right"},
+			{"id": "starter-dnconf-tracking-label", "kind": "text", "x": 4, "y": 106, "width": 30, "height": 5, "staticText": "Seguimiento", "fontSize": 7, "align": "left"},
+			{"id": "starter-dnconf-tracking", "kind": "field", "x": 4, "y": 111, "width": 72, "height": 6, "fieldPath": "custom_tracking_code", "label": "Tracking Code", "fontSize": 9, "align": "left"},
+			{"id": "starter-dnconf-qr", "kind": "qrcode", "x": 4, "y": 119, "width": 30, "height": 30, "fieldPath": "custom_tracking_code"},
+		],
+	},
+	{
+		"template_name": "Recibo de Pago (80mm)",
+		"source_doctype": "Delivery Note",
+		"paper_kind": "Thermal 80mm",
+		"margin_mm": [4, 4, 4, 4],
+		"elements": [
+			{"id": "starter-dnpay-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "Recibo de Pago", "fontSize": 12, "bold": True, "align": "center"},
+			{"id": "starter-dnpay-ref", "kind": "field", "x": 4, "y": 15, "width": 72, "height": 6, "fieldPath": "name", "label": "Delivery Note", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-dnpay-customer", "kind": "field", "x": 4, "y": 23, "width": 72, "height": 6, "fieldPath": "customer_name", "label": "Customer", "fontSize": 9, "align": "left"},
+			{"id": "starter-dnpay-date", "kind": "field", "x": 4, "y": 31, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
+			{"id": "starter-dnpay-total-label", "kind": "text", "x": 4, "y": 41, "width": 30, "height": 6, "staticText": "Total", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-dnpay-total", "kind": "field", "x": 34, "y": 41, "width": 42, "height": 8, "fieldPath": "grand_total", "label": "Total", "fontSize": 11, "bold": True, "align": "right"},
+		],
+	},
+	{
+		"template_name": "Recibo de Devolución (80mm)",
+		"source_doctype": "Delivery Note",
+		"paper_kind": "Thermal 80mm",
+		"margin_mm": [4, 4, 4, 4],
+		"elements": [
+			{"id": "starter-dnret-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "Recibo de Devolución", "fontSize": 12, "bold": True, "align": "center"},
+			{"id": "starter-dnret-ref", "kind": "field", "x": 4, "y": 15, "width": 72, "height": 6, "fieldPath": "name", "label": "Delivery Note", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-dnret-customer", "kind": "field", "x": 4, "y": 23, "width": 72, "height": 6, "fieldPath": "customer_name", "label": "Customer", "fontSize": 9, "align": "left"},
+			{"id": "starter-dnret-date", "kind": "field", "x": 4, "y": 31, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
+			{
+				"id": "starter-dnret-items",
+				"kind": "line-items",
+				"x": 4,
+				"y": 41,
+				"width": 72,
+				"height": 40,
+				"childTableFieldname": "items",
+				"columns": [
+					{"fieldPath": "item_name", "label": "Item", "width": 44},
+					{"fieldPath": "qty", "label": "Cant", "width": 28},
+				],
+			},
+		],
+	},
 ]
 
 
@@ -587,7 +733,8 @@ def ensure_starter_print_templates():
 		if exists:
 			continue
 
-		width_mm, height_mm = _PAPER_SIZE_MM.get(starter["paper_kind"], (210, 297))
+		width_mm = starter.get("canvas_width_mm") or _PAPER_SIZE_MM.get(starter["paper_kind"], (210, 297))[0]
+		height_mm = starter.get("canvas_height_mm") or _PAPER_SIZE_MM.get(starter["paper_kind"], (210, 297))[1]
 		want_default = bool(starter.get("is_default"))
 		already_has_default = bool(
 			frappe.db.exists(

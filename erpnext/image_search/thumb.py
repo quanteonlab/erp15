@@ -78,6 +78,48 @@ def _decode_data_image(url: str) -> bytes:
 		frappe.throw(_("Invalid data image URL"))
 
 
+def probe_image_url(url: str) -> bool:
+	"""Return True when the URL returns a fetchable image (same rules as download_image_bytes)."""
+	if not url or not str(url).strip():
+		return False
+	url = unwrap_image_url(str(url).strip())
+	if url.startswith("data:image/"):
+		return True
+	try:
+		resp = requests.get(
+			url,
+			timeout=DOWNLOAD_TIMEOUT_S,
+			headers={
+				"User-Agent": USER_AGENT,
+				"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+			},
+			stream=True,
+			allow_redirects=True,
+		)
+		if resp.status_code != 200:
+			return False
+		ctype = (resp.headers.get("content-type") or "").lower()
+		total = 0
+		sniff = b""
+		for chunk in resp.iter_content(chunk_size=4096):
+			if not chunk:
+				continue
+			if not sniff:
+				sniff = chunk[:32]
+			total += len(chunk)
+			if total > MAX_DOWNLOAD_BYTES:
+				return False
+			if total >= 512:
+				break
+		if total <= 0:
+			return False
+		if "text/html" in ctype and not sniff.startswith((b"\x89PNG", b"\xff\xd8", b"RIFF", b"GIF")):
+			return False
+		return True
+	except Exception:
+		return False
+
+
 def download_image_bytes(url: str) -> bytes:
 	if not url or not str(url).strip():
 		frappe.throw(_("Empty image URL"))

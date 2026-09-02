@@ -75,6 +75,7 @@ def get_products(
 			"custom_normalized_title",
 			"custom_variant_group",
 			"custom_pack_qty",
+			"custom_unit_sku",
 			"stock_uom",
 			"is_stock_item",
 			"has_variants",
@@ -2737,6 +2738,7 @@ def create_guest_preorder(
 	items,
 	guest_phone=None,
 	guest_name=None,
+	guest_email=None,
 	price_list="Standard Selling",
 	delivery_date=None,
 	order_type="Sales",
@@ -2746,6 +2748,7 @@ def create_guest_preorder(
 	is_delivery=0,
 	paid_amount=None,
 	mode_of_payment=None,
+	customer=None,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -2755,6 +2758,11 @@ def create_guest_preorder(
 
 	Uses a valid SilkOS ``order_type`` (default ``Sales``). The flow is identified
 	via ``remarks`` containing ``guest_preorder=1``.
+
+	``customer``: optional Customer override for known parties (e.g. seed data,
+	a repeat order placed from the client tracking portal for a known
+	customer) - default behaviour (anonymous guest -> "Consumidor Final") is
+	unchanged when omitted.
 
 	Returns: { preorder_name, estimated_total, currency, status }
 	"""
@@ -2773,7 +2781,9 @@ def create_guest_preorder(
 	if not company:
 		frappe.throw(_("No Company configured"))
 
-	customer = _get_or_create_consumidor_final()
+	if customer and not frappe.db.exists("Customer", customer):
+		frappe.throw(_("Customer {0} not found").format(customer))
+	customer = customer or _get_or_create_consumidor_final()
 
 	# Create Sales Order in Draft (do NOT submit)
 	so = frappe.new_doc("Sales Order")
@@ -2790,6 +2800,8 @@ def create_guest_preorder(
 		remarks_parts.append(f"guest_phone:{_sanitize_guest_tag(guest_phone)}")
 	if guest_name:
 		remarks_parts.append(f"guest_name:{_sanitize_guest_tag(guest_name)}")
+	if guest_email:
+		remarks_parts.append(f"guest_email:{_sanitize_guest_tag(guest_email)}")
 	if cint(is_delivery):
 		remarks_parts.append("delivery:1")
 	if guest_address:
@@ -3003,6 +3015,7 @@ def get_guest_preorder(preorder_name):
 		"additional_discount_amount": flt(getattr(so, "additional_discount_amount", 0)),
 		"advance_paid": flt(getattr(so, "advance_paid", 0)),
 		"amended_from": so.amended_from or None,
+		"delivery_note": _delivery_note_for_sales_order(preorder_name),
 		"items": [
 			{
 				"item_code": d.item_code,
@@ -3758,6 +3771,59 @@ def create_delivery_note(sales_order):
 	dn.insert(ignore_permissions=True)
 
 	return dn.as_dict()
+
+
+def _delivery_note_for_sales_order(sales_order):
+	"""Any non-cancelled Delivery Note already built against this Sales Order."""
+	return frappe.db.get_value(
+		"Delivery Note Item", {"against_sales_order": sales_order, "docstatus": ["!=", 2]}, "parent"
+	)
+
+
+@frappe.whitelist()
+def create_delivery_note_for_preorder(preorder_name):
+	"""Create + submit a real Delivery Note from a confirmed guest preorder,
+	so it becomes visible in the TMS dispatcher (get_pending_deliveries only
+	lists submitted Delivery Notes) - and advances the preorder's display
+	status to "En Delivery". Idempotent: reuses an existing linked DN
+	instead of creating a duplicate.
+	"""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	if so.docstatus != 1:
+		frappe.throw(_("Confirm the order before creating a delivery note."))
+
+	dn_name = _delivery_note_for_sales_order(preorder_name)
+	if not dn_name:
+		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+
+		dn = make_delivery_note(preorder_name)
+
+		# Guest preorder items never carry a warehouse (no picker in that
+		# flow), so make_delivery_note falls back to the Item's own default
+		# warehouse - which may not be the one this business actually stocks
+		# from. Force the company's TMS depot warehouse instead, same
+		# resolution the dispatcher's own trip creation uses, so the item is
+		# actually available and the note lands where Rutas expects it.
+		default_warehouse = frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
+		if default_warehouse:
+			for row in dn.items:
+				row.warehouse = default_warehouse
+			dn.set_warehouse = default_warehouse
+
+		dn.insert(ignore_permissions=True)
+		dn.flags.ignore_permissions = True
+		dn.submit()
+		dn_name = dn.name
+		frappe.db.commit()
+
+	updated = set_guest_preorder_status(preorder_name, "En Delivery")
+	updated["delivery_note"] = dn_name
+	return updated
 
 
 @frappe.whitelist(allow_guest=True)

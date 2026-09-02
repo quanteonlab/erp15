@@ -1,0 +1,133 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:TMS-RET-{####}",
+ "creation": "2026-09-01 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "delivery_trip",
+  "stop_idx",
+  "customer",
+  "status",
+  "column_break_1",
+  "captured_at",
+  "captured_lat",
+  "captured_lng",
+  "section_break_2",
+  "lines",
+  "notes",
+  "signature",
+  "photo_urls"
+ ],
+ "fields": [
+  {
+   "fieldname": "delivery_trip",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Delivery Trip",
+   "options": "Delivery Trip",
+   "reqd": 1
+  },
+  {
+   "fieldname": "stop_idx",
+   "fieldtype": "Int",
+   "label": "Stop Index",
+   "reqd": 1
+  },
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Customer",
+   "options": "Customer",
+   "reqd": 1
+  },
+  {
+   "default": "Captured",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Captured\nProcessed",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "captured_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Captured At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "captured_lat",
+   "fieldtype": "Float",
+   "hidden": 1,
+   "label": "Captured Latitude",
+   "precision": "8",
+   "read_only": 1
+  },
+  {
+   "fieldname": "captured_lng",
+   "fieldtype": "Float",
+   "hidden": 1,
+   "label": "Captured Longitude",
+   "precision": "8",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_2",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "lines",
+   "fieldtype": "Table",
+   "label": "Returned Items",
+   "options": "Mobile Return Capture Item"
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  },
+  {
+   "fieldname": "signature",
+   "fieldtype": "Attach Image",
+   "label": "Customer Signature"
+  },
+  {
+   "fieldname": "photo_urls",
+   "fieldtype": "Long Text",
+   "label": "Photo URLs (JSON list)"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-09-01 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "Mobile Return Capture",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 1
+}

@@ -69,19 +69,33 @@ class ImageSearchWorker:
 
         try:
             target = cint(job.get("target_count")) or 9
-            # Request a few extra URLs in case some fail quality / dedupe
-            fetch_count = max(target, 12)
+            # Request extra URLs — many search results 404 or block server fetches.
+            fetch_count = max(target * 3, 24)
 
             images = self.search_service.search_images(
                 query=job['search_query'],
                 target_count=fetch_count,
             )
 
-            # Save image candidates
+            # Save image candidates (skip URLs that cannot be downloaded server-side).
             saved_count = 0
+            from erpnext.image_search.thumb import probe_image_url
+
             for image_data in images:
                 if saved_count >= target:
                     break
+                image_url = image_data.get("url")
+                if not image_url:
+                    continue
+                if not probe_image_url(image_url):
+                    thumb = image_data.get("thumbnail_url")
+                    if thumb and thumb != image_url and probe_image_url(thumb):
+                        image_data = {**image_data, "url": thumb}
+                    else:
+                        frappe.logger().info(
+                            f"image_search: skip unreachable URL for {job_name}: {image_url[:120]}"
+                        )
+                        continue
                 try:
                     self._save_image_candidate(
                         product_type=job['product_type'],

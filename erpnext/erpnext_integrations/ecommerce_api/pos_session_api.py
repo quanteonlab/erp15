@@ -19,6 +19,38 @@ from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
 PIN_SCOPE = "settings.pos_admin"
 CASH_MOP_HINTS = ("cash", "efectivo")
 
+# Actions governed by the C1 per-action PIN/comment policy matrix. "start" is
+# intentionally excluded — it keeps its own dedicated start_requires_pin flag.
+_POLICY_ACTIONS = ("cancel", "edit", "return_items", "opening", "cashier", "close")
+
+# Per-action defaults chosen to match today's *actual* enforced behavior exactly,
+# so installs see zero change until an admin edits the matrix:
+# - cancel/edit/opening/cashier already unconditionally require PIN and follow the
+#   legacy global amendment_note_required toggle for the comment.
+# - close already unconditionally requires PIN but has never required a comment.
+# - return_items is new; both are required by default (destructive-ish, stock+cash).
+_STATIC_POLICY_DEFAULTS = {
+	"close": {"requires_comment": False},
+	"return_items": {"requires_comment": True},
+}
+
+
+def _load_action_policy(cfg: dict) -> dict:
+	stored = cfg.get("action_policy")
+	stored = stored if isinstance(stored, dict) else {}
+	legacy_note_required = cfg.get("amendment_note_required")
+	if legacy_note_required is None:
+		legacy_note_required = True
+	out = {}
+	for action in _POLICY_ACTIONS:
+		default_comment = _STATIC_POLICY_DEFAULTS.get(action, {}).get("requires_comment", bool(legacy_note_required))
+		entry = stored.get(action) if isinstance(stored.get(action), dict) else {}
+		out[action] = {
+			"requires_pin": bool(entry.get("requires_pin", True)),
+			"requires_comment": bool(entry.get("requires_comment", default_comment)),
+		}
+	return out
+
 
 def _acting_user() -> str:
 	return (frappe.get_request_header("X-ERP-Acting-User") or "").strip() or frappe.session.user
@@ -82,10 +114,15 @@ def _verify_pin_value(pin: str) -> bool:
 	return False
 
 
-def _require_pin_or_admin(pin: str) -> dict:
-	"""PIN required when configured. If not configured, only desk admins may amend."""
+def _require_pin_or_admin(pin: str, action: str | None = None) -> dict:
+	"""PIN required when configured and the action's policy requires it. When the
+	policy explicitly disables the PIN for this action, any acting user is
+	authorized outright (matches the settings description: "works without PIN").
+	If not configured (and no policy override), only desk admins may amend."""
 	cfg = _load_pin_settings()
 	acting = _acting_user()
+	if action is not None and not _load_action_policy(cfg).get(action, {}).get("requires_pin", True):
+		return {"authorized": True, "admin_user": acting, "pin_used": False}
 	if _pin_configured(cfg):
 		if not _verify_pin_value(pin):
 			frappe.throw(_("Invalid admin PIN"))
@@ -332,12 +369,15 @@ def _cancel_invoice_and_payments(invoice_name: str) -> None:
 		inv.cancel()
 
 
-def _require_note(note: str) -> str:
+def _require_note(note: str, action: str | None = None) -> str:
 	note = (note or "").strip()
 	cfg = _load_pin_settings()
-	required = cfg.get("amendment_note_required")
-	if required is None:
-		required = True
+	if action is not None:
+		required = _load_action_policy(cfg).get(action, {}).get("requires_comment", True)
+	else:
+		required = cfg.get("amendment_note_required")
+		if required is None:
+			required = True
 	if required and not note:
 		frappe.throw(_("A note is required for this amendment."))
 	return note
@@ -364,6 +404,7 @@ def get_pos_admin_settings():
 		"session_mode": mode,
 		"start_requires_pin": bool(cint(cfg.get("start_requires_pin") or 0)),
 		"default_pos_profile": default_profile or None,
+		"action_policy": _load_action_policy(cfg),
 	}
 
 
@@ -375,6 +416,7 @@ def save_pos_admin_settings(
 	session_mode=None,
 	start_requires_pin=None,
 	default_pos_profile=None,
+	action_policy=None,
 ):
 	if not _can_manage_settings():
 		frappe.throw(_("Not permitted ({0})").format("tools.settings"))
@@ -403,6 +445,22 @@ def save_pos_admin_settings(
 		if name and not frappe.db.exists("POS Profile", name):
 			frappe.throw(_("Cash register {0} not found").format(name))
 		cfg["default_pos_profile"] = name
+	if action_policy is not None:
+		if isinstance(action_policy, str):
+			action_policy = json.loads(action_policy)
+		if not isinstance(action_policy, dict):
+			frappe.throw(_("Invalid action policy"))
+		current = cfg.get("action_policy") if isinstance(cfg.get("action_policy"), dict) else {}
+		for action, entry in action_policy.items():
+			if action not in _POLICY_ACTIONS or not isinstance(entry, dict):
+				continue
+			merged = dict(current.get(action) or {})
+			if "requires_pin" in entry:
+				merged["requires_pin"] = bool(cint(entry["requires_pin"]))
+			if "requires_comment" in entry:
+				merged["requires_comment"] = bool(cint(entry["requires_comment"]))
+			current[action] = merged
+		cfg["action_policy"] = current
 	_save_pin_settings(cfg)
 	return get_pos_admin_settings()
 
@@ -441,6 +499,28 @@ def list_pos_cash_sessions(pos_profile=None, status=None, page=1, page_length=50
 		rows.append(_serialize_session(doc, include_sales=False))
 	total = frappe.db.count("POS Cash Session", filters)
 	return {"rows": rows, "total": cint(total)}
+
+
+@frappe.whitelist()
+def list_recent_cashiers(limit=5):
+	"""Most recently used distinct cashier names, for the 'Cambiar cajero' quick-pick tags."""
+	limit = min(max(cint(limit) or 5, 1), 20)
+	rows = frappe.get_all(
+		"POS Cash Session",
+		fields=["cashier_user"],
+		filters={"cashier_user": ["!=", ""]},
+		order_by="modified desc",
+		limit_page_length=200,
+		ignore_permissions=True,
+	)
+	seen: list[str] = []
+	for r in rows:
+		name = (r.cashier_user or "").strip()
+		if name and name not in seen:
+			seen.append(name)
+		if len(seen) >= limit:
+			break
+	return {"cashiers": seen}
 
 
 @frappe.whitelist()
@@ -588,7 +668,8 @@ def ensure_pos_cash_session(pos_profile=None, cashier_user=None, pin=None, openi
 
 @frappe.whitelist()
 def close_pos_cash_session(session_id, pin=None, note=None):
-	_require_pin_or_admin(pin)
+	_require_pin_or_admin(pin, "close")
+	note = _require_note(note, "close")
 	if not frappe.db.exists("POS Cash Session", session_id):
 		frappe.throw(_("Session not found"))
 	frappe.flags.ignore_permissions = True
@@ -597,7 +678,7 @@ def close_pos_cash_session(session_id, pin=None, note=None):
 		frappe.throw(_("Session is already closed"))
 	doc.status = "Closed"
 	doc.ended_at = now_datetime()
-	_append_audit(doc, "closed", {"note": (note or "").strip()})
+	_append_audit(doc, "closed", {"note": note})
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
 	return _serialize_session(doc, include_sales=True)
@@ -605,8 +686,9 @@ def close_pos_cash_session(session_id, pin=None, note=None):
 
 @frappe.whitelist()
 def update_pos_cash_session(session_id, pin=None, cashier_user=None, opening_cash=None, note=None):
-	_require_pin_or_admin(pin)
-	note = _require_note(note) if opening_cash is not None or cashier_user else (note or "")
+	action = "cashier" if cashier_user is not None else "opening"
+	_require_pin_or_admin(pin, action)
+	note = _require_note(note, action) if opening_cash is not None or cashier_user else (note or "")
 	if not frappe.db.exists("POS Cash Session", session_id):
 		frappe.throw(_("Session not found"))
 	frappe.flags.ignore_permissions = True
@@ -667,14 +749,14 @@ def preview_pos_sale_amendment(invoice_name, action="cancel", items=None):
 		"cashier_delta": -cash_in + change,
 		"cash_in": cash_in,
 		"change_out": change,
-		"amendment_note_required": get_pos_admin_settings()["amendment_note_required"],
+		"amendment_note_required": _load_action_policy(_load_pin_settings()).get(action, {}).get("requires_comment", True),
 	}
 
 
 @frappe.whitelist()
 def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=None, session_id=None):
-	auth = _require_pin_or_admin(pin)
-	note = _require_note(note)
+	auth = _require_pin_or_admin(pin, action)
+	note = _require_note(note, action)
 	preview = preview_pos_sale_amendment(invoice_name, action=action, items=items)
 	inv = frappe.get_doc("Sales Invoice", invoice_name)
 	meta = _parse_invoice_remarks(inv.remarks)
@@ -708,7 +790,7 @@ def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=Non
 	_cancel_invoice_and_payments(invoice_name)
 
 	recreated = None
-	if action == "edit":
+	if action in ("edit", "return_items"):
 		if isinstance(items, str):
 			items = json.loads(items)
 		keep = [it for it in (items or []) if flt(it.get("qty")) > 0]

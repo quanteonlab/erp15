@@ -34,7 +34,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Source Doctype",
-   "options": "Sales Invoice\nPurchase Receipt\nItem",
+   "options": "Sales Invoice\nPurchase Receipt\nDelivery Note\nItem\nCatalog Header",
    "reqd": 1
   },
   {
@@ -43,7 +43,7 @@
    "default": "A4",
    "in_list_view": 1,
    "label": "Paper Kind",
-   "options": "A4\nThermal 58mm\nThermal 80mm",
+   "options": "A4\nThermal 58mm\nThermal 80mm\nCatalog Card",
    "reqd": 1
   },
   {

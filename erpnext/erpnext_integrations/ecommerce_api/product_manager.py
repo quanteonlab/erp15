@@ -935,21 +935,31 @@ def get_product_rows(
 
     rows = frappe.db.sql(sql, values, as_dict=True)
 
-    for row in rows:
-        raw = (row.pop("_user_tags", None) or "").strip()
-        row["tags"] = [t.strip() for t in raw.split(",") if t.strip()] if raw else []
-        row["is_active"] = 0 if row.pop("_disabled", 0) else 1
-        row.pop("_raw_norm", None)
-        row.pop("last_purchase_rate", None)
-        row.pop("valuation_rate", None)
-        buying = flt(row.pop("buying_price", None) or 0)
-        # Buying/cost: only show when a buying price list rate exists (else blank).
-        if buying > 0:
-            row["cost_price"] = buying
-            row["cost_from_buying"] = 1
-        else:
-            row["cost_price"] = None
-            row["cost_from_buying"] = 0
+    if rows:
+        from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+            migrate_item_user_tags,
+            tags_map_for_docs,
+        )
+
+        codes = [r["client_sku"] for r in rows]
+        tags_by_item = tags_map_for_docs("Item", codes)
+        for row in rows:
+            row.pop("_user_tags", None)
+            item_tags = tags_by_item.get(row["client_sku"], [])
+            if not item_tags:
+                item_tags = migrate_item_user_tags(row["client_sku"])
+            row["tags"] = item_tags
+            row["is_active"] = 0 if row.pop("_disabled", 0) else 1
+            row.pop("_raw_norm", None)
+            row.pop("last_purchase_rate", None)
+            row.pop("valuation_rate", None)
+            buying = flt(row.pop("buying_price", None) or 0)
+            if buying > 0:
+                row["cost_price"] = buying
+                row["cost_from_buying"] = 1
+            else:
+                row["cost_price"] = None
+                row["cost_from_buying"] = 0
 
     # Always attach selling prices by list so the grid can show one column per list.
     if rows:
@@ -1005,6 +1015,23 @@ def list_item_attribute_names():
     except Exception:
         return []
     return [n.name for n in names if n.get("name")]
+
+
+@frappe.whitelist()
+def list_uoms():
+    """Enabled ERPNext UOM master names — source of truth for stock_uom dropdowns
+    (i030 Part D), replacing the hardcoded ['Nos', 'Kg', 'g', 'L', 'mL', 'Unit'] list."""
+    try:
+        rows = frappe.get_all(
+            "UOM",
+            filters={"enabled": 1},
+            fields=["name"],
+            order_by="name",
+            ignore_permissions=True,
+        )
+    except Exception:
+        return []
+    return [r.name for r in rows if r.get("name")]
 
 
 # ---------------------------------------------------------------------------
@@ -1125,10 +1152,9 @@ def _upsert_barcode(item_code: str, barcode: str) -> None:
 
 
 def _sync_tags(item_code: str, new_tags) -> None:
-    if not isinstance(new_tags, list):
-        new_tags = []
-    new_set = sorted(set(t.strip() for t in new_tags if t and t.strip()))
-    frappe.db.set_value("Item", item_code, "_user_tags", ",".join(new_set) if new_set else None)
+    from erpnext.erpnext_integrations.ecommerce_api.tags_api import set_tags_for_doc
+
+    set_tags_for_doc("Item", item_code, tags=new_tags, commit=False)
 
 
 # ---------------------------------------------------------------------------
@@ -3286,3 +3312,24 @@ def export_floor_map_png(floor_id, width=1400, height=900, company=None):
         "filename": f"floor-map-{floor_id}.png",
         "content_type": "image/png",
     }
+
+
+@frappe.whitelist()
+def search_tags(query=""):
+    from erpnext.erpnext_integrations.ecommerce_api.tags_api import search_tags as _impl
+
+    return _impl(query=query)
+
+
+@frappe.whitelist()
+def get_tags_for_doc(reference_doctype, reference_name):
+    from erpnext.erpnext_integrations.ecommerce_api.tags_api import get_tags_for_doc as _impl
+
+    return _impl(reference_doctype, reference_name)
+
+
+@frappe.whitelist()
+def set_doc_tags(reference_doctype, reference_name, tags=None):
+    from erpnext.erpnext_integrations.ecommerce_api.tags_api import set_doc_tags as _impl
+
+    return _impl(reference_doctype, reference_name, tags=tags)

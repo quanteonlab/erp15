@@ -125,6 +125,18 @@ def _as_hex(val, default: str) -> str:
 	return default
 
 
+def _normalize_header_font(val) -> str:
+	if val in ("sans", "serif"):
+		return val
+	return "system"
+
+
+def _normalize_header_preset(val) -> str:
+	if val in ("marketplace", "dark", "custom"):
+		return val
+	return "default"
+
+
 def _normalize_catalog_display(raw) -> dict:
 	src = raw if isinstance(raw, dict) else {}
 	return {
@@ -134,6 +146,12 @@ def _normalize_catalog_display(raw) -> dict:
 		"showCardBorder": _as_bool(src.get("showCardBorder"), True),
 		"cardBorderRadius": _as_int(src.get("cardBorderRadius"), 8, 0, 32),
 		"noImageTilesAtEnd": _as_bool(src.get("noImageTilesAtEnd"), True),
+		"headerPreset": _normalize_header_preset(src.get("headerPreset")),
+		"headerSearchBackgroundColor": _as_hex(src.get("headerSearchBackgroundColor"), ""),
+		"headerSearchTextColor": _as_hex(src.get("headerSearchTextColor"), ""),
+		"headerNavBackgroundColor": _as_hex(src.get("headerNavBackgroundColor"), ""),
+		"headerNavTextColor": _as_hex(src.get("headerNavTextColor"), ""),
+		"headerFont": _normalize_header_font(src.get("headerFont")),
 	}
 
 
