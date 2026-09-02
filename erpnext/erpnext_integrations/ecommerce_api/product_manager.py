@@ -1514,11 +1514,37 @@ def apply_item_image_from_url(item_code, image_url, stage="temp"):
         materialize_item_thumb,
         read_local_file_bytes,
         _normalize_file_url,
+        thumb_filename,
         unwrap_image_url,
     )
 
     url = unwrap_image_url(url)
+    # Strip Next image-proxy wrapper if a client sent it by mistake.
+    if "/api/image-proxy" in url and "src=" in url:
+        from urllib.parse import parse_qs, urlparse, unquote
+
+        qs = parse_qs(urlparse(url).query)
+        src_vals = qs.get("src") or []
+        if src_vals:
+            url = unwrap_image_url(unquote(src_vals[0]))
+
     variant = "temp" if str(stage).strip().lower() != "final" else "final"
+    normalized = _normalize_file_url(url)
+    expected_final = f"/files/{thumb_filename(item_code, 'final')}"
+
+    # Already the local final thumb — skip re-download / re-encode (Update should be instant).
+    if variant == "final" and normalized.split("?", 1)[0] == expected_final:
+        frappe.db.set_value("Item", item_code, "image", expected_final)
+        frappe.db.sql(
+            """
+            UPDATE `tabProduct Image Candidate`
+            SET is_selected = 0
+            WHERE product_type = 'Item' AND product_id = %s
+            """,
+            (item_code,),
+        )
+        frappe.db.commit()
+        return {"ok": True, "success": True, "image_url": expected_final}
 
     if url.startswith("data:image/"):
         image_bytes = download_image_bytes(url)
