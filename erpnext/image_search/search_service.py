@@ -18,6 +18,7 @@ def _ddg_images_subprocess(query: str, num_results: int, result_queue) -> None:
 				ddgs.images(
 					query=query,
 					max_results=num_results,
+					safesearch="on",
 					size="Medium",
 					type_image=None,
 					layout=None,
