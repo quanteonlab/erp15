@@ -105,7 +105,7 @@ def _normalize_stock_warning(raw) -> dict:
 	return {
 		"showWarning": _as_bool(src.get("showWarning"), True),
 		"warnAtOrBelow": _as_int(src.get("warnAtOrBelow"), 0),
-		"hideExactCount": _as_bool(src.get("hideExactCount"), False),
+		"hideExactCount": _as_bool(src.get("hideExactCount"), True),
 		"allowSessionIgnore": _as_bool(src.get("allowSessionIgnore"), True),
 		"allow24hIgnore": _as_bool(src.get("allow24hIgnore"), True),
 		"cajaOverrides": overrides,
