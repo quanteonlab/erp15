@@ -1469,6 +1469,138 @@ def materialize_remote_item_images(limit=20, dry_run=0):
     }
 
 
+def _remote_hotlink_image_where(column="image") -> str:
+    """Item image values that are still external http(s) URLs, not local /files/ paths."""
+    col = column if column in ("image", "website_image") else "image"
+    return f"""
+        IFNULL({col}, '') LIKE 'http%%'
+        AND IFNULL({col}, '') NOT LIKE '%%/files/%%'
+        AND IFNULL({col}, '') NOT LIKE '%%/private/files/%%'
+    """
+
+
+@frappe.whitelist()
+def bomb_remote_url_item_images(limit=100, dry_run=0):
+    """
+    Unset Item.image values that are still remote http(s) URLs, drop their
+    stored candidates, and queue a fresh image search (safe-search).
+
+    Local /files/ thumbs are left alone. Processes one batch so the UI can loop.
+    """
+    frappe.has_permission("Item", "write", throw=True)
+
+    limit_val = cint(limit) if limit not in (None, "", 0, "0") else 100
+    if limit_val <= 0:
+        limit_val = 100
+    if limit_val > 500:
+        limit_val = 500
+    dry = cint(dry_run) == 1
+    url_where = _remote_hotlink_image_where("image")
+
+    total = cint(
+        frappe.db.sql(f"SELECT COUNT(*) FROM `tabItem` WHERE {url_where}")[0][0]
+    )
+
+    if dry:
+        return {
+            "ok": True,
+            "dry_run": 1,
+            "total": total,
+            "cleared": 0,
+            "queued_count": 0,
+            "remaining": total,
+            "errors": [],
+        }
+
+    item_rows = frappe.db.sql(
+        f"""
+        SELECT name
+        FROM `tabItem`
+        WHERE {url_where}
+        ORDER BY modified DESC
+        LIMIT %s
+        """,
+        (limit_val,),
+        as_dict=True,
+    )
+    names = [row.name for row in item_rows if row.name]
+    if not names:
+        return {
+            "ok": True,
+            "dry_run": 0,
+            "total": total,
+            "cleared": 0,
+            "queued_count": 0,
+            "remaining": 0,
+            "errors": [],
+        }
+
+    placeholders = ", ".join(["%s"] * len(names))
+    frappe.db.sql(
+        f"UPDATE `tabItem` SET image = NULL WHERE name IN ({placeholders})",
+        tuple(names),
+    )
+    if frappe.db.has_column("Item", "website_image"):
+        site_where = _remote_hotlink_image_where("website_image")
+        frappe.db.sql(
+            f"""
+            UPDATE `tabItem`
+            SET website_image = NULL
+            WHERE name IN ({placeholders})
+              AND {site_where}
+            """,
+            tuple(names),
+        )
+
+    frappe.db.sql(
+        f"""
+        DELETE FROM `tabProduct Image Candidate`
+        WHERE product_type = 'Item' AND product_id IN ({placeholders})
+        """,
+        tuple(names),
+    )
+    frappe.db.sql(
+        f"""
+        DELETE FROM `tabProduct Image Search Job`
+        WHERE product_type = 'Item'
+          AND product_id IN ({placeholders})
+          AND status IN ('Pending', 'Queued', 'In Progress', 'Retrying')
+        """,
+        tuple(names),
+    )
+    frappe.db.commit()
+
+    from erpnext.image_search.queue_manager import ImageSearchQueueManager
+    from erpnext.image_search.worker import start_worker
+
+    queue_manager = ImageSearchQueueManager()
+    queued_count = 0
+    errors = []
+    for item_code in names:
+        try:
+            job_name = queue_manager.enqueue_product("Item", item_code, "Low")
+            if job_name:
+                queued_count += 1
+        except Exception as exc:
+            errors.append({"item_code": item_code, "error": str(exc)})
+
+    if queued_count:
+        start_worker()
+
+    remaining = cint(
+        frappe.db.sql(f"SELECT COUNT(*) FROM `tabItem` WHERE {url_where}")[0][0]
+    )
+    return {
+        "ok": True,
+        "dry_run": 0,
+        "total": total,
+        "cleared": len(names),
+        "queued_count": queued_count,
+        "remaining": remaining,
+        "errors": errors[:50],
+    }
+
+
 # ---------------------------------------------------------------------------
 # image search helpers for POS products modal
 # ---------------------------------------------------------------------------
