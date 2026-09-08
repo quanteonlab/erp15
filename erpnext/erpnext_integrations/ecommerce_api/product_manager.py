@@ -337,6 +337,70 @@ def _default_item_group() -> str:
     return "All Item Groups"
 
 
+def _ensure_brand(name: str) -> str | None:
+    brand_name = (name or "").strip()
+    if not brand_name:
+        return None
+    if not frappe.db.exists("Brand", brand_name):
+        frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(ignore_permissions=True)
+    return brand_name
+
+
+def _ensure_item_group(name: str) -> str | None:
+    group_name = (name or "").strip()
+    if not group_name or group_name == "All Item Groups":
+        return group_name or None
+    if frappe.db.exists("Item Group", group_name):
+        return group_name
+    parent = (
+        (frappe.db.exists("Item Group", "All Item Groups") and "All Item Groups")
+        or frappe.db.get_value("Item Group", {"is_group": 1}, "name")
+        or _default_item_group()
+    )
+    frappe.get_doc(
+        {
+            "doctype": "Item Group",
+            "item_group_name": group_name,
+            "parent_item_group": parent,
+            "is_group": 0,
+        }
+    ).insert(ignore_permissions=True)
+    return group_name
+
+
+def _ensure_uom(name: str) -> str | None:
+    uom_name = (name or "").strip()
+    if not uom_name:
+        return None
+    if frappe.db.exists("UOM", uom_name):
+        return uom_name
+    frappe.get_doc(
+        {
+            "doctype": "UOM",
+            "uom_name": uom_name,
+            "enabled": 1,
+        }
+    ).insert(ignore_permissions=True)
+    return uom_name
+
+
+@frappe.whitelist()
+def ensure_product_lookup(kind, name):
+    """Create a Brand, Item Group, or UOM if it does not already exist."""
+    frappe.has_permission("Item", "write", throw=True)
+    kind_key = (kind or "").strip().lower()
+    if kind_key == "brand":
+        created = _ensure_brand(name)
+    elif kind_key in ("category", "item_group"):
+        created = _ensure_item_group(name)
+    elif kind_key == "uom":
+        created = _ensure_uom(name)
+    else:
+        frappe.throw(_("Unsupported lookup type"))
+    frappe.db.commit()
+    return {"ok": True, "name": created}
+
+
 def _generate_unique_item_code(exclude_codes=None) -> str:
     """Generate a UUID-like item_code that does not collide with Item or exclude_codes.
 
@@ -1082,12 +1146,15 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             updates["disabled"] = 0 if cint(changes["is_active"]) else 1
 
         if "brand" in changes:
-            brand_name = (changes["brand"] or "").strip()
-            if brand_name and not frappe.db.exists("Brand", brand_name):
-                frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(
-                    ignore_permissions=True
-                )
-            updates["brand"] = brand_name or None
+            updates["brand"] = _ensure_brand(changes.get("brand") or "")
+
+        if "source_category" in changes:
+            group_name = (changes.get("source_category") or "").strip()
+            updates["item_group"] = _ensure_item_group(group_name) if group_name else None
+
+        if "stock_uom" in changes:
+            uom_name = (changes.get("stock_uom") or "").strip()
+            updates["stock_uom"] = _ensure_uom(uom_name) if uom_name else None
 
         if updates:
             frappe.db.set_value("Item", item_code, updates)
@@ -2382,7 +2449,8 @@ def get_category_list():
         fields=["name"],
         order_by="name asc",
     )
-    return [g["name"] for g in groups]
+    # Root group is the same as "All categories" in the product filter.
+    return [g["name"] for g in groups if g["name"] != "All Item Groups"]
 
 
 # ---------------------------------------------------------------------------
