@@ -2854,6 +2854,16 @@ def create_guest_preorder(
 	if customer and not frappe.db.exists("Customer", customer):
 		frappe.throw(_("Customer {0} not found").format(customer))
 	customer = customer or _get_or_create_consumidor_final()
+	company_currency = frappe.db.get_value("Company", company, "default_currency") or "ARS"
+	price_list_currency = (
+		frappe.db.get_value("Price List", price_list, "currency") if price_list else None
+	)
+	# A price list with no currency makes ERPNext look up None → ARS. Consultas
+	# are local quotes: use company currency and skip Currency Exchange.
+	if price_list and not price_list_currency:
+		frappe.db.set_value("Price List", price_list, "currency", company_currency)
+		price_list_currency = company_currency
+	price_list_currency = price_list_currency or company_currency
 
 	# Create Sales Order in Draft (do NOT submit)
 	so = frappe.new_doc("Sales Order")
@@ -2864,6 +2874,11 @@ def create_guest_preorder(
 	so.delivery_date = delivery_date or add_days(nowdate(), 7)
 	so.company = company
 	so.selling_price_list = price_list
+	# Consultas are local quotes. Do not look up Currency Exchange (None → ARS).
+	so.currency = company_currency
+	so.conversion_rate = 1
+	so.price_list_currency = price_list_currency
+	so.plc_conversion_rate = 1
 
 	remarks_parts = [GUEST_PREORDER_REMARKS_TAG, f"customer:{customer}"]
 	if guest_phone:
@@ -2918,6 +2933,10 @@ def create_guest_preorder(
 				"customer": customer,
 				"company": company,
 				"selling_price_list": price_list,
+				"currency": company_currency,
+				"conversion_rate": 1,
+				"price_list_currency": price_list_currency,
+				"plc_conversion_rate": 1,
 				"doctype": "Sales Order",
 			})
 			rate = item_details.get("price_list_rate", 0)
@@ -2929,7 +2948,11 @@ def create_guest_preorder(
 			"delivery_date": so.delivery_date,
 		})
 
-	# Calculate totals
+	# Calculate totals. Re-stamp so insert/validate cannot treat currency as None.
+	so.currency = company_currency
+	so.conversion_rate = 1
+	so.price_list_currency = price_list_currency
+	so.plc_conversion_rate = 1
 	so.run_method("calculate_taxes_and_totals")
 
 	# Save as Draft (Consulta). Stamp the acting cashier so Pedidos propios can match.
