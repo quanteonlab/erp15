@@ -7,6 +7,7 @@ API caller; writes require tools.settings (acting-user check when header set).
 from __future__ import annotations
 
 import json
+import re
 
 import frappe
 from frappe import _
@@ -66,6 +67,13 @@ def _as_int(val, default: int, min_v: int = 0, max_v: int = 9999) -> int:
 	return max(min_v, min(max_v, n))
 
 
+def _normalize_order_tag(raw) -> str:
+	s = str(raw or "").strip().lower()
+	s = re.sub(r"\s+", "-", s)
+	s = re.sub(r"[^a-z0-9_-]", "", s)
+	return s[:40]
+
+
 def _normalize_pos_display(raw) -> dict:
 	src = raw if isinstance(raw, dict) else {}
 	layout = src.get("productLayout")
@@ -82,6 +90,7 @@ def _normalize_pos_display(raw) -> dict:
 		"showDisabledProducts": _as_bool(src.get("showDisabledProducts"), False),
 		"showNegativeStockProducts": _as_bool(src.get("showNegativeStockProducts"), True),
 		"alertOnDisabledAdd": _as_bool(src.get("alertOnDisabledAdd"), True),
+		"orderTag": _normalize_order_tag(src.get("orderTag")) or "caja",
 		# Kept for forward-compat if clients send them; personal prefs stay client-local.
 		"headerToggleShortcut": shortcut.strip(),
 	}

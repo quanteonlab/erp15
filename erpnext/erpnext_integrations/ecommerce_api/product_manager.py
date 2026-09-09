@@ -1159,6 +1159,16 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
         if updates:
             frappe.db.set_value("Item", item_code, updates)
 
+        unit_link = changes.get("unit_sku") if "unit_sku" in changes else ""
+        if "unit_sku" not in changes and frappe.db.has_column("Item", "custom_unit_sku"):
+            unit_link = frappe.db.get_value("Item", item_code, "custom_unit_sku") or ""
+        pack_link = changes.get("pack_qty") if "pack_qty" in changes else None
+        if pack_link is None and frappe.db.has_column("Item", "custom_pack_qty"):
+            pack_link = frappe.db.get_value("Item", item_code, "custom_pack_qty")
+        if (unit_link or "").strip() and (unit_link or "").strip() != item_code and flt(pack_link) > 1:
+            frappe.db.set_value("Item", item_code, "is_stock_item", 0)
+            stock_qty_target = None
+
         if "list_price" in changes:
             _upsert_item_price(item_code, flt(changes["list_price"]), pl)
 

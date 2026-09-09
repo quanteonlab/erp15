@@ -454,30 +454,83 @@ def assign_barcodes_to_all_items():
 	return {"assigned": len(assigned), "items": assigned}
 
 
+def _item_codes_for_barcode(barcode):
+	"""Every Item that owns this exact barcode, plus a direct item_code match."""
+	code = (barcode or "").strip()
+	if not code:
+		return []
+	rows = frappe.get_all(
+		"Item Barcode",
+		filters={"barcode": code},
+		fields=["parent"],
+		order_by="parent asc",
+		ignore_permissions=True,
+	)
+	codes = []
+	seen = set()
+	for row in rows:
+		parent = row.get("parent")
+		if parent and parent not in seen and frappe.db.exists("Item", parent):
+			seen.add(parent)
+			codes.append(parent)
+	if code not in seen and frappe.db.exists("Item", code):
+		codes.append(code)
+	return codes
+
+
+@frappe.whitelist(allow_guest=True)
+def search_products_by_barcode(barcode, price_list=None, allow_disabled=0):
+	"""
+	All products that share this barcode (or whose item_code is the barcode).
+
+	Returns a list of get_product() dicts. Empty list when nothing matches —
+	does not throw, so the POS can show "not found" or a picker.
+	"""
+	codes = _item_codes_for_barcode(barcode)
+	if not codes:
+		return []
+	products = []
+	prev = frappe.flags.ignore_permissions
+	frappe.flags.ignore_permissions = True
+	try:
+		for item_code in codes:
+			if not cint(allow_disabled) and cint(frappe.db.get_value("Item", item_code, "disabled")):
+				continue
+			products.append(get_product(item_code, price_list=price_list))
+	finally:
+		frappe.flags.ignore_permissions = prev
+	products.sort(key=lambda p: (p.get("item_name") or p.get("item_code") or "").lower())
+	return products
+
+
 @frappe.whitelist(allow_guest=True)
 def search_by_barcode(barcode, price_list=None, allow_disabled=0):
 	"""
 	Find a product by barcode value.
 	Falls back to matching item_code directly if no Item Barcode record exists.
 
-	Returns the same structure as get_product().
+	Returns the same structure as get_product(). When several items share the
+	barcode, returns the first — POS should call search_products_by_barcode
+	and let the cashier pick.
 	When allow_disabled=0 (default), disabled Items raise DoesNotExistError so
 	cashiers do not silently sell inactive SKUs — POS can pass allow_disabled=1
 	to surface them and show its own alert.
 	"""
-	item_code = frappe.db.get_value("Item Barcode", {"barcode": barcode}, "parent")
-	if not item_code:
-		# Try direct item_code match (useful when item_code IS the barcode)
-		if frappe.db.exists("Item", barcode):
-			item_code = barcode
-	if not item_code:
+	codes = _item_codes_for_barcode(barcode)
+	if not cint(allow_disabled):
+		codes = [
+			code
+			for code in codes
+			if not cint(frappe.db.get_value("Item", code, "disabled"))
+		]
+	if not codes:
 		frappe.throw(_("No item found for barcode: {0}").format(barcode), frappe.DoesNotExistError)
-	if not cint(allow_disabled) and cint(frappe.db.get_value("Item", item_code, "disabled")):
-		frappe.throw(
-			_("Item {0} is disabled").format(item_code),
-			frappe.DoesNotExistError,
-		)
-	return get_product(item_code, price_list=price_list)
+	prev = frappe.flags.ignore_permissions
+	frappe.flags.ignore_permissions = True
+	try:
+		return get_product(codes[0], price_list=price_list)
+	finally:
+		frappe.flags.ignore_permissions = prev
 
 
 @frappe.whitelist(allow_guest=True)
@@ -2712,6 +2765,22 @@ def _guest_preorder_tag_fieldname():
 	return None
 
 
+def _guest_preorder_tag_text(so) -> str:
+	return str(getattr(so, "remarks", None) or getattr(so, "terms", None) or "")
+
+
+def _require_guest_preorder_visible(so) -> None:
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_order_visibility_scope,
+		guest_preorder_matches_scope,
+	)
+
+	scope = _order_visibility_scope()
+	if guest_preorder_matches_scope(getattr(so, "owner", ""), _guest_preorder_tag_text(so), scope):
+		return
+	frappe.throw(_("Not permitted (tables.orders)"))
+
+
 def _is_guest_preorder_sales_order(so):
 	"""True if this SO was created by create_guest_preorder (tag in remarks or terms)."""
 	tag = GUEST_PREORDER_REMARKS_TAG
@@ -2749,6 +2818,7 @@ def create_guest_preorder(
 	paid_amount=None,
 	mode_of_payment=None,
 	customer=None,
+	order_tag=None,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -2810,6 +2880,17 @@ def create_guest_preorder(
 		remarks_parts.append(f"guest_notes:{_sanitize_guest_tag(guest_notes)}")
 	if mode_of_payment:
 		remarks_parts.append(f"guest_pay_method:{_sanitize_guest_tag(mode_of_payment)}")
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_acting_username,
+		_normalize_order_tag,
+	)
+
+	acting = _acting_username()
+	if acting:
+		remarks_parts.append(f"order_owner:{str(acting).replace('|', '')[:140]}")
+	tag_slug = _normalize_order_tag(order_tag)
+	if tag_slug:
+		remarks_parts.append(f"order_tag:{tag_slug}")
 	tag_text = " | ".join(remarks_parts)
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -2851,8 +2932,12 @@ def create_guest_preorder(
 	# Calculate totals
 	so.run_method("calculate_taxes_and_totals")
 
-	# Save as Draft (Consulta)
+	# Save as Draft (Consulta). Stamp the acting cashier so Pedidos propios can match.
+	if acting and frappe.db.exists("User", acting):
+		so.owner = acting
 	so.insert(ignore_permissions=True)
+	if acting and frappe.db.exists("User", acting) and so.owner != acting:
+		so.db_set("owner", acting)
 
 	paid = flt(paid_amount)
 	if paid > 0:
@@ -2884,6 +2969,15 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 	if not tag_fn:
 		return {"preorders": [], "total_count": 0}
 
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_order_visibility_scope,
+		guest_preorder_matches_scope,
+	)
+
+	scope = _order_visibility_scope()
+	if scope is not None and not scope.get("own") and not scope.get("tags"):
+		return {"preorders": [], "total_count": 0}
+
 	filters = {tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]}
 
 	if status:
@@ -2899,6 +2993,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 		filters=filters,
 		fields=[
 			"name",
+			"owner",
 			"customer",
 			"customer_name",
 			"transaction_date",
@@ -2908,9 +3003,10 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 			"docstatus",
 			"status",
 			"amended_from",
+			tag_fn,
 		],
 		start=start,
-		limit_page_length=int(page_length) + 50,  # fetch extra to account for filtering
+		limit_page_length=int(page_length) + (200 if scope else 50),  # fetch extra to account for filtering
 		order_by="transaction_date desc, creation desc",
 		ignore_permissions=True,
 	)
@@ -2933,8 +3029,23 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 			for a in amenders:
 				superseded.add(a["amended_from"])
 
-	# Filter out superseded cancelled orders
-	filtered = [o for o in orders if not (o.get("docstatus") == 2 and o["name"] in superseded)]
+	# Filter out superseded cancelled orders and orders outside this user's Pedidos scope.
+	filtered = []
+	for o in orders:
+		if o.get("docstatus") == 2 and o["name"] in superseded:
+			continue
+		if not guest_preorder_matches_scope(o.get("owner"), o.get(tag_fn), scope):
+			continue
+		tag_raw = str(o.get(tag_fn) or "")
+		order_tag = ""
+		for part in tag_raw.split("|"):
+			part = part.strip()
+			if part.startswith("order_tag:"):
+				order_tag = part.split(":", 1)[1].strip()
+				break
+		o["order_tag"] = order_tag or None
+		o.pop(tag_fn, None)
+		filtered.append(o)
 	total_count = len(filtered)
 	filtered = filtered[:int(page_length)]
 
@@ -2984,6 +3095,7 @@ def get_guest_preorder(preorder_name):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 
 	tag_raw = getattr(so, "remarks", None) or getattr(so, "terms", None) or ""
 	tags = {}
@@ -3040,6 +3152,9 @@ def get_guest_preorder_history(preorder_name):
 	"""
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	frappe.flags.ignore_permissions = True
+	_require_guest_preorder_visible(frappe.get_doc("Sales Order", preorder_name))
 
 	# Walk backward to find the root
 	root = preorder_name
@@ -3146,6 +3261,7 @@ def set_guest_preorder_status(preorder_name, target_status):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot change status of a cancelled order"))
@@ -3199,6 +3315,7 @@ def confirm_guest_preorder(preorder_name):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 
 	if so.docstatus == 0:
 		so.submit()
@@ -3229,6 +3346,7 @@ def cancel_guest_preorder(preorder_name):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 
 	if so.docstatus == 2:
 		frappe.throw(_("Order is already cancelled"))
@@ -3266,6 +3384,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot edit a cancelled order"))
 
@@ -3362,6 +3481,7 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot edit a cancelled order"))
@@ -3435,6 +3555,7 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 
 	if so.docstatus != 0:
 		frappe.throw(_("Price editing is only allowed on draft orders (before confirming)"))
@@ -3469,6 +3590,7 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 
 	if so.docstatus != 1:
 		frappe.throw(_("Payment can only be recorded on submitted (confirmed) orders"))
@@ -3794,6 +3916,7 @@ def create_delivery_note_for_preorder(preorder_name):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
 	if so.docstatus != 1:
 		frappe.throw(_("Confirm the order before creating a delivery note."))
 
@@ -4801,6 +4924,9 @@ def create_pos_sale(
 		remarks_tag, warehouse=warehouse, pos_session_id=pos_session_id
 	)
 
+	for item in items:
+		_linked_box_pack(item.get("item_code"))
+
 	invoice = frappe.get_doc(
 		{
 			"doctype": "Sales Invoice",
@@ -4838,6 +4964,27 @@ def create_pos_sale(
 
 	invoice.insert(ignore_permissions=True)
 	invoice.submit()
+
+	# Box lines are priced as boxes but stock lives on the unit SKU.
+	from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+
+	for item in items:
+		box = _linked_box_pack(item.get("item_code"))
+		if not box or not warehouse:
+			continue
+		issue_qty = flt(item.get("qty")) * box["pack"]
+		if issue_qty <= 0:
+			continue
+		stock_entry = make_stock_entry(
+			item_code=box["unit"],
+			qty=issue_qty,
+			from_warehouse=warehouse,
+			posting_date=nowdate(),
+			purpose="Material Issue",
+			do_not_save=True,
+		)
+		stock_entry.insert(ignore_permissions=True)
+		stock_entry.submit()
 
 	# ── Create Payment Entry (one per split) ──────────────────────────────────
 	payment_ids = _submit_pos_payments(
@@ -5180,6 +5327,24 @@ def search_items_for_receiving(search_term=None, page_length=8):
 	return items
 
 
+def _linked_box_pack(item_code):
+	"""Box SKU linked to another unit with pack > 1. Boxes do not hold stock."""
+	code = (item_code or "").strip()
+	if not code or not frappe.db.exists("Item", code):
+		return None
+	unit = ""
+	pack = 0
+	if frappe.db.has_column("Item", "custom_unit_sku"):
+		unit = (frappe.db.get_value("Item", code, "custom_unit_sku") or "").strip()
+	if frappe.db.has_column("Item", "custom_pack_qty"):
+		pack = flt(frappe.db.get_value("Item", code, "custom_pack_qty"))
+	if not unit or unit == code or pack <= 1 or not frappe.db.exists("Item", unit):
+		return None
+	if cint(frappe.db.get_value("Item", code, "is_stock_item")):
+		frappe.db.set_value("Item", code, "is_stock_item", 0)
+	return {"unit": unit, "pack": pack}
+
+
 @frappe.whitelist(allow_guest=True)
 def commit_receiving_session(session_id, reference, supplier, warehouse, lines, draft_items):
 	"""
@@ -5338,10 +5503,18 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 		if flt(line.get("qty") or 0) <= 0:
 			continue
 		basic_rate = flt(line.get("unit_cost") or 0)
+		qty = flt(line.get("qty") or 0)
+		# A scanned box never receives its own stock — credit the unit SKU by pack size.
+		box = _linked_box_pack(item_code)
+		if box:
+			qty = qty * box["pack"]
+			if basic_rate > 0:
+				basic_rate = basic_rate / box["pack"]
+			item_code = box["unit"]
 		# unit_cost 0 / empty → do not force valuation overwrite (allow current valuation)
 		resolved_lines.append({
 			"item_code": item_code,
-			"qty": flt(line.get("qty") or 0),
+			"qty": qty,
 			"basic_rate": basic_rate,
 			"t_warehouse": warehouse,
 			"allow_zero_valuation_rate": 1 if basic_rate <= 0 else 0,

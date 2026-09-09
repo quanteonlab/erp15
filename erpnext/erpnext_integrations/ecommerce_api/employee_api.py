@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import string
 
@@ -189,14 +190,24 @@ APP_PERMISSIONS = [
 		"desc_zh": "POS 配置、班次与收银合计。",
 	},
 	{
-		"id": "tables.orders",
+		"id": "tables.orders.own",
 		"group": "tablas",
-		"label_en": "Orders",
-		"label_es": "Pedidos",
-		"label_zh": "订单",
-		"desc_en": "Guest preorders: confirm, prepare, collect.",
-		"desc_es": "Pedidos de invitados: confirmar, preparar, cobrar.",
-		"desc_zh": "访客预订单：确认、备货、收款。",
+		"label_en": "Own orders",
+		"label_es": "Pedidos propios",
+		"label_zh": "自己的订单",
+		"desc_en": "Guest preorders created by this user.",
+		"desc_es": "Pedidos de invitados creados por este usuario.",
+		"desc_zh": "此用户创建的访客预订单。",
+	},
+	{
+		"id": "tables.orders.all",
+		"group": "tablas",
+		"label_en": "All orders",
+		"label_es": "Todos los pedidos",
+		"label_zh": "全部订单",
+		"desc_en": "Every guest preorder, regardless of owner or tag.",
+		"desc_es": "Todos los pedidos de invitados, sin filtro de dueño ni tag.",
+		"desc_zh": "全部访客预订单，不按创建人或标签过滤。",
 	},
 	{
 		"id": "tools.sync",
@@ -302,6 +313,35 @@ APP_PERMISSIONS = [
 
 KNOWN_PERMISSION_IDS = {p["id"] for p in APP_PERMISSIONS}
 
+ORDER_TAG_PREFIX = "tables.orders.tag:"
+DEFAULT_CAJA_ORDER_TAG = "caja"
+CATALOG_ORDER_TAG = "catalogo"
+
+
+def _normalize_order_tag(raw) -> str:
+	s = str(raw or "").strip().lower()
+	s = re.sub(r"\s+", "-", s)
+	s = re.sub(r"[^a-z0-9_-]", "", s)
+	return s[:40]
+
+
+def _order_tag_permission_id(tag) -> str:
+	slug = _normalize_order_tag(tag)
+	return f"{ORDER_TAG_PREFIX}{slug}" if slug else ""
+
+
+def _accept_permission_id(key: str) -> str | None:
+	key = str(key or "").strip()
+	# Legacy single Pedidos permission means every order.
+	if key == "tables.orders":
+		key = "tables.orders.all"
+	if key in KNOWN_PERMISSION_IDS:
+		return key
+	if key.startswith(ORDER_TAG_PREFIX):
+		pid = _order_tag_permission_id(key[len(ORDER_TAG_PREFIX) :])
+		return pid or None
+	return None
+
 PERMISSION_TO_ROLES = {
 	"ops.pos": ["Sales User"],
 	"ops.catalog": ["Sales User"],
@@ -321,6 +361,8 @@ PERMISSION_TO_ROLES = {
 	"tables.employees": ["HR User"],
 	"tables.cajas": ["Accounts User"],
 	"tables.orders": ["Sales User"],
+	"tables.orders.own": ["Sales User"],
+	"tables.orders.all": ["Sales User"],
 	"tools.sync": ["Stock Manager"],
 	"tools.labels": ["Stock User"],
 	"tools.migrate": ["Stock Manager"],
@@ -350,7 +392,8 @@ _STARTER_REPOSITOR = [
 _STARTER_CAJA = [
 	"ops.pos",
 	"ops.catalog",
-	"tables.orders",
+	"tables.orders.own",
+	"tables.orders.tag:caja",
 	"tables.cajas",
 	"log.accounting",
 	"tools.labels",
@@ -429,8 +472,8 @@ def _normalize_permission_ids(raw) -> list[str]:
 	out = []
 	seen = set()
 	for item in raw:
-		key = str(item or "").strip()
-		if key in KNOWN_PERMISSION_IDS and key not in seen:
+		key = _accept_permission_id(str(item or "").strip())
+		if key and key not in seen:
 			seen.add(key)
 			out.append(key)
 	return out
@@ -512,6 +555,8 @@ _COARSE_FLAG = {
 	"ops.pos": "pos",
 	"ops.catalog": "pos",
 	"tables.orders": "pos",
+	"tables.orders.own": "pos",
+	"tables.orders.all": "pos",
 	"tools.labels": "pos",
 	"log.accounting": "payments",
 	"tables.cajas": "payments",
@@ -540,6 +585,8 @@ _COARSE_FLAG = {
 
 def _coarse_allows(username: str, pid: str) -> bool:
 	flag = _COARSE_FLAG.get(pid)
+	if not flag and str(pid or "").startswith(ORDER_TAG_PREFIX):
+		flag = "pos"
 	if not flag:
 		return False
 	roles = set(frappe.get_roles(username))
@@ -557,6 +604,8 @@ def _coarse_allows(username: str, pid: str) -> bool:
 def _roles_from_permission_ids(permission_ids: list[str]) -> list[str]:
 	roles = {"Employee"}
 	for pid in permission_ids:
+		if str(pid or "").startswith(ORDER_TAG_PREFIX):
+			roles.add("Sales User")
 		for role in PERMISSION_TO_ROLES.get(pid, []):
 			roles.add(role)
 	return sorted(roles)
@@ -665,6 +714,7 @@ def get_user_app_permissions(username=None):
 		frappe.throw(_("username is required"))
 	if not frappe.db.exists("User", username):
 		frappe.throw(_("User {0} not found").format(username))
+	_ensure_starter_staff_groups()
 	roles = frappe.get_roles(username)
 	if "Administrator" in roles or "System Manager" in roles:
 		return {"permissions": ["*"], "groups": [], "source": "admin"}
@@ -1158,6 +1208,87 @@ def _find_employee_group_by_title(title: str) -> str | None:
 	return None
 
 
+def _order_visibility_scope() -> dict | None:
+	"""None = unrestricted. Else {user, own, tags} for Pedidos list/detail."""
+	info = _acting_perm_info()
+	if not info:
+		return None
+	perms = info.get("permissions") or []
+	if info.get("source") == "admin" or "*" in perms:
+		return None
+	if "tables.orders" in perms or "tables.orders.all" in perms:
+		return None
+	tags = []
+	seen = set()
+	for pid in perms:
+		if not str(pid).startswith(ORDER_TAG_PREFIX):
+			continue
+		tag = _normalize_order_tag(str(pid)[len(ORDER_TAG_PREFIX) :])
+		if tag and tag not in seen:
+			seen.add(tag)
+			tags.append(tag)
+	return {
+		"user": _acting_username(),
+		"own": "tables.orders.own" in perms,
+		"tags": tags,
+	}
+
+
+def guest_preorder_matches_scope(owner: str, tag_text: str, scope: dict | None) -> bool:
+	if scope is None:
+		return True
+	if not scope.get("own") and not scope.get("tags"):
+		return False
+	tokens = {part.strip() for part in str(tag_text or "").split("|") if part.strip()}
+	if scope.get("own"):
+		user = str(scope.get("user") or "").strip()
+		if user and (str(owner or "").strip() == user or f"order_owner:{user}" in tokens):
+			return True
+	for tag in scope.get("tags") or []:
+		if f"order_tag:{tag}" in tokens:
+			return True
+	return False
+
+
+def _apply_caja_orders_split(store: dict) -> bool:
+	"""One-time: caja loses blanket Pedidos and gets own + tag caja."""
+	meta = store.get("_migrations")
+	if not isinstance(meta, dict):
+		meta = {}
+	if meta.get("caja_orders_v1"):
+		return False
+	existing = _find_employee_group_by_title("caja")
+	if not existing:
+		meta["caja_orders_v1"] = True
+		store["_migrations"] = meta
+		return True
+	raw = store.get(existing) or []
+	if isinstance(raw, str):
+		raw = _parse_json(raw, [])
+	if not isinstance(raw, list) or not raw:
+		meta["caja_orders_v1"] = True
+		store["_migrations"] = meta
+		return True
+	next_ids = []
+	seen = set()
+	for item in raw:
+		key = str(item or "").strip()
+		if key in ("tables.orders", "tables.orders.all"):
+			continue
+		accepted = _accept_permission_id(key)
+		if accepted and accepted not in seen:
+			seen.add(accepted)
+			next_ids.append(accepted)
+	for extra in ("tables.orders.own", _order_tag_permission_id(DEFAULT_CAJA_ORDER_TAG)):
+		if extra and extra not in seen:
+			seen.add(extra)
+			next_ids.append(extra)
+	store[existing] = next_ids
+	meta["caja_orders_v1"] = True
+	store["_migrations"] = meta
+	return True
+
+
 def _ensure_starter_staff_groups() -> dict:
 	"""Create repositor / caja / admin if missing. Do not overwrite non-empty permission lists."""
 	if getattr(frappe.local, "_staff_starter_ensured", False):
@@ -1168,7 +1299,7 @@ def _ensure_starter_staff_groups() -> dict:
 	created = []
 	attached = []
 	skipped = []
-	dirty = False
+	dirty = _apply_caja_orders_split(store)
 	for spec in STARTER_STAFF_GROUPS:
 		title = spec["employee_group_name"]
 		perms = _normalize_permission_ids(spec["permissions"])
