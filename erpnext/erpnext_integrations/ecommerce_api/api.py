@@ -2637,8 +2637,10 @@ def create_order(
 	so.delivery_date = delivery_date or add_days(nowdate(), 7)
 	so.company = company
 
-	if currency:
-		so.currency = currency
+	company_currency = frappe.get_cached_value("Company", company, "default_currency")
+	so.currency = currency or company_currency
+	if so.currency == company_currency:
+		so.conversion_rate = 1.0
 
 	if price_list:
 		so.selling_price_list = price_list
@@ -2668,6 +2670,9 @@ def create_order(
 				"customer": customer,
 				"company": company,
 				"selling_price_list": price_list,
+				"currency": so.currency,
+				"conversion_rate": so.conversion_rate,
+				"transaction_date": so.transaction_date,
 				"doctype": "Sales Order",
 			})
 			rate = item_details.get("price_list_rate", 0)
