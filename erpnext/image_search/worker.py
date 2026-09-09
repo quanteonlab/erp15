@@ -22,13 +22,15 @@ class ImageSearchWorker:
         self.search_service = ImageSearchService()
 
     def start_worker(self):
-        """Start processing jobs from the queue (one RQ job at a time)."""
-        enqueue_image_search_batch()
+        """Start processing jobs from the queue (one RQ job chain at a time)."""
+        settings = frappe.get_single("Image Search Settings")
+        batch_size = cint(settings.batch_size) or 1
+        enqueue_image_search_batch(batch_size=batch_size)
 
     def process_job_batch(self, batch_size: int = 1):
         """Process a small batch so one hung search cannot stall the queue."""
         try:
-            batch_size = max(1, min(int(batch_size or 1), 3))
+            batch_size = max(1, min(int(batch_size or 1), 10))
         except (TypeError, ValueError):
             batch_size = 1
 
@@ -59,7 +61,17 @@ class ImageSearchWorker:
         print(f"image_search: {pending_count} remaining after batch", flush=True)
 
         if pending_count > 0:
-            enqueue_image_search_batch(batch_size=batch_size)
+            # No job_id/dedup here: this call runs while our own RQ job is still
+            # STARTED under IMAGE_SEARCH_RQ_JOB_ID, so reusing that id with
+            # deduplicate=True (as enqueue_image_search_batch does) would see
+            # itself as already queued and silently drop the continuation.
+            enqueue(
+                "erpnext.image_search.worker.process_job_batch",
+                queue="default",
+                timeout=120,
+                is_async=True,
+                batch_size=batch_size,
+            )
 
     def process_single_job(self, job: Dict):
         """Process a single image search job"""
