@@ -17,6 +17,26 @@ DEFAULT_NOTIFY_EMAILS = ["wangnelson2@gmail.com", "help@l0l.in"]
 EMAIL_LANGUAGES = ("es", "en", "zh")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# Outbound SMTP profiles editable in Tools > Settings > Automation.
+# Add new keys here when another flow starts sending mail.
+EMAIL_OPERATIONS = {
+	"inquiry": {
+		"label_en": "Inquiry / consulta alerts",
+		"label_es": "Alertas de consulta",
+		"label_zh": "咨询提醒邮件",
+		"default_sender_name": "SilkOS Consultas",
+	},
+}
+
+DEFAULT_SMTP = {
+	"email": "",
+	"password": "",
+	"server": "smtp.hostinger.com",
+	"port": "465",
+	"useSsl": True,
+	"senderName": "",
+}
+
 
 def _parse_json(raw, default):
 	if raw is None or raw == "":
@@ -92,14 +112,91 @@ def _normalize_email_language(raw) -> str:
 	return "es"
 
 
-def _normalize_settings(data: dict | None) -> dict:
+def _normalize_smtp_account(raw, op_id: str, previous: dict | None = None) -> dict:
+	src = raw if isinstance(raw, dict) else {}
+	prev = previous if isinstance(previous, dict) else {}
+	meta = EMAIL_OPERATIONS.get(op_id) or {}
+	email = str(src.get("email") or prev.get("email") or "").strip().lower()
+	if email and not _EMAIL_RE.match(email):
+		email = ""
+	password = str(src.get("password") if "password" in src else "").strip()
+	# Blank password on save keeps the previously stored secret.
+	if not password:
+		password = str(prev.get("password") or "")
+	server = str(src.get("server") if "server" in src else prev.get("server") or DEFAULT_SMTP["server"]).strip()
+	port = str(src.get("port") if "port" in src else prev.get("port") or DEFAULT_SMTP["port"]).strip() or "465"
+	use_ssl = _as_bool(
+		src.get("useSsl") if "useSsl" in src else (src.get("use_ssl") if "use_ssl" in src else None),
+		_as_bool(prev.get("useSsl"), True),
+	)
+	sender_raw = src.get("senderName") if "senderName" in src else None
+	if sender_raw is None and "sender_name" in src:
+		sender_raw = src.get("sender_name")
+	if sender_raw is None:
+		sender_raw = prev.get("senderName") or meta.get("default_sender_name") or ""
+	sender_name = str(sender_raw or "").strip()[:120]
+	return {
+		"email": email,
+		"password": password,
+		"server": server or DEFAULT_SMTP["server"],
+		"port": port,
+		"useSsl": use_ssl,
+		"senderName": sender_name,
+	}
+
+
+def _normalize_email_accounts(raw, previous: dict | None = None) -> dict:
+	src = raw if isinstance(raw, dict) else {}
+	prev = previous if isinstance(previous, dict) else {}
+	out = {}
+	for op_id in EMAIL_OPERATIONS:
+		out[op_id] = _normalize_smtp_account(src.get(op_id), op_id, prev.get(op_id))
+	# Keep unknown ops that were already saved (forward-compat).
+	for key, val in src.items():
+		if key in out or not isinstance(val, dict):
+			continue
+		out[str(key)] = _normalize_smtp_account(val, str(key), prev.get(key))
+	return out
+
+
+def _public_smtp_account(account: dict) -> dict:
+	return {
+		"email": str(account.get("email") or ""),
+		"server": str(account.get("server") or DEFAULT_SMTP["server"]),
+		"port": str(account.get("port") or DEFAULT_SMTP["port"]),
+		"useSsl": bool(account.get("useSsl", True)),
+		"senderName": str(account.get("senderName") or ""),
+		"passwordSet": bool(str(account.get("password") or "").strip()),
+	}
+
+
+def _public_settings(settings: dict) -> dict:
+	"""API-safe view: never return SMTP passwords."""
+	out = dict(settings or {})
+	accounts = out.get("emailAccounts") or {}
+	out["emailAccounts"] = {
+		op_id: _public_smtp_account(cfg if isinstance(cfg, dict) else {})
+		for op_id, cfg in accounts.items()
+	}
+	out["emailOperations"] = [
+		{"id": op_id, **meta} for op_id, meta in EMAIL_OPERATIONS.items()
+	]
+	return out
+
+
+def _normalize_settings(data: dict | None, previous: dict | None = None) -> dict:
 	src = data if isinstance(data, dict) else {}
+	prev = previous if isinstance(previous, dict) else {}
 	notify_emails = _normalize_emails(src.get("notifyEmails") or src.get("notify_emails"))
 	if not notify_emails:
 		notify_emails = list(DEFAULT_NOTIFY_EMAILS)
 	contact_email = str(src.get("contactEmail") or src.get("contact_email") or "").strip().lower()
 	if contact_email and _EMAIL_RE.match(contact_email) and contact_email not in notify_emails:
 		notify_emails = [contact_email, *notify_emails]
+	email_accounts_raw = src.get("emailAccounts") if "emailAccounts" in src else src.get("email_accounts")
+	if email_accounts_raw is None and "emailAccounts" not in src and "email_accounts" not in src:
+		# Preserve existing accounts when a partial patch omits the key.
+		email_accounts_raw = prev.get("emailAccounts")
 	return {
 		"contactName": str(src.get("contactName") or src.get("contact_name") or "").strip()[:120],
 		"contactEmail": contact_email if _EMAIL_RE.match(contact_email or "") else "",
@@ -131,6 +228,7 @@ def _normalize_settings(data: dict | None) -> dict:
 			for item in (src.get("notifyPhones") or src.get("notify_phones") or [])
 			if str(item or "").strip()
 		][:40],
+		"emailAccounts": _normalize_email_accounts(email_accounts_raw, prev.get("emailAccounts")),
 	}
 
 
@@ -138,7 +236,18 @@ def get_inquiry_automation_settings_internal() -> dict:
 	raw = _load_raw()
 	if not raw:
 		return _normalize_settings({})
-	return _normalize_settings(raw)
+	return _normalize_settings(raw, previous=raw)
+
+
+def get_email_account_for_operation(operation: str = "inquiry") -> dict:
+	"""Full SMTP credentials for an operation (includes password). Falls back to empty defaults."""
+	settings = get_inquiry_automation_settings_internal()
+	accounts = settings.get("emailAccounts") or {}
+	op = str(operation or "inquiry").strip() or "inquiry"
+	account = accounts.get(op) if isinstance(accounts.get(op), dict) else {}
+	if not account and op != "inquiry":
+		account = accounts.get("inquiry") if isinstance(accounts.get("inquiry"), dict) else {}
+	return _normalize_smtp_account(account, op)
 
 
 def _can_manage_settings() -> bool:
@@ -149,20 +258,29 @@ def _can_manage_settings() -> bool:
 
 @frappe.whitelist()
 def get_inquiry_automation_settings():
-	"""Return inquiry automation settings for Tools > Automation."""
+	"""Return inquiry automation settings for Tools > Automation (passwords redacted)."""
 	settings = get_inquiry_automation_settings_internal()
-	return {"ok": True, "settings": settings, "source": "server" if _load_raw() else "default"}
+	return {
+		"ok": True,
+		"settings": _public_settings(settings),
+		"source": "server" if _load_raw() else "default",
+	}
 
 
 @frappe.whitelist()
 def save_inquiry_automation_settings(settings=None):
-	"""Persist inquiry automation settings (admin)."""
+	"""Persist inquiry automation settings (admin). Empty password keeps the previous one."""
 	if not _can_manage_settings():
 		frappe.throw(_("Not permitted ({0})").format("tools.settings"))
 	if isinstance(settings, str):
 		settings = frappe.parse_json(settings)
 	incoming = settings if isinstance(settings, dict) else {}
 	current = _load_raw()
-	merged = _normalize_settings({**current, **incoming})
+	merged = _normalize_settings({**current, **incoming}, previous=current)
+	# When client sends public emailAccounts (passwordSet only), merge passwords carefully.
+	if isinstance(incoming.get("emailAccounts"), dict):
+		merged["emailAccounts"] = _normalize_email_accounts(
+			incoming.get("emailAccounts"), current.get("emailAccounts")
+		)
 	_save_raw(merged)
-	return {"ok": True, "settings": merged, "source": "server"}
+	return {"ok": True, "settings": _public_settings(merged), "source": "server"}

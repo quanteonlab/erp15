@@ -118,63 +118,95 @@ def _email_copy(lang: str) -> dict:
 	return EMAIL_COPY.get(lang) or EMAIL_COPY["es"]
 
 
-def _smtp_config() -> dict:
+def _smtp_config(operation: str = "inquiry") -> dict:
+	"""Resolve SMTP for an operation: Settings first, then env / site_config."""
+	from erpnext.erpnext_integrations.ecommerce_api.inquiry_automation_settings import (
+		EMAIL_OPERATIONS,
+		get_email_account_for_operation,
+	)
+
+	account = get_email_account_for_operation(operation)
 	conf = frappe.conf or {}
-	return {
-		"email": (
-			os.environ.get("ERPNEXT_SMTP_EMAIL")
-			or conf.get("smtp_email")
-			or conf.get("mail_login")
-			or "help@l0l.in"
-		),
-		"password": (
-			os.environ.get("ERPNEXT_SMTP_PASSWORD")
-			or conf.get("smtp_password")
-			or conf.get("mail_password")
-			or ""
-		),
-		"server": (
-			os.environ.get("ERPNEXT_SMTP_SERVER")
-			or conf.get("smtp_server")
-			or conf.get("mail_server")
-			or "smtp.hostinger.com"
-		),
-		"port": str(
-			os.environ.get("ERPNEXT_SMTP_PORT")
-			or conf.get("smtp_port")
-			or conf.get("mail_port")
-			or "465"
-		),
-		"use_ssl": cint(
+	meta = EMAIL_OPERATIONS.get(operation) or {}
+	email = (
+		str(account.get("email") or "").strip()
+		or os.environ.get("ERPNEXT_SMTP_EMAIL")
+		or conf.get("smtp_email")
+		or conf.get("mail_login")
+		or "help@l0l.in"
+	)
+	password = (
+		str(account.get("password") or "").strip()
+		or os.environ.get("ERPNEXT_SMTP_PASSWORD")
+		or conf.get("smtp_password")
+		or conf.get("mail_password")
+		or ""
+	)
+	server = (
+		str(account.get("server") or "").strip()
+		or os.environ.get("ERPNEXT_SMTP_SERVER")
+		or conf.get("smtp_server")
+		or conf.get("mail_server")
+		or "smtp.hostinger.com"
+	)
+	port = str(
+		account.get("port")
+		or os.environ.get("ERPNEXT_SMTP_PORT")
+		or conf.get("smtp_port")
+		or conf.get("mail_port")
+		or "465"
+	)
+	if account.get("email") or account.get("password"):
+		use_ssl = cint(account.get("useSsl", 1))
+	else:
+		use_ssl = cint(
 			os.environ.get("ERPNEXT_SMTP_USE_SSL")
 			or conf.get("smtp_use_ssl")
 			or conf.get("use_ssl")
 			or 1
-		),
-		"sender_name": str(conf.get("smtp_sender_name") or "SilkOS Consultas"),
+		)
+	sender_name = (
+		str(account.get("senderName") or "").strip()
+		or str(conf.get("smtp_sender_name") or "")
+		or meta.get("default_sender_name")
+		or "SilkOS Consultas"
+	)
+	return {
+		"email": email,
+		"password": password,
+		"server": server,
+		"port": port,
+		"use_ssl": use_ssl,
+		"sender_name": sender_name,
+		"operation": operation,
 	}
 
 
-def ensure_outgoing_email_account() -> bool:
-	"""Create or update the default outgoing Email Account from env/site config."""
-	cfg = _smtp_config()
+def ensure_outgoing_email_account(operation: str = "inquiry") -> str | None:
+	"""Create/update an Email Account for the operation. Returns account name or None."""
+	cfg = _smtp_config(operation)
 	if not cfg["password"]:
 		frappe.log_error(
-			"Set ERPNEXT_SMTP_PASSWORD or smtp_password in site_config to send consulta emails.",
+			"Set SMTP password in Settings > Automation (or ERPNEXT_SMTP_PASSWORD / site_config).",
 			"Inquiry Email Setup",
 		)
-		return False
+		return None
 
 	email_id = cfg["email"].strip()
 	if not email_id:
-		return False
+		return None
 
-	account_name = frappe.db.get_value("Email Account", {"email_id": email_id}, "name")
+	account_label = f"SilkOS {operation}"
+	account_name = (
+		frappe.db.get_value("Email Account", {"email_id": email_id}, "name")
+		or frappe.db.get_value("Email Account", {"email_account_name": account_label}, "name")
+	)
 	frappe.flags.ignore_permissions = True
 	if account_name:
 		doc = frappe.get_doc("Email Account", account_name)
 	else:
 		doc = frappe.new_doc("Email Account")
+		doc.email_account_name = account_label
 		doc.email_id = email_id
 
 	doc.enable_outgoing = 1
@@ -192,6 +224,8 @@ def ensure_outgoing_email_account() -> bool:
 	if doc.is_new():
 		doc.insert(ignore_permissions=True)
 	else:
+		if doc.email_id != email_id:
+			doc.email_id = email_id
 		doc.save(ignore_permissions=True)
 
 	# Clear default flag on other accounts
@@ -205,7 +239,7 @@ def ensure_outgoing_email_account() -> bool:
 	)
 	frappe.db.set_value("Email Account", doc.name, "default_outgoing", 1, update_modified=False)
 	frappe.db.commit()
-	return True
+	return doc.name
 
 
 def _load_item_barcodes(item_codes: list[str]) -> dict[str, list[dict]]:
@@ -397,7 +431,8 @@ def send_consulta_notification(preorder_name: str, guest_name=None, guest_phone=
 		if not recipients:
 			return False
 
-		if not ensure_outgoing_email_account():
+		account_name = ensure_outgoing_email_account("inquiry")
+		if not account_name:
 			return False
 
 		frappe.flags.ignore_permissions = True
@@ -418,8 +453,14 @@ def send_consulta_notification(preorder_name: str, guest_name=None, guest_phone=
 			so, guest_name, guest_phone, lang, include_barcodes=include_barcodes
 		)
 
+		cfg = _smtp_config("inquiry")
+		sender = cfg["email"]
+		if cfg.get("sender_name"):
+			sender = f'{cfg["sender_name"]} <{cfg["email"]}>'
+
 		frappe.sendmail(
 			recipients=recipients,
+			sender=sender,
 			subject=subject,
 			message=body,
 			delayed=False,
@@ -445,13 +486,21 @@ def send_test_inquiry_email():
 	if not recipients:
 		frappe.throw("No notify emails configured.")
 
-	if not ensure_outgoing_email_account():
-		frappe.throw("SMTP is not configured. Set ERPNEXT_SMTP_PASSWORD or smtp_password in site_config.")
+	if not ensure_outgoing_email_account("inquiry"):
+		frappe.throw(
+			"SMTP is not configured. Set email and password under Settings > Automation "
+			"(or ERPNEXT_SMTP_PASSWORD / smtp_password in site_config)."
+		)
 
 	lang = str(settings.get("emailLanguage") or "es")
 	copy = _email_copy(lang)
+	cfg = _smtp_config("inquiry")
+	sender = cfg["email"]
+	if cfg.get("sender_name"):
+		sender = f'{cfg["sender_name"]} <{cfg["email"]}>'
 	frappe.sendmail(
 		recipients=recipients,
+		sender=sender,
 		subject=copy["test_subject"],
 		message=copy["test_body"],
 		delayed=False,
