@@ -1,0 +1,130 @@
+{
+ "actions": [],
+ "creation": "2026-09-14 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "setup_instructions",
+  "enabled",
+  "environment",
+  "column_break_2",
+  "company_name",
+  "cuit",
+  "punto_venta",
+  "default_invoice_type",
+  "section_break_certs",
+  "certificate",
+  "private_key",
+  "column_break_certs",
+  "last_wsaa_login",
+  "last_error"
+ ],
+ "fields": [
+  {
+   "fieldname": "setup_instructions",
+   "fieldtype": "HTML",
+   "options": "<div class=\"alert alert-info\" style=\"line-height:1.6\"><b>Before enabling:</b> register on AFIP (Argentina) and upload the resulting certificate/key here.<ol style=\"margin-bottom:0\"><li>Log in with your Clave Fiscal at <a href=\"https://auth.afip.gob.ar/contribuyente_/login.xhtml\" target=\"_blank\">auth.afip.gob.ar</a> (level 3 required).</li><li>Go to <b>Administrador de Certificados Digitales</b> and generate a CSR (or use <code>openssl req -new -newkey rsa:2048 -nodes -keyout private.key -out request.csr</code> locally), then upload the <code>.csr</code> there to get a <code>.crt</code> back.</li><li>Go to <b>Administrador de Relaciones de Clave Fiscal</b>, create a new relation for your CUIT, service <b>WSFEv1 (Factura Electrónica)</b>, and attach the certificate from step 2.</li><li>Go to <b>Regímenes de Facturación y Registros Especiales → Puntos de Venta</b> and register a Punto de Venta of type \"Web Services\" (not manual). Use that number below.</li><li>Upload the <code>.crt</code> as <b>Certificate</b> and the matching <code>.key</code> (from step 2) as <b>Private Key</b> below, fill in CUIT and Punto de Venta, then enable.</li><li>Test against <b>Homologación</b> first (AFIP's sandbox needs a separate test certificate, generated the same way at <a href=\"https://wsass-homo.afip.gob.ar/wsass/portal/main.aspx\" target=\"_blank\">wsass-homo.afip.gob.ar</a>) before switching Environment to Producción.</li></ol></div>"
+  },
+  {
+   "default": "0",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled"
+  },
+  {
+   "default": "homologacion",
+   "depends_on": "enabled",
+   "fieldname": "environment",
+   "fieldtype": "Select",
+   "label": "Environment",
+   "options": "homologacion\nproduccion"
+  },
+  {
+   "fieldname": "column_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "enabled",
+   "description": "Printed on the ticket header (e.g. \"PABLO A SUCHMANS\")",
+   "fieldname": "company_name",
+   "fieldtype": "Data",
+   "label": "Business Name (ticket header)"
+  },
+  {
+   "depends_on": "enabled",
+   "fieldname": "cuit",
+   "fieldtype": "Data",
+   "label": "CUIT"
+  },
+  {
+   "default": "1",
+   "depends_on": "enabled",
+   "fieldname": "punto_venta",
+   "fieldtype": "Int",
+   "label": "Punto de Venta"
+  },
+  {
+   "default": "6",
+   "depends_on": "enabled",
+   "description": "AFIP comprobante type code, e.g. 6 = Factura B, 11 = Factura C, 1 = Factura A",
+   "fieldname": "default_invoice_type",
+   "fieldtype": "Int",
+   "label": "Default Invoice Type (Cbte. Tipo)"
+  },
+  {
+   "depends_on": "enabled",
+   "fieldname": "section_break_certs",
+   "fieldtype": "Section Break",
+   "label": "Certificate"
+  },
+  {
+   "fieldname": "certificate",
+   "fieldtype": "Attach",
+   "label": "Certificate (.crt)"
+  },
+  {
+   "fieldname": "private_key",
+   "fieldtype": "Attach",
+   "label": "Private Key (.key)"
+  },
+  {
+   "fieldname": "column_break_certs",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_wsaa_login",
+   "fieldtype": "Datetime",
+   "label": "Last WSAA Login",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_error",
+   "fieldtype": "Small Text",
+   "label": "Last Error",
+   "read_only": 1
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-09-14 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "AFIP Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 1
+}

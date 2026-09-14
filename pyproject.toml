@@ -27,6 +27,11 @@ dependencies = [
     # Image search (free provider)
     "ddgs>=7.0.0",
     "python-barcode~=0.15.1",
+
+    # AFIP (Argentina) electronic invoicing - deps for vendored pyafipws
+    "pysimplesoap~=1.8.22",
+    "cryptography>=41.0.1",
+    "qrcode~=6.1",
 ]
 
 [build-system]
