@@ -3027,6 +3027,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 			"transaction_date",
 			"delivery_date",
 			"grand_total",
+			"advance_paid",
 			"currency",
 			"docstatus",
 			"status",
@@ -3095,19 +3096,12 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 
 	for o in filtered:
 		o["items_count"] = items_count_map.get(o["name"], 0)
-		# Compute display status from docstatus + status
-		ds = o.get("docstatus", 0)
-		st = o.get("status", "")
-		if ds == 0:
-			o["display_status"] = "Consulta"
-		elif ds == 2:
-			o["display_status"] = "Archivado"
-		elif st in ("Preparado", "En Delivery"):
-			o["display_status"] = st
-		elif st == "Completed":
-			o["display_status"] = "Completado"
-		else:
-			o["display_status"] = "Orden"
+		o["display_status"] = _display_status_from_row(
+			o.get("docstatus", 0),
+			o.get("status", ""),
+			o.get("grand_total", 0),
+			o.get("advance_paid", 0),
+		)
 
 	return {"preorders": filtered, "total_count": total_count}
 
@@ -3245,6 +3239,14 @@ def get_guest_preorder_history(preorder_name):
 #   Archivado  = docstatus 2 (Cancelled)
 
 WORKFLOW_STATUSES = ["Consulta", "Orden", "Preparado", "En Delivery", "Completado"]
+COMPLETED_UNPAID_LABEL = "Completado (no pagado)"
+
+
+def _so_is_fully_paid(so) -> bool:
+	total = flt(getattr(so, "grand_total", 0) or 0)
+	paid = flt(getattr(so, "advance_paid", 0) or 0)
+	return total > 0 and paid + 0.005 >= total
+
 
 def _display_status(so):
 	"""Return the user-facing workflow status for a Sales Order."""
@@ -3257,8 +3259,25 @@ def _display_status(so):
 	if s in ("Preparado", "En Delivery"):
 		return s
 	if s == "Completed":
-		return "Completado"
+		return "Completado" if _so_is_fully_paid(so) else COMPLETED_UNPAID_LABEL
 	# "To Deliver and Bill", "To Deliver", "To Bill", etc.
+	return "Orden"
+
+
+def _display_status_from_row(docstatus, status, grand_total=0, advance_paid=0):
+	"""Same as _display_status but from list-row fields."""
+	if docstatus == 0:
+		return "Consulta"
+	if docstatus == 2:
+		return "Archivado"
+	if status in ("Preparado", "En Delivery"):
+		return status
+	if status == "Completed":
+		total = flt(grand_total or 0)
+		paid = flt(advance_paid or 0)
+		if total > 0 and paid + 0.005 >= total:
+			return "Completado"
+		return COMPLETED_UNPAID_LABEL
 	return "Orden"
 
 
@@ -3269,6 +3288,7 @@ def _erp_status_for_display(display_status):
 		"Preparado": "Preparado",
 		"En Delivery": "En Delivery",
 		"Completado": "Completed",
+		COMPLETED_UNPAID_LABEL: "Completed",
 	}.get(display_status)
 
 
@@ -3318,8 +3338,10 @@ def set_guest_preorder_status(preorder_name, target_status):
 	if not erp_status:
 		frappe.throw(_("Invalid target status"))
 
-	# For standard SilkOS statuses, use update_status; for custom ones, db_set
-	if erp_status in ("To Deliver and Bill", "Completed"):
+	# Completado is allowed even when SilkOS would block update_status
+	# (not fully delivered/billed). Persist the workflow marker directly.
+	# Other custom steps (Preparado / En Delivery) also use db_set.
+	if erp_status in ("To Deliver and Bill",):
 		so.update_status(erp_status)
 	else:
 		so.db_set("status", erp_status)
@@ -3628,22 +3650,9 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 		frappe.throw(_("Paid amount must be greater than zero"))
 
 	company = so.company
-
-	receivable_account = frappe.get_value("Company", company, "default_receivable_account")
-	cash_account = frappe.db.get_value(
-		"Mode of Payment Account",
-		{"parent": mode_of_payment, "company": company},
-		"default_account",
+	receivable_account, cash_account, mop = _resolve_preorder_payment_accounts(
+		company, mode_of_payment, so.customer
 	)
-	if not cash_account:
-		cash_account = frappe.db.get_value(
-			"Account",
-			{"account_type": "Cash", "company": company, "is_group": 0},
-			"name",
-		)
-
-	if not receivable_account or not cash_account:
-		frappe.throw(_("Could not find debit/credit accounts for payment. Check company defaults."))
 
 	outstanding = flt(so.grand_total) - flt(getattr(so, "advance_paid", 0))
 	allocated = min(paid_amount, outstanding) if outstanding > 0 else paid_amount
@@ -3653,6 +3662,7 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 	pe.company = company
 	pe.party_type = "Customer"
 	pe.party = so.customer
+	pe.mode_of_payment = mop
 	pe.paid_from = receivable_account
 	pe.paid_to = cash_account
 	pe.paid_from_account_currency = so.currency
@@ -3672,6 +3682,157 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 	pe.insert(ignore_permissions=True)
 	pe.submit()
 	return get_guest_preorder(preorder_name)
+
+
+def _resolve_preorder_mop_name(preferred: str | None = None) -> str | None:
+	"""Pick an enabled Mode of Payment (Efectivo/Cash first for local cash)."""
+	candidates = []
+	if preferred:
+		candidates.append(preferred)
+	candidates.extend(["Efectivo", "Cash", "Transferencia", "Bank Draft"])
+	seen = set()
+	for name in candidates:
+		key = (name or "").strip()
+		if not key or key in seen:
+			continue
+		seen.add(key)
+		if frappe.db.exists("Mode of Payment", key) and frappe.db.get_value(
+			"Mode of Payment", key, "enabled"
+		):
+			return key
+	return frappe.db.get_value("Mode of Payment", {"enabled": 1}, "name")
+
+
+def _resolve_preorder_cash_account(company: str, mop: str | None) -> str | None:
+	"""Cash/Bank account to receive payment into."""
+	if mop:
+		acc = frappe.db.get_value(
+			"Mode of Payment Account",
+			{"parent": mop, "company": company},
+			"default_account",
+		)
+		if acc:
+			return acc
+
+	for field in ("default_cash_account", "default_bank_account"):
+		acc = frappe.db.get_value("Company", company, field)
+		if acc and frappe.db.exists("Account", acc):
+			return acc
+
+	for account_type in ("Cash", "Bank"):
+		acc = frappe.db.get_value(
+			"Account",
+			{"company": company, "account_type": account_type, "is_group": 0, "disabled": 0},
+			"name",
+		)
+		if acc:
+			return acc
+
+	# Argentine chart often leaves Caja untyped.
+	for like in ("%Caja - %", "%Cash%", "%Bank Account%", "%Banco%"):
+		acc = frappe.db.get_value(
+			"Account",
+			{
+				"company": company,
+				"root_type": "Asset",
+				"is_group": 0,
+				"disabled": 0,
+				"name": ("like", like),
+			},
+			"name",
+		)
+		if acc:
+			return acc
+	return None
+
+
+def _resolve_preorder_receivable_account(company: str, customer: str | None = None) -> str | None:
+	"""Customer receivable (debit) account for Payment Entry Receive."""
+	if customer:
+		acc = frappe.db.get_value(
+			"Party Account",
+			{"parent": customer, "parenttype": "Customer", "company": company},
+			"account",
+		)
+		if acc:
+			return acc
+
+	# Prefer real trade debtors over a mis-set company default (e.g. supplier advances).
+	for like in (
+		"%Deudores locales%",
+		"%Debtors%",
+		"%Deudores%",
+		"%Clientes%",
+		"%Receivable%",
+	):
+		acc = frappe.db.get_value(
+			"Account",
+			{
+				"company": company,
+				"account_type": "Receivable",
+				"is_group": 0,
+				"disabled": 0,
+				"name": ("like", like),
+			},
+			"name",
+		)
+		if acc and "anticipo" not in acc.lower() and "proveedor" not in acc.lower():
+			return acc
+
+	acc = frappe.db.get_value("Company", company, "default_receivable_account")
+	if acc and frappe.db.exists("Account", acc):
+		# Skip supplier-advance style accounts for customer receipts.
+		low = acc.lower()
+		if "anticipo" not in low and "proveedor" not in low:
+			return acc
+
+	acc = frappe.db.get_value(
+		"Account",
+		{"company": company, "account_type": "Receivable", "is_group": 0, "disabled": 0},
+		"name",
+		order_by="name asc",
+	)
+	if acc and "anticipo" not in acc.lower() and "proveedor" not in acc.lower():
+		return acc
+	return acc
+
+
+def _ensure_preorder_mop_account(company: str, mop: str, cash_account: str) -> None:
+	"""Attach cash account to Mode of Payment for this company when missing."""
+	if not mop or not cash_account:
+		return
+	if frappe.db.exists("Mode of Payment Account", {"parent": mop, "company": company}):
+		return
+	if not frappe.db.exists("Mode of Payment", mop):
+		return
+	doc = frappe.get_doc("Mode of Payment", mop)
+	doc.append("accounts", {"company": company, "default_account": cash_account})
+	doc.save(ignore_permissions=True)
+
+
+def _resolve_preorder_payment_accounts(
+	company: str, mode_of_payment: str | None = None, customer: str | None = None
+):
+	"""Return (receivable_account, cash_account, mop_name) or throw a clear error."""
+	mop = _resolve_preorder_mop_name(mode_of_payment)
+	cash_account = _resolve_preorder_cash_account(company, mop)
+	receivable_account = _resolve_preorder_receivable_account(company, customer)
+
+	if cash_account and mop:
+		_ensure_preorder_mop_account(company, mop, cash_account)
+
+	if not receivable_account or not cash_account:
+		missing = []
+		if not receivable_account:
+			missing.append(_("receivable (Company → Default Receivable Account)"))
+		if not cash_account:
+			missing.append(_("cash/bank (Mode of Payment Account or Company cash account)"))
+		frappe.throw(
+			_("Could not find debit/credit accounts for payment ({0}). Check company defaults.").format(
+				", ".join(str(m) for m in missing)
+			)
+		)
+	return receivable_account, cash_account, mop
 
 
 

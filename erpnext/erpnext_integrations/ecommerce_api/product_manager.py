@@ -1102,6 +1102,64 @@ def list_uoms():
 # save_product_row
 # ---------------------------------------------------------------------------
 
+# Version.ref_doctype = Item history labels shown in Historial (reuse tabVersion).
+_ITEM_HISTORY_FIELD_LABEL = {
+    "item_name": "source_title",
+    "item_group": "source_category",
+    "stock_uom": "stock_uom",
+    "brand": "brand",
+    "image": "image",
+    "custom_pack_qty": "pack_qty",
+    "custom_pack_size": "pack_size",
+    "custom_pack_unit": "unit",
+    "custom_unit_sku": "unit_sku",
+    "custom_normalized_title": "normalized_title",
+    "custom_review_notes": "review_notes",
+    "disabled": "is_active",
+}
+
+_ITEM_HISTORY_FIELD_REVERSE = {v: k for k, v in _ITEM_HISTORY_FIELD_LABEL.items()}
+
+
+def _item_barcode_value(item_code: str) -> str | None:
+    rows = frappe.get_all(
+        "Item Barcode",
+        filters={"parent": item_code},
+        fields=["barcode"],
+        order_by="idx asc",
+        limit=1,
+    )
+    if not rows:
+        return None
+    val = (rows[0].get("barcode") or "").strip()
+    return val or None
+
+
+def _item_tags_value(item_code: str) -> str:
+    try:
+        from erpnext.erpnext_integrations.ecommerce_api.tags_api import get_tags_for_doc
+
+        tags = get_tags_for_doc("Item", item_code) or []
+        return ", ".join(sorted(str(t).strip() for t in tags if str(t).strip()))
+    except Exception:
+        return ""
+
+
+def _normalize_history_val(field: str, val):
+    if field == "disabled":
+        return 1 if not cint(val) else 0  # store as is_active
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val.strip() or None
+    return val
+
+
+def _log_item_field_history(item_code: str, changes: list[tuple[str, object, object]]) -> None:
+    from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
+    log_field_changes("Item", item_code, changes)
+
 
 def _save_product_row_impl(item_code, changes, price_list=None, commit=True, warehouse=None):
     if isinstance(changes, str):
@@ -1156,7 +1214,21 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             uom_name = (changes.get("stock_uom") or "").strip()
             updates["stock_uom"] = _ensure_uom(uom_name) if uom_name else None
 
+        history: list[tuple[str, object, object]] = []
+
         if updates:
+            cols = list(updates.keys())
+            old_row = frappe.db.get_value("Item", item_code, cols, as_dict=True) or {}
+            for item_field, new_val in updates.items():
+                old_val = old_row.get(item_field)
+                label = _ITEM_HISTORY_FIELD_LABEL.get(item_field, item_field)
+                history.append(
+                    (
+                        label,
+                        _normalize_history_val(item_field, old_val),
+                        _normalize_history_val(item_field, new_val),
+                    )
+                )
             frappe.db.set_value("Item", item_code, updates)
 
         unit_link = changes.get("unit_sku") if "unit_sku" in changes else ""
@@ -1186,17 +1258,32 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
                 _upsert_item_price(item_code, flt(rate), name)
 
         if "barcode" in changes:
+            old_bc = _item_barcode_value(item_code)
+            new_bc = (changes.get("barcode") or "").strip() or None
             _upsert_barcode(item_code, changes["barcode"])
+            history.append(("barcode", old_bc, new_bc))
 
         if "tags" in changes:
+            old_tags = _item_tags_value(item_code)
             _sync_tags(item_code, changes["tags"])
+            new_tags = _item_tags_value(item_code)
+            history.append(("tags", old_tags or None, new_tags or None))
 
         if stock_qty_target is not None:
             if not warehouse:
                 frappe.throw(
                     _("Select a warehouse in Product Manager before saving quantity changes.")
                 )
+            old_qty = frappe.db.get_value(
+                "Bin",
+                {"item_code": item_code, "warehouse": warehouse},
+                "actual_qty",
+            )
             _reconcile_item_stock_qty(item_code, warehouse, flt(stock_qty_target))
+            history.append(("stock_qty", flt(old_qty or 0), flt(stock_qty_target)))
+
+        if history:
+            _log_item_field_history(item_code, history)
 
         if commit:
             frappe.db.commit()
@@ -1330,6 +1417,29 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
 
     item_doc.insert(ignore_permissions=True)
 
+    create_history: list[tuple[str, object, object]] = [
+        ("source_title", None, title),
+        ("source_category", None, item_group),
+        ("stock_uom", None, stock_uom),
+        ("is_active", None, 1 if is_active else 0),
+    ]
+    if brand_name:
+        create_history.append(("brand", None, brand_name))
+    if changes.get("normalized_title"):
+        create_history.append(("normalized_title", None, changes.get("normalized_title")))
+    if changes.get("pack_qty") not in (None, ""):
+        create_history.append(("pack_qty", None, changes.get("pack_qty")))
+    if changes.get("pack_size") not in (None, ""):
+        create_history.append(("pack_size", None, changes.get("pack_size")))
+    if changes.get("unit"):
+        create_history.append(("unit", None, changes.get("unit")))
+    if changes.get("unit_sku"):
+        create_history.append(("unit_sku", None, changes.get("unit_sku")))
+    if changes.get("review_notes"):
+        create_history.append(("review_notes", None, changes.get("review_notes")))
+    if changes.get("image"):
+        create_history.append(("image", None, changes.get("image")))
+
     if changes.get("list_price") not in (None, ""):
         _upsert_item_price(candidate_code, flt(changes.get("list_price")), price_list)
 
@@ -1339,9 +1449,13 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
     barcode = (changes.get("barcode") or "").strip()
     if barcode:
         _upsert_barcode(candidate_code, barcode)
+        create_history.append(("barcode", None, barcode))
 
     if "tags" in changes:
         _sync_tags(candidate_code, changes.get("tags"))
+        tags_val = _item_tags_value(candidate_code)
+        if tags_val:
+            create_history.append(("tags", None, tags_val))
 
     queued_image_search = False
     if title:
@@ -1358,6 +1472,9 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
 
     if warehouse and changes.get("stock_qty") is not None:
         _reconcile_item_stock_qty(candidate_code, warehouse, flt(changes["stock_qty"]))
+        create_history.append(("stock_qty", None, flt(changes["stock_qty"])))
+
+    _log_item_field_history(candidate_code, create_history)
 
     frappe.db.commit()
 
