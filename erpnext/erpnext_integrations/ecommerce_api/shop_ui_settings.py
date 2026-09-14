@@ -90,6 +90,9 @@ def _normalize_pos_display(raw) -> dict:
 		"showDisabledProducts": _as_bool(src.get("showDisabledProducts"), False),
 		"showNegativeStockProducts": _as_bool(src.get("showNegativeStockProducts"), True),
 		"alertOnDisabledAdd": _as_bool(src.get("alertOnDisabledAdd"), True),
+		# When True, POS stock docs fail if Item has no valuation rate.
+		# Default False so offline/POS sales are not blocked.
+		"requireValuationRate": _as_bool(src.get("requireValuationRate"), False),
 		"orderTag": _normalize_order_tag(src.get("orderTag")) or "caja",
 		# Kept for forward-compat if clients send them; personal prefs stay client-local.
 		"headerToggleShortcut": shortcut.strip(),
@@ -220,3 +223,10 @@ def save_shop_ui_settings(settings=None):
 	}
 	_save_raw(merged)
 	return {"ok": True, "settings": merged, "source": "server"}
+
+
+def require_valuation_rate() -> bool:
+	"""POS stock policy: require Item valuation rate. Default False (allow zero)."""
+	raw = _load_raw()
+	pos = (raw.get("posDisplay") or {}) if isinstance(raw, dict) else {}
+	return _as_bool(pos.get("requireValuationRate"), False)

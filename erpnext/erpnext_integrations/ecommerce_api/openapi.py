@@ -13,6 +13,15 @@ def _guess_schema(param_name: str) -> dict:
     lower = param_name.lower()
     if lower.startswith(("is_", "has_")):
         return {"type": "boolean"}
+    if lower in {
+        "store_in_erp",
+        "set_item_image",
+        "delayed",
+        "dry_run",
+        "in_stock_only",
+        "include_disabled",
+    }:
+        return {"type": "boolean"}
     if lower in {"start", "page", "page_length", "limit", "offset", "qty", "width", "height"}:
         return {"type": "integer"}
     if lower in {"rate", "amount", "total", "price", "discount", "delta"}:

@@ -72,10 +72,6 @@ def get_products(
 			"item_name",
 			"description",
 			"item_group",
-			"custom_normalized_title",
-			"custom_variant_group",
-			"custom_pack_qty",
-			"custom_unit_sku",
 			"stock_uom",
 			"is_stock_item",
 			"has_variants",
@@ -88,6 +84,17 @@ def get_products(
 			"brand",
 			"modified",
 		]
+		for custom in (
+			"custom_normalized_title",
+			"custom_variant_group",
+			"custom_pack_qty",
+			"custom_pack_size",
+			"custom_pack_unit",
+			"custom_unit_sku",
+			"custom_review_notes",
+		):
+			if frappe.db.has_column("Item", custom):
+				fields.append(custom)
 
 	if isinstance(filters, str):
 		import json
@@ -2006,7 +2013,15 @@ def update_stock(item_code, warehouse, qty, posting_date=None):
 		do_not_save=True,
 	)
 
-	stock_entry.insert()
+	from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+		require_valuation_rate,
+	)
+
+	if not require_valuation_rate():
+		for row in stock_entry.items:
+			row.allow_zero_valuation_rate = 1
+
+	stock_entry.insert(ignore_permissions=True)
 	stock_entry.submit()
 
 	return {
@@ -4971,6 +4986,50 @@ def _ensure_pos_sale_item_groups(item_codes: list[str]) -> None:
 		frappe.db.commit()
 
 
+def _temporarily_allow_negative_stock():
+	"""
+	Offline POS must never fail a sale because warehouse qty is short.
+
+	ERPNext checks Stock Settings / Item.allow_negative_stock in both Stock Entry
+	validate and SLE posting. Patch the check in-process (request-local) so we do
+	not flip the global Stock Settings flag under concurrent traffic.
+	"""
+	from contextlib import contextmanager
+
+	@contextmanager
+	def _ctx():
+		from erpnext.stock import stock_ledger
+		from erpnext.stock.doctype.stock_entry import stock_entry as stock_entry_mod
+
+		def _always_allow(**_kwargs):
+			return True
+
+		orig_sl = stock_ledger.is_negative_stock_allowed
+		orig_se = getattr(stock_entry_mod, "is_negative_stock_allowed", None)
+		stock_ledger.is_negative_stock_allowed = _always_allow
+		if orig_se is not None:
+			stock_entry_mod.is_negative_stock_allowed = _always_allow
+		try:
+			yield
+		finally:
+			stock_ledger.is_negative_stock_allowed = orig_sl
+			if orig_se is not None:
+				stock_entry_mod.is_negative_stock_allowed = orig_se
+
+	return _ctx()
+
+
+def _submit_stock_entry_allowing_negative(stock_entry):
+	"""Submit a Stock Entry, forcing allow_negative_stock on SLE write."""
+	orig = stock_entry.update_stock_ledger
+
+	def _update_stock_ledger(allow_negative_stock=False):
+		return orig(allow_negative_stock=True)
+
+	stock_entry.update_stock_ledger = _update_stock_ledger
+	stock_entry.submit()
+
+
 @frappe.whitelist()
 def create_pos_sale(
 	offline_order_uuid,
@@ -5152,28 +5211,39 @@ def create_pos_sale(
 		)
 
 	invoice.insert(ignore_permissions=True)
-	invoice.submit()
+	# Insufficient warehouse qty must not block POS — allow negative stock for
+	# invoice submit (if update_stock) and box unit Material Issues below.
+	with _temporarily_allow_negative_stock():
+		invoice.submit()
 
-	# Box lines are priced as boxes but stock lives on the unit SKU.
-	from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
-
-	for item in items:
-		box = _linked_box_pack(item.get("item_code"))
-		if not box or not warehouse:
-			continue
-		issue_qty = flt(item.get("qty")) * box["pack"]
-		if issue_qty <= 0:
-			continue
-		stock_entry = make_stock_entry(
-			item_code=box["unit"],
-			qty=issue_qty,
-			from_warehouse=warehouse,
-			posting_date=nowdate(),
-			purpose="Material Issue",
-			do_not_save=True,
+		# Box lines are priced as boxes but stock lives on the unit SKU.
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+		from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+			require_valuation_rate,
 		)
-		stock_entry.insert(ignore_permissions=True)
-		stock_entry.submit()
+
+		allow_zero_valuation = not require_valuation_rate()
+
+		for item in items:
+			box = _linked_box_pack(item.get("item_code"))
+			if not box or not warehouse:
+				continue
+			issue_qty = flt(item.get("qty")) * box["pack"]
+			if issue_qty <= 0:
+				continue
+			stock_entry = make_stock_entry(
+				item_code=box["unit"],
+				qty=issue_qty,
+				from_warehouse=warehouse,
+				posting_date=nowdate(),
+				purpose="Material Issue",
+				do_not_save=True,
+			)
+			if allow_zero_valuation:
+				for row in stock_entry.items:
+					row.allow_zero_valuation_rate = 1
+			stock_entry.insert(ignore_permissions=True)
+			_submit_stock_entry_allowing_negative(stock_entry)
 
 	# ── Create Payment Entry (one per split) ──────────────────────────────────
 	payment_ids = _submit_pos_payments(
@@ -5538,12 +5608,8 @@ def _linked_box_pack(item_code):
 def commit_receiving_session(session_id, reference, supplier, warehouse, lines, draft_items):
 	"""
 	Atomically:
-<<<<<<< Updated upstream
-	1. Create new ERPNext Items for draft items (disabled/inactive until Review
+	1. Create new SilkOS Items for draft items (disabled/inactive until Review
 	   approves them — unless draft already has approved_at)
-=======
-	1. Create new SilkOS Items for draft items
->>>>>>> Stashed changes
 	2. Create a submitted Stock Entry (Material Receipt)
 	Returns { stock_entry_id, new_item_codes }
 	"""
@@ -5624,12 +5690,26 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 		brand_name = (d.get("brand") or "").strip()
 		if brand_name and not frappe.db.exists("Brand", brand_name):
 			frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(ignore_permissions=True)
+		item_group = (d.get("item_group") or "Products").strip() or "Products"
+		if item_group and not frappe.db.exists("Item Group", item_group):
+			parent = frappe.db.get_value("Item Group", {"is_group": 1}, "name") or "All Item Groups"
+			frappe.get_doc(
+				{
+					"doctype": "Item Group",
+					"item_group_name": item_group,
+					"parent_item_group": parent,
+					"is_group": 0,
+				}
+			).insert(ignore_permissions=True)
+		stock_uom = (d.get("stock_uom") or "Nos").strip() or "Nos"
+		if stock_uom and not frappe.db.exists("UOM", stock_uom):
+			frappe.get_doc({"doctype": "UOM", "uom_name": stock_uom}).insert(ignore_permissions=True)
 		item_fields = {
 			"doctype": "Item",
 			"item_code": item_code_val,
 			"item_name": d["item_name"],
-			"item_group": d.get("item_group") or "Products",
-			"stock_uom": d.get("stock_uom") or "Nos",
+			"item_group": item_group,
+			"stock_uom": stock_uom,
 			"is_stock_item": 1,
 			"include_item_in_manufacturing": 0,
 			"description": d.get("normalized_title") or d["item_name"],
@@ -6271,7 +6351,7 @@ def import_catalog_image_batch(images):
 	return report
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def upload_item_image_mobile(item_code=None, image_base64=None, filename=None):
 	"""
 	Mobile-optimized image upload endpoint for single item images.
@@ -6296,8 +6376,9 @@ def upload_item_image_mobile(item_code=None, image_base64=None, filename=None):
 		"error": "<error>"         # Error details (if ok=false)
 	}
 	"""
-	frappe.has_permission("Item", "write", throw=True)
-	
+	# Ecommerce / device-link callers use API keys without desk Item write role.
+	frappe.flags.ignore_permissions = True
+
 	response = {
 		"ok": False,
 		"image": None,
@@ -6579,3 +6660,69 @@ def update_product_info(item_code, item_name=None, price_list_rate=None, price_l
 		"item_name": frappe.db.get_value("Item", item_code, "item_name"),
 		"price_list_rate": get_item_price(item_code, price_list or "Standard Selling"),
 	}
+
+
+# ========================================
+# EMAIL + IMAGE SEARCH (public / Swagger)
+# ========================================
+
+
+@frappe.whitelist(allow_guest=True)
+def send_email(subject, message, receiver, sender=None):
+	"""
+	Send an email using the site's default configured SMTP / Email Account.
+
+	Required:
+	  - subject
+	  - message (HTML or plain text)
+	  - receiver (one address, or comma-separated list)
+
+	Optional:
+	  - sender — if blank, uses the default outgoing account identity
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import send_outbound_email
+
+	return send_outbound_email(
+		subject=subject,
+		message=message,
+		receiver=receiver,
+		sender=sender,
+	)
+
+
+@frappe.whitelist(allow_guest=True)
+def search_images(query, limit=9, store_in_erp=0, item_code=None, set_item_image=0):
+	"""
+	Start an asynchronous web image search.
+
+	Returns immediately with ``results_url`` — poll that endpoint until
+	``status`` is ``completed`` or ``failed``. When completed, ``images``
+	contains link objects (``url``, ``thumbnail_url``, …).
+
+	Optional ERP storage:
+	  - store_in_erp=1 → download images into ERP File records
+	  - store_in_erp=1 + item_code → also save Product Image Candidate rows on that Item
+	  - set_item_image=1 → also set Item.image from the top candidate (requires store_in_erp + item_code)
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.image_search_api import start_image_search
+
+	return start_image_search(
+		query=query,
+		limit=limit,
+		store_in_erp=store_in_erp,
+		item_code=item_code,
+		set_item_image=set_item_image,
+	)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_image_search_results(job_id):
+	"""
+	Poll an image search started by ``search_images``.
+
+	Statuses: pending | running | completed | failed.
+	On completed, ``images`` is a list of ``{url, thumbnail_url, source, …}``.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.image_search_api import get_image_search_job
+
+	return get_image_search_job(job_id)

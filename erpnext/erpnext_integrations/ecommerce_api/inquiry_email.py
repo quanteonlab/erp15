@@ -506,3 +506,80 @@ def send_test_inquiry_email():
 		delayed=False,
 	)
 	return {"ok": True, "recipients": recipients, "emailLanguage": lang}
+
+
+def _parse_recipient_list(receiver) -> list[str]:
+	if receiver is None:
+		return []
+	if isinstance(receiver, (list, tuple)):
+		parts = [str(x).strip() for x in receiver]
+	else:
+		raw = str(receiver).strip()
+		if not raw:
+			return []
+		# JSON list string
+		if raw.startswith("["):
+			try:
+				import json
+
+				parsed = json.loads(raw)
+				if isinstance(parsed, list):
+					parts = [str(x).strip() for x in parsed]
+				else:
+					parts = [raw]
+			except Exception:
+				parts = [p.strip() for p in raw.replace(";", ",").split(",")]
+		else:
+			parts = [p.strip() for p in raw.replace(";", ",").split(",")]
+	return [p for p in parts if p and "@" in p]
+
+
+def send_outbound_email(
+	subject: str,
+	message: str,
+	receiver,
+	sender: str | None = None,
+) -> dict:
+	"""
+	Send email using the default configured SMTP account.
+
+	Required: subject, message, receiver (one email or comma-separated list).
+	Optional: sender — blank uses the default Email Account / SMTP identity.
+	"""
+	subj = (subject or "").strip()
+	body = message if message is not None else ""
+	recipients = _parse_recipient_list(receiver)
+	if not subj:
+		frappe.throw("subject is required")
+	if not str(body).strip():
+		frappe.throw("message is required")
+	if not recipients:
+		frappe.throw("receiver is required (valid email address)")
+
+	if not ensure_outgoing_email_account("inquiry"):
+		frappe.throw(
+			"SMTP is not configured. Set email and password under Settings > Automation "
+			"(or ERPNEXT_SMTP_PASSWORD / smtp_password in site_config)."
+		)
+
+	cfg = _smtp_config("inquiry")
+	from_addr = (sender or "").strip()
+	if not from_addr:
+		from_addr = cfg["email"]
+		if cfg.get("sender_name"):
+			from_addr = f'{cfg["sender_name"]} <{cfg["email"]}>'
+
+	frappe.sendmail(
+		recipients=recipients,
+		sender=from_addr,
+		subject=subj,
+		message=body,
+		delayed=False,
+	)
+	return {
+		"ok": True,
+		"recipients": recipients,
+		"sender": from_addr,
+		"subject": subj,
+	}
+
