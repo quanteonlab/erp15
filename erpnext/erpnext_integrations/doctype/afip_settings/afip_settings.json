@@ -18,7 +18,11 @@
   "private_key",
   "column_break_certs",
   "last_wsaa_login",
-  "last_error"
+  "last_error",
+  "section_break_print",
+  "print_qr",
+  "column_break_print",
+  "auto_print_after_sale"
  ],
  "fields": [
   {
@@ -103,6 +107,32 @@
    "fieldtype": "Small Text",
    "label": "Last Error",
    "read_only": 1
+  },
+  {
+   "depends_on": "enabled",
+   "fieldname": "section_break_print",
+   "fieldtype": "Section Break",
+   "label": "Ticket Printing"
+  },
+  {
+   "default": "1",
+   "depends_on": "enabled",
+   "description": "Show the AFIP QR code (RG 4892) on the printed ticket",
+   "fieldname": "print_qr",
+   "fieldtype": "Check",
+   "label": "Print AFIP QR on ticket"
+  },
+  {
+   "fieldname": "column_break_print",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "depends_on": "enabled",
+   "description": "Automatically open the print dialog for the ticket once a CAE is obtained",
+   "fieldname": "auto_print_after_sale",
+   "fieldtype": "Check",
+   "label": "Auto-print after sale"
   }
  ],
  "issingle": 1,

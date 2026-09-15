@@ -29,6 +29,16 @@ if VENDOR_PATH not in sys.path:
 	sys.path.insert(0, VENDOR_PATH)
 
 
+def _require_link_token_or_session(link_token: str) -> None:
+	"""Guest callers (POS device using the app-link token) must pass a valid
+	link_token. Authenticated callers (the Next.js admin, via site API key)
+	are trusted the same way every other ecommerce_api endpoint trusts them.
+	"""
+	if frappe.session.user != "Guest":
+		return
+	_require_link_token(link_token or "")
+
+
 def _get_settings():
 	frappe.flags.ignore_permissions = True
 	settings = frappe.get_single("AFIP Settings")
@@ -113,7 +123,7 @@ def solicitar_cae(
 	doc_type: AFIP tipo de documento (99 = Consumidor Final, 80 = CUIT, 96 = DNI, ...)
 	iva_id: AFIP alicuota id (5 = 21%, 4 = 10.5%, 3 = 0%, ...)
 	"""
-	_require_link_token(link_token or "")
+	_require_link_token_or_session(link_token or "")
 
 	settings = _get_settings()
 	punto_venta = cint(settings.punto_venta)
@@ -185,7 +195,7 @@ def get_invoice_qr(
 	doc_number=0,
 ):
 	"""Build the AFIP RG 4892 QR payload/URL for a previously authorized invoice."""
-	_require_link_token(link_token or "")
+	_require_link_token_or_session(link_token or "")
 
 	import base64
 	import json
@@ -245,7 +255,8 @@ def render_ticket_html(settings, cae_result: dict, customer: dict, items: list) 
 	cod_str = str(cae_result["tipo_cbte"]).zfill(3)
 	pv_str = str(cae_result["punto_venta"]).zfill(5)
 	nro_str = str(cae_result["nro_cbte"]).zfill(8)
-	qr = _qr_data_uri(cae_result.get("qr_url") or "")
+	show_qr = cint(settings.get("print_qr", 1))
+	qr = _qr_data_uri(cae_result.get("qr_url") or "") if show_qr else ""
 	vto = cae_result.get("cae_vencimiento") or ""
 	if len(vto) == 8:
 		vto = f"{vto[6:8]}/{vto[4:6]}/{vto[0:4]}"
@@ -289,9 +300,7 @@ def render_ticket_html(settings, cae_result: dict, customer: dict, items: list) 
 	<hr>
 	<div>CAE Nro: {cae_result.get('cae')}</div>
 	<div>Fecha Vto CAE: {vto}</div>
-	<div style="text-align:center;margin-top:8px">
-		<img src="{qr}" width="120" height="120">
-	</div>
+	{f'<div style="text-align:center;margin-top:8px"><img src="{qr}" width="120" height="120"></div>' if show_qr else ''}
 	<div style="text-align:center;font-size:10px">Comprobante Autorizado</div>
 </div>
 """
@@ -314,7 +323,7 @@ def print_pos_invoice(
 
 	`items` is a JSON list of {description, qty, rate}.
 	"""
-	_require_link_token(link_token or "")
+	_require_link_token_or_session(link_token or "")
 
 	import json as _json
 
@@ -364,3 +373,65 @@ def get_afip_status():
 		"last_wsaa_login": settings.last_wsaa_login,
 		"last_error": settings.last_error,
 	}
+
+
+_SETTINGS_FIELDS = (
+	"enabled",
+	"environment",
+	"cuit",
+	"punto_venta",
+	"company_name",
+	"default_invoice_type",
+	"print_qr",
+	"auto_print_after_sale",
+	"last_wsaa_login",
+	"last_error",
+)
+
+
+@frappe.whitelist()
+def get_afip_settings():
+	"""Full config for the Integrations settings panel (no secret file contents)."""
+	frappe.flags.ignore_permissions = True
+	settings = frappe.get_single("AFIP Settings")
+	data = {field: settings.get(field) for field in _SETTINGS_FIELDS}
+	data["certificate_uploaded"] = bool(settings.certificate)
+	data["private_key_uploaded"] = bool(settings.private_key)
+	return data
+
+
+@frappe.whitelist()
+def save_afip_settings(
+	enabled=None,
+	environment=None,
+	cuit=None,
+	punto_venta=None,
+	company_name=None,
+	default_invoice_type=None,
+	print_qr=None,
+	auto_print_after_sale=None,
+):
+	"""Patch the non-file AFIP Settings fields (cert/key are uploaded via the
+	Frappe desk Attach fields — file uploads aren't wired through this API).
+	"""
+	frappe.flags.ignore_permissions = True
+	settings = frappe.get_single("AFIP Settings")
+	if enabled is not None:
+		settings.enabled = cint(enabled)
+	if environment in ("homologacion", "produccion"):
+		settings.environment = environment
+	if cuit is not None:
+		settings.cuit = str(cuit).strip()
+	if punto_venta is not None:
+		settings.punto_venta = cint(punto_venta)
+	if company_name is not None:
+		settings.company_name = str(company_name).strip()
+	if default_invoice_type is not None:
+		settings.default_invoice_type = cint(default_invoice_type)
+	if print_qr is not None:
+		settings.print_qr = cint(print_qr)
+	if auto_print_after_sale is not None:
+		settings.auto_print_after_sale = cint(auto_print_after_sale)
+	settings.save(ignore_permissions=True)
+	frappe.db.commit()
+	return get_afip_settings()
