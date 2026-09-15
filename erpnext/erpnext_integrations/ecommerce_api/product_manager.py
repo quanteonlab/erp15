@@ -667,18 +667,21 @@ def ensure_product_manager_custom_fields() -> None:
                     "fieldtype": "Int",
                     "label": "Pack Qty",
                     "insert_after": "stock_uom",
+                    "reqd": 0,
                 },
                 {
                     "fieldname": "custom_pack_size",
                     "fieldtype": "Float",
                     "label": "Pack Size",
                     "insert_after": "custom_pack_qty",
+                    "reqd": 0,
                 },
                 {
                     "fieldname": "custom_pack_unit",
                     "fieldtype": "Data",
                     "label": "Pack Unit",
                     "insert_after": "custom_pack_size",
+                    "reqd": 0,
                 },
                 {
                     "fieldname": "custom_unit_sku",
@@ -686,18 +689,78 @@ def ensure_product_manager_custom_fields() -> None:
                     "label": "Unit SKU",
                     "insert_after": "custom_pack_unit",
                     "description": "Item code of the base/unit SKU this pack or variant decomposes into.",
+                    "reqd": 0,
                 },
                 {
                     "fieldname": "custom_review_notes",
                     "fieldtype": "Small Text",
                     "label": "Review Notes",
                     "insert_after": "custom_unit_sku",
+                    "reqd": 0,
                 },
             ]
         },
         ignore_validate=True,
     )
+    _ensure_pack_columns_nullable()
     frappe.clear_cache(doctype="Item")
+
+
+def _ensure_pack_columns_nullable() -> None:
+    """
+    Frappe Int/Float columns are often created as NOT NULL DEFAULT 0, which
+    rejects clearing Pack Qty / Pack Size. Allow true NULL so the grid can
+    leave pack blank when needed.
+    """
+    alters = (
+        ("custom_pack_qty", "int(11) NULL DEFAULT NULL"),
+        ("custom_pack_size", "decimal(21,9) NULL DEFAULT NULL"),
+        ("custom_pack_unit", f"varchar({frappe.db.VARCHAR_LEN}) NULL DEFAULT NULL"),
+    )
+    for fieldname, ddl_type in alters:
+        if not frappe.db.has_column("Item", fieldname):
+            continue
+        try:
+            nullable = frappe.db.sql(
+                """
+                SELECT IS_NULLABLE
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = %s
+                  AND COLUMN_NAME = %s
+                """,
+                ("tabItem", fieldname),
+            )
+            if nullable and str(nullable[0][0]).upper() == "YES":
+                continue
+            frappe.db.sql_ddl(f"ALTER TABLE `tabItem` MODIFY `{fieldname}` {ddl_type}")
+        except Exception:
+            frappe.log_error(title=f"Could not make Item.{fieldname} nullable")
+
+        # Keep Custom Field metadata in sync (not required).
+        try:
+            cf_name = frappe.db.get_value(
+                "Custom Field", {"dt": "Item", "fieldname": fieldname}, "name"
+            )
+            if cf_name:
+                frappe.db.set_value("Custom Field", cf_name, "reqd", 0, update_modified=False)
+        except Exception:
+            pass
+
+
+def _normalize_pack_change_value(field: str, value):
+    """Empty pack fields become None (allowed); keep numeric 0 as 0."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if field == "pack_qty":
+        return cint(value)
+    if field == "pack_size":
+        return flt(value)
+    if field == "unit":
+        return (str(value).strip() or None)
+    return value
 
 
 def _ensure_unit_sku_column() -> bool:
@@ -1169,6 +1232,13 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
     stock_qty_target = changes.pop("stock_qty", None)
     changes.pop("cost_from_buying", None)
 
+    # Allow clearing pack qty/size/unit (DB Int columns are often NOT NULL by default).
+    if any(k in changes for k in ("pack_qty", "pack_size", "unit")):
+        _ensure_pack_columns_nullable()
+        for pack_key in ("pack_qty", "pack_size", "unit"):
+            if pack_key in changes:
+                changes[pack_key] = _normalize_pack_change_value(pack_key, changes.get(pack_key))
+
     # Ecommerce API-key callers may not hold Item write roles; whitelist is the gate.
     frappe.flags.ignore_permissions = True
     try:
@@ -1389,6 +1459,11 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
     if brand_name and not frappe.db.exists("Brand", brand_name):
         frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(ignore_permissions=True)
 
+    _ensure_pack_columns_nullable()
+    pack_qty = _normalize_pack_change_value("pack_qty", changes.get("pack_qty"))
+    pack_size = _normalize_pack_change_value("pack_size", changes.get("pack_size"))
+    pack_unit = _normalize_pack_change_value("unit", changes.get("unit"))
+
     item_doc = frappe.get_doc(
         {
             "doctype": "Item",
@@ -1399,9 +1474,9 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
             "disabled": 0 if is_active else 1,
             "brand": brand_name or None,
             "custom_normalized_title": (changes.get("normalized_title") or "").strip() or None,
-            "custom_pack_qty": changes.get("pack_qty"),
-            "custom_pack_size": changes.get("pack_size"),
-            "custom_pack_unit": (changes.get("unit") or "").strip() or None,
+            "custom_pack_qty": pack_qty,
+            "custom_pack_size": pack_size,
+            "custom_pack_unit": pack_unit,
             "custom_review_notes": (changes.get("review_notes") or "").strip() or None,
             "image": (changes.get("image") or "").strip() or None,
         }
@@ -1417,6 +1492,17 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
 
     item_doc.insert(ignore_permissions=True)
 
+    # Document insert can coerce empty Int/Float to 0; force true NULL when cleared.
+    null_pack = {}
+    if "pack_qty" in changes and pack_qty is None:
+        null_pack["custom_pack_qty"] = None
+    if "pack_size" in changes and pack_size is None:
+        null_pack["custom_pack_size"] = None
+    if "unit" in changes and pack_unit is None:
+        null_pack["custom_pack_unit"] = None
+    if null_pack:
+        frappe.db.set_value("Item", candidate_code, null_pack, update_modified=False)
+
     create_history: list[tuple[str, object, object]] = [
         ("source_title", None, title),
         ("source_category", None, item_group),
@@ -1427,12 +1513,12 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
         create_history.append(("brand", None, brand_name))
     if changes.get("normalized_title"):
         create_history.append(("normalized_title", None, changes.get("normalized_title")))
-    if changes.get("pack_qty") not in (None, ""):
-        create_history.append(("pack_qty", None, changes.get("pack_qty")))
-    if changes.get("pack_size") not in (None, ""):
-        create_history.append(("pack_size", None, changes.get("pack_size")))
-    if changes.get("unit"):
-        create_history.append(("unit", None, changes.get("unit")))
+    if pack_qty not in (None, ""):
+        create_history.append(("pack_qty", None, pack_qty))
+    if pack_size not in (None, ""):
+        create_history.append(("pack_size", None, pack_size))
+    if pack_unit:
+        create_history.append(("unit", None, pack_unit))
     if changes.get("unit_sku"):
         create_history.append(("unit_sku", None, changes.get("unit_sku")))
     if changes.get("review_notes"):
