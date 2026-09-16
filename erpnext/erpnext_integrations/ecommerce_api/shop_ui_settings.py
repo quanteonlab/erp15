@@ -196,6 +196,38 @@ def _normalize_locale(raw) -> dict:
 	return {"defaultLanguage": lang}
 
 
+def _normalize_printers(raw) -> dict:
+	src = raw if isinstance(raw, dict) else {}
+	rows = []
+	seen = set()
+	for item in src.get("printers") or []:
+		if not isinstance(item, dict):
+			continue
+		pid = str(item.get("id") or "").strip()
+		name = str(item.get("name") or "").strip()
+		if not pid or not name or pid in seen:
+			continue
+		seen.add(pid)
+		paper = item.get("preferredPaperKind")
+		if paper not in ("A4", "Thermal 58mm", "Thermal 80mm"):
+			paper = "Thermal 80mm"
+		rows.append(
+			{
+				"id": pid[:80],
+				"name": name[:140],
+				"systemName": str(item.get("systemName") or "").strip()[:140],
+				"preferredPaperKind": paper,
+				"notes": str(item.get("notes") or "")[:500],
+			}
+		)
+	default_id = str(src.get("defaultPrinterId") or "").strip() or None
+	if default_id and default_id not in seen:
+		default_id = rows[0]["id"] if rows else None
+	if not default_id and len(rows) == 1:
+		default_id = rows[0]["id"]
+	return {"printers": rows, "defaultPrinterId": default_id}
+
+
 def _normalize_bundle(data: dict | None) -> dict:
 	src = data if isinstance(data, dict) else {}
 	return {
@@ -204,6 +236,7 @@ def _normalize_bundle(data: dict | None) -> dict:
 		"catalogDisplay": _normalize_catalog_display(src.get("catalogDisplay")),
 		"companies": _normalize_companies(src.get("companies")),
 		"locale": _normalize_locale(src.get("locale")),
+		"printers": _normalize_printers(src.get("printers")),
 	}
 
 
@@ -247,6 +280,9 @@ def save_shop_ui_settings(settings=None):
 		),
 		"locale": _normalize_locale(
 			{**(current.get("locale") or {}), **(incoming.get("locale") or {})}
+		),
+		"printers": _normalize_printers(
+			{**(current.get("printers") or {}), **(incoming.get("printers") or {})}
 		),
 	}
 	_save_raw(merged)
