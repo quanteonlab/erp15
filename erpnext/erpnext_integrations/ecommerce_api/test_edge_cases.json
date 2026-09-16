@@ -1,0 +1,173 @@
+{
+  "_readme": "API edge / dirty-payload kit. Expand this file whenever an API bug is fixed (see .cursor/rules/api-test-kit.mdc). Runner: scripts/test_edge.sh → test_edge.run",
+  "matrix_fields": {
+    "page_length": [null, "", " ", "null", "10", 10, 0, -1, true, []],
+    "start": [null, "", "0", 0, "abc"],
+    "price_list": [null, "", " ", "Standard Selling", 123, []],
+    "barcode": [null, "", " ", "null", " 7790580132170 ", "7790580132170", 7790580132170, []],
+    "item_code": [null, "", " ", "MISSING-ITEM-XYZ", []],
+    "qty": [null, "", " ", "1", 1, 0, -1, "1.5", 1.5, true, []],
+    "items": [null, "", "null", [], [{}], [{"item_code": null, "qty": ""}], [{"item_code": "", "qty": null}]]
+  },
+  "cases": [
+    {
+      "id": "ping_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.ping",
+      "args": {},
+      "expect": "ok",
+      "source": "seed"
+    },
+    {
+      "id": "get_products_empty_args",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_products",
+      "args": {},
+      "expect": "ok",
+      "source": "seed",
+      "note": "Frontend often omits optional filters"
+    },
+    {
+      "id": "get_products_nullish_paging",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_products",
+      "args": {
+        "page_length": null,
+        "start": null,
+        "price_list": null,
+        "in_stock_only": null,
+        "include_disabled": ""
+      },
+      "expect": "no_500",
+      "source": "seed",
+      "note": "Dirty nulls from flexible clients"
+    },
+    {
+      "id": "get_products_stringy_numbers",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_products",
+      "args": {
+        "page_length": "5",
+        "start": "0",
+        "price_list": "Standard Selling",
+        "in_stock_only": "0",
+        "include_disabled": "false"
+      },
+      "expect": "ok",
+      "source": "seed"
+    },
+    {
+      "id": "search_by_barcode_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_by_barcode",
+      "args": { "barcode": null, "price_list": null },
+      "expect": "no_500",
+      "source": "seed"
+    },
+    {
+      "id": "search_by_barcode_blank",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_by_barcode",
+      "args": { "barcode": "   ", "price_list": "" },
+      "expect": "no_500",
+      "source": "seed"
+    },
+    {
+      "id": "search_by_barcode_numeric",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_by_barcode",
+      "args": { "barcode": 7790580132170, "price_list": "Standard Selling" },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "AttributeError: int barcode had no .strip() — coerce via cstr in _item_codes_for_barcode",
+      "note": "Flutter/JSON may send barcode as number and drop leading zeros"
+    },
+    {
+      "id": "get_pm_context_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_pm_context",
+      "args": {},
+      "expect": "ok",
+      "source": "seed"
+    },
+    {
+      "id": "get_pm_context_null_company",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_pm_context",
+      "args": { "company": null },
+      "expect": "no_500",
+      "source": "seed",
+      "note": "Null company from clients; unknown keys are stripped by Frappe HTTP layer so not tested via get_attr"
+    },
+    {
+      "id": "create_pos_sale_empty_items",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_pos_sale",
+      "args": {
+        "offline_order_uuid": "edge-empty-items",
+        "receipt_number": "EDGE-EMPTY",
+        "items": [],
+        "total_amount": 0,
+        "payments": [],
+        "sale_mode": null
+      },
+      "expect": "fail",
+      "source": "seed",
+      "note": "Must reject empty sale with ValidationError, not 500"
+    },
+    {
+      "id": "create_pos_sale_null_items",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_pos_sale",
+      "args": {
+        "offline_order_uuid": "edge-null-items",
+        "receipt_number": "EDGE-NULL",
+        "items": null,
+        "total_amount": null,
+        "payments": null
+      },
+      "expect": "no_500",
+      "source": "seed"
+    },
+    {
+      "id": "create_pos_sale_dirty_line",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_pos_sale",
+      "args": {
+        "offline_order_uuid": "edge-dirty-line",
+        "receipt_number": "EDGE-DIRTY",
+        "items": [{ "item_code": null, "qty": "", "rate": "null" }],
+        "total_amount": "",
+        "payments": [{ "mode_of_payment": null, "amount": "" }]
+      },
+      "expect": "no_500",
+      "source": "seed",
+      "bug": "Dirty cart lines must ValidationError/InvalidQtyError, never TypeError",
+      "note": "Partial/dirty cart lines from offline Flutter sync"
+    },
+    {
+      "id": "validate_discount_pin_wrong_when_configured",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.validate_discount_pin",
+      "args": { "pin": "000000_WRONG_EDGE" },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Smoke 5.5.3 used legacy conf.pos_manager_pin; hashed admin PIN settings are the source of truth via _pin_configured()",
+      "note": "When PIN configured, response must include pin_configured and authorized=false for wrong pin — checked in smoke; here only no-crash"
+    },
+    {
+      "id": "simulate_receiving_flow_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.simulate_receiving_flow",
+      "args": {},
+      "expect": "ok",
+      "source": "seed"
+    },
+    {
+      "id": "list_leads_admin_null_filters",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.list_leads_admin",
+      "args": {
+        "filters": null,
+        "start": null,
+        "page_length": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "CRM /tables/crm crashed reading r.fields.mobile_no because list_leads_admin returned flat Lead rows without nested fields"
+    },
+    {
+      "id": "get_my_board_datetime_vs_str_lastseen",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.get_my_board",
+      "args": {},
+      "expect": "ok",
+      "source": "regression",
+      "bug": "unread badge compared Lead.modified (datetime) to JSON lastseen seen_at (str) → TypeError"
+    }
+  ]
+}

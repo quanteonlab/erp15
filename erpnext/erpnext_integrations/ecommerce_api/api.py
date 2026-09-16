@@ -16,6 +16,7 @@ import zipfile
 from frappe import _
 from frappe.utils import (
 	cint,
+	cstr,
 	flt,
 	getdate,
 	nowdate,
@@ -463,7 +464,7 @@ def assign_barcodes_to_all_items():
 
 def _item_codes_for_barcode(barcode):
 	"""Every Item that owns this exact barcode, plus a direct item_code match."""
-	code = (barcode or "").strip()
+	code = cstr(barcode or "").strip()
 	if not code:
 		return []
 	rows = frappe.get_all(
@@ -1584,14 +1585,10 @@ def _compute_cart_promotions_local(items, price_list=None):
 def apply_cart_promotions(items, price_list=None):
 	"""
 	Given cart items [{item_code, qty, rate, amount}], return computed discounts
-<<<<<<< Updated upstream
 	and upsell hints using ERPNext Pricing Rules and Product Bundles.
 
 	3x2 (same_item Product discount) is applied as "Llevá N, pagás N-free":
 	adding min_qty units grants free_qty free units.
-=======
-	and upsell hints using SilkOS Pricing Rules.
->>>>>>> Stashed changes
 
 	Returns:
 		{
@@ -2935,12 +2932,9 @@ def create_guest_preorder(
 	paid_amount=None,
 	mode_of_payment=None,
 	customer=None,
-<<<<<<< Updated upstream
 	order_tag=None,
-=======
 	seller_ref_user=None,
 	cashier_id=None,
->>>>>>> Stashed changes
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -3017,7 +3011,6 @@ def create_guest_preorder(
 		remarks_parts.append(f"guest_notes:{_sanitize_guest_tag(guest_notes)}")
 	if mode_of_payment:
 		remarks_parts.append(f"guest_pay_method:{_sanitize_guest_tag(mode_of_payment)}")
-<<<<<<< Updated upstream
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 		_acting_username,
 		_normalize_order_tag,
@@ -3029,11 +3022,9 @@ def create_guest_preorder(
 	tag_slug = _normalize_order_tag(order_tag)
 	if tag_slug:
 		remarks_parts.append(f"order_tag:{tag_slug}")
-=======
 	cashier = _resolve_order_cashier(cashier_id)
 	if cashier:
 		remarks_parts.append(f"cashier:{_sanitize_guest_tag(cashier)}")
->>>>>>> Stashed changes
 	tag_text = " | ".join(remarks_parts)
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -3154,25 +3145,9 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		else:
 			filters["status"] = status
 
-	list_fields = [
-		"name",
-		"customer",
-		"customer_name",
-		"transaction_date",
-		"delivery_date",
-		"grand_total",
-		"currency",
-		"docstatus",
-		"status",
-		"amended_from",
-	]
-	if tag_fn:
-		list_fields.append(tag_fn)
-
 	orders = frappe.get_all(
 		"Sales Order",
 		filters=filters,
-<<<<<<< Updated upstream
 		fields=[
 			"name",
 			"owner",
@@ -3188,9 +3163,6 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			"amended_from",
 			tag_fn,
 		],
-=======
-		fields=list_fields,
->>>>>>> Stashed changes
 		start=start,
 		limit_page_length=int(page_length) + (200 if scope else 50),  # fetch extra to account for filtering
 		order_by="transaction_date desc, creation desc",
@@ -3215,7 +3187,6 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			for a in amenders:
 				superseded.add(a["amended_from"])
 
-<<<<<<< Updated upstream
 	# Filter out superseded cancelled orders and orders outside this user's Pedidos scope.
 	filtered = []
 	for o in orders:
@@ -3233,23 +3204,6 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		o["order_tag"] = order_tag or None
 		o.pop(tag_fn, None)
 		filtered.append(o)
-=======
-	# Filter out superseded cancelled orders
-	filtered = [o for o in orders if not (o.get("docstatus") == 2 and o["name"] in superseded)]
-
-	scope_key = str(scope or "pos").strip().lower()
-	if scope_key == "admin":
-		if not _can_view_all_guest_preorders():
-			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
-	else:
-		viewer = _resolve_order_cashier(cashier_id)
-		mode = _orders_visibility_mode()
-		if viewer:
-			filtered = [o for o in filtered if _guest_preorder_visible_to_viewer(o, viewer, mode)]
-		else:
-			filtered = []
-
->>>>>>> Stashed changes
 	total_count = len(filtered)
 	filtered = filtered[:int(page_length)]
 
@@ -3271,29 +3225,13 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 
 	for o in filtered:
 		o["items_count"] = items_count_map.get(o["name"], 0)
-<<<<<<< Updated upstream
+		o["cashier_user"] = _cashier_from_guest_preorder(o)
 		o["display_status"] = _display_status_from_row(
 			o.get("docstatus", 0),
 			o.get("status", ""),
 			o.get("grand_total", 0),
 			o.get("advance_paid", 0),
 		)
-=======
-		o["cashier_user"] = _cashier_from_guest_preorder(o)
-		# Compute display status from docstatus + status
-		ds = o.get("docstatus", 0)
-		st = o.get("status", "")
-		if ds == 0:
-			o["display_status"] = "Consulta"
-		elif ds == 2:
-			o["display_status"] = "Archivado"
-		elif st in ("Preparado", "En Delivery"):
-			o["display_status"] = st
-		elif st == "Completed":
-			o["display_status"] = "Completado"
-		else:
-			o["display_status"] = "Orden"
->>>>>>> Stashed changes
 
 	return {"preorders": filtered, "total_count": total_count}
 
@@ -5991,18 +5929,38 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 				continue
 			_upsert_item_default_supplier(code, supplier_name)
 
+	# Draft/new items are often created disabled until Review. ERPNext rejects
+	# inactive Items on Stock Entry — temporarily enable for Material Receipt,
+	# then restore so POS still hides them until approved.
+	receipt_item_codes = list({row["item_code"] for row in resolved_lines if row.get("item_code")})
+	reactivated = []
+	for code in receipt_item_codes:
+		if cint(frappe.db.get_value("Item", code, "disabled")):
+			frappe.db.set_value("Item", code, "disabled", 0)
+			reactivated.append(code)
+	if reactivated:
+		frappe.db.commit()
+
 	# 3. Create Stock Entry
-	se = frappe.get_doc({
-		"doctype": "Stock Entry",
-		"stock_entry_type": "Material Receipt",
-		"posting_date": nowdate(),
-		"to_warehouse": warehouse,
-		"items": resolved_lines,
-		"remarks": f"Receiving session {session_id}" + (f" — ref: {reference}" if reference else ""),
-	})
-	se.insert(ignore_permissions=True)
-	se.submit()
-	frappe.db.commit()
+	try:
+		se = frappe.get_doc({
+			"doctype": "Stock Entry",
+			"stock_entry_type": "Material Receipt",
+			"posting_date": nowdate(),
+			"to_warehouse": warehouse,
+			"items": resolved_lines,
+			"remarks": f"Receiving session {session_id}" + (f" — ref: {reference}" if reference else ""),
+		})
+		se.insert(ignore_permissions=True)
+		se.submit()
+		frappe.db.commit()
+	finally:
+		for code in reactivated:
+			# Only restore if still present and we flipped it for this receipt
+			if frappe.db.exists("Item", code):
+				frappe.db.set_value("Item", code, "disabled", 1)
+		if reactivated:
+			frappe.db.commit()
 
 	return {
 		"stock_entry_id": se.name,
@@ -6013,13 +5971,39 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 @frappe.whitelist(allow_guest=True)
 def simulate_receiving_flow():
 	"""Return a deterministic sample payload for testing the receiving screen."""
-	# Use 3 existing items + 2 fake new ones
+	# Prefer simple stock items (no box/pack redirection) so Material Receipt is stable.
+	filters = {"disabled": 0, "is_stock_item": 1}
 	existing = frappe.get_all(
 		"Item",
-		filters={"disabled": 0, "is_stock_item": 1},
+		filters=filters,
 		fields=["item_code", "item_name", "stock_uom", "image"],
-		limit=3,
+		limit=20,
 	)
+	simple = []
+	for e in existing:
+		if _linked_box_pack(e["item_code"]):
+			continue
+		simple.append(e)
+		if len(simple) >= 3:
+			break
+	existing = simple
+	company = frappe.defaults.get_user_default("Company") or frappe.db.get_single_value(
+		"Global Defaults", "default_company"
+	)
+	warehouse = frappe.db.get_value(
+		"Warehouse", {"is_group": 0, "company": company, "disabled": 0}, "name", order_by="name asc"
+	)
+	# Prefer a Stores warehouse when present
+	stores = frappe.get_all(
+		"Warehouse",
+		filters={"is_group": 0, "company": company, "disabled": 0, "name": ("like", "%Stores%")},
+		pluck="name",
+		limit=1,
+	)
+	if stores:
+		warehouse = stores[0]
+	if not warehouse:
+		warehouse = "Stores - L"
 	import uuid
 	draft_items = [
 		{
@@ -6064,7 +6048,7 @@ def simulate_receiving_flow():
 	return {
 		"reference": "Container-SIM-001",
 		"supplier": "",   # intentionally empty
-		"warehouse": "POSNET Stores - L",
+		"warehouse": warehouse,
 		"lines": lines,
 		"draft_items": draft_items,
 	}

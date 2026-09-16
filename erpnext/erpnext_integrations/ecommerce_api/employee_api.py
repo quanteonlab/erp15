@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import string
+import unicodedata
 
 import frappe
 from frappe import _
@@ -1004,11 +1005,21 @@ def _set_user_roles(user: str, roles: list[str]) -> None:
 	user_doc.save(ignore_permissions=True)
 
 
+def _email_local_slug(text: str, max_len: int = 18) -> str:
+	"""ASCII-only local-part from a name (accents stripped). Frappe rejects non-ASCII emails."""
+	folded = unicodedata.normalize("NFKD", text or "")
+	ascii_only = folded.encode("ascii", "ignore").decode("ascii")
+	slug = "".join(ch for ch in ascii_only.lower() if ch.isalnum())[:max_len]
+	return slug or "staff"
+
+
 def _unique_staff_email(base_email: str, employee_name: str) -> str:
+	from frappe.utils import validate_email_address
+
 	email = (base_email or "").strip().lower()
-	if email and not frappe.db.exists("User", email):
+	if email and validate_email_address(email) and not frappe.db.exists("User", email):
 		return email
-	slug = "".join(ch for ch in (employee_name or "staff").lower() if ch.isalnum())[:18] or "staff"
+	slug = _email_local_slug(employee_name or "staff")
 	for i in range(0, 40):
 		candidate = f"{slug}{i or ''}@employees.local"
 		if not frappe.db.exists("User", candidate):

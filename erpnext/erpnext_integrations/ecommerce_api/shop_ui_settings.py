@@ -99,6 +99,17 @@ def _normalize_pos_display(raw) -> dict:
 		"showManualDiscount": _as_bool(src.get("showManualDiscount"), True),
 		# Discounts strictly above this % need admin PIN. Default 0 = all discounts.
 		"discountPinThresholdPct": _as_int(src.get("discountPinThresholdPct"), 0, 0, 100),
+		# Cant. / % / Precio / +/− on the tablet numpad. Default off (digits only).
+		"showNumpadModeKeys": _as_bool(src.get("showNumpadModeKeys"), False),
+		"receiptPaperKind": (
+			"A4"
+			if src.get("receiptPaperKind") == "A4"
+			else "Thermal 58mm"
+			if src.get("receiptPaperKind") == "Thermal 58mm"
+			else "Thermal 80mm"
+		),
+		"showCobroPrintPreview": _as_bool(src.get("showCobroPrintPreview"), True),
+		"printOnCobro": _as_bool(src.get("printOnCobro"), False),
 		# Kept for forward-compat if clients send them; personal prefs stay client-local.
 		"headerToggleShortcut": shortcut.strip(),
 	}

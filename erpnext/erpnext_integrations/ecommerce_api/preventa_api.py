@@ -20,7 +20,7 @@ import secrets
 
 import frappe
 from frappe import _
-from frappe.utils import cint, now_datetime
+from frappe.utils import cint, get_datetime, now_datetime
 
 from erpnext.erpnext_integrations.ecommerce_api.company_context import acting_user as _acting_user
 from erpnext.erpnext_integrations.ecommerce_api.employee_api import _can_app, _require_app_permission
@@ -283,6 +283,16 @@ def _save_board_columns_raw(owner_user: str, columns: list) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _as_dt(value):
+	"""Normalize Datetime field / JSON-serialized timestamps for safe compare."""
+	if value is None or value == "":
+		return None
+	try:
+		return get_datetime(value)
+	except Exception:
+		return None
+
+
 def _lastseen_scope(owner_user: str) -> str:
 	return f"preventa.lastseen.{owner_user}"
 
@@ -293,12 +303,15 @@ def _get_lastseen(owner_user: str):
 		return None
 	raw = frappe.db.get_value("Table Extra Schema", scope, "columns_json")
 	data = frappe.parse_json(raw) if raw else {}
-	return data.get("seen_at") if isinstance(data, dict) else None
+	if not isinstance(data, dict):
+		return None
+	return _as_dt(data.get("seen_at"))
 
 
 def _touch_lastseen(owner_user: str) -> None:
 	scope = _lastseen_scope(owner_user)
-	payload = frappe.as_json({"seen_at": now_datetime()})
+	# Persist as ISO string so JSON round-trip stays comparable via get_datetime
+	payload = frappe.as_json({"seen_at": str(now_datetime())})
 	frappe.flags.ignore_permissions = True
 	if frappe.db.exists("Table Extra Schema", scope):
 		doc = frappe.get_doc("Table Extra Schema", scope)
@@ -395,9 +408,10 @@ def get_my_board(owner_user=None):
 				continue
 			fields_out[fid] = r.get(attr)
 		agg = consulta_by_lead.get(r.name, {"cnt": 0, "last_linked": None})
-		last_activity = r.modified
-		if agg["last_linked"] and agg["last_linked"] > last_activity:
-			last_activity = agg["last_linked"]
+		last_activity = _as_dt(r.modified)
+		linked = _as_dt(agg.get("last_linked"))
+		if linked and (not last_activity or linked > last_activity):
+			last_activity = linked
 		unread = bool(prior_seen and last_activity and last_activity > prior_seen)
 		leads_out.append(
 			{
@@ -433,7 +447,9 @@ def _consulta_aggregate(lead_names: list) -> dict:
 	for row in rows:
 		agg = out.setdefault(row.lead, {"cnt": 0, "last_linked": None})
 		agg["cnt"] += 1
-		if not agg["last_linked"] or (row.linked_on and row.linked_on > agg["last_linked"]):
+		linked_on = _as_dt(row.linked_on)
+		prev = _as_dt(agg["last_linked"])
+		if not prev or (linked_on and linked_on > prev):
 			agg["last_linked"] = row.linked_on
 	return out
 
@@ -832,6 +848,7 @@ def track_preventa_event(event_type, lead=None, seller_link=None, visitor_key=No
 
 @frappe.whitelist(allow_guest=True)
 def list_leads_admin(filters=None, start=0, page_length=50):
+	"""Admin CRM lead list — same card shape as get_my_board (incl. nested `fields`)."""
 	_require_app_permission("tables.crm")
 	ensure_preventa_custom_fields()
 	if isinstance(filters, str):
@@ -854,6 +871,9 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 			["email_id", "like", f"%{search}%"],
 		]
 
+	settings = _load_preventa_settings()
+	layout = settings.get("field_layout") or {}
+
 	rows = frappe.get_all(
 		"Lead",
 		filters=query_filters,
@@ -861,7 +881,9 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 		fields=[
 			"name", "lead_name", "company_name", "lead_owner", "status",
 			"custom_preventa_stage", "custom_preventa_stage_since",
-			"mobile_no", "whatsapp_no", "phone", "email_id", "modified",
+			"mobile_no", "whatsapp_no", "phone", "email_id",
+			"city", "state", "country", "custom_address_line1", "custom_pincode",
+			"modified",
 		],
 		order_by="modified desc",
 		start=cint(start),
@@ -871,11 +893,40 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 	names = [r.name for r in rows]
 	tags_map = tags_map_for_docs("Lead", names) if names else {}
 	consulta_by_lead = _consulta_aggregate(names)
-	for r in rows:
-		r["tags"] = tags_map.get(r.name, [])
-		r["consulta_count"] = consulta_by_lead.get(r.name, {}).get("cnt", 0)
 
-	return {"leads": rows, "start": cint(start), "page_length": cint(page_length)}
+	leads_out = []
+	for r in rows:
+		fields_out = {}
+		for fid, vis in layout.items():
+			if vis == "omit":
+				continue
+			attr = LEAD_FIELD_MAP.get(fid)
+			if not attr:
+				continue
+			fields_out[fid] = r.get(attr)
+		agg = consulta_by_lead.get(r.name, {"cnt": 0, "last_linked": None})
+		last_activity = _as_dt(r.modified)
+		linked = _as_dt(agg.get("last_linked"))
+		if linked and (not last_activity or linked > last_activity):
+			last_activity = linked
+		leads_out.append(
+			{
+				"name": r.name,
+				"lead_name": r.lead_name,
+				"company_name": r.company_name,
+				"lead_owner": r.lead_owner,
+				"status": r.status,
+				"stage": r.custom_preventa_stage or _default_new_stage_key(settings),
+				"stage_since": r.custom_preventa_stage_since,
+				"fields": fields_out,
+				"tags": tags_map.get(r.name, []),
+				"consulta_count": agg["cnt"],
+				"last_activity": last_activity,
+				"unread": False,
+			}
+		)
+
+	return {"leads": leads_out, "start": cint(start), "page_length": cint(page_length)}
 
 
 @frappe.whitelist(allow_guest=True)
