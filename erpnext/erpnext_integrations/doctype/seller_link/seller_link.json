@@ -1,0 +1,114 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:slug",
+ "creation": "2026-09-16 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "slug",
+  "owner_user",
+  "label",
+  "company",
+  "active",
+  "column_break_1",
+  "created_by_user",
+  "last_used_on",
+  "open_count"
+ ],
+ "fields": [
+  {
+   "fieldname": "slug",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Slug",
+   "reqd": 1,
+   "unique": 1,
+   "description": "Unguessable token used in /s/{slug}"
+  },
+  {
+   "fieldname": "owner_user",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Owner User",
+   "options": "User",
+   "reqd": 1
+  },
+  {
+   "fieldname": "label",
+   "fieldtype": "Data",
+   "label": "Label"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company"
+  },
+  {
+   "default": "1",
+   "fieldname": "active",
+   "fieldtype": "Check",
+   "in_standard_filter": 1,
+   "label": "Active"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "created_by_user",
+   "fieldtype": "Data",
+   "label": "Created By User"
+  },
+  {
+   "fieldname": "last_used_on",
+   "fieldtype": "Datetime",
+   "label": "Last Used On"
+  },
+  {
+   "default": "0",
+   "fieldname": "open_count",
+   "fieldtype": "Int",
+   "label": "Open Count"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-09-16 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "Seller Link",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "Sales User",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

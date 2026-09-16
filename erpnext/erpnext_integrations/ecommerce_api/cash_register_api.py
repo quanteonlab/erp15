@@ -279,7 +279,7 @@ def _serialize_pos_profile(name: str) -> dict:
 
 
 @frappe.whitelist()
-def list_pos_profiles(search=None, company=None):
+def list_pos_profiles(search=None, company=None, minimal=0):
 	from erpnext.erpnext_integrations.ecommerce_api.company_context import company_scope
 
 	filters = {}
@@ -294,6 +294,16 @@ def list_pos_profiles(search=None, company=None):
 			["warehouse", "like", q],
 			["company", "like", q],
 		]
+	if cint(minimal):
+		rows = frappe.get_all(
+			"POS Profile",
+			filters=filters,
+			or_filters=or_filters,
+			fields=["name", "disabled", "company", "warehouse"],
+			order_by="name asc",
+			ignore_permissions=True,
+		)
+		return {"rows": rows, "total": len(rows)}
 	names = frappe.get_all(
 		"POS Profile",
 		filters=filters,

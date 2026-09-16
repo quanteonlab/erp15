@@ -16,6 +16,10 @@ from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_c
 
 # JSON map of Employee Group name -> permission ids (Table Extra Schema reuse; no migrate).
 PERM_STORE_SCOPE = "settings.staff_group_permissions"
+# Employee -> POS login barcode (numeric, printable). No migrate required.
+STAFF_LOGIN_SCOPE = "settings.staff_login_barcodes"
+STAFF_LOGIN_PREFIX = "99"
+STAFF_LOGIN_LEN = 12
 
 # App permissions that match the current Next.js UI (not ERPNext desk roles).
 APP_PERMISSIONS = [
@@ -58,6 +62,16 @@ APP_PERMISSIONS = [
 		"desc_en": "See assigned delivery routes and record proof of delivery.",
 		"desc_es": "Ver las rutas de entrega asignadas y registrar la prueba de entrega.",
 		"desc_zh": "查看已分配的配送路线并记录送达凭证。",
+	},
+	{
+		"id": "ops.preventa",
+		"group": "operaciones",
+		"label_en": "Preventa",
+		"label_es": "Preventa",
+		"label_zh": "预售",
+		"desc_en": "Work the personal sales pipeline (Kanban) and share the seller link.",
+		"desc_es": "Trabajar el pipeline de ventas personal (Kanban) y compartir el link de vendedor.",
+		"desc_zh": "管理个人销售看板并分享销售员链接。",
 	},
 	{
 		"id": "log.reports",
@@ -347,6 +361,7 @@ PERMISSION_TO_ROLES = {
 	"ops.catalog": ["Sales User"],
 	"ops.receiving": ["Stock User", "Purchase User"],
 	"ops.delivery": ["Stock User"],
+	"ops.preventa": ["Sales User"],
 	"log.reports": ["Accounts User"],
 	"log.accounting": ["Accounts User"],
 	"log.sections": ["Stock User"],
@@ -398,11 +413,17 @@ _STARTER_CAJA = [
 	"log.accounting",
 	"tools.labels",
 ]
+_STARTER_VENTAS = [
+	"ops.preventa",
+	"ops.catalog",
+	"tables.orders",
+]
 
 
 STARTER_STAFF_GROUPS = [
 	{"employee_group_name": "repositor", "permissions": list(_STARTER_REPOSITOR)},
 	{"employee_group_name": "caja", "permissions": list(_STARTER_CAJA)},
+	{"employee_group_name": "ventas", "permissions": list(_STARTER_VENTAS)},
 	{
 		"employee_group_name": "admin",
 		"permissions": sorted(KNOWN_PERMISSION_IDS),
@@ -554,6 +575,7 @@ _SYNC_ROLES = {"Administrator", "System Manager"}
 _COARSE_FLAG = {
 	"ops.pos": "pos",
 	"ops.catalog": "pos",
+	"ops.preventa": "pos",
 	"tables.orders": "pos",
 	"tables.orders.own": "pos",
 	"tables.orders.all": "pos",
@@ -653,6 +675,11 @@ def _serialize_employee(name: str) -> dict:
 	if emp.user_id and frappe.db.exists("User", emp.user_id):
 		roles = [r for r in frappe.get_roles(emp.user_id) if r not in ("All", "Guest", "Desk User")]
 		user_enabled = cint(frappe.db.get_value("User", emp.user_id, "enabled"))
+	login_barcode = None
+	store = _load_staff_login_store()
+	entry = (store.get("by_employee") or {}).get(emp.name)
+	if isinstance(entry, dict):
+		login_barcode = str(entry.get("code") or "").strip() or None
 	row = {
 		"name": emp.name,
 		"employee_name": emp.employee_name,
@@ -676,6 +703,7 @@ def _serialize_employee(name: str) -> dict:
 		"roles": roles,
 		"permissions": _permission_ids_for_employee(emp.name),
 		"groups": groups,
+		"login_barcode": login_barcode,
 		"date_of_joining": str(emp.date_of_joining) if emp.date_of_joining else None,
 		"modified": str(emp.modified) if emp.modified else None,
 	}
@@ -699,6 +727,40 @@ def list_app_permissions():
 			{"id": "empleados", "label_en": "Staff", "label_es": "Personal", "label_zh": "员工管理"},
 		],
 	}
+
+
+def cashier_names_in_shared_groups(cashier_name: str) -> list[str]:
+	"""Employee names sharing at least one Employee Group with the given cashier label."""
+	cashier_name = (cashier_name or "").strip()
+	if not cashier_name:
+		return []
+	emp = frappe.db.get_value("Employee", {"employee_name": cashier_name}, "name")
+	if not emp:
+		emp = frappe.db.get_value("Employee", {"user_id": cashier_name}, "name")
+	if not emp:
+		return [cashier_name]
+	group_ids = frappe.get_all(
+		"Employee Group Table",
+		filters={"employee": emp},
+		pluck="parent",
+		ignore_permissions=True,
+	)
+	if not group_ids:
+		return [cashier_name]
+	member_rows = frappe.get_all(
+		"Employee Group Table",
+		filters={"parent": ["in", group_ids]},
+		fields=["employee", "employee_name"],
+		ignore_permissions=True,
+	)
+	names: set[str] = {cashier_name}
+	for row in member_rows or []:
+		label = (row.employee_name or "").strip()
+		if not label and row.employee:
+			label = (frappe.db.get_value("Employee", row.employee, "employee_name") or "").strip()
+		if label:
+			names.add(label)
+	return sorted(names)
 
 
 @frappe.whitelist()
@@ -1361,4 +1423,205 @@ def list_employee_meta():
 		"roles": [],
 		"permissions": catalog["permissions"],
 		"permission_groups": catalog["groups"],
+	}
+
+
+def _load_staff_login_store() -> dict:
+	if not frappe.db.exists("Table Extra Schema", STAFF_LOGIN_SCOPE):
+		return {"by_employee": {}, "by_code": {}}
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Table Extra Schema", STAFF_LOGIN_SCOPE)
+	data = _parse_json(doc.columns_json, {})
+	if not isinstance(data, dict):
+		return {"by_employee": {}, "by_code": {}}
+	by_employee = data.get("by_employee") if isinstance(data.get("by_employee"), dict) else {}
+	by_code = data.get("by_code") if isinstance(data.get("by_code"), dict) else {}
+	return {"by_employee": by_employee, "by_code": by_code}
+
+
+def _save_staff_login_store(data: dict) -> None:
+	payload = json.dumps(
+		{
+			"by_employee": data.get("by_employee") or {},
+			"by_code": data.get("by_code") or {},
+		},
+		ensure_ascii=False,
+	)
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", STAFF_LOGIN_SCOPE):
+		doc = frappe.get_doc("Table Extra Schema", STAFF_LOGIN_SCOPE)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc(
+			{"doctype": "Table Extra Schema", "scope": STAFF_LOGIN_SCOPE, "columns_json": payload}
+		)
+		doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def _gen_staff_login_code(used: set[str]) -> str:
+	"""12-digit numeric code starting with 99 (HID scanners + existing digit-only POS hook)."""
+	suffix_len = STAFF_LOGIN_LEN - len(STAFF_LOGIN_PREFIX)
+	for _ in range(80):
+		suffix = "".join(secrets.choice(string.digits) for _ in range(suffix_len))
+		code = f"{STAFF_LOGIN_PREFIX}{suffix}"
+		if code not in used:
+			return code
+	frappe.throw(_("Could not allocate a unique staff login barcode"))
+
+
+def _normalize_employee_list(employees) -> list[str]:
+	if isinstance(employees, str):
+		employees = frappe.parse_json(employees)
+	if not isinstance(employees, list):
+		return []
+	out = []
+	seen = set()
+	for item in employees:
+		name = str(item or "").strip()
+		if name and name not in seen:
+			seen.add(name)
+			out.append(name)
+	return out
+
+
+def _can_manage_staff_login_barcodes() -> bool:
+	return (
+		_can_app("tables.employees")
+		or _can_app("tools.labels")
+		or _can_app("employees.edit")
+		or _can_app("employees.create_user")
+	)
+
+
+@frappe.whitelist()
+def ensure_staff_login_barcodes(employees=None, rotate=0):
+	"""Issue (or rotate) numeric POS login barcodes for employees that have a User.
+
+	Returns printable rows for Tools > Labels. Requires employees or labels permission.
+	"""
+	if not _can_manage_staff_login_barcodes():
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	names = _normalize_employee_list(employees)
+	if not names:
+		frappe.throw(_("employees is required"))
+
+	rotate = cint(rotate)
+	store = _load_staff_login_store()
+	by_employee = dict(store.get("by_employee") or {})
+	by_code = dict(store.get("by_code") or {})
+	used = set(str(k) for k in by_code.keys())
+	rows = []
+	changed = False
+
+	for emp_name in names:
+		if not frappe.db.exists("Employee", emp_name):
+			rows.append(
+				{
+					"name": emp_name,
+					"ok": False,
+					"error": "not_found",
+				}
+			)
+			continue
+		frappe.flags.ignore_permissions = True
+		emp = frappe.get_doc("Employee", emp_name)
+		user_id = (emp.user_id or "").strip()
+		if not user_id or not frappe.db.exists("User", user_id):
+			rows.append(
+				{
+					"name": emp.name,
+					"employee_name": emp.employee_name,
+					"user_id": user_id or None,
+					"ok": False,
+					"error": "no_user",
+				}
+			)
+			continue
+		if cint(frappe.db.get_value("User", user_id, "enabled")) == 0:
+			rows.append(
+				{
+					"name": emp.name,
+					"employee_name": emp.employee_name,
+					"user_id": user_id,
+					"ok": False,
+					"error": "user_disabled",
+				}
+			)
+			continue
+
+		existing = by_employee.get(emp.name) if isinstance(by_employee.get(emp.name), dict) else None
+		code = str((existing or {}).get("code") or "").strip()
+		if rotate or not code or len(code) != STAFF_LOGIN_LEN or not code.startswith(STAFF_LOGIN_PREFIX):
+			if code and code in by_code:
+				by_code.pop(code, None)
+				used.discard(code)
+			code = _gen_staff_login_code(used)
+			used.add(code)
+			by_employee[emp.name] = {"code": code, "user_id": user_id}
+			by_code[code] = emp.name
+			changed = True
+		else:
+			# Keep mapping in sync if user_id changed.
+			by_employee[emp.name] = {"code": code, "user_id": user_id}
+			by_code[code] = emp.name
+
+		rows.append(
+			{
+				"name": emp.name,
+				"employee_name": emp.employee_name,
+				"user_id": user_id,
+				"login_barcode": code,
+				"ok": True,
+			}
+		)
+
+	if changed:
+		_save_staff_login_store({"by_employee": by_employee, "by_code": by_code})
+
+	return {"rows": rows}
+
+
+@frappe.whitelist()
+def resolve_staff_login_barcode(code=None):
+	"""Resolve a staff login barcode to an enabled User.
+
+	Intended for the Next.js `/api/auth/login-barcode` server route (API token).
+	Does not grant a Frappe session by itself.
+	"""
+	raw = str(code or "").strip()
+	if not raw:
+		frappe.throw(_("code is required"))
+	if not raw.isdigit() or len(raw) != STAFF_LOGIN_LEN or not raw.startswith(STAFF_LOGIN_PREFIX):
+		frappe.throw(_("Invalid staff login barcode"))
+
+	store = _load_staff_login_store()
+	emp_name = (store.get("by_code") or {}).get(raw)
+	if not emp_name:
+		frappe.throw(_("Unknown staff login barcode"))
+
+	frappe.flags.ignore_permissions = True
+	if not frappe.db.exists("Employee", emp_name):
+		frappe.throw(_("Employee for barcode not found"))
+	emp = frappe.get_doc("Employee", emp_name)
+	if (emp.status or "") != "Active":
+		frappe.throw(_("Employee is not active"))
+	user_id = (emp.user_id or "").strip()
+	if not user_id or not frappe.db.exists("User", user_id):
+		frappe.throw(_("Employee has no login user"))
+	if cint(frappe.db.get_value("User", user_id, "enabled")) == 0:
+		frappe.throw(_("User account is disabled"))
+
+	# Stale mapping guard
+	entry = (store.get("by_employee") or {}).get(emp.name)
+	if isinstance(entry, dict) and str(entry.get("code") or "") != raw:
+		frappe.throw(_("Unknown staff login barcode"))
+
+	return {
+		"username": user_id,
+		"employee": emp.name,
+		"employee_name": emp.employee_name,
+		"login_barcode": raw,
 	}

@@ -3307,6 +3307,24 @@ def ensure_starter_staff_groups():
 
 
 @frappe.whitelist()
+def ensure_staff_login_barcodes(employees=None, rotate=0):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        ensure_staff_login_barcodes as _impl,
+    )
+
+    return _impl(employees=employees, rotate=rotate)
+
+
+@frappe.whitelist()
+def resolve_staff_login_barcode(code=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        resolve_staff_login_barcode as _impl,
+    )
+
+    return _impl(code=code)
+
+
+@frappe.whitelist()
 def get_extra_fields_bundle(scope, row_keys=None):
     from erpnext.erpnext_integrations.ecommerce_api.extra_fields import (
         get_extra_fields_bundle as _impl,
@@ -3330,12 +3348,12 @@ def save_extra_row(scope, row_key, values=None):
 
 
 @frappe.whitelist()
-def list_pos_profiles(search=None, company=None):
+def list_pos_profiles(search=None, company=None, minimal=0):
     from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
         list_pos_profiles as _impl,
     )
 
-    return _impl(search=search, company=company)
+    return _impl(search=search, company=company, minimal=minimal)
 
 
 @frappe.whitelist()
@@ -3395,7 +3413,17 @@ def get_pos_admin_settings():
 
 
 @frappe.whitelist()
-def save_pos_admin_settings(pin=None, amendment_note_required=None, clear_pin=0, session_mode=None, start_requires_pin=None, default_pos_profile=None):
+def save_pos_admin_settings(
+    pin=None,
+    amendment_note_required=None,
+    clear_pin=0,
+    session_mode=None,
+    start_requires_pin=None,
+    default_pos_profile=None,
+    default_opening_cash=None,
+    action_policy=None,
+    orders_visibility_mode=None,
+):
     from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
         save_pos_admin_settings as _impl,
     )
@@ -3407,6 +3435,9 @@ def save_pos_admin_settings(pin=None, amendment_note_required=None, clear_pin=0,
         session_mode=session_mode,
         start_requires_pin=start_requires_pin,
         default_pos_profile=default_pos_profile,
+        default_opening_cash=default_opening_cash,
+        action_policy=action_policy,
+        orders_visibility_mode=orders_visibility_mode,
     )
 
 
@@ -3429,12 +3460,12 @@ def list_pos_cash_sessions(pos_profile=None, status=None, page=1, page_length=50
 
 
 @frappe.whitelist()
-def get_pos_cash_session(session_id=None, pos_profile=None):
+def get_pos_cash_session(session_id=None, pos_profile=None, include_sales=1):
     from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
         get_pos_cash_session as _impl,
     )
 
-    return _impl(session_id=session_id, pos_profile=pos_profile)
+    return _impl(session_id=session_id, pos_profile=pos_profile, include_sales=include_sales)
 
 
 @frappe.whitelist()

@@ -2822,6 +2822,103 @@ def _sanitize_guest_tag(value) -> str:
 	return str(value or "").replace("|", " ").strip()[:240]
 
 
+def _parse_remarks_tags(raw) -> dict:
+	tags = {}
+	for part in str(raw or "").split("|"):
+		part = part.strip()
+		if ":" in part:
+			key, val = part.split(":", 1)
+			tags[key.strip()] = val.strip()
+	return tags
+
+
+def _guest_preorder_tag_text(so_or_dict):
+	if isinstance(so_or_dict, dict):
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn:
+			return so_or_dict.get(tag_fn) or ""
+		return so_or_dict.get("remarks") or so_or_dict.get("terms") or ""
+	for fn in ("remarks", "terms"):
+		if hasattr(so_or_dict, fn):
+			val = getattr(so_or_dict, fn, None) or ""
+			if val:
+				return str(val)
+	return ""
+
+
+def _cashier_from_guest_preorder(so_or_dict):
+	return _parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("cashier") or None
+
+
+def _update_guest_preorder_tag(so, key: str, value: str | None) -> None:
+	tag_fn = _guest_preorder_tag_fieldname()
+	if not tag_fn:
+		return
+	raw = getattr(so, tag_fn, None) or ""
+	prefix = f"{key}:"
+	parts = [p for p in str(raw).split("|") if p.strip() and not p.strip().startswith(prefix)]
+	clean = _sanitize_guest_tag(value)
+	if clean:
+		parts.append(f"{key}:{clean}")
+	setattr(so, tag_fn, " | ".join(p.strip() for p in parts if p.strip()))
+
+
+def _resolve_order_cashier(cashier_id=None) -> str | None:
+	cid = str(cashier_id or "").strip()
+	if cid:
+		return cid
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import _acting_user
+
+	user = (_acting_user() or "").strip()
+	if not user or user in ("Guest", "Administrator"):
+		return None
+	emp_name = frappe.db.get_value("Employee", {"user_id": user}, "employee_name")
+	return (emp_name or user).strip() or None
+
+
+def _orders_visibility_mode() -> str:
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import _load_pin_settings
+
+	mode = (_load_pin_settings().get("orders_visibility_mode") or "own_only").strip()
+	if mode not in ("own_only", "group", "all_tagged"):
+		return "own_only"
+	return mode
+
+
+def _allowed_cashiers_for_viewer(viewer: str, mode: str) -> set[str] | None:
+	viewer = (viewer or "").strip()
+	if not viewer:
+		return set()
+	if mode == "all_tagged":
+		return None
+	if mode == "group":
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+			cashier_names_in_shared_groups,
+		)
+
+		names = cashier_names_in_shared_groups(viewer)
+		return set(names) if names else {viewer}
+	return {viewer}
+
+
+def _guest_preorder_visible_to_viewer(order: dict, viewer: str, mode: str) -> bool:
+	cashier = _cashier_from_guest_preorder(order)
+	if mode == "all_tagged":
+		return bool(cashier)
+	if not cashier:
+		return False
+	allowed = _allowed_cashiers_for_viewer(viewer, mode)
+	if allowed is None:
+		return bool(cashier)
+	return cashier in allowed
+
+
+def _can_view_all_guest_preorders() -> bool:
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _can_app
+
+	return _can_app("tables.orders")
+
+
 @frappe.whitelist(allow_guest=True)
 def create_guest_preorder(
 	items,
@@ -2838,7 +2935,12 @@ def create_guest_preorder(
 	paid_amount=None,
 	mode_of_payment=None,
 	customer=None,
+<<<<<<< Updated upstream
 	order_tag=None,
+=======
+	seller_ref_user=None,
+	cashier_id=None,
+>>>>>>> Stashed changes
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -2915,6 +3017,7 @@ def create_guest_preorder(
 		remarks_parts.append(f"guest_notes:{_sanitize_guest_tag(guest_notes)}")
 	if mode_of_payment:
 		remarks_parts.append(f"guest_pay_method:{_sanitize_guest_tag(mode_of_payment)}")
+<<<<<<< Updated upstream
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 		_acting_username,
 		_normalize_order_tag,
@@ -2926,6 +3029,11 @@ def create_guest_preorder(
 	tag_slug = _normalize_order_tag(order_tag)
 	if tag_slug:
 		remarks_parts.append(f"order_tag:{tag_slug}")
+=======
+	cashier = _resolve_order_cashier(cashier_id)
+	if cashier:
+		remarks_parts.append(f"cashier:{_sanitize_guest_tag(cashier)}")
+>>>>>>> Stashed changes
 	tag_text = " | ".join(remarks_parts)
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -2991,6 +3099,21 @@ def create_guest_preorder(
 
 	send_consulta_notification(so.name, guest_name=guest_name, guest_phone=guest_phone)
 
+	# Best-effort Pre-venta bridge: never let a Lead-sync problem affect the
+	# guest preorder response (see local_docs/proposals/i033_preventa_sales_kanban.md).
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import sync_lead_from_guest_preorder
+
+		sync_lead_from_guest_preorder(
+			so.name,
+			guest_name=guest_name,
+			guest_phone=guest_phone,
+			guest_email=guest_email,
+			seller_ref_user=seller_ref_user,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so.name}")
+
 	return {
 		"preorder_name": so.name,
 		"estimated_total": flt(so.grand_total),
@@ -3001,7 +3124,7 @@ def create_guest_preorder(
 
 
 @frappe.whitelist()
-def get_guest_preorders_list(status=None, start=0, page_length=20):
+def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=None, scope="pos"):
 	"""
 	List Guest Preorders created by `create_guest_preorder`.
 
@@ -3031,9 +3154,25 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 		else:
 			filters["status"] = status
 
+	list_fields = [
+		"name",
+		"customer",
+		"customer_name",
+		"transaction_date",
+		"delivery_date",
+		"grand_total",
+		"currency",
+		"docstatus",
+		"status",
+		"amended_from",
+	]
+	if tag_fn:
+		list_fields.append(tag_fn)
+
 	orders = frappe.get_all(
 		"Sales Order",
 		filters=filters,
+<<<<<<< Updated upstream
 		fields=[
 			"name",
 			"owner",
@@ -3049,6 +3188,9 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 			"amended_from",
 			tag_fn,
 		],
+=======
+		fields=list_fields,
+>>>>>>> Stashed changes
 		start=start,
 		limit_page_length=int(page_length) + (200 if scope else 50),  # fetch extra to account for filtering
 		order_by="transaction_date desc, creation desc",
@@ -3073,6 +3215,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 			for a in amenders:
 				superseded.add(a["amended_from"])
 
+<<<<<<< Updated upstream
 	# Filter out superseded cancelled orders and orders outside this user's Pedidos scope.
 	filtered = []
 	for o in orders:
@@ -3090,6 +3233,23 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 		o["order_tag"] = order_tag or None
 		o.pop(tag_fn, None)
 		filtered.append(o)
+=======
+	# Filter out superseded cancelled orders
+	filtered = [o for o in orders if not (o.get("docstatus") == 2 and o["name"] in superseded)]
+
+	scope_key = str(scope or "pos").strip().lower()
+	if scope_key == "admin":
+		if not _can_view_all_guest_preorders():
+			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
+	else:
+		viewer = _resolve_order_cashier(cashier_id)
+		mode = _orders_visibility_mode()
+		if viewer:
+			filtered = [o for o in filtered if _guest_preorder_visible_to_viewer(o, viewer, mode)]
+		else:
+			filtered = []
+
+>>>>>>> Stashed changes
 	total_count = len(filtered)
 	filtered = filtered[:int(page_length)]
 
@@ -3111,12 +3271,29 @@ def get_guest_preorders_list(status=None, start=0, page_length=20):
 
 	for o in filtered:
 		o["items_count"] = items_count_map.get(o["name"], 0)
+<<<<<<< Updated upstream
 		o["display_status"] = _display_status_from_row(
 			o.get("docstatus", 0),
 			o.get("status", ""),
 			o.get("grand_total", 0),
 			o.get("advance_paid", 0),
 		)
+=======
+		o["cashier_user"] = _cashier_from_guest_preorder(o)
+		# Compute display status from docstatus + status
+		ds = o.get("docstatus", 0)
+		st = o.get("status", "")
+		if ds == 0:
+			o["display_status"] = "Consulta"
+		elif ds == 2:
+			o["display_status"] = "Archivado"
+		elif st in ("Preparado", "En Delivery"):
+			o["display_status"] = st
+		elif st == "Completed":
+			o["display_status"] = "Completado"
+		else:
+			o["display_status"] = "Orden"
+>>>>>>> Stashed changes
 
 	return {"preorders": filtered, "total_count": total_count}
 
@@ -3157,6 +3334,7 @@ def get_guest_preorder(preorder_name):
 		"docstatus": so.docstatus,
 		"status": so.status,
 		"display_status": _display_status(so),
+		"cashier_user": _cashier_from_guest_preorder(so),
 		"estimated_total": flt(so.grand_total),
 		"currency": so.currency,
 		"remarks": getattr(so, "remarks", None),
@@ -3437,6 +3615,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 	  customer_name?,     # Display name on Customer
 	  paid_amount?,       # Absolute advance_paid target
 	  new_name?,          # Rename Sales Order
+	  cashier_user?,      # Assign/reassign POS cashier (tables.orders)
 	}
 	"""
 	if isinstance(data, str):
@@ -3465,13 +3644,12 @@ def update_guest_preorder_details(preorder_name, data=None):
 		if not frappe.db.exists("Customer", customer):
 			frappe.throw(_("Customer {0} not found").format(customer))
 		so.customer = customer
-		# Keep guest tag metadata in sync
-		tag_fn = _guest_preorder_tag_fieldname()
-		if tag_fn:
-			raw = getattr(so, tag_fn, None) or ""
-			parts = [p for p in str(raw).split("|") if p.strip() and not p.strip().startswith("customer:")]
-			parts.append(f"customer:{customer}")
-			setattr(so, tag_fn, " | ".join(p.strip() for p in parts if p.strip()))
+		_update_guest_preorder_tag(so, "customer", customer)
+
+	if data.get("cashier_user") is not None:
+		if not _can_view_all_guest_preorders():
+			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
+		_update_guest_preorder_tag(so, "cashier", str(data.get("cashier_user") or "").strip())
 
 	if so.docstatus == 0:
 		so.save(ignore_permissions=True)
@@ -3482,9 +3660,9 @@ def update_guest_preorder_details(preorder_name, data=None):
 			updates["delivery_date"] = so.delivery_date
 		if data.get("customer"):
 			updates["customer"] = so.customer
-			tag_fn = _guest_preorder_tag_fieldname()
-			if tag_fn:
-				updates[tag_fn] = getattr(so, tag_fn, None)
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn and (data.get("customer") or data.get("cashier_user") is not None):
+			updates[tag_fn] = getattr(so, tag_fn, None)
 		if updates:
 			frappe.db.set_value("Sales Order", current_name, updates)
 			if data.get("delivery_date"):

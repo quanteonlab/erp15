@@ -1,0 +1,85 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-09-16 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["lead", "sales_order", "source", "linked_on", "added_by"],
+ "fields": [
+  {
+   "fieldname": "lead",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Lead",
+   "options": "Lead",
+   "reqd": 1
+  },
+  {
+   "fieldname": "sales_order",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Sales Order",
+   "options": "Sales Order",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "source",
+   "fieldtype": "Data",
+   "label": "Source",
+   "description": "catalog | manual"
+  },
+  {
+   "fieldname": "linked_on",
+   "fieldtype": "Datetime",
+   "label": "Linked On",
+   "reqd": 1
+  },
+  {
+   "fieldname": "added_by",
+   "fieldtype": "Link",
+   "label": "Added By",
+   "options": "User"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-09-16 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "Preventa Lead Consulta",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "Sales User",
+   "share": 0,
+   "write": 0
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

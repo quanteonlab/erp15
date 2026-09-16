@@ -229,7 +229,8 @@ def _cash_expected(doc, sales: list[dict] | None = None) -> dict:
 
 def _serialize_session(doc, include_sales=False) -> dict:
 	sales = _session_sales(doc.name) if include_sales else []
-	cash = _cash_expected(doc, sales if include_sales else None)
+	# Pass [] (not None) when skipping sales — None would re-trigger a full invoice scan.
+	cash = _cash_expected(doc, sales)
 	out = {
 		"name": doc.name,
 		"pos_profile": doc.pos_profile,
@@ -398,12 +399,20 @@ def get_pos_admin_settings():
 	if mode not in ("autostart", "require_before_sale"):
 		mode = "autostart"
 	default_profile = str(cfg.get("default_pos_profile") or "").strip()
+	opening = cfg.get("default_opening_cash")
+	if opening is None or opening == "":
+		opening = 5000
+	orders_visibility_mode = cfg.get("orders_visibility_mode") or "own_only"
+	if orders_visibility_mode not in ("own_only", "group", "all_tagged"):
+		orders_visibility_mode = "own_only"
 	return {
 		"pin_configured": _pin_configured(cfg),
 		"amendment_note_required": bool(required),
 		"session_mode": mode,
 		"start_requires_pin": bool(cint(cfg.get("start_requires_pin") or 0)),
 		"default_pos_profile": default_profile or None,
+		"default_opening_cash": flt(opening),
+		"orders_visibility_mode": orders_visibility_mode,
 		"action_policy": _load_action_policy(cfg),
 	}
 
@@ -416,7 +425,9 @@ def save_pos_admin_settings(
 	session_mode=None,
 	start_requires_pin=None,
 	default_pos_profile=None,
+	default_opening_cash=None,
 	action_policy=None,
+	orders_visibility_mode=None,
 ):
 	if not _can_manage_settings():
 		frappe.throw(_("Not permitted ({0})").format("tools.settings"))
@@ -445,6 +456,13 @@ def save_pos_admin_settings(
 		if name and not frappe.db.exists("POS Profile", name):
 			frappe.throw(_("Cash register {0} not found").format(name))
 		cfg["default_pos_profile"] = name
+	if default_opening_cash is not None:
+		cfg["default_opening_cash"] = max(0.0, flt(default_opening_cash))
+	if orders_visibility_mode is not None:
+		mode = str(orders_visibility_mode).strip()
+		if mode not in ("own_only", "group", "all_tagged"):
+			frappe.throw(_("Invalid orders visibility mode"))
+		cfg["orders_visibility_mode"] = mode
 	if action_policy is not None:
 		if isinstance(action_policy, str):
 			action_policy = json.loads(action_policy)
@@ -524,18 +542,19 @@ def list_recent_cashiers(limit=5):
 
 
 @frappe.whitelist()
-def get_pos_cash_session(session_id=None, pos_profile=None):
+def get_pos_cash_session(session_id=None, pos_profile=None, include_sales=1):
+	include = cint(include_sales)
 	if session_id:
 		if not frappe.db.exists("POS Cash Session", session_id):
 			frappe.throw(_("Session not found"))
 		frappe.flags.ignore_permissions = True
 		doc = frappe.get_doc("POS Cash Session", session_id)
-		return _serialize_session(doc, include_sales=True)
+		return _serialize_session(doc, include_sales=include)
 	if pos_profile:
 		doc = _open_session_for_profile(pos_profile)
 		if not doc:
 			return {"name": None, "is_open": 0, "pos_profile": pos_profile}
-		return _serialize_session(doc, include_sales=True)
+		return _serialize_session(doc, include_sales=include)
 	frappe.throw(_("session_id or pos_profile is required"))
 
 
@@ -583,7 +602,8 @@ def start_pos_cash_session(pos_profile, cashier_user=None, opening_cash=0, pin=N
 	existing = _open_session_for_profile(pos_profile)
 	if existing:
 		if not cint(close_existing):
-			return _serialize_session(existing, include_sales=True)
+			# Skip sales list here — get_pos_cash_session loads it when the Sessions tab opens.
+			return _serialize_session(existing, include_sales=False)
 		_require_pin_or_admin(pin)
 		existing.status = "Closed"
 		existing.ended_at = now_datetime()
@@ -609,11 +629,11 @@ def start_pos_cash_session(pos_profile, cashier_user=None, opening_cash=0, pin=N
 	_append_audit(doc, "started", {"opening_cash": flt(opening_cash), "cashier_user": cashier})
 	doc.insert(ignore_permissions=True)
 	frappe.db.commit()
-	return _serialize_session(doc, include_sales=True)
+	return _serialize_session(doc, include_sales=False)
 
 
 @frappe.whitelist()
-def ensure_pos_cash_session(pos_profile=None, cashier_user=None, pin=None, opening_cash=0):
+def ensure_pos_cash_session(pos_profile=None, cashier_user=None, pin=None, opening_cash=None):
 	"""Reuse an open session, or autostart when settings allow (no PIN)."""
 	cfg = get_pos_admin_settings()
 	profile = (pos_profile or cfg.get("default_pos_profile") or "").strip()
@@ -646,13 +666,18 @@ def ensure_pos_cash_session(pos_profile=None, cashier_user=None, pin=None, openi
 		}
 	existing = _open_session_for_profile(profile)
 	if existing:
-		return _serialize_session(existing, include_sales=True)
+		return _serialize_session(existing, include_sales=False)
 	autostart = cfg.get("session_mode") == "autostart" and not cfg.get("start_requires_pin")
 	if autostart:
+		cash = (
+			flt(opening_cash)
+			if opening_cash not in (None, "")
+			else flt(cfg.get("default_opening_cash") if cfg.get("default_opening_cash") is not None else 5000)
+		)
 		return start_pos_cash_session(
 			pos_profile=profile,
 			cashier_user=cashier_user,
-			opening_cash=opening_cash,
+			opening_cash=cash,
 			pin=None,
 			close_existing=0,
 		)

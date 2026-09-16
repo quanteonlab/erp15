@@ -63,6 +63,7 @@ after_install = "erpnext.setup.install.after_install"
 after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.product_manager.ensure_product_manager_custom_fields",
 	"erpnext.erpnext_integrations.ecommerce_api.api.ensure_product_bundle_promo_fields",
+	"erpnext.erpnext_integrations.ecommerce_api.preventa_api.ensure_preventa_custom_fields",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"
