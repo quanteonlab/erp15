@@ -85,6 +85,7 @@ def _normalize_pos_display(raw) -> dict:
 	return {
 		"showDiscountName": _as_bool(src.get("showDiscountName"), True),
 		"productLayout": layout,
+		"loadProductImages": _as_bool(src.get("loadProductImages"), False),
 		"showSessionsTab": _as_bool(src.get("showSessionsTab"), True),
 		"showOrdersTab": _as_bool(src.get("showOrdersTab"), True),
 		"showDisabledProducts": _as_bool(src.get("showDisabledProducts"), False),
@@ -94,6 +95,10 @@ def _normalize_pos_display(raw) -> dict:
 		# Default False so offline/POS sales are not blocked.
 		"requireValuationRate": _as_bool(src.get("requireValuationRate"), False),
 		"orderTag": _normalize_order_tag(src.get("orderTag")) or "caja",
+		# Manual line % button; off hides it for all cashiers.
+		"showManualDiscount": _as_bool(src.get("showManualDiscount"), True),
+		# Discounts strictly above this % need admin PIN. Default 0 = all discounts.
+		"discountPinThresholdPct": _as_int(src.get("discountPinThresholdPct"), 0, 0, 100),
 		# Kept for forward-compat if clients send them; personal prefs stay client-local.
 		"headerToggleShortcut": shortcut.strip(),
 	}
