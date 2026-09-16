@@ -679,6 +679,23 @@ def suite_5_12_modules_read():
         from erpnext.erpnext_integrations.ecommerce_api import print_templates_api as pta
         rows = pta.list_print_templates()
         assert rows is not None
+        fields = pta.get_doctype_fields("Staff Cred.")
+        assert isinstance(fields, dict) and fields.get("fields"), f"Staff Cred. fields: {fields}"
+        names = {f.get("fieldname") for f in (fields.get("fields") or [])}
+        assert "employee_name" in names and "barcode" in names
+        # Missing employee must be controlled error, not AttributeError/500.
+        try:
+            pta.get_print_data("Staff Cred.", "")
+            raise AssertionError("expected DoesNotExistError for empty Staff Cred. docname")
+        except Exception as e:
+            assert "DoesNotExistError" in type(e).__name__ or "not found" in str(e).lower()
+
+    def check_company_settings():
+        from erpnext.erpnext_integrations.ecommerce_api import company_settings as cs
+        payload = cs.get_company_settings()
+        assert isinstance(payload, dict) and payload.get("company"), payload
+        assert payload["company"].get("company_name") or payload["company"].get("name")
+        assert payload.get("default_language") in ("en", "es", "zh")
 
     def check_tms():
         from erpnext.erpnext_integrations.ecommerce_api import tms_api as tms
@@ -711,6 +728,7 @@ def suite_5_12_modules_read():
     _run("5.12.3 device link + push status", check_devices, "S3")
     _run("5.12.4 get_floors", check_floors, "S3")
     _run("5.12.5 list_print_templates", check_print, "S3")
+    _run("5.12.5b get_company_settings", check_company_settings, "S3")
     _run("5.12.6 tms planner context + settings", check_tms, "S3")
     _run("5.12.7 get_shop_ui_settings", check_shop_ui, "S3")
     _run("5.12.8 search_tags", check_tags, "S3")

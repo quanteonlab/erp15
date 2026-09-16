@@ -3729,6 +3729,24 @@ def save_shop_ui_settings(settings=None):
 
 
 @frappe.whitelist()
+def get_company_settings(company=None):
+    from erpnext.erpnext_integrations.ecommerce_api.company_settings import (
+        get_company_settings as _impl,
+    )
+
+    return _impl(company=company)
+
+
+@frappe.whitelist()
+def save_company_settings(company=None, settings=None):
+    from erpnext.erpnext_integrations.ecommerce_api.company_settings import (
+        save_company_settings as _impl,
+    )
+
+    return _impl(company=company, settings=settings)
+
+
+@frappe.whitelist()
 def get_inquiry_automation_settings():
     from erpnext.erpnext_integrations.ecommerce_api.inquiry_automation_settings import (
         get_inquiry_automation_settings as _impl,

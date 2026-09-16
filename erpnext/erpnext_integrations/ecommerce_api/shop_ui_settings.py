@@ -188,6 +188,14 @@ def _normalize_companies(raw) -> dict:
 	return {"enabled": _as_bool(src.get("enabled"), False)}
 
 
+def _normalize_locale(raw) -> dict:
+	src = raw if isinstance(raw, dict) else {}
+	lang = src.get("defaultLanguage")
+	if lang not in ("en", "es", "zh"):
+		lang = "es"
+	return {"defaultLanguage": lang}
+
+
 def _normalize_bundle(data: dict | None) -> dict:
 	src = data if isinstance(data, dict) else {}
 	return {
@@ -195,6 +203,7 @@ def _normalize_bundle(data: dict | None) -> dict:
 		"stockWarning": _normalize_stock_warning(src.get("stockWarning")),
 		"catalogDisplay": _normalize_catalog_display(src.get("catalogDisplay")),
 		"companies": _normalize_companies(src.get("companies")),
+		"locale": _normalize_locale(src.get("locale")),
 	}
 
 
@@ -235,6 +244,9 @@ def save_shop_ui_settings(settings=None):
 		),
 		"companies": _normalize_companies(
 			{**(current.get("companies") or {}), **(incoming.get("companies") or {})}
+		),
+		"locale": _normalize_locale(
+			{**(current.get("locale") or {}), **(incoming.get("locale") or {})}
 		),
 	}
 	_save_raw(merged)

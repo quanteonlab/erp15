@@ -14,6 +14,8 @@ _SOURCE_DOCTYPE_CHILD_TABLE = {
 	# at export time from the current export settings (heading/phone/description),
 	# not from a stored document.
 	"Catalog Header": None,
+	# Synthetic — preview/print binds from Employee (+ staff login barcode store).
+	"Staff Cred.": None,
 }
 
 # Field list for the synthetic "Catalog Header" source doctype (see above).
@@ -23,6 +25,20 @@ _CATALOG_HEADER_FIELDS = [
 	{"fieldname": "phone", "label": "WhatsApp Phone", "fieldtype": "Data"},
 	{"fieldname": "qr_value", "label": "QR Value (wa.me link)", "fieldtype": "Data"},
 	{"fieldname": "company_name", "label": "Company Name", "fieldtype": "Data"},
+]
+
+# Field list for the synthetic "Staff Cred." source (Labels / ID card designer).
+_STAFF_CRED_FIELDS = [
+	{"fieldname": "org_name", "label": "Organization", "fieldtype": "Data"},
+	{"fieldname": "company_name", "label": "Company Name", "fieldtype": "Data"},
+	{"fieldname": "employee_name", "label": "Employee Name", "fieldtype": "Data"},
+	{"fieldname": "designation", "label": "Designation", "fieldtype": "Data"},
+	{"fieldname": "department", "label": "Department", "fieldtype": "Data"},
+	{"fieldname": "employee_id", "label": "Employee ID", "fieldtype": "Data"},
+	{"fieldname": "date_of_joining", "label": "Date of Joining", "fieldtype": "Date"},
+	{"fieldname": "expiration", "label": "Expiration", "fieldtype": "Date"},
+	{"fieldname": "barcode", "label": "Login Barcode", "fieldtype": "Data"},
+	{"fieldname": "image", "label": "Photo", "fieldtype": "Attach Image"},
 ]
 
 # Extra synthetic fields available only when designing an Item template scoped to
@@ -247,11 +263,51 @@ def set_default_print_template(template_id):
 	return {"status": "updated", "message": "Default print template set", "template_id": doc.name}
 
 
+def _staff_cred_print_data(docname):
+	"""Map an Employee (+ login barcode) into the synthetic Staff Cred. print doc."""
+	docname = (docname or "").strip()
+	if not docname or not frappe.db.exists("Employee", docname):
+		frappe.throw(_("Employee {0} not found").format(docname or "—"), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	emp = frappe.get_doc("Employee", docname)
+	frappe.flags.ignore_permissions = False
+
+	login_barcode = ""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import _load_staff_login_store
+
+		store = _load_staff_login_store()
+		entry = (store.get("by_employee") or {}).get(emp.name)
+		if isinstance(entry, dict):
+			login_barcode = str(entry.get("code") or "").strip()
+	except Exception:
+		login_barcode = ""
+
+	company_name = (emp.company or "").strip() or (frappe.defaults.get_global_default("company") or "")
+	data = {
+		"name": emp.name,
+		"org_name": company_name,
+		"company_name": company_name,
+		"employee_name": emp.employee_name or emp.name,
+		"designation": emp.designation or "",
+		"department": emp.department or "",
+		"employee_id": emp.name,
+		"date_of_joining": str(emp.date_of_joining) if emp.date_of_joining else "",
+		"expiration": "",
+		"barcode": login_barcode,
+		"image": emp.image or "",
+	}
+	return {"doc": data, "lineItems": []}
+
+
 @frappe.whitelist(allow_guest=True)
 def get_doctype_fields(source_doctype, paper_kind=None):
 	if source_doctype == "Catalog Header":
 		# Synthetic doctype — no frappe.get_meta lookup, fields are fixed.
 		return {"fields": list(_CATALOG_HEADER_FIELDS), "childTableFieldname": None, "childTableFields": []}
+	if source_doctype == "Staff Cred.":
+		return {"fields": list(_STAFF_CRED_FIELDS), "childTableFieldname": None, "childTableFields": []}
 
 	meta = frappe.get_meta(source_doctype)
 
@@ -283,6 +339,9 @@ def get_doctype_fields(source_doctype, paper_kind=None):
 
 @frappe.whitelist(allow_guest=True)
 def get_print_data(source_doctype, docname):
+	if source_doctype == "Staff Cred.":
+		return _staff_cred_print_data(docname)
+
 	if not frappe.db.exists(source_doctype, docname):
 		frappe.throw(_("{0} {1} not found").format(source_doctype, docname), frappe.DoesNotExistError)
 
@@ -680,6 +739,28 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-hdr-wa-phone", "kind": "field", "x": 29, "y": 42, "width": 60, "height": 8, "fieldPath": "phone", "label": "Phone", "fontSize": 9, "bold": True, "align": "left"},
 			{"id": "starter-hdr-qr-frame", "kind": "shape", "x": 150, "y": 8, "width": 36, "height": 36, "shapeType": "rect", "color": "#93c5fd"},
 			{"id": "starter-hdr-qr", "kind": "qrcode", "x": 152, "y": 10, "width": 32, "height": 32, "fieldPath": "qr_value"},
+		],
+	},
+	# ── Staff Cred. (ID card, Labels-style) ────────────────────────────
+	{
+		"template_name": "Default Staff Cred.",
+		"source_doctype": "Staff Cred.",
+		"paper_kind": "A4",
+		"is_default": True,
+		"canvas_width_mm": 86,
+		"canvas_height_mm": 54,
+		"margin_mm": [0, 0, 0, 0],
+		"elements": [
+			{"id": "starter-sc-header", "kind": "shape", "x": 0, "y": 0, "width": 86, "height": 12, "shapeType": "rect", "color": "#1d4ed8", "filled": True, "bgColor": "#1d4ed8"},
+			{"id": "starter-sc-org", "kind": "field", "x": 3, "y": 2, "width": 80, "height": 8, "fieldPath": "org_name", "label": "Organization", "fontSize": 10, "bold": True, "align": "center"},
+			{"id": "starter-sc-photo", "kind": "image", "x": 3, "y": 14, "width": 22, "height": 26, "fieldPath": "image"},
+			{"id": "starter-sc-name", "kind": "field", "x": 28, "y": 14, "width": 55, "height": 8, "fieldPath": "employee_name", "label": "Employee Name", "fontSize": 11, "bold": True, "align": "left"},
+			{"id": "starter-sc-role", "kind": "field", "x": 28, "y": 22, "width": 55, "height": 6, "fieldPath": "designation", "label": "Designation", "fontSize": 8, "align": "left"},
+			{"id": "starter-sc-id-label", "kind": "text", "x": 28, "y": 29, "width": 12, "height": 5, "staticText": "ID:", "fontSize": 7, "bold": True, "align": "left"},
+			{"id": "starter-sc-id", "kind": "field", "x": 40, "y": 29, "width": 43, "height": 5, "fieldPath": "employee_id", "label": "Employee ID", "fontSize": 7, "align": "left"},
+			{"id": "starter-sc-join-label", "kind": "text", "x": 28, "y": 34, "width": 14, "height": 5, "staticText": "Joined:", "fontSize": 7, "bold": True, "align": "left"},
+			{"id": "starter-sc-join", "kind": "field", "x": 42, "y": 34, "width": 41, "height": 5, "fieldPath": "date_of_joining", "label": "Date of Joining", "fontSize": 7, "align": "left"},
+			{"id": "starter-sc-barcode", "kind": "barcode", "x": 3, "y": 42, "width": 80, "height": 10, "fieldPath": "barcode"},
 		],
 	},
 	# ── Catalog Card (default product card, i030 A2) ───────────────────
