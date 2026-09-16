@@ -370,7 +370,7 @@ def _cancel_invoice_and_payments(invoice_name: str) -> None:
 		inv.cancel()
 
 
-def _require_note(note: str, action: str | None = None) -> str:
+def _require_note(note: str, action: str | None = None, items=None) -> str:
 	note = (note or "").strip()
 	cfg = _load_pin_settings()
 	if action is not None:
@@ -379,9 +379,56 @@ def _require_note(note: str, action: str | None = None) -> str:
 		required = cfg.get("amendment_note_required")
 		if required is None:
 			required = True
+	# Per-item return reasons can satisfy the comment requirement for Devolver.
+	if required and not note and action == "return_items":
+		has_item_reason = False
+		for it in items or []:
+			if isinstance(it, dict) and str(it.get("return_reason") or "").strip():
+				has_item_reason = True
+				break
+		if has_item_reason:
+			required = False
 	if required and not note:
 		frappe.throw(_("A note is required for this amendment."))
 	return note
+
+
+def _ensure_pos_return_qty_field() -> bool:
+	from erpnext.erpnext_integrations.ecommerce_api.product_manager import (
+		ensure_product_manager_custom_fields,
+	)
+
+	if frappe.db.has_column("Item", "custom_pos_return_qty"):
+		return True
+	ensure_product_manager_custom_fields()
+	return bool(frappe.db.has_column("Item", "custom_pos_return_qty"))
+
+
+def _record_item_pos_return(item_code: str, qty_returned: float, reason: str, invoice_name: str) -> None:
+	"""Append return reason to Item notes and bump cumulative return qty."""
+	code = (item_code or "").strip()
+	qty = flt(qty_returned)
+	if not code or qty <= 0 or not frappe.db.exists("Item", code):
+		return
+	_ensure_pos_return_qty_field()
+	stamp = str(now_datetime())[:16]
+	reason_txt = (reason or "").strip()
+	line = f"[{stamp}] Devolución POS x{qty:g}"
+	if reason_txt:
+		line += f": {reason_txt}"
+	line += f" ({invoice_name})"
+
+	if frappe.db.has_column("Item", "custom_review_notes"):
+		existing = frappe.db.get_value("Item", code, "custom_review_notes") or ""
+		combined = f"{line}\n{existing}".strip() if str(existing).strip() else line
+		# Small Text is short; keep newest notes first.
+		if len(combined) > 500:
+			combined = combined[:500]
+		frappe.db.set_value("Item", code, "custom_review_notes", combined, update_modified=False)
+
+	if frappe.db.has_column("Item", "custom_pos_return_qty"):
+		prev = flt(frappe.db.get_value("Item", code, "custom_pos_return_qty") or 0)
+		frappe.db.set_value("Item", code, "custom_pos_return_qty", prev + qty, update_modified=False)
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +461,8 @@ def get_pos_admin_settings():
 		"default_opening_cash": flt(opening),
 		"orders_visibility_mode": orders_visibility_mode,
 		"action_policy": _load_action_policy(cfg),
+		# Per-line return reason on Devolver (default on).
+		"return_reason_per_item": bool(cfg.get("return_reason_per_item", True)),
 	}
 
 
@@ -428,6 +477,7 @@ def save_pos_admin_settings(
 	default_opening_cash=None,
 	action_policy=None,
 	orders_visibility_mode=None,
+	return_reason_per_item=None,
 ):
 	if not _can_manage_settings():
 		frappe.throw(_("Not permitted ({0})").format("tools.settings"))
@@ -463,6 +513,8 @@ def save_pos_admin_settings(
 		if mode not in ("own_only", "group", "all_tagged"):
 			frappe.throw(_("Invalid orders visibility mode"))
 		cfg["orders_visibility_mode"] = mode
+	if return_reason_per_item is not None:
+		cfg["return_reason_per_item"] = bool(cint(return_reason_per_item))
 	if action_policy is not None:
 		if isinstance(action_policy, str):
 			action_policy = json.loads(action_policy)
@@ -780,8 +832,10 @@ def preview_pos_sale_amendment(invoice_name, action="cancel", items=None):
 
 @frappe.whitelist()
 def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=None, session_id=None):
+	if isinstance(items, str):
+		items = json.loads(items)
 	auth = _require_pin_or_admin(pin, action)
-	note = _require_note(note, action)
+	note = _require_note(note, action, items=items)
 	preview = preview_pos_sale_amendment(invoice_name, action=action, items=items)
 	inv = frappe.get_doc("Sales Invoice", invoice_name)
 	meta = _parse_invoice_remarks(inv.remarks)
@@ -812,20 +866,23 @@ def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=Non
 		trace["warehouse"] = ses.warehouse
 		trace["opening_cash"] = flt(ses.opening_cash)
 
+	# Capture original qtys before cancel (for return side-effects).
+	orig_before = frappe.get_all(
+		"Sales Invoice Item",
+		filters={"parent": invoice_name},
+		fields=["item_code", "qty"],
+		ignore_permissions=True,
+	)
+	old_qty_by = {r.item_code: flt(r.qty) for r in orig_before}
+
 	_cancel_invoice_and_payments(invoice_name)
 
 	recreated = None
 	if action in ("edit", "return_items"):
-		if isinstance(items, str):
-			items = json.loads(items)
 		keep = [it for it in (items or []) if flt(it.get("qty")) > 0]
 		if keep:
 			from erpnext.erpnext_integrations.ecommerce_api.api import create_pos_sale
 
-			total = sum(flt(it.get("qty")) * flt(it.get("rate") or 0) for it in keep)
-			# Rebuild from original invoice items for rate/warehouse
-			orig = _items_for_invoices([invoice_name]).get(invoice_name) or []
-			# invoice already cancelled — fetch from cancelled child? get_all may still see cancelled parent items
 			orig = frappe.get_all(
 				"Sales Invoice Item",
 				filters={"parent": invoice_name},
@@ -841,7 +898,7 @@ def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=Non
 				payload.append(
 					{
 						"item_code": it.get("item_code"),
-						"item_name": (src.item_name if src else it.get("item_code")),
+						"item_name": (src.item_name if src else it.get("item_name") or it.get("item_code")),
 						"qty": qty,
 						"rate": rate,
 						"amount": qty * rate,
@@ -861,6 +918,24 @@ def amend_pos_sale(invoice_name, action="cancel", pin=None, note=None, items=Non
 				branch_id=meta.get("branch"),
 				sale_mode=meta.get("sale_mode") or "WHITE",
 				pos_session_id=session_id,
+			)
+
+	if action == "return_items":
+		new_qty_by = {str(it.get("item_code")): flt(it.get("qty")) for it in (items or [])}
+		reason_by = {
+			str(it.get("item_code")): str(it.get("return_reason") or "").strip()
+			for it in (items or [])
+			if isinstance(it, dict)
+		}
+		for code, old_q in old_qty_by.items():
+			returned = old_q - new_qty_by.get(code, 0.0)
+			if returned <= 0:
+				continue
+			_record_item_pos_return(
+				code,
+				returned,
+				reason_by.get(code) or note,
+				invoice_name,
 			)
 
 	sr_name = _submit_stock_reconciliation(preview.get("stock_preview") or [], note, trace)

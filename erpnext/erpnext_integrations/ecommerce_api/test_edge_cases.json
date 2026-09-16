@@ -1,13 +1,84 @@
 {
   "_readme": "API edge / dirty-payload kit. Expand this file whenever an API bug is fixed (see .cursor/rules/api-test-kit.mdc). Runner: scripts/test_edge.sh → test_edge.run",
   "matrix_fields": {
-    "page_length": [null, "", " ", "null", "10", 10, 0, -1, true, []],
-    "start": [null, "", "0", 0, "abc"],
-    "price_list": [null, "", " ", "Standard Selling", 123, []],
-    "barcode": [null, "", " ", "null", " 7790580132170 ", "7790580132170", 7790580132170, []],
-    "item_code": [null, "", " ", "MISSING-ITEM-XYZ", []],
-    "qty": [null, "", " ", "1", 1, 0, -1, "1.5", 1.5, true, []],
-    "items": [null, "", "null", [], [{}], [{"item_code": null, "qty": ""}], [{"item_code": "", "qty": null}]]
+    "page_length": [
+      null,
+      "",
+      " ",
+      "null",
+      "10",
+      10,
+      0,
+      -1,
+      true,
+      []
+    ],
+    "start": [
+      null,
+      "",
+      "0",
+      0,
+      "abc"
+    ],
+    "price_list": [
+      null,
+      "",
+      " ",
+      "Standard Selling",
+      123,
+      []
+    ],
+    "barcode": [
+      null,
+      "",
+      " ",
+      "null",
+      " 7790580132170 ",
+      "7790580132170",
+      7790580132170,
+      []
+    ],
+    "item_code": [
+      null,
+      "",
+      " ",
+      "MISSING-ITEM-XYZ",
+      []
+    ],
+    "qty": [
+      null,
+      "",
+      " ",
+      "1",
+      1,
+      0,
+      -1,
+      "1.5",
+      1.5,
+      true,
+      []
+    ],
+    "items": [
+      null,
+      "",
+      "null",
+      [],
+      [
+        {}
+      ],
+      [
+        {
+          "item_code": null,
+          "qty": ""
+        }
+      ],
+      [
+        {
+          "item_code": "",
+          "qty": null
+        }
+      ]
+    ]
   },
   "cases": [
     {
@@ -55,21 +126,30 @@
     {
       "id": "search_by_barcode_null",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_by_barcode",
-      "args": { "barcode": null, "price_list": null },
+      "args": {
+        "barcode": null,
+        "price_list": null
+      },
       "expect": "no_500",
       "source": "seed"
     },
     {
       "id": "search_by_barcode_blank",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_by_barcode",
-      "args": { "barcode": "   ", "price_list": "" },
+      "args": {
+        "barcode": "   ",
+        "price_list": ""
+      },
       "expect": "no_500",
       "source": "seed"
     },
     {
       "id": "search_by_barcode_numeric",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_by_barcode",
-      "args": { "barcode": 7790580132170, "price_list": "Standard Selling" },
+      "args": {
+        "barcode": 7790580132170,
+        "price_list": "Standard Selling"
+      },
       "expect": "no_500",
       "source": "regression",
       "bug": "AttributeError: int barcode had no .strip() — coerce via cstr in _item_codes_for_barcode",
@@ -85,7 +165,9 @@
     {
       "id": "get_pm_context_null_company",
       "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_pm_context",
-      "args": { "company": null },
+      "args": {
+        "company": null
+      },
       "expect": "no_500",
       "source": "seed",
       "note": "Null company from clients; unknown keys are stripped by Frappe HTTP layer so not tested via get_attr"
@@ -124,9 +206,20 @@
       "args": {
         "offline_order_uuid": "edge-dirty-line",
         "receipt_number": "EDGE-DIRTY",
-        "items": [{ "item_code": null, "qty": "", "rate": "null" }],
+        "items": [
+          {
+            "item_code": null,
+            "qty": "",
+            "rate": "null"
+          }
+        ],
         "total_amount": "",
-        "payments": [{ "mode_of_payment": null, "amount": "" }]
+        "payments": [
+          {
+            "mode_of_payment": null,
+            "amount": ""
+          }
+        ]
       },
       "expect": "no_500",
       "source": "seed",
@@ -136,7 +229,9 @@
     {
       "id": "validate_discount_pin_wrong_when_configured",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.validate_discount_pin",
-      "args": { "pin": "000000_WRONG_EDGE" },
+      "args": {
+        "pin": "000000_WRONG_EDGE"
+      },
       "expect": "ok",
       "source": "regression",
       "bug": "Smoke 5.5.3 used legacy conf.pos_manager_pin; hashed admin PIN settings are the source of truth via _pin_configured()",
@@ -168,6 +263,21 @@
       "expect": "ok",
       "source": "regression",
       "bug": "unread badge compared Lead.modified (datetime) to JSON lastseen seen_at (str) → TypeError"
+    },
+    {
+      "id": "amend_pos_sale_return_null_items",
+      "source": "regression",
+      "bug": "amend return_items with null/empty items must not TypeError; controlled error or empty keep",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.amend_pos_sale",
+      "args": {
+        "invoice_name": null,
+        "action": "return_items",
+        "pin": "",
+        "note": null,
+        "items": null,
+        "session_id": null
+      },
+      "expect": "error"
     }
   ]
 }

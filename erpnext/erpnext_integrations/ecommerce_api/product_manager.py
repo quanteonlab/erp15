@@ -698,6 +698,14 @@ def ensure_product_manager_custom_fields() -> None:
                     "insert_after": "custom_unit_sku",
                     "reqd": 0,
                 },
+                {
+                    "fieldname": "custom_pos_return_qty",
+                    "fieldtype": "Float",
+                    "label": "POS Return Qty",
+                    "insert_after": "custom_review_notes",
+                    "description": "Cumulative qty returned via POS Sesiones → Devolver.",
+                    "reqd": 0,
+                },
             ]
         },
         ignore_validate=True,
@@ -815,6 +823,7 @@ def get_product_rows(
     if warehouse in ("", None, "null"):
         warehouse = None
     has_unit_sku_col = frappe.db.has_column("Item", "custom_unit_sku")
+    has_return_qty_col = frappe.db.has_column("Item", "custom_pos_return_qty")
 
     page = cint(page) or 1
     page_length = cint(page_length) or 100
@@ -1003,6 +1012,11 @@ def get_product_rows(
         val_join = ""
 
     unit_sku_select = "COALESCE(i.custom_unit_sku, NULL) AS unit_sku" if has_unit_sku_col else "NULL AS unit_sku"
+    return_qty_select = (
+        "COALESCE(i.custom_pos_return_qty, 0) AS return_qty"
+        if has_return_qty_col
+        else "0 AS return_qty"
+    )
 
     sql = f"""
         SELECT
@@ -1015,6 +1029,7 @@ def get_product_rows(
             COALESCE(i.custom_pack_size, NULL)         AS pack_size,
             COALESCE(i.custom_pack_unit, NULL)         AS unit,
             {unit_sku_select},
+            {return_qty_select},
             i.disabled               AS _disabled,
             COALESCE(i.custom_normalized_title, NULL)  AS _raw_norm,
             COALESCE(NULLIF(TRIM(i.custom_normalized_title), ''), i.item_name) AS normalized_title,
@@ -3423,6 +3438,7 @@ def save_pos_admin_settings(
     default_opening_cash=None,
     action_policy=None,
     orders_visibility_mode=None,
+    return_reason_per_item=None,
 ):
     from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
         save_pos_admin_settings as _impl,
@@ -3438,6 +3454,7 @@ def save_pos_admin_settings(
         default_opening_cash=default_opening_cash,
         action_policy=action_policy,
         orders_visibility_mode=orders_visibility_mode,
+        return_reason_per_item=return_reason_per_item,
     )
 
 
