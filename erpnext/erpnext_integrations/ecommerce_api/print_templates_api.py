@@ -9,6 +9,7 @@ _SOURCE_DOCTYPE_CHILD_TABLE = {
 	"Sales Invoice": "items",
 	"Purchase Receipt": "items",
 	"Delivery Note": "items",
+	"Sales Order": "items",
 	"Item": None,
 	# Synthetic — not a real Frappe doctype. The catalog PDF binds these fields
 	# at export time from the current export settings (heading/phone/description),
@@ -16,6 +17,8 @@ _SOURCE_DOCTYPE_CHILD_TABLE = {
 	"Catalog Header": None,
 	# Synthetic — preview/print binds from Employee (+ staff login barcode store).
 	"Staff Cred.": None,
+	# Synthetic — armado de pedido / picking list bound from a Sales Order (+ floor map).
+	"Delivery Checklist": "items",
 }
 
 # Field list for the synthetic "Catalog Header" source doctype (see above).
@@ -39,6 +42,30 @@ _STAFF_CRED_FIELDS = [
 	{"fieldname": "expiration", "label": "Expiration", "fieldtype": "Date"},
 	{"fieldname": "barcode", "label": "Login Barcode", "fieldtype": "Data"},
 	{"fieldname": "image", "label": "Photo", "fieldtype": "Attach Image"},
+]
+
+# Synthetic "Delivery Checklist" (armado de pedido) — bound from Sales Order + warehouse/floor.
+_DELIVERY_CHECKLIST_FIELDS = [
+	{"fieldname": "name", "label": "Order Nº", "fieldtype": "Data"},
+	{"fieldname": "customer_name", "label": "Cliente", "fieldtype": "Data"},
+	{"fieldname": "tax_id", "label": "Numero de identificador", "fieldtype": "Data"},
+	{"fieldname": "delivery_date", "label": "Fecha de Envio", "fieldtype": "Date"},
+	{"fieldname": "transaction_date", "label": "Order Date", "fieldtype": "Date"},
+	{"fieldname": "warehouse_name", "label": "Almacen", "fieldtype": "Data"},
+	{"fieldname": "net_total", "label": "Subtotal", "fieldtype": "Currency"},
+	{"fieldname": "grand_total", "label": "TOTAL", "fieldtype": "Currency"},
+	{"fieldname": "_map", "label": "Warehouse Map", "fieldtype": "JSON"},
+]
+
+_DELIVERY_CHECKLIST_CHILD_FIELDS = [
+	{"fieldname": "item_code", "label": "Código", "fieldtype": "Data"},
+	{"fieldname": "item_name", "label": "Descripción", "fieldtype": "Data"},
+	{"fieldname": "qty", "label": "Cantidad", "fieldtype": "Float"},
+	{"fieldname": "warehouse", "label": "Desde", "fieldtype": "Data"},
+	{"fieldname": "location", "label": "Ubicación", "fieldtype": "Data"},
+	{"fieldname": "barcode", "label": "Codigo de Barras", "fieldtype": "Data"},
+	{"fieldname": "amount", "label": "Importe", "fieldtype": "Currency"},
+	{"fieldname": "rate", "label": "Precio", "fieldtype": "Currency"},
 ]
 
 # Extra synthetic fields available only when designing an Item template scoped to
@@ -65,6 +92,47 @@ _SKIP_FIELDTYPES = {
 	"Password",
 	"Signature",
 }
+
+# Keep Select options in sync with code even if `bench migrate` has not run yet
+# (starter gift from /logistica/prints would otherwise ValidationError on new sources).
+_SOURCE_DOCTYPE_SELECT_OPTIONS = "\n".join(
+	[
+		"Sales Invoice",
+		"Purchase Receipt",
+		"Delivery Note",
+		"Sales Order",
+		"Delivery Checklist",
+		"Item",
+		"Catalog Header",
+		"Staff Cred.",
+	]
+)
+
+
+def _ensure_source_doctype_select_options():
+	"""Patch DocField options when JSON/code is ahead of the site's DocType cache."""
+	try:
+		row = frappe.db.get_value(
+			"DocField",
+			{"parent": "ECommerce Print Template", "fieldname": "source_doctype"},
+			["name", "options"],
+			as_dict=True,
+		)
+		if not row:
+			return
+		if (row.options or "").strip() == _SOURCE_DOCTYPE_SELECT_OPTIONS:
+			return
+		frappe.db.set_value(
+			"DocField",
+			row.name,
+			"options",
+			_SOURCE_DOCTYPE_SELECT_OPTIONS,
+			update_modified=False,
+		)
+		frappe.clear_cache(doctype="ECommerce Print Template")
+		frappe.db.commit()
+	except Exception:
+		frappe.log_error(title="print_templates_api: sync source_doctype options")
 
 
 def _has_company_column() -> bool:
@@ -308,6 +376,12 @@ def get_doctype_fields(source_doctype, paper_kind=None):
 		return {"fields": list(_CATALOG_HEADER_FIELDS), "childTableFieldname": None, "childTableFields": []}
 	if source_doctype == "Staff Cred.":
 		return {"fields": list(_STAFF_CRED_FIELDS), "childTableFieldname": None, "childTableFields": []}
+	if source_doctype == "Delivery Checklist":
+		return {
+			"fields": list(_DELIVERY_CHECKLIST_FIELDS),
+			"childTableFieldname": "items",
+			"childTableFields": list(_DELIVERY_CHECKLIST_CHILD_FIELDS),
+		}
 
 	meta = frappe.get_meta(source_doctype)
 
@@ -337,10 +411,179 @@ def get_doctype_fields(source_doctype, paper_kind=None):
 	}
 
 
+def _item_barcode(item_code: str) -> str:
+	if not item_code:
+		return ""
+	try:
+		rows = frappe.get_all(
+			"Item Barcode",
+			filters={"parent": item_code},
+			fields=["barcode"],
+			limit=1,
+			ignore_permissions=True,
+		)
+		if rows:
+			return rows[0].barcode or ""
+	except Exception:
+		pass
+	return frappe.db.get_value("Item", item_code, "item_code") or item_code
+
+
+def _default_warehouse_name(company=None) -> str:
+	wh = None
+	if company and frappe.db.has_column("Company", "custom_default_warehouse"):
+		wh = frappe.db.get_value("Company", company, "custom_default_warehouse")
+	if not wh:
+		wh = frappe.db.get_single_value("Stock Settings", "default_warehouse")
+	if not wh:
+		wh = frappe.db.get_value("Warehouse", {"is_group": 0}, "name", order_by="modified desc")
+	return wh or ""
+
+
+def _floor_sku_locations(floor_id=None, company=None):
+	"""Map item_code → {location, section_id} from ECommerce Floor Map racks."""
+	filters = {}
+	try:
+		if company and frappe.db.has_column("ECommerce Floor Map", "company"):
+			filters["company"] = company
+	except Exception:
+		pass
+	if floor_id:
+		filters["name"] = floor_id
+
+	floors = frappe.get_all(
+		"ECommerce Floor Map",
+		filters=filters or None,
+		fields=["name", "sections_data", "location_name", "floor_name", "canvas_width", "canvas_height"],
+		order_by="modified desc",
+		ignore_permissions=True,
+	)
+	sku_to_loc = {}
+	map_payload = None
+	for f in floors:
+		sections = []
+		try:
+			sections = json.loads(f.sections_data or "[]")
+		except Exception:
+			sections = []
+		highlighted = set()
+		for s in sections:
+			if not isinstance(s, dict):
+				continue
+			code = (s.get("code") or s.get("name") or "").strip()
+			skus = list(s.get("products") or [])
+			for row in s.get("productRows") or []:
+				if isinstance(row, dict) and row.get("sku"):
+					skus.append(row["sku"])
+			for sku in skus:
+				sku = (sku or "").strip()
+				if not sku:
+					continue
+				if sku not in sku_to_loc:
+					sku_to_loc[sku] = {"location": code, "section_id": s.get("id")}
+					if s.get("id"):
+						highlighted.add(s.get("id"))
+		if map_payload is None:
+			map_payload = {
+				"floor_id": f.name,
+				"title": f"{f.location_name} / {f.floor_name}",
+				"canvas": {"width": f.canvas_width or 1400, "height": f.canvas_height or 900},
+				"sections": [
+					{
+						"id": s.get("id"),
+						"code": s.get("code") or "",
+						"name": s.get("name") or "",
+						"x": s.get("x") or 0,
+						"y": s.get("y") or 0,
+						"width": s.get("width") or 0,
+						"height": s.get("height") or 0,
+						"color": s.get("color") or "#94a3b8",
+						"highlight": False,
+					}
+					for s in sections
+					if isinstance(s, dict)
+				],
+			}
+			# highlight filled after we know which SKUs matter — caller updates
+			map_payload["_sku_to_loc"] = sku_to_loc
+		# Prefer first matching floor when floor_id set; otherwise first floor with sections
+		if floor_id or sections:
+			break
+	return sku_to_loc, map_payload
+
+
+def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=None):
+	if not frappe.db.exists("Sales Order", sales_order_name):
+		frappe.throw(_("Sales Order {0} not found").format(sales_order_name), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", sales_order_name)
+	frappe.flags.ignore_permissions = False
+
+	company = so.company
+	wh = warehouse or _default_warehouse_name(company)
+	sku_to_loc, map_payload = _floor_sku_locations(floor_id=floor_id, company=company)
+
+	tax_id = ""
+	if so.customer:
+		tax_id = frappe.db.get_value("Customer", so.customer, "tax_id") or ""
+
+	rows = []
+	highlight_ids = set()
+	for it in so.items or []:
+		loc_info = sku_to_loc.get(it.item_code) or {}
+		loc = loc_info.get("location") or ""
+		sid = loc_info.get("section_id")
+		if sid:
+			highlight_ids.add(sid)
+		rows.append(
+			{
+				"item_code": it.item_code,
+				"item_name": it.item_name,
+				"qty": it.qty,
+				"rate": it.rate,
+				"amount": it.amount,
+				"warehouse": it.warehouse or wh,
+				"location": loc,
+				"barcode": _item_barcode(it.item_code),
+			}
+		)
+
+	map_out = None
+	if map_payload:
+		map_out = {
+			"floor_id": map_payload["floor_id"],
+			"title": map_payload["title"],
+			"canvas": map_payload["canvas"],
+			"sections": [
+				{**s, "highlight": s.get("id") in highlight_ids}
+				for s in map_payload["sections"]
+			],
+		}
+
+	doc = {
+		"name": so.name,
+		"customer": so.customer,
+		"customer_name": so.customer_name or so.customer,
+		"tax_id": tax_id,
+		"delivery_date": so.delivery_date,
+		"transaction_date": so.transaction_date,
+		"warehouse_name": wh,
+		"net_total": so.net_total,
+		"grand_total": so.grand_total,
+		"company": company,
+		"_map": map_out,
+	}
+	return {"doc": doc, "lineItems": rows, "map": map_out}
+
+
 @frappe.whitelist(allow_guest=True)
-def get_print_data(source_doctype, docname):
+def get_print_data(source_doctype, docname, warehouse=None, floor_id=None):
 	if source_doctype == "Staff Cred.":
 		return _staff_cred_print_data(docname)
+
+	if source_doctype == "Delivery Checklist":
+		return _delivery_checklist_print_data(docname, warehouse=warehouse, floor_id=floor_id)
 
 	if not frappe.db.exists(source_doctype, docname):
 		frappe.throw(_("{0} {1} not found").format(source_doctype, docname), frappe.DoesNotExistError)
@@ -362,6 +605,79 @@ def get_print_data(source_doctype, docname):
 	}
 
 
+@frappe.whitelist(allow_guest=True)
+def get_order_print_bundle(sales_order, warehouse=None, floor_id=None):
+	"""Resolve linked commercial docs + Delivery Checklist data for the orders print modal."""
+	if not sales_order:
+		frappe.throw(_("sales_order is required"))
+	if not frappe.db.exists("Sales Order", sales_order):
+		frappe.throw(_("Sales Order {0} not found").format(sales_order), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", sales_order)
+	frappe.flags.ignore_permissions = False
+
+	# Linked Delivery Note (via DN Item against_sales_order)
+	dn = frappe.db.get_value(
+		"Delivery Note Item",
+		{"against_sales_order": sales_order, "docstatus": ["!=", 2]},
+		"parent",
+	)
+	# Linked Sales Invoice
+	si = frappe.db.get_value(
+		"Sales Invoice Item",
+		{"sales_order": sales_order, "docstatus": ["!=", 2]},
+		"parent",
+	)
+	# Purchase Receipt is unusual for SO; still surface if a return/receipt was linked somehow
+	pr = None
+
+	advance = float(so.advance_paid or 0)
+	grand = float(so.grand_total or 0)
+	paid = advance >= grand - 0.01 if grand else advance > 0
+
+	wh = warehouse or _default_warehouse_name(so.company)
+	warehouses = frappe.get_all(
+		"Warehouse",
+		filters={"is_group": 0, "company": so.company} if so.company else {"is_group": 0},
+		fields=["name"],
+		order_by="name asc",
+		limit_page_length=200,
+		ignore_permissions=True,
+	)
+
+	floors_raw = frappe.get_all(
+		"ECommerce Floor Map",
+		fields=["name", "location_name", "floor_name"],
+		order_by="modified desc",
+		ignore_permissions=True,
+		limit_page_length=50,
+	)
+
+	checklist = _delivery_checklist_print_data(sales_order, warehouse=wh, floor_id=floor_id)
+
+	return {
+		"sales_order": so.name,
+		"customer_name": so.customer_name or so.customer,
+		"grand_total": grand,
+		"advance_paid": advance,
+		"paid": paid,
+		"currency": so.currency,
+		"default_warehouse": wh,
+		"warehouses": [w.name for w in warehouses],
+		"floors": [
+			{"id": f.name, "title": f"{f.location_name} / {f.floor_name}"} for f in floors_raw
+		],
+		"links": {
+			"sales_invoice": si,
+			"delivery_note": dn,
+			"purchase_receipt": pr,
+		},
+		"checklist": checklist,
+		"item_codes": [it.item_code for it in (so.items or []) if it.item_code],
+	}
+
+
 _PAPER_SIZE_MM = {
 	"A4": (210, 297),
 	"Thermal 58mm": (58, 150),
@@ -370,7 +686,574 @@ _PAPER_SIZE_MM = {
 	"Catalog Card": (48, 66),
 }
 
+
+def _ar_documento_no_valido_a4_elements(*, party_label: str, party_field: str, id_prefix: str):
+	"""A4 commercial layout matching 'DOCUMENTO NO VALIDO COMO FACTURA'.
+
+	Used for both Sales Invoice (Cliente) and Purchase Receipt (Proveedor).
+	Columns include Precio Kg. / Precio U. for bazar weight+unit mixes.
+	"""
+	p = id_prefix
+	return [
+		# Header (right)
+		{
+			"id": f"{p}-title",
+			"kind": "text",
+			"x": 95,
+			"y": 12,
+			"width": 100,
+			"height": 10,
+			"staticText": "DOCUMENTO NO VALIDO COMO FACTURA",
+			"fontSize": 11,
+			"bold": True,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-nro-label",
+			"kind": "text",
+			"x": 130,
+			"y": 24,
+			"width": 18,
+			"height": 6,
+			"staticText": "N°",
+			"fontSize": 9,
+			"bold": True,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-nro",
+			"kind": "field",
+			"x": 148,
+			"y": 24,
+			"width": 47,
+			"height": 6,
+			"fieldPath": "name",
+			"label": "N°",
+			"fontSize": 9,
+			"bold": True,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-fecha-label",
+			"kind": "text",
+			"x": 130,
+			"y": 32,
+			"width": 18,
+			"height": 6,
+			"staticText": "Fecha:",
+			"fontSize": 9,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-fecha",
+			"kind": "field",
+			"x": 148,
+			"y": 32,
+			"width": 47,
+			"height": 6,
+			"fieldPath": "posting_date",
+			"label": "Fecha",
+			"fontSize": 9,
+			"align": "right",
+		},
+		# Party block (left)
+		{
+			"id": f"{p}-party-label",
+			"kind": "text",
+			"x": 15,
+			"y": 48,
+			"width": 28,
+			"height": 6,
+			"staticText": f"{party_label} :",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-party",
+			"kind": "field",
+			"x": 43,
+			"y": 48,
+			"width": 85,
+			"height": 6,
+			"fieldPath": party_field,
+			"label": party_label,
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-dir-label",
+			"kind": "text",
+			"x": 15,
+			"y": 56,
+			"width": 28,
+			"height": 6,
+			"staticText": "Dirección :",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-dir",
+			"kind": "field",
+			"x": 43,
+			"y": 56,
+			"width": 85,
+			"height": 6,
+			"fieldPath": "address_display",
+			"label": "Dirección",
+			"fontSize": 8,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-iva-label",
+			"kind": "text",
+			"x": 15,
+			"y": 64,
+			"width": 28,
+			"height": 6,
+			"staticText": "IVA:",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-iva",
+			"kind": "field",
+			"x": 43,
+			"y": 64,
+			"width": 50,
+			"height": 6,
+			"fieldPath": "tax_category",
+			"label": "IVA",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-cuit-label",
+			"kind": "text",
+			"x": 100,
+			"y": 64,
+			"width": 18,
+			"height": 6,
+			"staticText": "CUIT:",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-cuit",
+			"kind": "field",
+			"x": 118,
+			"y": 64,
+			"width": 50,
+			"height": 6,
+			"fieldPath": "tax_id",
+			"label": "CUIT",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-ri-label",
+			"kind": "text",
+			"x": 15,
+			"y": 72,
+			"width": 42,
+			"height": 6,
+			"staticText": "Responsable Inscripto :",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-ri",
+			"kind": "text",
+			"x": 57,
+			"y": 72,
+			"width": 40,
+			"height": 6,
+			"staticText": "",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-cond-label",
+			"kind": "text",
+			"x": 100,
+			"y": 72,
+			"width": 40,
+			"height": 6,
+			"staticText": "Condición de Venta :",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-cond",
+			"kind": "field",
+			"x": 140,
+			"y": 72,
+			"width": 55,
+			"height": 6,
+			"fieldPath": "payment_terms_template",
+			"label": "Condición",
+			"fontSize": 9,
+			"align": "left",
+		},
+		# Line items — navy header bar like the paper form
+		{
+			"id": f"{p}-items",
+			"kind": "line-items",
+			"x": 12,
+			"y": 86,
+			"width": 186,
+			"height": 120,
+			"childTableFieldname": "items",
+			"headerBg": "#1e3a5f",
+			"headerColor": "#ffffff",
+			"columns": [
+				{"fieldPath": "item_code", "label": "Código", "width": 22},
+				{"fieldPath": "item_name", "label": "Descripción", "width": 48},
+				{"fieldPath": "uom", "label": "Unidades", "width": 22},
+				{"fieldPath": "qty", "label": "Cantidad", "width": 18},
+				{"fieldPath": "price_list_rate", "label": "Precio Kg.", "width": 22},
+				{"fieldPath": "rate", "label": "Precio U.", "width": 20},
+				{"fieldPath": "discount_percentage", "label": "Descuento", "width": 16},
+				{"fieldPath": "amount", "label": "Importe", "width": 18},
+			],
+		},
+		# Totals (right)
+		{
+			"id": f"{p}-sub-label",
+			"kind": "text",
+			"x": 130,
+			"y": 220,
+			"width": 30,
+			"height": 7,
+			"staticText": "Subtotal",
+			"fontSize": 10,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-sub",
+			"kind": "field",
+			"x": 160,
+			"y": 220,
+			"width": 35,
+			"height": 7,
+			"fieldPath": "net_total",
+			"label": "Subtotal",
+			"fontSize": 10,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-total-label",
+			"kind": "text",
+			"x": 130,
+			"y": 230,
+			"width": 30,
+			"height": 8,
+			"staticText": "TOTAL",
+			"fontSize": 12,
+			"bold": True,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-total",
+			"kind": "field",
+			"x": 160,
+			"y": 230,
+			"width": 35,
+			"height": 8,
+			"fieldPath": "grand_total",
+			"label": "TOTAL",
+			"fontSize": 12,
+			"bold": True,
+			"align": "right",
+		},
+		# Signature
+		{
+			"id": f"{p}-firma-label",
+			"kind": "text",
+			"x": 110,
+			"y": 255,
+			"width": 85,
+			"height": 6,
+			"staticText": "Recibi Conforme (Firma y Aclaración):",
+			"fontSize": 8,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-firma-line",
+			"kind": "shape",
+			"x": 110,
+			"y": 268,
+			"width": 85,
+			"height": 1,
+			"shapeType": "line",
+			"color": "#0f172a",
+		},
+	]
+
+
+def _ar_entregas_checklist_a4_elements(*, id_prefix: str, with_location: bool = False, with_map: bool = False):
+	"""A4 picking / armado de pedido layout matching ENTREGAS commercial form."""
+	p = id_prefix
+	columns = [
+		{"fieldPath": "item_code", "label": "Código", "width": 28},
+		{"fieldPath": "item_name", "label": "Descripción", "width": 62 if with_location else 72},
+		{"fieldPath": "qty", "label": "Cantidad", "width": 20},
+		{"fieldPath": "warehouse", "label": "Desde", "width": 28},
+	]
+	if with_location:
+		columns.append({"fieldPath": "location", "label": "Ubicación", "width": 22})
+	columns.append({"fieldPath": "barcode", "label": "Codigo de Barras", "width": 26 if with_location else 32})
+
+	items_height = 90 if with_map else 120
+	elements = [
+		{
+			"id": f"{p}-title",
+			"kind": "text",
+			"x": 15,
+			"y": 12,
+			"width": 180,
+			"height": 14,
+			"staticText": "ENTREGAS",
+			"fontSize": 22,
+			"bold": True,
+			"align": "center",
+		},
+		{
+			"id": f"{p}-nro-label",
+			"kind": "text",
+			"x": 15,
+			"y": 28,
+			"width": 180,
+			"height": 6,
+			"staticText": "Nº",
+			"fontSize": 10,
+			"align": "center",
+		},
+		{
+			"id": f"{p}-nro",
+			"kind": "field",
+			"x": 15,
+			"y": 34,
+			"width": 180,
+			"height": 7,
+			"fieldPath": "name",
+			"label": "Nº",
+			"fontSize": 11,
+			"bold": True,
+			"align": "center",
+		},
+		{
+			"id": f"{p}-cli-label",
+			"kind": "text",
+			"x": 15,
+			"y": 48,
+			"width": 28,
+			"height": 6,
+			"staticText": "Cliente :",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-cli",
+			"kind": "field",
+			"x": 43,
+			"y": 48,
+			"width": 90,
+			"height": 6,
+			"fieldPath": "customer_name",
+			"label": "Cliente",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-wh-label",
+			"kind": "text",
+			"x": 145,
+			"y": 46,
+			"width": 50,
+			"height": 5,
+			"staticText": "Almacen",
+			"fontSize": 8,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-wh",
+			"kind": "field",
+			"x": 130,
+			"y": 52,
+			"width": 65,
+			"height": 10,
+			"fieldPath": "warehouse_name",
+			"label": "Almacen",
+			"fontSize": 14,
+			"bold": True,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-id-label",
+			"kind": "text",
+			"x": 15,
+			"y": 56,
+			"width": 50,
+			"height": 6,
+			"staticText": "Numero de identificador:",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-id",
+			"kind": "field",
+			"x": 65,
+			"y": 56,
+			"width": 60,
+			"height": 6,
+			"fieldPath": "tax_id",
+			"label": "ID",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-ship-label",
+			"kind": "text",
+			"x": 15,
+			"y": 64,
+			"width": 40,
+			"height": 6,
+			"staticText": "Fecha de Envio:",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-ship",
+			"kind": "field",
+			"x": 55,
+			"y": 64,
+			"width": 50,
+			"height": 6,
+			"fieldPath": "delivery_date",
+			"label": "Fecha de Envio",
+			"fontSize": 9,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-items",
+			"kind": "line-items",
+			"x": 12,
+			"y": 78,
+			"width": 186,
+			"height": items_height,
+			"childTableFieldname": "items",
+			"headerBg": "#1e3a5f",
+			"headerColor": "#ffffff",
+			"columns": columns,
+		},
+	]
+
+	footer_y = 200 if with_map else 210
+	if with_map:
+		elements.append(
+			{
+				"id": f"{p}-map",
+				"kind": "warehouse-map",
+				"x": 12,
+				"y": 172,
+				"width": 186,
+				"height": 55,
+				"fieldPath": "_map",
+			}
+		)
+		footer_y = 232
+
+	elements.extend(
+		[
+			{
+				"id": f"{p}-sub-label",
+				"kind": "text",
+				"x": 130,
+				"y": footer_y,
+				"width": 30,
+				"height": 7,
+				"staticText": "Subtotal",
+				"fontSize": 10,
+				"align": "right",
+			},
+			{
+				"id": f"{p}-sub",
+				"kind": "field",
+				"x": 160,
+				"y": footer_y,
+				"width": 35,
+				"height": 7,
+				"fieldPath": "net_total",
+				"label": "Subtotal",
+				"fontSize": 10,
+				"align": "right",
+			},
+			{
+				"id": f"{p}-total-label",
+				"kind": "text",
+				"x": 130,
+				"y": footer_y + 10,
+				"width": 30,
+				"height": 8,
+				"staticText": "TOTAL",
+				"fontSize": 12,
+				"bold": True,
+				"align": "right",
+			},
+			{
+				"id": f"{p}-total",
+				"kind": "field",
+				"x": 160,
+				"y": footer_y + 10,
+				"width": 35,
+				"height": 8,
+				"fieldPath": "grand_total",
+				"label": "TOTAL",
+				"fontSize": 12,
+				"bold": True,
+				"align": "right",
+			},
+			{
+				"id": f"{p}-firma-label",
+				"kind": "text",
+				"x": 110,
+				"y": footer_y + 28,
+				"width": 85,
+				"height": 6,
+				"staticText": "Recibi Conforme (Firma y Aclaración):",
+				"fontSize": 8,
+				"align": "left",
+			},
+			{
+				"id": f"{p}-firma-line",
+				"kind": "shape",
+				"x": 110,
+				"y": footer_y + 40,
+				"width": 85,
+				"height": 1,
+				"shapeType": "line",
+				"color": "#0f172a",
+			},
+		]
+	)
+	return elements
+
+
 _STARTER_TEMPLATES = [
+	# ── Sales Invoice · AR commercial A4 (gifted core) ─────────────────
+	{
+		"template_name": "Documento no válido como factura (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"margin_mm": [12, 12, 12, 12],
+		"elements": _ar_documento_no_valido_a4_elements(
+			party_label="Cliente",
+			party_field="customer_name",
+			id_prefix="starter-siad",
+		),
+	},
 	# ── Sales Invoice ──────────────────────────────────────────────────
 	{
 		"template_name": "Standard Invoice (A4)",
@@ -559,6 +1442,19 @@ _STARTER_TEMPLATES = [
 		],
 	},
 	# ── Purchase Receipt · A4 (2) ──────────────────────────────────────
+	{
+		"template_name": "Documento no válido como factura — Remito (A4)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"margin_mm": [12, 12, 12, 12],
+		"elements": _ar_documento_no_valido_a4_elements(
+			party_label="Proveedor",
+			party_field="supplier_name",
+			id_prefix="starter-prad",
+		),
+	},
 	{
 		"template_name": "Goods Receipt (A4)",
 		"source_doctype": "Purchase Receipt",
@@ -780,6 +1676,25 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-card-barcode", "kind": "barcode", "x": 2, "y": 59, "width": 44, "height": 6, "fieldPath": "barcode"},
 		],
 	},
+	# ── Delivery Checklist · A4 (armado de pedido / ENTREGAS) ───────────
+	{
+		"template_name": "Armado de Pedido — ENTREGAS (A4)",
+		"source_doctype": "Delivery Checklist",
+		"paper_kind": "A4",
+		"is_default": True,
+		"gift": True,
+		"margin_mm": [12, 12, 12, 12],
+		"elements": _ar_entregas_checklist_a4_elements(id_prefix="starter-ent", with_location=False, with_map=False),
+	},
+	{
+		"template_name": "Armado de Pedido — ENTREGAS + Mapa (A4)",
+		"source_doctype": "Delivery Checklist",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"margin_mm": [12, 12, 12, 12],
+		"elements": _ar_entregas_checklist_a4_elements(id_prefix="starter-entmap", with_location=True, with_map=True),
+	},
 	# ── TMS delivery tickets (Delivery Note · Thermal 80mm) ─────────────
 	{
 		"template_name": "Confirmación de Entrega (80mm)",
@@ -860,7 +1775,13 @@ _STARTER_TEMPLATES = [
 
 @frappe.whitelist(allow_guest=True)
 def ensure_starter_print_templates():
-	"""Idempotently create the built-in starter templates so the designer never opens empty."""
+	"""Idempotently create built-in starter templates (core gifts for every site).
+
+	New entries in `_STARTER_TEMPLATES` are created on every site the next time
+	this runs (after_migrate, provision-tenant, or /logistica/prints open).
+	Existing templates are never overwritten — cashiers can customize freely.
+	"""
+	_ensure_source_doctype_select_options()
 	created = []
 	for starter in _STARTER_TEMPLATES:
 		exists = frappe.db.exists(
@@ -907,4 +1828,9 @@ def ensure_starter_print_templates():
 
 	if created:
 		frappe.db.commit()
-	return {"created": created}
+	return {"created": created, "gifted": created}
+
+
+def gift_core_print_templates():
+	"""after_migrate / hypervisor hook: ensure every site receives new core templates."""
+	return ensure_starter_print_templates()

@@ -280,6 +280,58 @@
       "expect": "error"
     },
     {
+      "id": "ensure_starter_print_templates_gift_idempotent",
+      "source": "regression",
+      "bug": "Hypervisor gifts A4 DOCUMENTO NO VALIDO + Delivery Checklist starters; ensure_starter must sync Select options and stay idempotent (null args OK)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.ensure_starter_print_templates",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "gift_core_print_templates_idempotent",
+      "source": "regression",
+      "bug": "after_migrate gift_core_print_templates must not crash / must return created list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.gift_core_print_templates",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "get_order_print_bundle_empty_so",
+      "source": "regression",
+      "bug": "get_order_print_bundle with empty sales_order must controlled error, not AttributeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_order_print_bundle",
+      "args": {
+        "sales_order": "",
+        "warehouse": null,
+        "floor_id": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "delivery_checklist_fields_ok",
+      "source": "regression",
+      "bug": "Delivery Checklist is synthetic — get_doctype_fields must not call get_meta",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_doctype_fields",
+      "args": {
+        "source_doctype": "Delivery Checklist",
+        "paper_kind": "A4"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "delivery_checklist_print_data_missing_so",
+      "source": "regression",
+      "bug": "Delivery Checklist get_print_data with bad SO must DoesNotExistError, not crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_print_data",
+      "args": {
+        "source_doctype": "Delivery Checklist",
+        "docname": "",
+        "warehouse": null,
+        "floor_id": null
+      },
+      "expect": "error"
+    },
+    {
       "id": "staff_cred_print_fields_and_missing_doc",
       "source": "regression",
       "bug": "Staff Cred. is synthetic like Catalog Header — get_doctype_fields must not call get_meta; empty docname must controlled error",

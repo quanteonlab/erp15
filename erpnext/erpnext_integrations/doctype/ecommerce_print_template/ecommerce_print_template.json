@@ -34,7 +34,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Source Doctype",
-   "options": "Sales Invoice\nPurchase Receipt\nDelivery Note\nItem\nCatalog Header\nStaff Cred.",
+   "options": "Sales Invoice\nPurchase Receipt\nDelivery Note\nSales Order\nDelivery Checklist\nItem\nCatalog Header\nStaff Cred.",
    "reqd": 1
   },
   {

@@ -110,6 +110,18 @@ def _normalize_pos_display(raw) -> dict:
 		),
 		"showCobroPrintPreview": _as_bool(src.get("showCobroPrintPreview"), True),
 		"printOnCobro": _as_bool(src.get("printOnCobro"), False),
+		# Orders print modal (armado / SI / DN / PR / catalog)
+		"orderPrintPaperKind": (
+			"Thermal 80mm"
+			if src.get("orderPrintPaperKind") == "Thermal 80mm"
+			else "Thermal 58mm"
+			if src.get("orderPrintPaperKind") == "Thermal 58mm"
+			else "A4"
+		),
+		"orderPrintWarnUnpaid": _as_bool(src.get("orderPrintWarnUnpaid"), True),
+		"orderPrintAllowUnpaid": _as_bool(src.get("orderPrintAllowUnpaid"), True),
+		"orderPrintWarnMissingDn": _as_bool(src.get("orderPrintWarnMissingDn"), True),
+		"orderPrintAllowMissingDn": _as_bool(src.get("orderPrintAllowMissingDn"), True),
 		# Kept for forward-compat if clients send them; personal prefs stay client-local.
 		"headerToggleShortcut": shortcut.strip(),
 	}
