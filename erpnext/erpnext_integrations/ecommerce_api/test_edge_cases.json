@@ -265,6 +265,38 @@
       "bug": "unread badge compared Lead.modified (datetime) to JSON lastseen seen_at (str) → TypeError"
     },
     {
+      "id": "preview_merge_leads_null_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.preview_merge_leads",
+      "args": { "leads": null },
+      "expect": "error",
+      "source": "regression",
+      "bug": "merge preview with null/empty leads must return controlled error, not TypeError"
+    },
+    {
+      "id": "archive_leads_empty_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.archive_leads",
+      "args": { "leads": [] },
+      "expect": "error",
+      "source": "regression",
+      "bug": "archive_leads with empty list must throw controlled error"
+    },
+    {
+      "id": "duplicate_lead_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.duplicate_lead",
+      "args": { "lead": null },
+      "expect": "error",
+      "source": "regression",
+      "bug": "duplicate_lead with null lead must not AttributeError"
+    },
+    {
+      "id": "get_or_create_lead_seller_link_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.get_or_create_lead_seller_link",
+      "args": { "lead": null },
+      "expect": "error",
+      "source": "regression",
+      "bug": "lead-specific seller link requires lead id"
+    },
+    {
       "id": "amend_pos_sale_return_null_items",
       "source": "regression",
       "bug": "amend return_items with null/empty items must not TypeError; controlled error or empty keep",
@@ -483,6 +515,36 @@
         "action": "apply",
         "overrides": null,
         "steal_barcode": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "resolve_staff_login_barcode_null",
+      "source": "regression",
+      "bug": "resolve_staff_login_barcode with null code must controlled error (scanner login)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.resolve_staff_login_barcode",
+      "args": {
+        "code": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "resolve_staff_login_barcode_empty",
+      "source": "regression",
+      "bug": "resolve_staff_login_barcode with empty code must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.resolve_staff_login_barcode",
+      "args": {
+        "code": ""
+      },
+      "expect": "error"
+    },
+    {
+      "id": "resolve_staff_login_barcode_invalid_shape",
+      "source": "regression",
+      "bug": "non-staff-shape codes must controlled Scan not recognized error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.resolve_staff_login_barcode",
+      "args": {
+        "code": "123"
       },
       "expect": "error"
     }

@@ -383,7 +383,7 @@ def get_my_board(owner_user=None):
 
 	lead_rows = frappe.get_all(
 		"Lead",
-		filters={"lead_owner": owner_user, "status": ["!=", "Converted"]},
+		filters={"lead_owner": owner_user, "status": ["not in", ["Converted", "Do Not Contact"]]},
 		fields=[
 			"name", "lead_name", "company_name", "mobile_no", "whatsapp_no", "phone", "email_id",
 			"city", "state", "country", "custom_address_line1", "custom_pincode",
@@ -420,6 +420,7 @@ def get_my_board(owner_user=None):
 				"company_name": r.company_name,
 				"stage": r.custom_preventa_stage or _default_new_stage_key(settings),
 				"stage_since": r.custom_preventa_stage_since,
+				"modified": r.modified,
 				"fields": fields_out,
 				"tags": tags_map.get(r.name, []),
 				"consulta_count": agg["cnt"],
@@ -579,6 +580,349 @@ def move_lead(lead, to_stage, lost_reason=None):
 			frappe.log_error(frappe.get_traceback(), "Preventa auto-opportunity failed")
 
 	return result
+
+
+@frappe.whitelist(allow_guest=True)
+def duplicate_lead(lead=None):
+	"""Clone a Lead onto the same board (new name, same stage + mapped fields)."""
+	lead = (lead or "").strip()
+	if not lead:
+		frappe.throw(_("Lead is required"))
+	ensure_preventa_custom_fields()
+	frappe.flags.ignore_permissions = True
+	src = frappe.get_doc("Lead", lead)
+	frappe.flags.ignore_permissions = False
+	_require_owner_or_crm(src.lead_owner)
+
+	doc = frappe.new_doc("Lead")
+	doc.lead_owner = src.lead_owner
+	doc.custom_preventa_stage = src.custom_preventa_stage or _default_new_stage_key()
+	doc.custom_preventa_stage_since = now_datetime()
+	doc.source = src.source
+	doc.status = "Lead"
+	for _fid, attr in LEAD_FIELD_MAP.items():
+		doc.set(attr, src.get(attr))
+	# Mark duplicate in name so sellers can tell them apart.
+	base_name = (src.lead_name or src.company_name or src.name or "Lead").strip()
+	doc.lead_name = f"{base_name} (copy)"
+	doc.flags.ignore_permissions = True
+	doc.insert(ignore_permissions=True)
+
+	src_tags = tags_map_for_docs("Lead", [src.name]).get(src.name, [])
+	if src_tags:
+		set_tags_for_doc("Lead", doc.name, tags=src_tags, commit=False)
+
+	frappe.db.commit()
+	try:
+		_log_preventa_event("duplicate", lead=doc.name, payload={"from": src.name})
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Preventa duplicate event failed")
+	return {"ok": True, "name": doc.name, "from": src.name}
+
+
+@frappe.whitelist(allow_guest=True)
+def archive_leads(leads=None):
+	"""Hide leads from the board by setting status to Do Not Contact."""
+	if isinstance(leads, str):
+		leads = frappe.parse_json(leads)
+	leads = [str(x).strip() for x in (leads or []) if str(x).strip()]
+	if not leads:
+		frappe.throw(_("At least one lead is required"))
+	archived = []
+	for name in leads:
+		if not frappe.db.exists("Lead", name):
+			continue
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Lead", name)
+		frappe.flags.ignore_permissions = False
+		_require_owner_or_crm(doc.lead_owner)
+		doc.status = "Do Not Contact"
+		doc.flags.ignore_permissions = True
+		doc.save(ignore_permissions=True)
+		archived.append(name)
+	frappe.db.commit()
+	return {"ok": True, "archived": archived}
+
+
+def _norm_merge_value(v):
+	if v is None:
+		return ""
+	if isinstance(v, (int, float)) and not isinstance(v, bool):
+		return str(v)
+	return str(v).strip()
+
+
+def _build_merge_plan(lead_names: list):
+	docs = []
+	for name in lead_names:
+		if not frappe.db.exists("Lead", name):
+			continue
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Lead", name)
+		frappe.flags.ignore_permissions = False
+		_require_owner_or_crm(doc.lead_owner)
+		docs.append(doc)
+	if len(docs) < 2:
+		frappe.throw(_("Select at least two leads to merge"))
+
+	docs.sort(key=lambda d: get_datetime(d.modified) or now_datetime(), reverse=True)
+	survivor = docs[0]
+	donors = docs[1:]
+
+	proposed = {}
+	conflicts = []
+	for fid, attr in LEAD_FIELD_MAP.items():
+		entries = []
+		for d in docs:
+			raw = d.get(attr)
+			norm = _norm_merge_value(raw)
+			if norm == "":
+				continue
+			entries.append(
+				{
+					"lead": d.name,
+					"value": norm,
+					"modified": str(d.modified),
+					"label": d.lead_name or d.company_name or d.name,
+				}
+			)
+		if not entries:
+			proposed[fid] = ""
+			continue
+		# Newest lead with a value wins by default (docs already newest-first).
+		proposed[fid] = entries[0]["value"]
+		unique = {e["value"] for e in entries}
+		if len(unique) > 1:
+			conflicts.append(
+				{
+					"field": fid,
+					"label": fid,
+					"values": entries,
+					"proposed": proposed[fid],
+					"will_overwrite": [
+						{"lead": e["lead"], "value": e["value"]}
+						for e in entries
+						if e["value"] != proposed[fid]
+					],
+				}
+			)
+
+	return {
+		"survivor": survivor.name,
+		"donors": [d.name for d in donors],
+		"leads": [
+			{
+				"name": d.name,
+				"lead_name": d.lead_name,
+				"company_name": d.company_name,
+				"modified": str(d.modified),
+			}
+			for d in docs
+		],
+		"proposed": proposed,
+		"conflicts": conflicts,
+		"_docs": docs,
+		"_survivor_doc": survivor,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def preview_merge_leads(leads=None):
+	if isinstance(leads, str):
+		leads = frappe.parse_json(leads)
+	leads = [str(x).strip() for x in (leads or []) if str(x).strip()]
+	plan = _build_merge_plan(leads)
+	return {
+		"survivor": plan["survivor"],
+		"donors": plan["donors"],
+		"leads": plan["leads"],
+		"proposed": plan["proposed"],
+		"conflicts": plan["conflicts"],
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def merge_leads(leads=None, resolutions=None, survivor=None):
+	"""Merge duplicate leads into the newest (or explicit) survivor.
+
+	Per-field default: value from the most recently modified lead that has it.
+	`resolutions` overrides conflicted (or any) fields with the user's text.
+	Donors are archived (Do Not Contact); notes/tags/consultas move to survivor.
+	"""
+	if isinstance(leads, str):
+		leads = frappe.parse_json(leads)
+	if isinstance(resolutions, str):
+		resolutions = frappe.parse_json(resolutions)
+	leads = [str(x).strip() for x in (leads or []) if str(x).strip()]
+	resolutions = resolutions if isinstance(resolutions, dict) else {}
+	survivor_name = (survivor or "").strip() or None
+
+	plan = _build_merge_plan(leads)
+	docs = plan["_docs"]
+	if survivor_name:
+		picked = next((d for d in docs if d.name == survivor_name), None)
+		if not picked:
+			frappe.throw(_("Survivor lead not in selection"))
+		survivor_doc = picked
+		donors = [d for d in docs if d.name != survivor_name]
+	else:
+		survivor_doc = plan["_survivor_doc"]
+		donors = [d for d in docs if d.name != survivor_doc.name]
+
+	final_values = dict(plan["proposed"])
+	for fid, val in resolutions.items():
+		if fid in LEAD_FIELD_MAP:
+			final_values[fid] = _norm_merge_value(val)
+
+	for fid, attr in LEAD_FIELD_MAP.items():
+		survivor_doc.set(attr, final_values.get(fid) or None)
+
+	# Merge tags
+	all_names = [survivor_doc.name] + [d.name for d in donors]
+	tags_map = tags_map_for_docs("Lead", all_names)
+	merged_tags = []
+	seen_tags = set()
+	for n in all_names:
+		for tag in tags_map.get(n, []):
+			if tag not in seen_tags:
+				seen_tags.add(tag)
+				merged_tags.append(tag)
+
+	# Move notes from donors
+	for donor in donors:
+		for row in donor.get("notes") or []:
+			note = (row.get("note") or "").strip()
+			if not note:
+				continue
+			survivor_doc.append(
+				"notes",
+				{
+					"note": note,
+					"added_by": row.get("added_by") or _acting_user(),
+					"added_on": row.get("added_on") or now_datetime(),
+				},
+			)
+
+	survivor_doc.flags.ignore_permissions = True
+	survivor_doc.save(ignore_permissions=True)
+	if merged_tags:
+		set_tags_for_doc("Lead", survivor_doc.name, tags=merged_tags, commit=False)
+
+	# Re-point consultas
+	donor_names = [d.name for d in donors]
+	if donor_names and frappe.db.exists("DocType", "Preventa Lead Consulta"):
+		frappe.db.sql(
+			"""
+			UPDATE `tabPreventa Lead Consulta`
+			SET lead = %s
+			WHERE lead IN ({placeholders})
+			""".format(placeholders=",".join(["%s"] * len(donor_names))),
+			tuple([survivor_doc.name] + donor_names),
+		)
+
+	for donor in donors:
+		donor.status = "Do Not Contact"
+		donor.flags.ignore_permissions = True
+		donor.save(ignore_permissions=True)
+
+	frappe.db.commit()
+	try:
+		_log_preventa_event(
+			"merge",
+			lead=survivor_doc.name,
+			payload={"donors": donor_names, "resolutions": list(resolutions.keys())},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Preventa merge event failed")
+
+	return {
+		"ok": True,
+		"survivor": survivor_doc.name,
+		"archived": donor_names,
+		"conflicts_resolved": len(resolutions),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_or_create_lead_seller_link(lead=None, owner_user=None, label=None):
+	"""Seller+prospect share link for targeted discounts / attribution."""
+	lead = (lead or "").strip()
+	if not lead:
+		frappe.throw(_("Lead is required"))
+	if not frappe.db.exists("Lead", lead):
+		frappe.throw(_("Lead not found"), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	lead_doc = frappe.get_doc("Lead", lead)
+	frappe.flags.ignore_permissions = False
+	_require_owner_or_crm(lead_doc.lead_owner)
+
+	owner_user = (owner_user or lead_doc.lead_owner or _acting_user() or "").strip()
+	_require_self_or_crm(owner_user)
+	_ensure_seller_link_lead_field()
+
+	existing = frappe.get_all(
+		"Seller Link",
+		filters={"owner_user": owner_user, "lead": lead, "active": 1},
+		fields=["slug", "label", "lead"],
+		order_by="creation desc",
+		limit_page_length=1,
+		ignore_permissions=True,
+	)
+	if existing:
+		row = existing[0]
+		return {
+			"slug": row.slug,
+			"label": row.label,
+			"lead": lead,
+			"path": f"/s/{row.slug}",
+		}
+
+	slug = _new_seller_slug()
+	for _attempt in range(5):
+		if not frappe.db.exists("Seller Link", slug):
+			break
+		slug = _new_seller_slug()
+
+	prospect_label = label or lead_doc.lead_name or lead_doc.company_name or lead
+	doc = frappe.get_doc(
+		{
+			"doctype": "Seller Link",
+			"slug": slug,
+			"owner_user": owner_user,
+			"lead": lead,
+			"label": prospect_label,
+			"created_by_user": _acting_user(),
+			"active": 1,
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return {"slug": doc.slug, "label": doc.label, "lead": lead, "path": f"/s/{doc.slug}"}
+
+
+def _ensure_seller_link_lead_field():
+	"""Optional Link(Lead) on Seller Link for prospect-specific share URLs."""
+	if frappe.db.has_column("Seller Link", "lead"):
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+	create_custom_fields(
+		{
+			"Seller Link": [
+				{
+					"fieldname": "lead",
+					"fieldtype": "Link",
+					"label": "Lead",
+					"options": "Lead",
+					"insert_after": "owner_user",
+					"in_standard_filter": 1,
+				}
+			]
+		},
+		ignore_validate=True,
+	)
+	frappe.clear_cache(doctype="Seller Link")
 
 
 def _create_opportunity_for_lead(lead: str):
@@ -789,19 +1133,30 @@ def resolve_seller_link(slug):
 	"""Public resolve for /s/{slug}. Never throws — a bad/expired slug just
 	returns {ok: false} so the guest can still be redirected to the catalog."""
 	try:
-		row = frappe.db.get_value(
-			"Seller Link", slug, ["owner_user", "company", "active", "open_count"], as_dict=True
-		)
+		fields = ["owner_user", "company", "active", "open_count"]
+		if frappe.db.has_column("Seller Link", "lead"):
+			fields.append("lead")
+		row = frappe.db.get_value("Seller Link", slug, fields, as_dict=True)
 		if not row or not cint(row.active):
 			return {"ok": False}
 		frappe.db.set_value("Seller Link", slug, "last_used_on", now_datetime(), update_modified=False)
 		frappe.db.set_value("Seller Link", slug, "open_count", cint(row.open_count) + 1, update_modified=False)
 		frappe.db.commit()
 		try:
-			_log_preventa_event("link_open", seller_link=slug, company=row.company)
+			_log_preventa_event(
+				"link_open",
+				lead=getattr(row, "lead", None),
+				seller_link=slug,
+				company=row.company,
+			)
 		except Exception:
 			pass
-		return {"ok": True, "owner_user": row.owner_user, "company": row.company}
+		return {
+			"ok": True,
+			"owner_user": row.owner_user,
+			"company": row.company,
+			"lead": getattr(row, "lead", None),
+		}
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "resolve_seller_link failed")
 		return {"ok": False}

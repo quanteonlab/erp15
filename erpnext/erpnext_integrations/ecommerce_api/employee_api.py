@@ -1506,6 +1506,38 @@ def _can_manage_staff_login_barcodes() -> bool:
 	)
 
 
+def _employee_in_admin_group(emp_name: str) -> bool:
+	"""True when the employee is in the starter `admin` group (or a group with `*`)."""
+	if not emp_name:
+		return False
+	groups = frappe.get_all(
+		"Employee Group Table",
+		filters={"employee": emp_name},
+		pluck="parent",
+		ignore_permissions=True,
+	)
+	for g in groups:
+		title = (frappe.db.get_value("Employee Group", g, "employee_group_name") or g or "").strip().lower()
+		if title == "admin" or str(g).strip().lower() == "admin":
+			return True
+		if "*" in _permissions_for_group(g):
+			return True
+	return False
+
+
+def _scanner_login_forbidden(user_id: str, emp_name: str | None = None) -> bool:
+	"""Scanner sign-in is for cashiers / non-admin staff only."""
+	uid = (user_id or "").strip()
+	if not uid or uid in ("Administrator", "Guest"):
+		return True
+	roles = set(frappe.get_roles(uid) or [])
+	if "Administrator" in roles or "System Manager" in roles:
+		return True
+	if emp_name and _employee_in_admin_group(emp_name):
+		return True
+	return False
+
+
 @frappe.whitelist()
 def ensure_staff_login_barcodes(employees=None, rotate=0):
 	"""Issue (or rotate) numeric POS login barcodes for employees that have a User.
@@ -1562,6 +1594,17 @@ def ensure_staff_login_barcodes(employees=None, rotate=0):
 				}
 			)
 			continue
+		if _scanner_login_forbidden(user_id, emp.name):
+			rows.append(
+				{
+					"name": emp.name,
+					"employee_name": emp.employee_name,
+					"user_id": user_id,
+					"ok": False,
+					"error": "admin_forbidden",
+				}
+			)
+			continue
 
 		existing = by_employee.get(emp.name) if isinstance(by_employee.get(emp.name), dict) else None
 		code = str((existing or {}).get("code") or "").strip()
@@ -1597,38 +1640,42 @@ def ensure_staff_login_barcodes(employees=None, rotate=0):
 
 @frappe.whitelist()
 def resolve_staff_login_barcode(code=None):
-	"""Resolve a staff login barcode to an enabled User.
+	"""Resolve a staff login barcode to an enabled non-admin User.
 
 	Intended for the Next.js `/api/auth/login-barcode` server route (API token).
-	Does not grant a Frappe session by itself.
+	Does not grant a Frappe session by itself. Administrators / System Managers /
+	admin-group members must use password sign-in.
 	"""
 	raw = str(code or "").strip()
 	if not raw:
 		frappe.throw(_("code is required"))
 	if not raw.isdigit() or len(raw) != STAFF_LOGIN_LEN or not raw.startswith(STAFF_LOGIN_PREFIX):
-		frappe.throw(_("Invalid staff login barcode"))
+		frappe.throw(_("Scan not recognized"))
 
 	store = _load_staff_login_store()
 	emp_name = (store.get("by_code") or {}).get(raw)
 	if not emp_name:
-		frappe.throw(_("Unknown staff login barcode"))
+		frappe.throw(_("Scan not recognized"))
 
 	frappe.flags.ignore_permissions = True
 	if not frappe.db.exists("Employee", emp_name):
-		frappe.throw(_("Employee for barcode not found"))
+		frappe.throw(_("Scan not recognized"))
 	emp = frappe.get_doc("Employee", emp_name)
 	if (emp.status or "") != "Active":
-		frappe.throw(_("Employee is not active"))
+		frappe.throw(_("Scan not recognized"))
 	user_id = (emp.user_id or "").strip()
 	if not user_id or not frappe.db.exists("User", user_id):
-		frappe.throw(_("Employee has no login user"))
+		frappe.throw(_("Scan not recognized"))
 	if cint(frappe.db.get_value("User", user_id, "enabled")) == 0:
-		frappe.throw(_("User account is disabled"))
+		frappe.throw(_("Scan not recognized"))
 
 	# Stale mapping guard
 	entry = (store.get("by_employee") or {}).get(emp.name)
 	if isinstance(entry, dict) and str(entry.get("code") or "") != raw:
-		frappe.throw(_("Unknown staff login barcode"))
+		frappe.throw(_("Scan not recognized"))
+
+	if _scanner_login_forbidden(user_id, emp.name):
+		frappe.throw(_("Scanner sign-in is not available for this account. Use password."))
 
 	return {
 		"username": user_id,

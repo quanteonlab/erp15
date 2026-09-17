@@ -8,6 +8,7 @@
  "field_order": [
   "slug",
   "owner_user",
+  "lead",
   "label",
   "company",
   "active",
@@ -34,6 +35,14 @@
    "label": "Owner User",
    "options": "User",
    "reqd": 1
+  },
+  {
+   "fieldname": "lead",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Lead",
+   "options": "Lead",
+   "description": "Optional prospect for seller+customer specific share links"
   },
   {
    "fieldname": "label",
