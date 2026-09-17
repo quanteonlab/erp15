@@ -697,6 +697,58 @@ def suite_5_12_modules_read():
         assert payload["company"].get("company_name") or payload["company"].get("name")
         assert payload.get("default_language") in ("en", "es", "zh")
 
+        # Rename must succeed even when orphan Singles (Shopify Setting / Module shopify
+        # not found) would crash core rename_doc — this is the Save Settings failure mode.
+        company = payload["company"]
+        old_name = company["name"]
+        tmp_name = f"{old_name}__smoke_ren"
+        if frappe.db.exists("Company", tmp_name):
+            tmp_name = f"{old_name}__smoke_ren2"
+        settings = {
+            **company,
+            "company_name": tmp_name,
+            "domain": "shopify",  # invalid domain must coerce, not crash
+            "default_language": payload.get("default_language") or "es",
+            "multi_company_enabled": payload.get("multi_company_enabled") or 0,
+        }
+        renamed = cs.save_company_settings(company=old_name, settings=settings)
+        assert renamed["company"]["name"] == tmp_name, renamed["company"]
+        assert (renamed["company"].get("domain") or "") != "shopify"
+        # Rename back
+        settings_back = {
+            **renamed["company"],
+            "company_name": old_name,
+            "default_language": renamed.get("default_language") or "es",
+            "multi_company_enabled": renamed.get("multi_company_enabled") or 0,
+        }
+        restored = cs.save_company_settings(company=tmp_name, settings=settings_back)
+        assert restored["company"]["name"] == old_name, restored["company"]
+
+    def check_catalog_import_reviews():
+        from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
+        rows = ecommerce_api.list_catalog_import_reviews(status="open", limit=5, start=0)
+        assert isinstance(rows, list)
+        # Minimal permissive import: header + blank-ish invalid row → review_created >= 1
+        csv_text = (
+            "sku,barcode,name,u1,title,pack,uom,a,b,group,c,d,price\n"
+            ",,,,\n"
+        )
+        report = ecommerce_api.import_catalog_csv_products(
+            csv_text=csv_text,
+            price_list="Standard Selling",
+            default_item_group="Products",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=50,
+            file_name="smoke-catalog-import.csv",
+        )
+        assert isinstance(report, dict)
+        assert "review_created" in report
+        assert report.get("import_session")
+        guide = ecommerce_api.get_catalog_csv_column_guide()
+        assert isinstance(guide, list) and len(guide) >= 1
+
     def check_tms():
         from erpnext.erpnext_integrations.ecommerce_api import tms_api as tms
         ctx = tms.get_planner_context()
@@ -728,7 +780,11 @@ def suite_5_12_modules_read():
     _run("5.12.3 device link + push status", check_devices, "S3")
     _run("5.12.4 get_floors", check_floors, "S3")
     _run("5.12.5 list_print_templates", check_print, "S3")
-    _run("5.12.5b get_company_settings", check_company_settings, "S3")
+    _run("5.12.5b get/save company settings (rename + orphan Shopify Single)", check_company_settings, "S2")
+    if frappe.db.exists("DocType", "Catalog Import Session"):
+        _run("5.12.5c catalog import reviews + permissive enqueue", check_catalog_import_reviews, "S2")
+    else:
+        _skip("5.12.5c catalog import reviews + permissive enqueue", "Catalog Import Session DocType not migrated", "S2")
     _run("5.12.6 tms planner context + settings", check_tms, "S3")
     _run("5.12.7 get_shop_ui_settings", check_shop_ui, "S3")
     _run("5.12.8 search_tags", check_tags, "S3")

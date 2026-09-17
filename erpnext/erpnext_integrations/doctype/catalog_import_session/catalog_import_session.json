@@ -1,0 +1,201 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:CIS-{YYYY}-{#####}",
+ "creation": "2026-09-16 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "status",
+  "operator",
+  "file_name",
+  "column_break_1",
+  "price_list",
+  "default_item_group",
+  "update_existing",
+  "create_missing_groups",
+  "section_counts",
+  "total_rows",
+  "parsed_rows",
+  "created_items",
+  "updated_items",
+  "review_created",
+  "skipped_invalid",
+  "skipped_existing",
+  "price_updates",
+  "barcode_updates",
+  "section_opts",
+  "options_json"
+ ],
+ "fields": [
+  {
+   "default": "running",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "running\ndone\nfailed",
+   "reqd": 1
+  },
+  {
+   "fieldname": "operator",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Operator"
+  },
+  {
+   "fieldname": "file_name",
+   "fieldtype": "Data",
+   "label": "File Name"
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Standard Selling",
+   "fieldname": "price_list",
+   "fieldtype": "Data",
+   "label": "Price List"
+  },
+  {
+   "default": "Products",
+   "fieldname": "default_item_group",
+   "fieldtype": "Data",
+   "label": "Default Item Group"
+  },
+  {
+   "default": "1",
+   "fieldname": "update_existing",
+   "fieldtype": "Check",
+   "label": "Update Existing"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_missing_groups",
+   "fieldtype": "Check",
+   "label": "Create Missing Groups"
+  },
+  {
+   "fieldname": "section_counts",
+   "fieldtype": "Section Break",
+   "label": "Counts"
+  },
+  {
+   "default": "0",
+   "fieldname": "total_rows",
+   "fieldtype": "Int",
+   "label": "Total Rows"
+  },
+  {
+   "default": "0",
+   "fieldname": "parsed_rows",
+   "fieldtype": "Int",
+   "label": "Parsed Rows"
+  },
+  {
+   "default": "0",
+   "fieldname": "created_items",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Created Items"
+  },
+  {
+   "default": "0",
+   "fieldname": "updated_items",
+   "fieldtype": "Int",
+   "label": "Updated Items"
+  },
+  {
+   "default": "0",
+   "fieldname": "review_created",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Review Created"
+  },
+  {
+   "default": "0",
+   "fieldname": "skipped_invalid",
+   "fieldtype": "Int",
+   "label": "Skipped Invalid"
+  },
+  {
+   "default": "0",
+   "fieldname": "skipped_existing",
+   "fieldtype": "Int",
+   "label": "Skipped Existing"
+  },
+  {
+   "default": "0",
+   "fieldname": "price_updates",
+   "fieldtype": "Int",
+   "label": "Price Updates"
+  },
+  {
+   "default": "0",
+   "fieldname": "barcode_updates",
+   "fieldtype": "Int",
+   "label": "Barcode Updates"
+  },
+  {
+   "fieldname": "section_opts",
+   "fieldtype": "Section Break",
+   "label": "Options"
+  },
+  {
+   "fieldname": "options_json",
+   "fieldtype": "Long Text",
+   "label": "Options JSON"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-09-16 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "Catalog Import Session",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "Stock User",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "Sales User",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

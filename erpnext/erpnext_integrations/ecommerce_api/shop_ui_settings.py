@@ -228,6 +228,78 @@ def _normalize_printers(raw) -> dict:
 	return {"printers": rows, "defaultPrinterId": default_id}
 
 
+def _normalize_company_transfer(raw) -> dict:
+	"""Per-company bank transfer / alias shown at cobro (copy + QR)."""
+	src = raw if isinstance(raw, dict) else {}
+	alias = str(src.get("transferAlias") or "").strip()[:200]
+	info = str(src.get("transferInfo") or "").strip()[:500]
+	qr = str(src.get("transferQrPayload") or "").strip()[:500]
+	return {
+		"transferAlias": alias,
+		"transferInfo": info,
+		# Empty → clients encode transferAlias for the QR.
+		"transferQrPayload": qr,
+	}
+
+
+def _normalize_payments(raw) -> dict:
+	src = raw if isinstance(raw, dict) else {}
+	by_company = {}
+	incoming = src.get("byCompany") if isinstance(src.get("byCompany"), dict) else {}
+	for company, row in incoming.items():
+		name = str(company or "").strip()
+		if not name:
+			continue
+		by_company[name[:140]] = _normalize_company_transfer(row)
+	return {"byCompany": by_company}
+
+
+def get_company_transfer_info(company: str | None = None) -> dict:
+	"""Return transfer alias/info for one company (empty defaults if unset)."""
+	name = str(company or "").strip()
+	raw = _load_raw()
+	payments = _normalize_payments(raw.get("payments") if isinstance(raw, dict) else {})
+	row = (payments.get("byCompany") or {}).get(name) if name else None
+	return _normalize_company_transfer(row)
+
+
+def set_company_transfer_info(company: str, patch: dict | None) -> dict:
+	"""Merge transfer alias/info for one company into shop_ui payments.byCompany."""
+	name = str(company or "").strip()
+	if not name:
+		frappe.throw(_("No company configured"), frappe.ValidationError)
+	incoming = patch if isinstance(patch, dict) else {}
+	current = _load_raw()
+	payments = _normalize_payments(current.get("payments") if isinstance(current, dict) else {})
+	by_company = dict(payments.get("byCompany") or {})
+	merged_row = _normalize_company_transfer({**(by_company.get(name) or {}), **incoming})
+	by_company[name] = merged_row
+	current = current if isinstance(current, dict) else {}
+	current["payments"] = {"byCompany": by_company}
+	_save_raw(_normalize_bundle(current))
+	return merged_row
+
+
+def rename_company_transfer_info(old_company: str, new_company: str) -> None:
+	"""Move payments.byCompany row when Company is renamed."""
+	old = str(old_company or "").strip()
+	new = str(new_company or "").strip()
+	if not old or not new or old == new:
+		return
+	current = _load_raw()
+	payments = _normalize_payments(current.get("payments") if isinstance(current, dict) else {})
+	by_company = dict(payments.get("byCompany") or {})
+	if old not in by_company:
+		return
+	if new not in by_company:
+		by_company[new] = by_company.pop(old)
+	else:
+		by_company.pop(old, None)
+	current = current if isinstance(current, dict) else {}
+	current["payments"] = {"byCompany": by_company}
+	_save_raw(_normalize_bundle(current))
+
+
 def _normalize_bundle(data: dict | None) -> dict:
 	src = data if isinstance(data, dict) else {}
 	return {
@@ -237,6 +309,7 @@ def _normalize_bundle(data: dict | None) -> dict:
 		"companies": _normalize_companies(src.get("companies")),
 		"locale": _normalize_locale(src.get("locale")),
 		"printers": _normalize_printers(src.get("printers")),
+		"payments": _normalize_payments(src.get("payments")),
 	}
 
 
@@ -283,6 +356,14 @@ def save_shop_ui_settings(settings=None):
 		),
 		"printers": _normalize_printers(
 			{**(current.get("printers") or {}), **(incoming.get("printers") or {})}
+		),
+		"payments": _normalize_payments(
+			{
+				"byCompany": {
+					**((current.get("payments") or {}).get("byCompany") or {}),
+					**((incoming.get("payments") or {}).get("byCompany") or {}),
+				}
+			}
 		),
 	}
 	_save_raw(merged)

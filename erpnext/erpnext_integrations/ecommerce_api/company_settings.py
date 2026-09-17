@@ -89,6 +89,11 @@ def get_company_settings(company=None):
 	name = _resolve_target_company(company)
 	row = _company_row(name)
 	locale = _locale_defaults()
+	from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+		get_company_transfer_info,
+	)
+
+	transfer = get_company_transfer_info(name)
 	currencies = frappe.get_all(
 		"Currency",
 		filters={"enabled": 1},
@@ -107,6 +112,9 @@ def get_company_settings(company=None):
 		"company": row,
 		"default_language": locale["default_language"],
 		"multi_company_enabled": locale["multi_company_enabled"],
+		"transfer_alias": transfer.get("transferAlias") or "",
+		"transfer_info": transfer.get("transferInfo") or "",
+		"transfer_qr_payload": transfer.get("transferQrPayload") or "",
 		"currencies": currencies or [],
 		"countries": countries or [],
 	}
@@ -114,6 +122,76 @@ def get_company_settings(company=None):
 
 def _clean_str(val, max_len: int = 140) -> str:
 	return str(val or "").strip()[:max_len]
+
+
+def _coerce_company_domain(val: str) -> str:
+	"""Company.domain is free text historically, but invalid values (e.g. 'shopify')
+	are confusing. Prefer known Domain DocType names; otherwise keep blank."""
+	val = _clean_str(val)
+	if not val:
+		return ""
+	if frappe.db.exists("DocType", "Domain") and frappe.db.exists("Domain", val):
+		return val
+	# Allow common ERPNext domain labels even if Domain row missing.
+	if val in ("Manufacturing", "Retail", "Distribution", "Services", "Education", "Healthcare"):
+		return val
+	return ""
+
+
+def _update_single_company_link_sql(doctype: str, fieldname: str, old: str, new: str) -> None:
+	"""Update a Single DocType Company link without loading its Python controller.
+
+	Orphan DocTypes (Shopify Setting, Webshop Settings, …) can raise
+	DoesNotExistError('Module X not found') when their app is not on apps.txt /
+	module_app — Frappe's rename_doc only catches ImportError for singles.
+	"""
+	frappe.db.sql(
+		"""
+		update `tabSingles`
+		set value = %s
+		where doctype = %s and field = %s and value = %s
+		""",
+		(new, doctype, fieldname, old),
+	)
+
+
+def _safe_rename_company(old_name: str, new_name: str) -> None:
+	"""Rename Company even when orphan Singles (Shopify Setting, etc.) break get_doc."""
+	import frappe.model.rename_doc as rename_mod
+
+	original = rename_mod.update_link_field_values
+
+	def safe_update(link_fields, old, new, doctype):
+		singles = [f for f in link_fields if f.get("issingle")]
+		non_singles = [f for f in link_fields if not f.get("issingle")]
+		if non_singles:
+			original(non_singles, old, new, doctype)
+		for field in singles:
+			parent = field["parent"]
+			fieldname = field["fieldname"]
+			try:
+				single_doc = frappe.get_doc(parent)
+				if single_doc.get(fieldname) == old:
+					single_doc.set(fieldname, new)
+					single_doc.flags.ignore_mandatory = True
+					single_doc.flags.ignore_links = True
+					single_doc.save(ignore_permissions=True)
+			except (ImportError, frappe.DoesNotExistError):
+				_update_single_company_link_sql(parent, fieldname, old, new)
+			except Exception:
+				try:
+					_update_single_company_link_sql(parent, fieldname, old, new)
+				except Exception:
+					frappe.log_error(
+						title=f"Company rename: skip single {parent}.{fieldname}",
+						message=frappe.get_traceback(),
+					)
+
+	rename_mod.update_link_field_values = safe_update
+	try:
+		frappe.rename_doc("Company", old_name, new_name, force=True, merge=False)
+	finally:
+		rename_mod.update_link_field_values = original
 
 
 @frappe.whitelist()
@@ -132,9 +210,12 @@ def save_company_settings(company=None, settings=None):
 	frappe.flags.ignore_permissions = False
 
 	new_company_name = _clean_str(incoming.get("company_name"))
+	renamed_from = None
 	if new_company_name and new_company_name != (doc.company_name or doc.name):
-		# Company autoname is field:company_name — renaming the doc updates name.
-		frappe.rename_doc("Company", doc.name, new_company_name, force=True, merge=False)
+		# Company autoname is field:company_name — renaming updates linked Singles
+		# (e.g. Shopify Setting.company). Orphan modules must not abort Save.
+		renamed_from = doc.name
+		_safe_rename_company(doc.name, new_company_name)
 		frappe.db.commit()
 		name = new_company_name
 		frappe.flags.ignore_permissions = True
@@ -146,6 +227,8 @@ def save_company_settings(company=None, settings=None):
 		if field not in incoming:
 			continue
 		val = _clean_str(incoming.get(field))
+		if field == "domain":
+			val = _coerce_company_domain(val)
 		if field == "default_currency" and val and not frappe.db.exists("Currency", val):
 			frappe.throw(_("Currency {0} not found").format(val), frappe.ValidationError)
 		if field == "country" and val and not frappe.db.exists("Country", val):
@@ -176,6 +259,27 @@ def save_company_settings(company=None, settings=None):
 		)
 
 		save_shop_ui_settings(locale_patch)
+
+	# Per-company transfer / alias defaults for cobro (copy + QR).
+	transfer_keys = ("transfer_alias", "transfer_info", "transfer_qr_payload")
+	if any(k in incoming for k in transfer_keys) or renamed_from:
+		from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+			rename_company_transfer_info,
+			set_company_transfer_info,
+		)
+
+		if renamed_from and renamed_from != name:
+			rename_company_transfer_info(renamed_from, name)
+
+		if any(k in incoming for k in transfer_keys):
+			patch = {}
+			if "transfer_alias" in incoming:
+				patch["transferAlias"] = _clean_str(incoming.get("transfer_alias"), 200)
+			if "transfer_info" in incoming:
+				patch["transferInfo"] = _clean_str(incoming.get("transfer_info"), 500)
+			if "transfer_qr_payload" in incoming:
+				patch["transferQrPayload"] = _clean_str(incoming.get("transfer_qr_payload"), 500)
+			set_company_transfer_info(name, patch)
 
 	# Refresh Global Defaults default_company if rename moved the active default.
 	try:

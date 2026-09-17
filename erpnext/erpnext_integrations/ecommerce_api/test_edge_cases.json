@@ -321,6 +321,118 @@
         "settings": null
       },
       "expect": "no_500"
+    },
+    {
+      "id": "save_company_settings_shopify_domain_coerce",
+      "source": "regression",
+      "bug": "domain=shopify must not crash Save Settings; coerce invalid domain. Rename path must tolerate orphan Shopify Setting Single (Module shopify not found)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.company_settings.save_company_settings",
+      "args": {
+        "company": null,
+        "settings": {
+          "domain": "shopify",
+          "default_language": "es",
+          "multi_company_enabled": 0
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "save_company_settings_transfer_alias",
+      "source": "regression",
+      "bug": "Company transfer alias/info must save without TypeError and round-trip on get_company_settings",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.company_settings.save_company_settings",
+      "args": {
+        "company": null,
+        "settings": {
+          "transfer_alias": "alias.prueba.mp",
+          "transfer_info": "Banco Test",
+          "transfer_qr_payload": ""
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_company_settings_includes_transfer",
+      "source": "regression",
+      "bug": "get_company_settings must return transfer_alias keys after payments.byCompany was added",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.company_settings.get_company_settings",
+      "args": {
+        "company": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_catalog_import_reviews_nullish",
+      "source": "regression",
+      "bug": "list_catalog_import_reviews must tolerate null status/session/limit without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_catalog_import_reviews",
+      "args": {
+        "status": null,
+        "session": null,
+        "limit": null,
+        "start": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "import_catalog_csv_products_empty_csv",
+      "source": "regression",
+      "bug": "Empty csv_text must return report with review_created, never crash before DocType session",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "",
+        "price_list": null,
+        "default_item_group": "",
+        "update_existing": null,
+        "create_missing_groups": "1",
+        "start": null,
+        "batch_size": "",
+        "import_session": null,
+        "file_name": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "import_catalog_csv_products_missing_sku_to_review",
+      "source": "regression",
+      "bug": "Missing item_code rows enqueue Catalog Import Review instead of hard-failing the batch",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "h1,h2,h3,h4,h5,h6,h7,h8,h9,h10,h11,h12,h13\n,,Missing Name Only,,,,,,,,,,,,\n",
+        "price_list": "Standard Selling",
+        "default_item_group": "Products",
+        "update_existing": 1,
+        "create_missing_groups": 0,
+        "start": 0,
+        "batch_size": 50,
+        "file_name": "edge-missing-sku.csv"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "dismiss_catalog_import_review_missing",
+      "source": "regression",
+      "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.dismiss_catalog_import_review",
+      "args": {
+        "name": null,
+        "note": ""
+      },
+      "expect": "error"
+    },
+    {
+      "id": "resolve_catalog_import_review_missing",
+      "source": "regression",
+      "bug": "resolve_catalog_import_review with blank name must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.resolve_catalog_import_review",
+      "args": {
+        "name": "",
+        "action": "apply",
+        "overrides": null,
+        "steal_barcode": null
+      },
+      "expect": "error"
     }
   ]
 }

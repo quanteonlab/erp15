@@ -61,6 +61,8 @@ _SKIP_CATALOG_EXACT = {
 	"import_catalog_csv_products",
 	"import_catalog_image_zip",
 	"import_catalog_image_batch",
+	"resolve_catalog_import_review",
+	"dismiss_catalog_import_review",
 }
 
 

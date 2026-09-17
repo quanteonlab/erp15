@@ -6220,11 +6220,16 @@ def import_catalog_csv_products(
 	create_missing_groups=0,
 	start=0,
 	batch_size=0,
+	import_session=None,
+	file_name=None,
 ):
 	"""
-	Create/update Item + Item Price records from catalog CSV.
+	Create/update Item + Item Price records from catalog CSV (permissive).
 	CSV header text is ignored; only stable column order is used.
+	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
+	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
+
 	parsed_rows, total_rows = _parse_catalog_csv(csv_text)
 	start = cint(start)
 	batch_size = cint(batch_size)
@@ -6236,6 +6241,17 @@ def import_catalog_csv_products(
 	selected_rows = parsed_rows
 	if batch_size > 0:
 		selected_rows = parsed_rows[start : start + batch_size]
+
+	session_name = cir.ensure_import_session(
+		import_session,
+		price_list=price_list,
+		default_item_group=default_item_group,
+		update_existing=update_existing,
+		create_missing_groups=create_missing_groups,
+		file_name=file_name,
+		total_rows=total_rows if start == 0 else 0,
+		parsed_rows=len(parsed_rows) if start == 0 else 0,
+	)
 
 	report = {
 		"total_rows": total_rows,
@@ -6251,27 +6267,118 @@ def import_catalog_csv_products(
 		"skipped_existing": 0,
 		"price_updates": 0,
 		"barcode_updates": 0,
+		"review_created": 0,
+		"import_session": session_name,
 		"errors": [],
 		"warnings": [],
 	}
 
+	# First occurrence of each SKU in the full file wins; later duplicates → review.
+	first_seen_line = {}
+	for prow in parsed_rows:
+		code = (prow.get("item_code") or "").strip()
+		if not code:
+			continue
+		if code not in first_seen_line:
+			first_seen_line[code] = prow.get("line_no")
+
 	for row in selected_rows:
+		item_code = (row.get("item_code") or "").strip()
+		payload = {
+			"line_no": row.get("line_no"),
+			"item_code": item_code,
+			"item_name": row.get("item_name"),
+			"title_simplified": row.get("title_simplified"),
+			"barcode": row.get("barcode"),
+			"stock_uom": row.get("stock_uom"),
+			"item_group": row.get("item_group"),
+			"price": row.get("price"),
+			"last_price": row.get("last_price"),
+			"stock_hint": row.get("stock_hint"),
+			"errors": row.get("errors") or [],
+		}
+
 		if row.get("errors"):
 			report["skipped_invalid"] += 1
 			report["errors"].append({"line_no": row["line_no"], "errors": row["errors"]})
+			reason = cir.REASON_MISSING_ITEM_CODE
+			joined = " ".join(row["errors"]).lower()
+			if "item_name" in joined or "title" in joined:
+				reason = cir.REASON_MISSING_NAME
+			if not item_code:
+				reason = cir.REASON_MISSING_ITEM_CODE
+			cir.enqueue_import_review(
+				session_name,
+				line_no=row.get("line_no"),
+				item_code=item_code,
+				reason_code=reason,
+				message="; ".join(row["errors"]),
+				severity="error",
+				payload=payload,
+			)
+			report["review_created"] += 1
 			continue
 
-		item_code = row["item_code"]
+		# Duplicate SKU later in the same file → review-only (first wins live).
+		if item_code and first_seen_line.get(item_code) not in (None, row.get("line_no")):
+			msg = (
+				f"Duplicate SKU {item_code} in file; first occurrence at line "
+				f"{first_seen_line.get(item_code)} already applied/queued."
+			)
+			report["warnings"].append({"line_no": row["line_no"], "message": msg})
+			cir.enqueue_import_review(
+				session_name,
+				line_no=row.get("line_no"),
+				item_code=item_code,
+				reason_code=cir.REASON_DUPLICATE_IN_FILE,
+				message=msg,
+				severity="conflict",
+				payload=payload,
+			)
+			report["review_created"] += 1
+			continue
+
 		item_name = row["item_name"]
 		description = row["title_simplified"] or item_name
 		barcode = row.get("barcode")
-		target_uom = _resolve_uom_for_import(row.get("stock_uom"))
-		target_group = _resolve_item_group_for_import(
-			row.get("item_group"),
-			default_item_group=default_item_group,
-			create_missing_groups=create_missing_groups,
-		)
 
+		try:
+			target_uom = _resolve_uom_for_import(row.get("stock_uom"))
+		except Exception as exc:
+			report["errors"].append({"line_no": row["line_no"], "errors": [str(exc)]})
+			cir.enqueue_import_review(
+				session_name,
+				line_no=row.get("line_no"),
+				item_code=item_code,
+				reason_code=cir.REASON_UOM_RESOLVE_FAILED,
+				message=str(exc),
+				severity="error",
+				payload=payload,
+			)
+			report["review_created"] += 1
+			continue
+
+		try:
+			target_group = _resolve_item_group_for_import(
+				row.get("item_group"),
+				default_item_group=default_item_group,
+				create_missing_groups=create_missing_groups,
+			)
+		except Exception as exc:
+			report["errors"].append({"line_no": row["line_no"], "errors": [str(exc)]})
+			cir.enqueue_import_review(
+				session_name,
+				line_no=row.get("line_no"),
+				item_code=item_code,
+				reason_code=cir.REASON_GROUP_RESOLVE_FAILED,
+				message=str(exc),
+				severity="error",
+				payload=payload,
+			)
+			report["review_created"] += 1
+			continue
+
+		live_item = None
 		try:
 			existing = frappe.db.exists("Item", item_code)
 			if existing and not cint(update_existing):
@@ -6298,52 +6405,150 @@ def import_catalog_csv_products(
 				item_doc.save(ignore_permissions=True)
 			else:
 				item_doc.insert(ignore_permissions=True)
+			live_item = item_doc.item_code
 
 			if barcode:
-				existing_same = frappe.db.exists("Item Barcode", {"parent": item_doc.item_code, "barcode": barcode})
+				existing_same = frappe.db.exists(
+					"Item Barcode", {"parent": item_doc.item_code, "barcode": barcode}
+				)
 				owner = frappe.db.get_value("Item Barcode", {"barcode": barcode}, "parent")
 				if owner and owner != item_doc.item_code:
-					report["warnings"].append(
-						{
-							"line_no": row["line_no"],
-							"message": f"Barcode {barcode} already assigned to {owner}; skipped for {item_doc.item_code}.",
-						}
+					msg = (
+						f"Barcode {barcode} already assigned to {owner}; "
+						f"skipped for {item_doc.item_code}."
 					)
+					report["warnings"].append({"line_no": row["line_no"], "message": msg})
+					cir.enqueue_import_review(
+						session_name,
+						line_no=row.get("line_no"),
+						item_code=item_code,
+						reason_code=cir.REASON_BARCODE_OWNED,
+						message=msg,
+						severity="conflict",
+						payload={**payload, "barcode_owner": owner},
+						live_item=live_item,
+					)
+					report["review_created"] += 1
 				elif not existing_same:
 					item_doc.append("barcodes", {"barcode": barcode, "barcode_type": "EAN"})
 					item_doc.save(ignore_permissions=True)
 					report["barcode_updates"] += 1
 
 			if flt(row.get("price")) > 0:
-				price_name = frappe.db.get_value(
-					"Item Price",
-					{"item_code": item_doc.item_code, "price_list": price_list, "selling": 1},
-					"name",
-				)
-				if price_name:
-					frappe.db.set_value("Item Price", price_name, "price_list_rate", flt(row["price"]))
-				else:
-					frappe.get_doc(
-						{
-							"doctype": "Item Price",
-							"item_code": item_doc.item_code,
-							"price_list": price_list,
-							"price_list_rate": flt(row["price"]),
-							"selling": 1,
-						}
-					).insert(ignore_permissions=True)
-				report["price_updates"] += 1
+				try:
+					price_name = frappe.db.get_value(
+						"Item Price",
+						{"item_code": item_doc.item_code, "price_list": price_list, "selling": 1},
+						"name",
+					)
+					if price_name:
+						frappe.db.set_value("Item Price", price_name, "price_list_rate", flt(row["price"]))
+					else:
+						frappe.get_doc(
+							{
+								"doctype": "Item Price",
+								"item_code": item_doc.item_code,
+								"price_list": price_list,
+								"price_list_rate": flt(row["price"]),
+								"selling": 1,
+							}
+						).insert(ignore_permissions=True)
+					report["price_updates"] += 1
+				except Exception as price_exc:
+					report["warnings"].append(
+						{"line_no": row["line_no"], "message": f"Price write failed: {price_exc}"}
+					)
+					cir.enqueue_import_review(
+						session_name,
+						line_no=row.get("line_no"),
+						item_code=item_code,
+						reason_code=cir.REASON_PRICE_WRITE_FAILED,
+						message=str(price_exc),
+						severity="warning",
+						payload=payload,
+						live_item=live_item,
+					)
+					report["review_created"] += 1
 
 		except Exception as exc:
+			reason = (
+				cir.REASON_ITEM_UPDATE_FAILED
+				if frappe.db.exists("Item", item_code)
+				else cir.REASON_ITEM_INSERT_FAILED
+			)
 			report["errors"].append({"line_no": row["line_no"], "errors": [str(exc)]})
+			cir.enqueue_import_review(
+				session_name,
+				line_no=row.get("line_no"),
+				item_code=item_code,
+				reason_code=reason,
+				message=str(exc),
+				severity="error",
+				payload=payload,
+				live_item=live_item,
+			)
+			report["review_created"] += 1
 
-	frappe.db.commit()
+	cir.bump_session_counters(
+		session_name,
+		{
+			"created_items": report["created_items"],
+			"updated_items": report["updated_items"],
+			"review_created": report["review_created"],
+			"skipped_invalid": report["skipped_invalid"],
+			"skipped_existing": report["skipped_existing"],
+			"price_updates": report["price_updates"],
+			"barcode_updates": report["barcode_updates"],
+		},
+	)
+
 	if batch_size > 0:
 		next_start = start + len(selected_rows)
 		if next_start < len(parsed_rows):
 			report["has_more"] = 1
 			report["next_start"] = next_start
+		else:
+			cir.finish_import_session(session_name, "done")
+	else:
+		cir.finish_import_session(session_name, "done")
+
+	frappe.db.commit()
 	return report
+
+
+@frappe.whitelist()
+def list_catalog_import_reviews(status="open", session=None, limit=100, start=0):
+	"""List Catalog Import Review rows for Aprobaciones / Migrate."""
+	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
+
+	return cir.list_import_reviews(status=status, session=session, limit=limit, start=start)
+
+
+@frappe.whitelist()
+def resolve_catalog_import_review(name, action="apply", overrides=None, steal_barcode=0):
+	"""Apply or dismiss a Catalog Import Review row."""
+	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
+	import json as _json
+
+	if isinstance(overrides, str):
+		try:
+			overrides = _json.loads(overrides) if overrides else {}
+		except Exception:
+			overrides = {}
+	return cir.resolve_import_review(
+		name,
+		action=action,
+		overrides=overrides,
+		steal_barcode=steal_barcode,
+	)
+
+
+@frappe.whitelist()
+def dismiss_catalog_import_review(name, note=None):
+	"""Dismiss a Catalog Import Review without applying."""
+	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
+
+	return cir.dismiss_import_review(name, note=note)
 
 
 @frappe.whitelist()
