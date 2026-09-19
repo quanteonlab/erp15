@@ -523,6 +523,36 @@
       "expect": "no_500"
     },
     {
+      "id": "preview_catalog_csv_custom_null_map",
+      "source": "regression",
+      "bug": "Custom preview with null/empty column_map must auto-guess or return controlled preview, never crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.preview_catalog_csv_import",
+      "args": {
+        "csv_text": "TAG,Producto,Clase,Efectivo,Transferencia\nEDGE-CU,Edge Custom,Products,10,11\n",
+        "source": "custom",
+        "column_map": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "import_catalog_csv_custom_empty_map_json",
+      "source": "regression",
+      "bug": "Custom import with empty column_map JSON string must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "Code,Name,Price\nEDGE-CU2,Edge Custom 2,99\n",
+        "source": "custom",
+        "column_map": "{}",
+        "price_list": "Standard Selling",
+        "update_existing": 1,
+        "create_missing_groups": 0,
+        "start": 0,
+        "batch_size": 10,
+        "file_name": "edge-custom-empty-map.csv"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",

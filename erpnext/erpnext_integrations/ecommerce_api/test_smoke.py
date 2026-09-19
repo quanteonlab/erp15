@@ -819,7 +819,6 @@ def suite_5_12_modules_read():
         assert std == 9064, f"Standard Selling missing/wrong: {std}"
         assert cash == 8800, f"Efectivo missing/wrong: {cash}"
         assert xfer == 9064, f"Transferencia missing/wrong: {xfer}"
-        # cleanup smoke SKU
         for pl in ("Standard Selling", "Efectivo", "Transferencia"):
             name = frappe.db.get_value(
                 "Item Price", {"item_code": sku, "price_list": pl, "selling": 1}, "name"
@@ -828,6 +827,67 @@ def suite_5_12_modules_read():
                 frappe.delete_doc("Item Price", name, ignore_permissions=True, force=1)
         if frappe.db.exists("Item", sku):
             frappe.delete_doc("Item", sku, ignore_permissions=True, force=1)
+
+        # Custom: manual column_map + preview, then import with Standard Selling price.
+        sku2 = f"SMOKE-CU-{frappe.generate_hash(length=6)}"
+        cu_csv = (
+            "Code,Title,Cat,Cash,List\n"
+            f"{sku2},Smoke Custom Map,Products,500,550\n"
+        )
+        preview = ecommerce_api.preview_catalog_csv_import(
+            csv_text=cu_csv,
+            source="custom",
+            column_map={
+                "item_code": "Code",
+                "item_name": "Title",
+                "item_group": "Cat",
+                "price": "List",
+                "cash_price": "Cash",
+            },
+        )
+        assert preview.get("valid_rows") == 1, preview
+        assert preview["preview"][0]["price"] == 550
+        assert preview["preview"][0]["cash_price"] == 500
+        cu_report = ecommerce_api.import_catalog_csv_products(
+            csv_text=cu_csv,
+            price_list="Standard Selling",
+            cash_price_list="Efectivo",
+            transfer_price_list="",
+            default_item_group="Products",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="custom",
+            column_map={
+                "item_code": "Code",
+                "item_name": "Title",
+                "item_group": "Cat",
+                "price": "List",
+                "cash_price": "Cash",
+            },
+            file_name="smoke-custom-import.csv",
+        )
+        assert cu_report.get("price_updates", 0) >= 2, cu_report
+        assert (
+            flt(
+                frappe.db.get_value(
+                    "Item Price",
+                    {"item_code": sku2, "price_list": "Standard Selling", "selling": 1},
+                    "price_list_rate",
+                )
+                or 0
+            )
+            == 550
+        )
+        for pl in ("Standard Selling", "Efectivo"):
+            name = frappe.db.get_value(
+                "Item Price", {"item_code": sku2, "price_list": pl, "selling": 1}, "name"
+            )
+            if name:
+                frappe.delete_doc("Item Price", name, ignore_permissions=True, force=1)
+        if frappe.db.exists("Item", sku2):
+            frappe.delete_doc("Item", sku2, ignore_permissions=True, force=1)
         frappe.db.commit()
 
     def check_tms():

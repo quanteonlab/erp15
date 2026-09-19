@@ -6255,29 +6255,154 @@ def _parse_airtable_catalog_csv(csv_text):
 	"image_url" (Imagen column — a remote Airtable attachment URL; note these
 	URLs are time-limited, so materialize/import promptly after exporting).
 	"""
-	if not csv_text:
-		return [], 0
+	column_map = {
+		"item_code": "TAG",
+		"item_name": "Producto",
+		"item_group": "Clase",
+		"price": "Transferencia",
+		"cash_price": "Efectivo",
+		"image_url": "Imagen",
+	}
+	parsed, total, _headers = _parse_mapped_catalog_csv(csv_text, column_map)
+	return parsed, total
 
+
+# Logical fields the custom mapper can bind to a CSV header.
+CUSTOM_CATALOG_MAP_FIELDS = (
+	"item_code",
+	"item_name",
+	"item_group",
+	"barcode",
+	"stock_uom",
+	"price",
+	"cash_price",
+	"image_url",
+)
+
+# Case-insensitive header aliases used to auto-guess a custom map.
+_CUSTOM_FIELD_ALIASES = {
+	"item_code": ("tag", "sku", "item_code", "item code", "codigo", "código", "code", "item"),
+	"item_name": ("producto", "item_name", "item name", "name", "title", "nombre", "description"),
+	"item_group": (
+		"clase",
+		"item_group",
+		"item group",
+		"category",
+		"categoria",
+		"categoría",
+		"group",
+		"grupo",
+	),
+	"barcode": ("barcode", "ean", "upc", "codigo_barras", "código de barras", "barras"),
+	"stock_uom": ("uom", "stock_uom", "unidad", "unit", "um"),
+	"price": ("transferencia", "price", "precio", "rate", "standard selling", "precio lista"),
+	"cash_price": ("efectivo", "cash", "cash_price", "precio efectivo", "precio_efectivo"),
+	"image_url": ("imagen", "image", "image_url", "foto", "photo", "url imagen"),
+}
+
+
+def _normalize_column_map(column_map):
+	"""Accept dict or JSON string; keep only known fields with non-empty headers."""
+	if column_map in (None, "", {}):
+		return {}
+	if isinstance(column_map, str):
+		try:
+			column_map = frappe.parse_json(column_map) or {}
+		except Exception:
+			return {}
+	if not isinstance(column_map, dict):
+		return {}
+	out = {}
+	for key in CUSTOM_CATALOG_MAP_FIELDS:
+		raw = column_map.get(key)
+		if raw in (None, ""):
+			continue
+		header = cstr(raw).strip()
+		if header:
+			out[key] = header
+	return out
+
+
+def _csv_header_row(csv_text):
+	"""Return the first non-empty CSV header row as a list of fieldnames."""
+	if not csv_text:
+		return []
+	reader = csv.reader(io.StringIO(csv_text))
+	for row in reader:
+		if any((cell or "").strip() for cell in row):
+			return [(cell or "").strip() for cell in row]
+	return []
+
+
+def _guess_column_map(headers):
+	"""Best-effort map from header names → logical fields (first match wins)."""
+	if not headers:
+		return {}
+	by_lower = {}
+	for h in headers:
+		key = (h or "").strip().lower()
+		if key and key not in by_lower:
+			by_lower[key] = h
+	guessed = {}
+	for field, aliases in _CUSTOM_FIELD_ALIASES.items():
+		for alias in aliases:
+			hit = by_lower.get(alias)
+			if hit:
+				guessed[field] = hit
+				break
+	return guessed
+
+
+def _dict_row_get(row, header):
+	"""Lookup a DictReader cell by header, tolerating BOM / stray spaces."""
+	if not header:
+		return ""
+	if header in row:
+		return row.get(header) or ""
+	want = header.strip().lower().lstrip("\ufeff")
+	for key, val in row.items():
+		if (key or "").strip().lower().lstrip("\ufeff") == want:
+			return val or ""
+	return ""
+
+
+def _parse_mapped_catalog_csv(csv_text, column_map):
+	"""Parse a headered CSV using an explicit column_map of logical→header names."""
+	column_map = _normalize_column_map(column_map)
+	if not csv_text:
+		return [], 0, []
+
+	headers = _csv_header_row(csv_text)
 	reader = csv.DictReader(io.StringIO(csv_text))
 	data_rows = list(reader)
 	parsed = []
 
 	for line_no, row in enumerate(data_rows, start=2):
-		if not any((v or "").strip() for v in row.values()):
+		if not any((v or "").strip() for v in (row or {}).values()):
 			continue
 
-		item_code = (row.get("TAG") or "").strip()
-		item_name = (row.get("Producto") or "").strip()
-		item_group = (row.get("Clase") or "").strip() or "Products"
-		price = _safe_float(row.get("Transferencia"))
-		cash_price = _safe_float(row.get("Efectivo"))
-		image_url = (row.get("Imagen") or "").strip()
+		item_code = cstr(_dict_row_get(row, column_map.get("item_code"))).strip()
+		item_name = cstr(_dict_row_get(row, column_map.get("item_name"))).strip()
+		item_group = cstr(_dict_row_get(row, column_map.get("item_group"))).strip() or "Products"
+		barcode = cstr(_dict_row_get(row, column_map.get("barcode"))).strip()
+		stock_uom = cstr(_dict_row_get(row, column_map.get("stock_uom"))).strip()
+		price = _safe_float(_dict_row_get(row, column_map.get("price"))) if column_map.get("price") else 0.0
+		cash_price = (
+			_safe_float(_dict_row_get(row, column_map.get("cash_price")))
+			if column_map.get("cash_price")
+			else 0.0
+		)
+		image_url = cstr(_dict_row_get(row, column_map.get("image_url"))).strip()
 
 		errors = []
-		if not item_code:
-			errors.append("Missing item_code (TAG column).")
-		if not item_name:
-			errors.append("Missing item_name/title (Producto column).")
+		if not column_map.get("item_code"):
+			errors.append("Map item_code to a CSV column.")
+		elif not item_code:
+			errors.append(f"Missing item_code ({column_map.get('item_code')} column).")
+		if not column_map.get("item_name"):
+			errors.append("Map item_name to a CSV column.")
+		elif not item_name:
+			errors.append(f"Missing item_name ({column_map.get('item_name')} column).")
 
 		parsed.append(
 			{
@@ -6285,8 +6410,8 @@ def _parse_airtable_catalog_csv(csv_text):
 				"item_code": item_code,
 				"item_name": item_name or item_code,
 				"title_simplified": item_name,
-				"barcode": "",
-				"stock_uom": "",
+				"barcode": barcode,
+				"stock_uom": stock_uom,
 				"item_group": item_group,
 				"price": price,
 				"cash_price": cash_price,
@@ -6297,7 +6422,17 @@ def _parse_airtable_catalog_csv(csv_text):
 			}
 		)
 
-	return parsed, len(data_rows)
+	return parsed, len(data_rows), headers
+
+
+def _parse_custom_catalog_csv(csv_text, column_map=None):
+	"""Custom format: real header row + caller-supplied column_map."""
+	column_map = _normalize_column_map(column_map)
+	headers = _csv_header_row(csv_text)
+	if not column_map:
+		column_map = _guess_column_map(headers)
+	parsed, total, headers = _parse_mapped_catalog_csv(csv_text, column_map)
+	return parsed, total, headers, column_map
 
 
 def _ensure_price_list(price_list_name):
@@ -6379,23 +6514,38 @@ def get_catalog_csv_column_guide():
 
 
 @frappe.whitelist()
-def preview_catalog_csv_import(csv_text, source="mingsheng"):
-	"""Preview parsed CSV rows. "mingsheng" uses stable column indexes (header
-	names ignored); "airtable" reads a real header row (TAG/Producto/...)."""
+def preview_catalog_csv_import(csv_text, source="mingsheng", column_map=None):
+	"""Preview parsed CSV rows.
+
+	source="mingsheng": stable column indexes (header names ignored).
+	source="airtable": fixed Airtable Productos headers.
+	source="custom": real header row + column_map (logical field → CSV header).
+	"""
+	headers = []
+	resolved_map = None
 	if source == "airtable":
 		parsed_rows, total_rows = _parse_airtable_catalog_csv(csv_text)
+	elif source == "custom":
+		parsed_rows, total_rows, headers, resolved_map = _parse_custom_catalog_csv(
+			csv_text, column_map
+		)
 	else:
 		parsed_rows, total_rows = _parse_catalog_csv(csv_text)
 	valid_rows = [r for r in parsed_rows if not r.get("errors")]
 	invalid_rows = [r for r in parsed_rows if r.get("errors")]
-	return {
+	out = {
 		"total_rows": total_rows,
 		"parsed_rows": len(parsed_rows),
 		"valid_rows": len(valid_rows),
 		"invalid_rows": len(invalid_rows),
 		"preview": parsed_rows[:25],
-		"guide": CATALOG_CSV_COLUMN_GUIDE if source != "airtable" else None,
+		"guide": CATALOG_CSV_COLUMN_GUIDE if source == "mingsheng" else None,
 	}
+	if source == "custom":
+		out["headers"] = headers
+		out["column_map"] = resolved_map or {}
+		out["mappable_fields"] = list(CUSTOM_CATALOG_MAP_FIELDS)
+	return out
 
 
 @frappe.whitelist()
@@ -6412,6 +6562,7 @@ def import_catalog_csv_products(
 	source="mingsheng",
 	cash_price_list="Efectivo",
 	transfer_price_list="Transferencia",
+	column_map=None,
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
@@ -6421,19 +6572,30 @@ def import_catalog_csv_products(
 	to price_list (catalog / Product Manager default, usually Standard
 	Selling) and also to transfer_price_list for payment-method pricing;
 	Efectivo writes to cash_price_list.
+	source="custom": same dual price lists when cash_price is mapped; column
+	bindings come from column_map.
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
 
-	if source == "airtable":
+	resolved_map = {}
+	if source in ("airtable", "custom"):
 		# Dirty clients may send null/"" — keep catalog + payment lists usable.
 		price_list = (cstr(price_list) or "").strip() or "Standard Selling"
 		cash_price_list = (cstr(cash_price_list) or "").strip() or "Efectivo"
-		transfer_price_list = (cstr(transfer_price_list) or "").strip() or "Transferencia"
+		transfer_price_list = (cstr(transfer_price_list) or "").strip()
+		if source == "airtable" and not transfer_price_list:
+			transfer_price_list = "Transferencia"
 		_ensure_price_list(price_list)
 		_ensure_price_list(cash_price_list)
-		_ensure_price_list(transfer_price_list)
-		parsed_rows, total_rows = _parse_airtable_catalog_csv(csv_text)
+		if transfer_price_list:
+			_ensure_price_list(transfer_price_list)
+		if source == "airtable":
+			parsed_rows, total_rows = _parse_airtable_catalog_csv(csv_text)
+		else:
+			parsed_rows, total_rows, _headers, resolved_map = _parse_custom_catalog_csv(
+				csv_text, column_map
+			)
 	else:
 		parsed_rows, total_rows = _parse_catalog_csv(csv_text)
 	start = cint(start)
@@ -6647,10 +6809,14 @@ def import_catalog_csv_products(
 					report["barcode_updates"] += 1
 
 			# Primary catalog price (Transferencia column for airtable, or
-			# mingsheng price column). Always lands on price_list so Product
-			# Manager / POS default "Standard Selling" shows a Price.
+			# mingsheng / custom price column). Always lands on price_list so
+			# Product Manager / POS default "Standard Selling" shows a Price.
 			price_targets = [price_list]
-			if source == "airtable" and transfer_price_list and transfer_price_list != price_list:
+			if (
+				source in ("airtable", "custom")
+				and transfer_price_list
+				and transfer_price_list != price_list
+			):
 				price_targets.append(transfer_price_list)
 
 			if flt(row.get("price")) > 0:
@@ -6677,7 +6843,10 @@ def import_catalog_csv_products(
 						)
 						report["review_created"] += 1
 
-			if source == "airtable" and flt(row.get("cash_price")) > 0:
+			write_cash = source == "airtable" or (
+				source == "custom" and resolved_map.get("cash_price")
+			)
+			if write_cash and flt(row.get("cash_price")) > 0:
 				try:
 					if _upsert_item_price(item_doc.item_code, cash_price_list, row["cash_price"]):
 						report["price_updates"] += 1
