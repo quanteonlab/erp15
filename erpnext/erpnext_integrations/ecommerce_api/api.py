@@ -1933,6 +1933,52 @@ def get_item_price(item_code, price_list, customer=None, uom=None):
 
 
 @frappe.whitelist(allow_guest=True)
+def get_item_prices_bulk(item_codes, price_list=None, price_lists=None):
+	"""Batch item-price lookup.
+
+	Pass price_list (single name, e.g. Efectivo) for POS checkout — returns
+	{item_code: price_list_rate} for items that have a row in that list.
+
+	Pass price_lists (JSON-encoded list, e.g. ["Efectivo", "Transferencia"])
+	for the catalog's optional payment-method price display — returns
+	{item_code: {price_list_name: rate}} covering whichever of the requested
+	lists each item actually has a price in.
+	"""
+	import json
+
+	if isinstance(item_codes, str):
+		item_codes = json.loads(item_codes)
+	item_codes = [c for c in (item_codes or []) if c]
+	if not item_codes:
+		return {}
+
+	if price_lists:
+		if isinstance(price_lists, str):
+			price_lists = json.loads(price_lists)
+		price_lists = [pl for pl in (price_lists or []) if pl]
+		if not price_lists:
+			return {}
+		from erpnext.erpnext_integrations.ecommerce_api.product_manager import _selling_prices_map
+
+		full_map = _selling_prices_map(item_codes)
+		out = {}
+		for code, prices in full_map.items():
+			filtered = {pl: prices[pl] for pl in price_lists if pl in prices}
+			if filtered:
+				out[code] = filtered
+		return out
+
+	if not price_list:
+		return {}
+	out = {}
+	for code in item_codes:
+		rate = get_item_price(code, price_list)
+		if rate:
+			out[code] = rate
+	return out
+
+
+@frappe.whitelist(allow_guest=True)
 def get_all_item_prices(item_code):
 	"""
 	Get all price list rates for an item
@@ -6201,6 +6247,74 @@ def _parse_catalog_csv(csv_text):
 	return parsed, len(data_rows)
 
 
+def _parse_airtable_catalog_csv(csv_text):
+	"""Parse an Airtable "Productos" export (real header row, named columns).
+
+	Produces the same row shape as _parse_catalog_csv, plus two optional keys
+	_parse_catalog_csv rows never set: "cash_price" (Efectivo column) and
+	"image_url" (Imagen column — a remote Airtable attachment URL; note these
+	URLs are time-limited, so materialize/import promptly after exporting).
+	"""
+	if not csv_text:
+		return [], 0
+
+	reader = csv.DictReader(io.StringIO(csv_text))
+	data_rows = list(reader)
+	parsed = []
+
+	for line_no, row in enumerate(data_rows, start=2):
+		if not any((v or "").strip() for v in row.values()):
+			continue
+
+		item_code = (row.get("TAG") or "").strip()
+		item_name = (row.get("Producto") or "").strip()
+		item_group = (row.get("Clase") or "").strip() or "Products"
+		price = _safe_float(row.get("Transferencia"))
+		cash_price = _safe_float(row.get("Efectivo"))
+		image_url = (row.get("Imagen") or "").strip()
+
+		errors = []
+		if not item_code:
+			errors.append("Missing item_code (TAG column).")
+		if not item_name:
+			errors.append("Missing item_name/title (Producto column).")
+
+		parsed.append(
+			{
+				"line_no": line_no,
+				"item_code": item_code,
+				"item_name": item_name or item_code,
+				"title_simplified": item_name,
+				"barcode": "",
+				"stock_uom": "",
+				"item_group": item_group,
+				"price": price,
+				"cash_price": cash_price,
+				"image_url": image_url,
+				"last_price": 0.0,
+				"stock_hint": 0.0,
+				"errors": errors,
+			}
+		)
+
+	return parsed, len(data_rows)
+
+
+def _ensure_price_list(price_list_name):
+	"""Create a selling Price List if it doesn't already exist (idempotent)."""
+	if not price_list_name or frappe.db.exists("Price List", price_list_name):
+		return
+	frappe.get_doc(
+		{
+			"doctype": "Price List",
+			"price_list_name": price_list_name,
+			"enabled": 1,
+			"selling": 1,
+			"currency": frappe.defaults.get_global_default("currency") or "USD",
+		}
+	).insert(ignore_permissions=True)
+
+
 def _resolve_uom_for_import(uom):
 	if uom and frappe.db.exists("UOM", uom):
 		return uom
@@ -6240,9 +6354,13 @@ def get_catalog_csv_column_guide():
 
 
 @frappe.whitelist()
-def preview_catalog_csv_import(csv_text):
-	"""Preview parsed CSV rows using stable column indexes (header names ignored)."""
-	parsed_rows, total_rows = _parse_catalog_csv(csv_text)
+def preview_catalog_csv_import(csv_text, source="mingsheng"):
+	"""Preview parsed CSV rows. "mingsheng" uses stable column indexes (header
+	names ignored); "airtable" reads a real header row (TAG/Producto/...)."""
+	if source == "airtable":
+		parsed_rows, total_rows = _parse_airtable_catalog_csv(csv_text)
+	else:
+		parsed_rows, total_rows = _parse_catalog_csv(csv_text)
 	valid_rows = [r for r in parsed_rows if not r.get("errors")]
 	invalid_rows = [r for r in parsed_rows if r.get("errors")]
 	return {
@@ -6251,7 +6369,7 @@ def preview_catalog_csv_import(csv_text):
 		"valid_rows": len(valid_rows),
 		"invalid_rows": len(invalid_rows),
 		"preview": parsed_rows[:25],
-		"guide": CATALOG_CSV_COLUMN_GUIDE,
+		"guide": CATALOG_CSV_COLUMN_GUIDE if source != "airtable" else None,
 	}
 
 
@@ -6266,15 +6384,26 @@ def import_catalog_csv_products(
 	batch_size=0,
 	import_session=None,
 	file_name=None,
+	source="mingsheng",
+	cash_price_list="Efectivo",
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
-	CSV header text is ignored; only stable column order is used.
+	source="mingsheng" (default): CSV header text is ignored, only stable
+	column order is used. source="airtable": a real header row (TAG/Producto/
+	Clase/Efectivo/Transferencia/...) is read by name, and a second Item
+	Price is written to cash_price_list from the Efectivo column alongside
+	the normal price_list write from the Transferencia column.
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
 
-	parsed_rows, total_rows = _parse_catalog_csv(csv_text)
+	if source == "airtable":
+		_ensure_price_list(price_list)
+		_ensure_price_list(cash_price_list)
+		parsed_rows, total_rows = _parse_airtable_catalog_csv(csv_text)
+	else:
+		parsed_rows, total_rows = _parse_catalog_csv(csv_text)
 	start = cint(start)
 	batch_size = cint(batch_size)
 	if start < 0:
@@ -6337,6 +6466,7 @@ def import_catalog_csv_products(
 			"stock_uom": row.get("stock_uom"),
 			"item_group": row.get("item_group"),
 			"price": row.get("price"),
+			"cash_price": row.get("cash_price"),
 			"last_price": row.get("last_price"),
 			"stock_hint": row.get("stock_hint"),
 			"errors": row.get("errors") or [],
@@ -6445,6 +6575,12 @@ def import_catalog_csv_products(
 			item_doc.include_item_in_manufacturing = 0
 			item_doc.disabled = 0
 
+			image_url = row.get("image_url")
+			if image_url and not item_doc.image:
+				# Remote URL — pick it up later with the existing "materialize
+				# remote images" admin action to download a local thumb.
+				item_doc.image = image_url
+
 			if existing:
 				item_doc.save(ignore_permissions=True)
 			else:
@@ -6508,6 +6644,44 @@ def import_catalog_csv_products(
 						item_code=item_code,
 						reason_code=cir.REASON_PRICE_WRITE_FAILED,
 						message=str(price_exc),
+						severity="warning",
+						payload=payload,
+						live_item=live_item,
+					)
+					report["review_created"] += 1
+
+			if flt(row.get("cash_price")) > 0:
+				try:
+					cash_price_name = frappe.db.get_value(
+						"Item Price",
+						{"item_code": item_doc.item_code, "price_list": cash_price_list, "selling": 1},
+						"name",
+					)
+					if cash_price_name:
+						frappe.db.set_value(
+							"Item Price", cash_price_name, "price_list_rate", flt(row["cash_price"])
+						)
+					else:
+						frappe.get_doc(
+							{
+								"doctype": "Item Price",
+								"item_code": item_doc.item_code,
+								"price_list": cash_price_list,
+								"price_list_rate": flt(row["cash_price"]),
+								"selling": 1,
+							}
+						).insert(ignore_permissions=True)
+					report["price_updates"] += 1
+				except Exception as cash_price_exc:
+					report["warnings"].append(
+						{"line_no": row["line_no"], "message": f"Cash price write failed: {cash_price_exc}"}
+					)
+					cir.enqueue_import_review(
+						session_name,
+						line_no=row.get("line_no"),
+						item_code=item_code,
+						reason_code=cir.REASON_PRICE_WRITE_FAILED,
+						message=str(cash_price_exc),
 						severity="warning",
 						payload=payload,
 						live_item=live_item,
