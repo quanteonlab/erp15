@@ -6315,6 +6315,31 @@ def _ensure_price_list(price_list_name):
 	).insert(ignore_permissions=True)
 
 
+def _upsert_item_price(item_code, price_list, rate):
+	"""Create or update a selling Item Price row. Returns True if written."""
+	rate = flt(rate)
+	if rate <= 0 or not item_code or not price_list:
+		return False
+	price_name = frappe.db.get_value(
+		"Item Price",
+		{"item_code": item_code, "price_list": price_list, "selling": 1},
+		"name",
+	)
+	if price_name:
+		frappe.db.set_value("Item Price", price_name, "price_list_rate", rate)
+	else:
+		frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"item_code": item_code,
+				"price_list": price_list,
+				"price_list_rate": rate,
+				"selling": 1,
+			}
+		).insert(ignore_permissions=True)
+	return True
+
+
 def _resolve_uom_for_import(uom):
 	if uom and frappe.db.exists("UOM", uom):
 		return uom
@@ -6386,21 +6411,28 @@ def import_catalog_csv_products(
 	file_name=None,
 	source="mingsheng",
 	cash_price_list="Efectivo",
+	transfer_price_list="Transferencia",
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
 	source="mingsheng" (default): CSV header text is ignored, only stable
 	column order is used. source="airtable": a real header row (TAG/Producto/
-	Clase/Efectivo/Transferencia/...) is read by name, and a second Item
-	Price is written to cash_price_list from the Efectivo column alongside
-	the normal price_list write from the Transferencia column.
+	Clase/Efectivo/Transferencia/...) is read by name. Transferencia writes
+	to price_list (catalog / Product Manager default, usually Standard
+	Selling) and also to transfer_price_list for payment-method pricing;
+	Efectivo writes to cash_price_list.
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
 
 	if source == "airtable":
+		# Dirty clients may send null/"" — keep catalog + payment lists usable.
+		price_list = (cstr(price_list) or "").strip() or "Standard Selling"
+		cash_price_list = (cstr(cash_price_list) or "").strip() or "Efectivo"
+		transfer_price_list = (cstr(transfer_price_list) or "").strip() or "Transferencia"
 		_ensure_price_list(price_list)
 		_ensure_price_list(cash_price_list)
+		_ensure_price_list(transfer_price_list)
 		parsed_rows, total_rows = _parse_airtable_catalog_csv(csv_text)
 	else:
 		parsed_rows, total_rows = _parse_catalog_csv(csv_text)
@@ -6614,64 +6646,41 @@ def import_catalog_csv_products(
 					item_doc.save(ignore_permissions=True)
 					report["barcode_updates"] += 1
 
-			if flt(row.get("price")) > 0:
-				try:
-					price_name = frappe.db.get_value(
-						"Item Price",
-						{"item_code": item_doc.item_code, "price_list": price_list, "selling": 1},
-						"name",
-					)
-					if price_name:
-						frappe.db.set_value("Item Price", price_name, "price_list_rate", flt(row["price"]))
-					else:
-						frappe.get_doc(
-							{
-								"doctype": "Item Price",
-								"item_code": item_doc.item_code,
-								"price_list": price_list,
-								"price_list_rate": flt(row["price"]),
-								"selling": 1,
-							}
-						).insert(ignore_permissions=True)
-					report["price_updates"] += 1
-				except Exception as price_exc:
-					report["warnings"].append(
-						{"line_no": row["line_no"], "message": f"Price write failed: {price_exc}"}
-					)
-					cir.enqueue_import_review(
-						session_name,
-						line_no=row.get("line_no"),
-						item_code=item_code,
-						reason_code=cir.REASON_PRICE_WRITE_FAILED,
-						message=str(price_exc),
-						severity="warning",
-						payload=payload,
-						live_item=live_item,
-					)
-					report["review_created"] += 1
+			# Primary catalog price (Transferencia column for airtable, or
+			# mingsheng price column). Always lands on price_list so Product
+			# Manager / POS default "Standard Selling" shows a Price.
+			price_targets = [price_list]
+			if source == "airtable" and transfer_price_list and transfer_price_list != price_list:
+				price_targets.append(transfer_price_list)
 
-			if flt(row.get("cash_price")) > 0:
-				try:
-					cash_price_name = frappe.db.get_value(
-						"Item Price",
-						{"item_code": item_doc.item_code, "price_list": cash_price_list, "selling": 1},
-						"name",
-					)
-					if cash_price_name:
-						frappe.db.set_value(
-							"Item Price", cash_price_name, "price_list_rate", flt(row["cash_price"])
-						)
-					else:
-						frappe.get_doc(
+			if flt(row.get("price")) > 0:
+				for target_list in price_targets:
+					try:
+						if _upsert_item_price(item_doc.item_code, target_list, row["price"]):
+							report["price_updates"] += 1
+					except Exception as price_exc:
+						report["warnings"].append(
 							{
-								"doctype": "Item Price",
-								"item_code": item_doc.item_code,
-								"price_list": cash_price_list,
-								"price_list_rate": flt(row["cash_price"]),
-								"selling": 1,
+								"line_no": row["line_no"],
+								"message": f"Price write failed ({target_list}): {price_exc}",
 							}
-						).insert(ignore_permissions=True)
-					report["price_updates"] += 1
+						)
+						cir.enqueue_import_review(
+							session_name,
+							line_no=row.get("line_no"),
+							item_code=item_code,
+							reason_code=cir.REASON_PRICE_WRITE_FAILED,
+							message=str(price_exc),
+							severity="warning",
+							payload=payload,
+							live_item=live_item,
+						)
+						report["review_created"] += 1
+
+			if source == "airtable" and flt(row.get("cash_price")) > 0:
+				try:
+					if _upsert_item_price(item_doc.item_code, cash_price_list, row["cash_price"]):
+						report["price_updates"] += 1
 				except Exception as cash_price_exc:
 					report["warnings"].append(
 						{"line_no": row["line_no"], "message": f"Cash price write failed: {cash_price_exc}"}

@@ -770,6 +770,66 @@ def suite_5_12_modules_read():
         guide = ecommerce_api.get_catalog_csv_column_guide()
         assert isinstance(guide, list) and len(guide) >= 1
 
+        # Airtable: Transferencia → Standard Selling (+ Transferencia list),
+        # Efectivo → Efectivo. Regression for empty Price column in PM.
+        sku = f"SMOKE-AT-{frappe.generate_hash(length=6)}"
+        at_csv = (
+            "TAG,Producto,Clase,Marca,Estado,Efectivo,Transferencia,Imagen\n"
+            f"{sku},Smoke Airtable Price,Products,,En Stock,8800,9064,\n"
+        )
+        at_report = ecommerce_api.import_catalog_csv_products(
+            csv_text=at_csv,
+            price_list="Standard Selling",
+            cash_price_list="Efectivo",
+            transfer_price_list="Transferencia",
+            default_item_group="Products",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            file_name="smoke-airtable-import.csv",
+        )
+        assert at_report.get("created_items", 0) + at_report.get("updated_items", 0) >= 1, at_report
+        assert at_report.get("price_updates", 0) >= 2, at_report
+        std = flt(
+            frappe.db.get_value(
+                "Item Price",
+                {"item_code": sku, "price_list": "Standard Selling", "selling": 1},
+                "price_list_rate",
+            )
+            or 0
+        )
+        cash = flt(
+            frappe.db.get_value(
+                "Item Price",
+                {"item_code": sku, "price_list": "Efectivo", "selling": 1},
+                "price_list_rate",
+            )
+            or 0
+        )
+        xfer = flt(
+            frappe.db.get_value(
+                "Item Price",
+                {"item_code": sku, "price_list": "Transferencia", "selling": 1},
+                "price_list_rate",
+            )
+            or 0
+        )
+        assert std == 9064, f"Standard Selling missing/wrong: {std}"
+        assert cash == 8800, f"Efectivo missing/wrong: {cash}"
+        assert xfer == 9064, f"Transferencia missing/wrong: {xfer}"
+        # cleanup smoke SKU
+        for pl in ("Standard Selling", "Efectivo", "Transferencia"):
+            name = frappe.db.get_value(
+                "Item Price", {"item_code": sku, "price_list": pl, "selling": 1}, "name"
+            )
+            if name:
+                frappe.delete_doc("Item Price", name, ignore_permissions=True, force=1)
+        if frappe.db.exists("Item", sku):
+            frappe.delete_doc("Item", sku, ignore_permissions=True, force=1)
+        frappe.db.commit()
+
     def check_tms():
         from erpnext.erpnext_integrations.ecommerce_api import tms_api as tms
         ctx = tms.get_planner_context()

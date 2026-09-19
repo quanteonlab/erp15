@@ -503,6 +503,26 @@
       "expect": "ok"
     },
     {
+      "id": "import_catalog_csv_airtable_null_price_lists",
+      "source": "regression",
+      "bug": "Airtable import with null price_list/cash_price_list/transfer_price_list must not TypeError; empty lists skip upsert",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "TAG,Producto,Clase,Marca,Estado,Efectivo,Transferencia,Imagen\nEDGE-AT-NULL,Edge Airtable Null Prices,Products,,En Stock,100,110,\n",
+        "price_list": null,
+        "cash_price_list": null,
+        "transfer_price_list": "",
+        "default_item_group": "Products",
+        "update_existing": 1,
+        "create_missing_groups": 0,
+        "start": 0,
+        "batch_size": 10,
+        "source": "airtable",
+        "file_name": "edge-airtable-null-lists.csv"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",
