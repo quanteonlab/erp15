@@ -652,6 +652,27 @@ def suite_5_12_modules_read():
                 f"list_leads_admin must nest contact data under fields: {list(lead.keys())}"
             assert "stage" in lead, f"list_leads_admin missing stage: {list(lead.keys())}"
 
+        # duplicate_lead must not 409 on unique email (clone clears email_id)
+        src = frappe.new_doc("Lead")
+        src.lead_name = "Smoke Dup Source"
+        src.email_id = f"smoke.dup.{frappe.generate_hash(length=8)}@example.com"
+        src.flags.ignore_permissions = True
+        src.insert(ignore_permissions=True)
+        frappe.db.commit()
+        clone_name = None
+        try:
+            out = pa.duplicate_lead(lead=src.name)
+            assert out and out.get("ok") and out.get("name"), out
+            clone_name = out["name"]
+            assert clone_name != src.name
+            clone_email = frappe.db.get_value("Lead", clone_name, "email_id")
+            assert not clone_email, f"clone must clear email_id, got {clone_email!r}"
+        finally:
+            for name in (clone_name, src.name):
+                if name and frappe.db.exists("Lead", name):
+                    frappe.delete_doc("Lead", name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_employees():
         from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
         perms = ea.list_app_permissions()
@@ -760,6 +781,13 @@ def suite_5_12_modules_read():
         from erpnext.erpnext_integrations.ecommerce_api import shop_ui_settings as sui
         s = sui.get_shop_ui_settings()
         assert s is not None
+        # catalogTemplate must round-trip (save response used to strip it → UI snap-back)
+        out = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "commerce"}})
+        settings = (out or {}).get("settings") or {}
+        assert (settings.get("catalogDisplay") or {}).get("catalogTemplate") == "commerce", settings.get("catalogDisplay")
+        out2 = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "classic"}})
+        settings2 = (out2 or {}).get("settings") or {}
+        assert (settings2.get("catalogDisplay") or {}).get("catalogTemplate") == "classic"
 
     def check_tags():
         from erpnext.erpnext_integrations.ecommerce_api import tags_api as ta
@@ -771,6 +799,18 @@ def suite_5_12_modules_read():
         spec = openapi.get_openapi_spec()
         assert isinstance(spec, dict) and (spec.get("paths") or spec.get("openapi")), \
             f"bad openapi: {list(spec.keys())[:8] if isinstance(spec, dict) else type(spec)}"
+
+    def check_crm_party():
+        from erpnext.erpnext_integrations.ecommerce_api import crm_party_api as cpa
+        cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+        if not cust:
+            return
+        inv = cpa.list_party_invoices(party_type="Customer", party=cust, is_return=0, page_length=5)
+        assert inv.get("ok") and isinstance(inv.get("rows"), list), f"bad invoices: {inv}"
+        pay = cpa.list_party_payments(party_type="Customer", party=cust, page_length=5)
+        assert pay.get("ok") and isinstance(pay.get("rows"), list), f"bad payments: {pay}"
+        prods = cpa.list_party_products(party_type="Customer", party=cust, page_length=5)
+        assert prods.get("ok") and isinstance(prods.get("products"), list), f"bad products: {prods}"
 
     if frappe.db.exists("DocType", "Preventa Lead Consulta") or frappe.db.exists("DocType", "Preventa Settings"):
         _run("5.12.1 preventa settings + board", check_preventa, "S3")
@@ -789,6 +829,7 @@ def suite_5_12_modules_read():
     _run("5.12.7 get_shop_ui_settings", check_shop_ui, "S3")
     _run("5.12.8 search_tags", check_tags, "S3")
     _run("5.12.9 get_openapi_spec", check_openapi, "S3")
+    _run("5.12.10 crm party invoices/payments/products", check_crm_party, "S3")
 
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────

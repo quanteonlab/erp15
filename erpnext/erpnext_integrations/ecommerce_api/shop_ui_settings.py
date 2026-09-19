@@ -177,6 +177,12 @@ def _normalize_header_preset(val) -> str:
 	return "default"
 
 
+def _normalize_catalog_template(val) -> str:
+	if val in ("commerce", "coming_soon", "classic"):
+		return val
+	return "classic"
+
+
 def _normalize_catalog_display(raw) -> dict:
 	src = raw if isinstance(raw, dict) else {}
 	return {
@@ -186,6 +192,7 @@ def _normalize_catalog_display(raw) -> dict:
 		"showCardBorder": _as_bool(src.get("showCardBorder"), True),
 		"cardBorderRadius": _as_int(src.get("cardBorderRadius"), 8, 0, 32),
 		"noImageTilesAtEnd": _as_bool(src.get("noImageTilesAtEnd"), True),
+		"catalogTemplate": _normalize_catalog_template(src.get("catalogTemplate")),
 		"headerPreset": _normalize_header_preset(src.get("headerPreset")),
 		"headerSearchBackgroundColor": _as_hex(src.get("headerSearchBackgroundColor"), ""),
 		"headerSearchTextColor": _as_hex(src.get("headerSearchTextColor"), ""),

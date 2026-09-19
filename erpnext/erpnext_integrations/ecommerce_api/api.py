@@ -28,6 +28,50 @@ from erpnext.stock.get_item_details import get_item_details as get_item_details_
 from erpnext.accounts.doctype.pricing_rule.pricing_rule import apply_pricing_rule
 
 
+@frappe.whitelist(allow_guest=True)
+def get_catalog_taxonomy(lang=None):
+	"""Item Group / Brand aliases + thumbnails for catalog UI."""
+	from erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n import (
+		get_catalog_taxonomy as _get_catalog_taxonomy,
+	)
+
+	return _get_catalog_taxonomy(lang=lang)
+
+
+@frappe.whitelist()
+def enqueue_generate_taxonomy_aliases(
+	doctype=None,
+	names=None,
+	langs=None,
+	only_missing=1,
+	limit=None,
+	use_online_translate=1,
+	now=0,
+):
+	"""Queue (or run) auto-generation of Item Group / Brand aliases."""
+	from erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n import (
+		enqueue_generate_taxonomy_aliases as _enqueue,
+	)
+
+	return _enqueue(
+		doctype=doctype,
+		names=names,
+		langs=langs,
+		only_missing=only_missing,
+		limit=limit,
+		use_online_translate=use_online_translate,
+		now=now,
+	)
+
+
+@frappe.whitelist()
+def set_taxonomy_aliases(doctype=None, name=None, aliases=None, overwrite=0):
+	"""Merge JSON aliases onto one Item Group or Brand."""
+	from erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n import set_taxonomy_aliases as _set
+
+	return _set(doctype=doctype, name=name, aliases=aliases, overwrite=overwrite)
+
+
 # ========================================
 # PRODUCT / ITEM APIs
 # ========================================

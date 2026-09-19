@@ -65,6 +65,7 @@ after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.api.ensure_product_bundle_promo_fields",
 	"erpnext.erpnext_integrations.ecommerce_api.preventa_api.ensure_preventa_custom_fields",
 	"erpnext.erpnext_integrations.ecommerce_api.print_templates_api.gift_core_print_templates",
+	"erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n.ensure_taxonomy_i18n",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"
@@ -476,6 +477,7 @@ scheduler_events = {
 	],
 	"weekly": [
 		"erpnext.accounts.utils.auto_create_exchange_rate_revaluation_weekly",
+		"erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n.weekly_generate_missing_taxonomy_aliases",
 	],
 	"daily_long": [
 		"erpnext.accounts.doctype.process_subscription.process_subscription.create_subscription_process",

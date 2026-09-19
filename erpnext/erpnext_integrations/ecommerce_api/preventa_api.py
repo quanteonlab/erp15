@@ -605,6 +605,8 @@ def duplicate_lead(lead=None):
 	# Mark duplicate in name so sellers can tell them apart.
 	base_name = (src.lead_name or src.company_name or src.name or "Lead").strip()
 	doc.lead_name = f"{base_name} (copy)"
+	# Lead.email_id must be unique (CRM Settings) — leave blank on the clone.
+	doc.email_id = None
 	doc.flags.ignore_permissions = True
 	doc.insert(ignore_permissions=True)
 

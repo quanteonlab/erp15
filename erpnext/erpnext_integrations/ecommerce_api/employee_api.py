@@ -245,6 +245,16 @@ APP_PERMISSIONS = [
 		"desc_zh": "打印条码与价格标签。",
 	},
 	{
+		"id": "tools.catalog_pdf",
+		"group": "herramientas",
+		"label_en": "Catalog PDF",
+		"label_es": "Catálogo PDF",
+		"label_zh": "目录 PDF",
+		"desc_en": "Export catalog PDFs (layouts, categories, selections).",
+		"desc_es": "Exportar PDF del catálogo (diseños, categorías, selecciones).",
+		"desc_zh": "导出目录 PDF（版式、分类、选集）。",
+	},
+	{
 		"id": "tools.migrate",
 		"group": "herramientas",
 		"label_en": "Migrate / CSV",
@@ -381,6 +391,7 @@ PERMISSION_TO_ROLES = {
 	"tables.orders.all": ["Sales User"],
 	"tools.sync": ["Stock Manager"],
 	"tools.labels": ["Stock User"],
+	"tools.catalog_pdf": ["Stock Manager", "Sales Manager"],
 	"tools.migrate": ["Stock Manager"],
 	"tools.settings": ["HR User"],
 	"employees.create_user": ["HR Manager"],
@@ -403,6 +414,7 @@ _STARTER_REPOSITOR = [
 	"tables.variants",
 	"log.sections",
 	"tools.labels",
+	"tools.catalog_pdf",
 	"tools.sync",
 ]
 _STARTER_CAJA = [
@@ -418,6 +430,7 @@ _STARTER_VENTAS = [
 	"ops.preventa",
 	"ops.catalog",
 	"tables.orders",
+	"tools.catalog_pdf",
 ]
 
 
@@ -581,6 +594,7 @@ _COARSE_FLAG = {
 	"tables.orders.own": "pos",
 	"tables.orders.all": "pos",
 	"tools.labels": "pos",
+	"tools.catalog_pdf": "receiving",
 	"log.accounting": "payments",
 	"tables.cajas": "payments",
 	"log.reports": "payments",

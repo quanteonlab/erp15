@@ -267,7 +267,9 @@
     {
       "id": "preview_merge_leads_null_list",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.preview_merge_leads",
-      "args": { "leads": null },
+      "args": {
+        "leads": null
+      },
       "expect": "error",
       "source": "regression",
       "bug": "merge preview with null/empty leads must return controlled error, not TypeError"
@@ -275,7 +277,9 @@
     {
       "id": "archive_leads_empty_list",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.archive_leads",
-      "args": { "leads": [] },
+      "args": {
+        "leads": []
+      },
       "expect": "error",
       "source": "regression",
       "bug": "archive_leads with empty list must throw controlled error"
@@ -283,7 +287,9 @@
     {
       "id": "duplicate_lead_null",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.duplicate_lead",
-      "args": { "lead": null },
+      "args": {
+        "lead": null
+      },
       "expect": "error",
       "source": "regression",
       "bug": "duplicate_lead with null lead must not AttributeError"
@@ -291,7 +297,9 @@
     {
       "id": "get_or_create_lead_seller_link_null",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.get_or_create_lead_seller_link",
-      "args": { "lead": null },
+      "args": {
+        "lead": null
+      },
       "expect": "error",
       "source": "regression",
       "bug": "lead-specific seller link requires lead id"
@@ -545,6 +553,112 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.resolve_staff_login_barcode",
       "args": {
         "code": "123"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "duplicate_lead_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.duplicate_lead",
+      "args": {
+        "lead": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "duplicate_lead with empty lead must controlled error (not 500)"
+    },
+    {
+      "id": "save_shop_ui_catalog_template_commerce",
+      "source": "regression",
+      "bug": "save_shop_ui_settings must keep catalogDisplay.catalogTemplate (commerce) so Settings UI does not snap back to classic",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {
+        "settings": {
+          "catalogDisplay": {
+            "catalogTemplate": "commerce"
+          }
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_catalog_taxonomy_null_lang",
+      "source": "regression",
+      "bug": "get_catalog_taxonomy with null lang must return groups/brands maps",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_catalog_taxonomy",
+      "args": {
+        "lang": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_catalog_taxonomy_empty_lang",
+      "source": "regression",
+      "bug": "get_catalog_taxonomy with empty lang must default and return maps",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n.get_catalog_taxonomy",
+      "args": {
+        "lang": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "set_taxonomy_aliases_null",
+      "source": "regression",
+      "bug": "set_taxonomy_aliases with null aliases must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_taxonomy_aliases",
+      "args": {
+        "doctype": "Item Group",
+        "name": "ALMACEN",
+        "aliases": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "enqueue_generate_taxonomy_aliases_inline_empty_langs",
+      "source": "regression",
+      "bug": "enqueue_generate_taxonomy_aliases with empty langs must default and run inline",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.enqueue_generate_taxonomy_aliases",
+      "args": {
+        "doctype": "Item Group",
+        "names": "ALMACEN",
+        "langs": "",
+        "only_missing": 1,
+        "use_online_translate": 0,
+        "now": 1
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_party_invoices_null_party",
+      "source": "regression",
+      "bug": "list_party_invoices with null party must controlled error not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.list_party_invoices",
+      "args": {
+        "party_type": "Customer",
+        "party": null,
+        "is_return": 0
+      },
+      "expect": "error"
+    },
+    {
+      "id": "list_party_payments_empty_party_type",
+      "source": "regression",
+      "bug": "list_party_payments with empty party_type must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.list_party_payments",
+      "args": {
+        "party_type": "",
+        "party": "Consumidor Final"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_party_doc_remarks_null_remarks",
+      "source": "regression",
+      "bug": "update_party_doc_remarks with null remarks coerces to empty when doc missing → controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.update_party_doc_remarks",
+      "args": {
+        "doctype": "Sales Invoice",
+        "name": "",
+        "remarks": null
       },
       "expect": "error"
     }
