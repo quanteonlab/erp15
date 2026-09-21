@@ -6252,8 +6252,9 @@ def _parse_airtable_catalog_csv(csv_text):
 
 	Produces the same row shape as _parse_catalog_csv, plus two optional keys
 	_parse_catalog_csv rows never set: "cash_price" (Efectivo column) and
-	"image_url" (Imagen column — a remote Airtable attachment URL; note these
-	URLs are time-limited, so materialize/import promptly after exporting).
+	"image_url" (Imagen column). Remote http(s) URLs are downloaded into a
+	local 256×256 thumb during import when possible; broken links fall back
+	to storing the remote URL and a warning.
 	"""
 	column_map = {
 		"item_code": "TAG",
@@ -6475,6 +6476,83 @@ def _upsert_item_price(item_code, price_list, rate):
 	return True
 
 
+def _is_remote_image_url(url):
+	u = cstr(url or "").strip()
+	return u.startswith("http://") or u.startswith("https://")
+
+
+def _should_apply_catalog_image(current_image, incoming_url):
+	"""Fill empty image, or replace a remote hotlink. Keep existing local /files/ thumbs."""
+	incoming = cstr(incoming_url or "").strip()
+	if not incoming:
+		return False
+	current = cstr(current_image or "").strip()
+	if not current:
+		return True
+	return _is_remote_image_url(current)
+
+
+def _materialize_catalog_import_image(item_code, image_url):
+	"""
+	Download a remote (or data:) image into a local 256×256 thumb like the
+	Product Manager "Materialize remote images" action.
+
+	Returns (local_file_url, None) on success, or (None, error_message) on failure.
+	Does not raise — callers treat broken Airtable/CDN links as warnings.
+	"""
+	url = cstr(image_url or "").strip()
+	if not item_code or not url:
+		return None, "empty image url"
+
+	try:
+		from erpnext.image_search.thumb import (
+			download_image_bytes,
+			materialize_item_thumb,
+			read_local_file_bytes,
+			_normalize_file_url,
+			unwrap_image_url,
+		)
+
+		url = unwrap_image_url(url)
+		if "/api/image-proxy" in url and "src=" in url:
+			from urllib.parse import parse_qs, unquote, urlparse
+
+			qs = parse_qs(urlparse(url).query)
+			src_vals = qs.get("src") or []
+			if src_vals:
+				url = unwrap_image_url(unquote(src_vals[0]))
+
+		if url.startswith("data:image/"):
+			image_bytes = download_image_bytes(url)
+		elif url.startswith("http://") or url.startswith("https://"):
+			parsed_path = _normalize_file_url(url)
+			if parsed_path.startswith("/files/") or parsed_path.startswith("/private/files/"):
+				try:
+					image_bytes = read_local_file_bytes(parsed_path)
+				except Exception:
+					image_bytes = download_image_bytes(url)
+			else:
+				image_bytes = download_image_bytes(url)
+		elif url.startswith("/"):
+			# Already a site-relative file — just point Item.image at it.
+			frappe.db.set_value("Item", item_code, "image", _normalize_file_url(url) or url)
+			return _normalize_file_url(url) or url, None
+		else:
+			return None, "unsupported image url"
+
+		file_url = materialize_item_thumb(
+			item_code,
+			image_bytes,
+			crop=None,
+			commit=False,
+			variant="final",
+			set_item_image=True,
+		)
+		return file_url, None
+	except Exception as exc:
+		return None, str(exc)
+
+
 def _resolve_uom_for_import(uom):
 	if uom and frappe.db.exists("UOM", uom):
 		return uom
@@ -6634,6 +6712,8 @@ def import_catalog_csv_products(
 		"skipped_existing": 0,
 		"price_updates": 0,
 		"barcode_updates": 0,
+		"image_updates": 0,
+		"image_failures": 0,
 		"review_created": 0,
 		"import_session": session_name,
 		"errors": [],
@@ -6769,17 +6849,42 @@ def import_catalog_csv_products(
 			item_doc.include_item_in_manufacturing = 0
 			item_doc.disabled = 0
 
-			image_url = row.get("image_url")
-			if image_url and not item_doc.image:
-				# Remote URL — pick it up later with the existing "materialize
-				# remote images" admin action to download a local thumb.
-				item_doc.image = image_url
+			# Defer remote images until after insert/save so we can materialize
+			# a local 256×256 thumb (same as Product Manager). Broken links
+			# fall back to the remote URL + a warning — never abort the row.
+			pending_image_url = cstr(row.get("image_url") or "").strip()
+			if pending_image_url and _should_apply_catalog_image(item_doc.image, pending_image_url):
+				if not _is_remote_image_url(pending_image_url) and not pending_image_url.startswith(
+					"data:image/"
+				):
+					# Local /files/ path or relative — set directly on the doc.
+					item_doc.image = pending_image_url
+					pending_image_url = ""
 
 			if existing:
 				item_doc.save(ignore_permissions=True)
 			else:
 				item_doc.insert(ignore_permissions=True)
 			live_item = item_doc.item_code
+
+			if pending_image_url:
+				local_url, img_err = _materialize_catalog_import_image(live_item, pending_image_url)
+				if local_url:
+					report["image_updates"] += 1
+				else:
+					report["image_failures"] += 1
+					# Keep a remote hotlink so the catalog still shows something;
+					# staff can re-run Materialize later if the CDN recovers.
+					try:
+						frappe.db.set_value("Item", live_item, "image", pending_image_url)
+					except Exception:
+						pass
+					report["warnings"].append(
+						{
+							"line_no": row["line_no"],
+							"message": f"Image download failed (kept remote URL): {img_err}",
+						}
+					)
 
 			if barcode:
 				existing_same = frappe.db.exists(

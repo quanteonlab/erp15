@@ -830,9 +830,14 @@ def suite_5_12_modules_read():
 
         # Custom: manual column_map + preview, then import with Standard Selling price.
         sku2 = f"SMOKE-CU-{frappe.generate_hash(length=6)}"
+        # 1×1 PNG
+        tiny_png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
         cu_csv = (
-            "Code,Title,Cat,Cash,List\n"
-            f"{sku2},Smoke Custom Map,Products,500,550\n"
+            "Code,Title,Cat,Cash,List,Img\n"
+            f"{sku2},Smoke Custom Map,Products,500,550,{tiny_png}\n"
         )
         preview = ecommerce_api.preview_catalog_csv_import(
             csv_text=cu_csv,
@@ -843,6 +848,7 @@ def suite_5_12_modules_read():
                 "item_group": "Cat",
                 "price": "List",
                 "cash_price": "Cash",
+                "image_url": "Img",
             },
         )
         assert preview.get("valid_rows") == 1, preview
@@ -865,10 +871,14 @@ def suite_5_12_modules_read():
                 "item_group": "Cat",
                 "price": "List",
                 "cash_price": "Cash",
+                "image_url": "Img",
             },
             file_name="smoke-custom-import.csv",
         )
         assert cu_report.get("price_updates", 0) >= 2, cu_report
+        assert cu_report.get("image_updates", 0) >= 1, cu_report
+        img = frappe.db.get_value("Item", sku2, "image") or ""
+        assert img.startswith("/files/"), f"expected local thumb, got {img!r}"
         assert (
             flt(
                 frappe.db.get_value(

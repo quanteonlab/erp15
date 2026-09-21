@@ -553,6 +553,24 @@
       "expect": "no_500"
     },
     {
+      "id": "import_catalog_csv_custom_broken_image_url",
+      "source": "regression",
+      "bug": "Broken remote image_url during custom CSV import must warn and keep going, never crash the batch",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "Code,Name,Price,Img\nEDGE-IMG-BAD,Edge Broken Image,99,https://127.0.0.1:9/does-not-exist.jpg\n",
+        "source": "custom",
+        "column_map": "{\"item_code\":\"Code\",\"item_name\":\"Name\",\"price\":\"Price\",\"image_url\":\"Img\"}",
+        "price_list": "Standard Selling",
+        "update_existing": 1,
+        "create_missing_groups": 0,
+        "start": 0,
+        "batch_size": 10,
+        "file_name": "edge-custom-broken-image.csv"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",
