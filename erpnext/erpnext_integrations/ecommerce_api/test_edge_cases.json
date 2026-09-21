@@ -729,6 +729,29 @@
         "remarks": null
       },
       "expect": "error"
+    },
+    {
+      "id": "upload_company_logo_null_payload",
+      "source": "regression",
+      "bug": "upload_company_logo with null filedata/source_url must controlled ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.company_settings.upload_company_logo",
+      "args": {
+        "company": null,
+        "filedata": null,
+        "filename": null,
+        "source_url": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "clear_company_logo_empty_company",
+      "source": "regression",
+      "bug": "clear_company_logo with empty company resolves default company (or controlled error), never AttributeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.company_settings.clear_company_logo",
+      "args": {
+        "company": ""
+      },
+      "expect": "no_500"
     }
   ]
 }

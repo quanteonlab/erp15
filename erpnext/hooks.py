@@ -7,13 +7,13 @@ app_color = "#e74c3c"
 app_email = "hello@frappe.io"
 app_license = "GNU General Public License (v3)"
 source_link = "https://github.com/frappe/erpnext"
-app_logo_url = "/assets/erpnext/images/erpnext-logo.svg"
+app_logo_url = "/assets/erpnext/images/erpnext-logo.png"
 
 
 add_to_apps_screen = [
 	{
 		"name": "erpnext",
-		"logo": "/assets/erpnext/images/erpnext-logo-blue.png",
+		"logo": "/assets/erpnext/images/erpnext-logo.png",
 		"title": "SilkOS",
 		"route": "/app/home",
 		"has_permission": "erpnext.check_app_permission",
@@ -66,6 +66,7 @@ after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.preventa_api.ensure_preventa_custom_fields",
 	"erpnext.erpnext_integrations.ecommerce_api.print_templates_api.gift_core_print_templates",
 	"erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n.ensure_taxonomy_i18n",
+	"erpnext.erpnext_integrations.ecommerce_api.silkos_branding.ensure_silkos_branding",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"
@@ -117,7 +118,7 @@ website_generators = ["BOM", "Sales Partner"]
 
 website_context = {
 	"favicon": "/assets/erpnext/images/erpnext-favicon.svg",
-	"splash_image": "/assets/erpnext/images/erpnext-logo.svg",
+	"splash_image": "/assets/erpnext/images/erpnext-logo.png",
 }
 
 # nosemgrep
@@ -492,7 +493,7 @@ scheduler_events = {
 	],
 }
 
-email_brand_image = "assets/erpnext/images/erpnext-logo.jpg"
+email_brand_image = "assets/erpnext/images/erpnext-logo.png"
 
 default_mail_footer = """
 	<span>

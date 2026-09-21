@@ -745,6 +745,20 @@ def suite_5_12_modules_read():
         restored = cs.save_company_settings(company=tmp_name, settings=settings_back)
         assert restored["company"]["name"] == old_name, restored["company"]
 
+        # Company logo: tiny PNG → local /files, then clear
+        tiny_png = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        uploaded = cs.upload_company_logo(
+            company=old_name,
+            filedata=f"data:image/png;base64,{tiny_png}",
+            filename="smoke-logo.png",
+        )
+        logo = (uploaded.get("company") or {}).get("company_logo") or uploaded.get("company_logo")
+        assert logo and str(logo).startswith("/files/"), uploaded
+        cleared = cs.clear_company_logo(company=old_name)
+        assert not ((cleared.get("company") or {}).get("company_logo") or ""), cleared
+
     def check_catalog_import_reviews():
         from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
         rows = ecommerce_api.list_catalog_import_reviews(status="open", limit=5, start=0)

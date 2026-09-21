@@ -1749,7 +1749,11 @@ def materialize_remote_item_images(limit=20, dry_run=0):
     for row in item_rows:
         item_code = row.name
         try:
-            image_bytes = download_image_bytes(row.image)
+            from erpnext.erpnext_integrations.ecommerce_api.image_cdn import (
+                download_image_prefer_imgproxy,
+            )
+
+            image_bytes = download_image_prefer_imgproxy(row.image)
             materialize_item_thumb(item_code, image_bytes, crop=None, commit=True)
             converted += 1
         except Exception as exc:
@@ -3744,6 +3748,24 @@ def save_company_settings(company=None, settings=None):
     )
 
     return _impl(company=company, settings=settings)
+
+
+@frappe.whitelist()
+def upload_company_logo(company=None, filedata=None, filename="logo.png", source_url=None):
+    from erpnext.erpnext_integrations.ecommerce_api.company_settings import (
+        upload_company_logo as _impl,
+    )
+
+    return _impl(company=company, filedata=filedata, filename=filename, source_url=source_url)
+
+
+@frappe.whitelist()
+def clear_company_logo(company=None):
+    from erpnext.erpnext_integrations.ecommerce_api.company_settings import (
+        clear_company_logo as _impl,
+    )
+
+    return _impl(company=company)
 
 
 @frappe.whitelist()

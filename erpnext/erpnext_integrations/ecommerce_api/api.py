@@ -6530,9 +6530,17 @@ def _materialize_catalog_import_image(item_code, image_url):
 				try:
 					image_bytes = read_local_file_bytes(parsed_path)
 				except Exception:
-					image_bytes = download_image_bytes(url)
+					from erpnext.erpnext_integrations.ecommerce_api.image_cdn import (
+						download_image_prefer_imgproxy,
+					)
+
+					image_bytes = download_image_prefer_imgproxy(url)
 			else:
-				image_bytes = download_image_bytes(url)
+				from erpnext.erpnext_integrations.ecommerce_api.image_cdn import (
+					download_image_prefer_imgproxy,
+				)
+
+				image_bytes = download_image_prefer_imgproxy(url)
 		elif url.startswith("/"):
 			# Already a site-relative file — just point Item.image at it.
 			frappe.db.set_value("Item", item_code, "image", _normalize_file_url(url) or url)

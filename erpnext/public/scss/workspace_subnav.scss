@@ -1,7 +1,10 @@
-// Blank the desk navbar logo — the brand mark isn't shown, just empty space
-// where it used to be.
+// SilkOS brand mark in the desk navbar (small, always visible).
 .navbar-home .app-logo {
-	display: none;
+	display: inline-block;
+	height: 22px;
+	width: 22px;
+	object-fit: contain;
+	border-radius: 5px;
 }
 
 // Hover-dropdown tab strip injected at the top of every Workspace page,

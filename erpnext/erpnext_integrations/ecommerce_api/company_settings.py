@@ -60,6 +60,7 @@ def _company_row(name: str) -> dict:
 		"email": doc.email or "",
 		"website": doc.website or "",
 		"domain": doc.domain or "",
+		"company_logo": doc.company_logo or "",
 	}
 
 
@@ -290,4 +291,65 @@ def save_company_settings(company=None, settings=None):
 	except Exception:
 		pass
 
+	return get_company_settings(company=name)
+
+
+@frappe.whitelist()
+def upload_company_logo(company=None, filedata=None, filename="logo.png", source_url=None):
+	"""
+	Upload or pull a company logo and persist a durable local /files/ copy.
+
+	- filedata: data-URL or raw base64
+	- source_url: remote http(s) (fetched via imgproxy when possible, then direct)
+
+	Sets Company.company_logo to the local file URL. Display can still wrap that
+	path with imgproxy for resized variants.
+	"""
+	import base64
+
+	if not _can_manage():
+		frappe.throw(_("Not permitted ({0})").format("tools.settings"), frappe.PermissionError)
+
+	name = _resolve_target_company(company)
+	from erpnext.erpnext_integrations.ecommerce_api.image_cdn import (
+		download_image_prefer_imgproxy,
+		materialize_company_logo_bytes,
+	)
+
+	image_bytes = None
+	filedata = (filedata or "").strip() if isinstance(filedata, str) else filedata
+	source_url = (source_url or "").strip() if isinstance(source_url, str) else ""
+
+	if filedata:
+		raw = filedata.split(",", 1)[1] if isinstance(filedata, str) and "," in filedata else filedata
+		try:
+			image_bytes = base64.b64decode(raw)
+		except Exception:
+			frappe.throw(_("Invalid logo file data"), frappe.ValidationError)
+	elif source_url:
+		try:
+			image_bytes = download_image_prefer_imgproxy(source_url, max_edge=1600)
+		except Exception as exc:
+			frappe.throw(_("Could not download logo: {0}").format(str(exc)), frappe.ValidationError)
+	else:
+		frappe.throw(_("Provide filedata or source_url"), frappe.ValidationError)
+
+	if not image_bytes:
+		frappe.throw(_("Empty logo image"), frappe.ValidationError)
+
+	file_url = materialize_company_logo_bytes(name, image_bytes, commit=True)
+	payload = get_company_settings(company=name)
+	payload["company_logo"] = file_url
+	payload["ok"] = True
+	return payload
+
+
+@frappe.whitelist()
+def clear_company_logo(company=None):
+	"""Unset Company.company_logo (local File rows left for history)."""
+	if not _can_manage():
+		frappe.throw(_("Not permitted ({0})").format("tools.settings"), frappe.PermissionError)
+	name = _resolve_target_company(company)
+	frappe.db.set_value("Company", name, "company_logo", None)
+	frappe.db.commit()
 	return get_company_settings(company=name)
