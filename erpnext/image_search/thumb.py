@@ -69,7 +69,7 @@ def unwrap_image_url(url: str) -> str:
 def _decode_data_image(url: str) -> bytes:
 	import base64
 
-	header, _, payload = url.partition(",")
+	header, _sep, payload = url.partition(",")
 	if not payload:
 		frappe.throw(_("Invalid data image URL"))
 	try:

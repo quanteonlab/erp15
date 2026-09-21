@@ -837,7 +837,7 @@ def suite_5_12_modules_read():
         )
         cu_csv = (
             "Code,Title,Cat,Cash,List,Img\n"
-            f"{sku2},Smoke Custom Map,Products,500,550,{tiny_png}\n"
+            f'{sku2},Smoke Custom Map,Products,500,550,"{tiny_png}"\n'
         )
         preview = ecommerce_api.preview_catalog_csv_import(
             csv_text=cu_csv,
