@@ -349,17 +349,47 @@ def _require_any_permission(pids: list) -> None:
 	frappe.throw(_("Not permitted ({0})").format(" / ".join(pids)))
 
 
+def _field_filled(doc, fid: str) -> bool:
+	"""True when the Preventa field id has a non-empty value on the Lead."""
+	attr = LEAD_FIELD_MAP.get(fid, fid)
+	val = doc.get(attr) if hasattr(doc, "get") else getattr(doc, attr, None)
+	if val is None:
+		return False
+	if isinstance(val, str):
+		return bool(val.strip())
+	return bool(val)
+
+
 def _missing_requirement_groups(doc, groups: list) -> list:
 	"""AND-of-OR check: each group is satisfied if at least one of its field
-	ids is non-empty on `doc`. Returns the groups that are NOT satisfied."""
+	ids is non-empty on `doc`. Returns the groups that are NOT satisfied.
+
+	Accepts either the canonical shape `[["a","b"],["c"]]` or a flat admin
+	list `["a","b","c"]` (treated as one OR-group).
+	"""
+	if not groups:
+		return []
+	if all(isinstance(x, str) for x in groups):
+		groups = [list(groups)]
 	missing = []
-	for group in groups or []:
+	for group in groups:
 		if not isinstance(group, list) or not group:
 			continue
-		satisfied = any(bool(getattr(doc, LEAD_FIELD_MAP.get(fid, fid), None)) for fid in group)
-		if not satisfied:
-			missing.append(group)
+		field_ids = [fid for fid in group if isinstance(fid, str)]
+		if not field_ids:
+			continue
+		if not any(_field_filled(doc, fid) for fid in field_ids):
+			missing.append(field_ids)
 	return missing
+
+
+def _apply_lead_values(doc, values: dict) -> None:
+	for fid, attr in LEAD_FIELD_MAP.items():
+		if fid in values:
+			doc.set(attr, values[fid])
+	if "lead_owner" in values and not doc.is_new() and values["lead_owner"] != doc.lead_owner:
+		_require_app_permission("tables.crm")
+		doc.lead_owner = values["lead_owner"]
 
 
 # ---------------------------------------------------------------------------
@@ -534,12 +564,31 @@ def add_lead_note(lead, note):
 
 
 @frappe.whitelist(allow_guest=True)
-def move_lead(lead, to_stage, lost_reason=None):
+def move_lead(lead, to_stage, lost_reason=None, values=None):
+	"""Move a Lead to a board stage. Optional `values` are applied first so
+	drawer edits (phone/email/…) satisfy stage gates in the same request."""
 	ensure_preventa_custom_fields()
+	lead = (lead or "").strip() if isinstance(lead, str) else str(lead or "").strip()
+	to_stage = (to_stage or "").strip() if isinstance(to_stage, str) else str(to_stage or "").strip()
+	if not lead:
+		frappe.throw(_("Lead is required"))
+	if not to_stage:
+		frappe.throw(_("Stage is required"))
+	if not frappe.db.exists("Lead", lead):
+		frappe.throw(_("Lead {0} not found").format(lead), frappe.DoesNotExistError)
+
 	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc("Lead", lead)
 	frappe.flags.ignore_permissions = False
 	_require_owner_or_crm(doc.lead_owner)
+
+	if isinstance(values, str):
+		try:
+			values = frappe.parse_json(values)
+		except Exception:
+			values = None
+	if isinstance(values, dict) and values:
+		_apply_lead_values(doc, values)
 
 	settings = _load_preventa_settings()
 	reqs = (settings.get("stage_requirements") or {}).get(to_stage) or []

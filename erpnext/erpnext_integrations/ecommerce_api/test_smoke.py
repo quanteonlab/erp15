@@ -673,6 +673,33 @@ def suite_5_12_modules_read():
                     frappe.delete_doc("Lead", name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+        # move_lead stage gate: contacted needs a contact channel; values can fill it in-call
+        gate = frappe.new_doc("Lead")
+        gate.lead_name = "Smoke Stage Gate"
+        gate.lead_owner = frappe.session.user
+        gate.custom_preventa_stage = "prospect"
+        gate.flags.ignore_permissions = True
+        gate.insert(ignore_permissions=True)
+        frappe.db.commit()
+        try:
+            try:
+                pa.move_lead(lead=gate.name, to_stage="contacted")
+                assert False, "move_lead to contacted without contact must raise ValidationError"
+            except frappe.ValidationError:
+                pass
+            out = pa.move_lead(
+                lead=gate.name,
+                to_stage="contacted",
+                values={"mobile_no": "+5491112345678"},
+            )
+            assert out and out.get("ok") and out.get("stage") == "contacted", out
+            assert frappe.db.get_value("Lead", gate.name, "custom_preventa_stage") == "contacted"
+            assert frappe.db.get_value("Lead", gate.name, "mobile_no")
+        finally:
+            if frappe.db.exists("Lead", gate.name):
+                frappe.delete_doc("Lead", gate.name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_employees():
         from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
         perms = ea.list_app_permissions()

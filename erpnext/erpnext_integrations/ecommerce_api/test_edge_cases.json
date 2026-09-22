@@ -245,6 +245,18 @@
       "source": "seed"
     },
     {
+      "id": "move_lead_null_stage",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.move_lead",
+      "args": {
+        "lead": null,
+        "to_stage": null,
+        "values": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "move_lead with null lead/to_stage must return controlled ValidationError, not TypeError; contacted stage still requires a contact channel unless values supplies one"
+    },
+    {
       "id": "list_leads_admin_null_filters",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.list_leads_admin",
       "args": {

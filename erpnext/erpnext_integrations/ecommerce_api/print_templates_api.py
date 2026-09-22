@@ -28,6 +28,11 @@ _CATALOG_HEADER_FIELDS = [
 	{"fieldname": "phone", "label": "WhatsApp Phone", "fieldtype": "Data"},
 	{"fieldname": "qr_value", "label": "QR Value (wa.me link)", "fieldtype": "Data"},
 	{"fieldname": "company_name", "label": "Company Name", "fieldtype": "Data"},
+	{"fieldname": "eyebrow", "label": "Eyebrow (e.g. CATÁLOGO DE PRODUCTOS)", "fieldtype": "Data"},
+	{"fieldname": "export_date", "label": "Export Date Label", "fieldtype": "Data"},
+	{"fieldname": "product_count", "label": "Product Count Label", "fieldtype": "Data"},
+	{"fieldname": "deadline_label", "label": "Deadline Pill (e.g. Pedidos hasta…)", "fieldtype": "Data"},
+	{"fieldname": "logo", "label": "Logo Image URL", "fieldtype": "Attach Image"},
 ]
 
 # Field list for the synthetic "Staff Cred." source (Labels / ID card designer).
@@ -682,8 +687,8 @@ _PAPER_SIZE_MM = {
 	"A4": (210, 297),
 	"Thermal 58mm": (58, 150),
 	"Thermal 80mm": (80, 150),
-	# One catalog print-grid card cell (approximates today's hardcoded PrintCard aspect).
-	"Catalog Card": (48, 66),
+	# One catalog print-grid card cell (retail ABIN-style starter).
+	"Catalog Card": (58, 78),
 }
 
 
@@ -1619,22 +1624,38 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-pr80b-barcode", "kind": "barcode", "x": 8, "y": 62, "width": 64, "height": 16, "fieldPath": "name"},
 		],
 	},
-	# ── Catalog Header (default banner, i030 A1) ───────────────────────
+	# ── Catalog Header (retail / ABIN-style banner) ─────────────────────
 	{
 		"template_name": "Default Catalog Header",
 		"source_doctype": "Catalog Header",
 		"paper_kind": "A4",
 		"is_default": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-hdr-logo",
 		"canvas_width_mm": 190,
-		"canvas_height_mm": 80,
+		"canvas_height_mm": 42,
 		"margin_mm": [0, 0, 0, 0],
 		"elements": [
-			{"id": "starter-hdr-heading", "kind": "field", "x": 5, "y": 5, "width": 120, "height": 24, "fieldPath": "heading", "label": "Heading", "fontSize": 30, "bold": True, "align": "left"},
-			{"id": "starter-hdr-desc", "kind": "field", "x": 5, "y": 30, "width": 120, "height": 10, "fieldPath": "description", "label": "Description", "fontSize": 9, "bold": True, "align": "left"},
-			{"id": "starter-hdr-wa-label", "kind": "text", "x": 5, "y": 42, "width": 24, "height": 8, "staticText": "WhatsApp:", "fontSize": 9, "bold": True, "align": "left"},
-			{"id": "starter-hdr-wa-phone", "kind": "field", "x": 29, "y": 42, "width": 60, "height": 8, "fieldPath": "phone", "label": "Phone", "fontSize": 9, "bold": True, "align": "left"},
-			{"id": "starter-hdr-qr-frame", "kind": "shape", "x": 150, "y": 8, "width": 36, "height": 36, "shapeType": "rect", "color": "#93c5fd"},
-			{"id": "starter-hdr-qr", "kind": "qrcode", "x": 152, "y": 10, "width": 32, "height": 32, "fieldPath": "qr_value"},
+			# Logo (seeded public brand asset; field `logo` overrides when set)
+			{
+				"id": "starter-hdr-logo",
+				"kind": "image",
+				"x": 2,
+				"y": 4,
+				"width": 28,
+				"height": 22,
+				"fieldPath": "logo",
+				"staticSrc": "/brand/abin-logo.png",
+			},
+			{"id": "starter-hdr-eyebrow", "kind": "field", "x": 34, "y": 4, "width": 90, "height": 5, "fieldPath": "eyebrow", "label": "Eyebrow", "fontSize": 7, "bold": True, "align": "left", "textColor": "#6b7280"},
+			{"id": "starter-hdr-heading", "kind": "field", "x": 34, "y": 10, "width": 90, "height": 14, "fieldPath": "heading", "label": "Heading", "fontSize": 26, "bold": True, "align": "left", "textColor": "#111827"},
+			# Right meta column
+			{"id": "starter-hdr-deadline-pill", "kind": "shape", "x": 130, "y": 4, "width": 56, "height": 7, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d", "borderRadius": 8},
+			{"id": "starter-hdr-deadline", "kind": "field", "x": 130, "y": 4.5, "width": 56, "height": 6, "fieldPath": "deadline_label", "label": "Deadline", "fontSize": 7, "bold": True, "align": "center", "textColor": "#ffffff"},
+			{"id": "starter-hdr-date", "kind": "field", "x": 128, "y": 13, "width": 58, "height": 5, "fieldPath": "export_date", "label": "Date", "fontSize": 7, "bold": True, "align": "right", "textColor": "#6b7280"},
+			{"id": "starter-hdr-count", "kind": "field", "x": 128, "y": 19, "width": 58, "height": 5, "fieldPath": "product_count", "label": "Count", "fontSize": 7, "bold": True, "align": "right", "textColor": "#6b7280"},
+			# Brand accent rule
+			{"id": "starter-hdr-rule", "kind": "shape", "x": 2, "y": 34, "width": 186, "height": 2.2, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d"},
 		],
 	},
 	# ── Staff Cred. (ID card, Labels-style) ────────────────────────────
@@ -1659,21 +1680,35 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-sc-barcode", "kind": "barcode", "x": 3, "y": 42, "width": 80, "height": 10, "fieldPath": "barcode"},
 		],
 	},
-	# ── Catalog Card (default product card, i030 A2) ───────────────────
+	# ── Catalog Card (retail / ABIN-style product card) ─────────────────
 	{
 		"template_name": "Default Catalog Card",
 		"source_doctype": "Item",
 		"paper_kind": "Catalog Card",
 		"is_default": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-card-accent",
+		"canvas_width_mm": 58,
+		"canvas_height_mm": 78,
 		"margin_mm": [0, 0, 0, 0],
 		"elements": [
-			{"id": "starter-card-image", "kind": "image", "x": 2, "y": 2, "width": 44, "height": 32, "fieldPath": "image"},
-			{"id": "starter-card-price-pill", "kind": "shape", "x": 9, "y": 30, "width": 30, "height": 9, "shapeType": "rect", "color": "#dbeafe", "filled": True, "bgColor": "#dbeafe"},
-			{"id": "starter-card-price", "kind": "field", "x": 9, "y": 31, "width": 30, "height": 7, "fieldPath": "display_price", "label": "Catalog Price", "fontSize": 13, "bold": True, "align": "center"},
-			{"id": "starter-card-title", "kind": "field", "x": 2, "y": 42, "width": 44, "height": 8, "fieldPath": "normalized_title", "label": "Normalized Title", "fontSize": 7, "bold": True, "align": "left"},
-			{"id": "starter-card-source-title", "kind": "field", "x": 2, "y": 49, "width": 44, "height": 6, "fieldPath": "item_name", "label": "Item Name", "fontSize": 6, "align": "left"},
-			{"id": "starter-card-brand", "kind": "field", "x": 2, "y": 54, "width": 44, "height": 5, "fieldPath": "brand", "label": "Brand", "fontSize": 6, "align": "left"},
-			{"id": "starter-card-barcode", "kind": "barcode", "x": 2, "y": 59, "width": 44, "height": 6, "fieldPath": "barcode"},
+			# Card frame + brand top accent
+			{"id": "starter-card-frame", "kind": "shape", "x": 0, "y": 0, "width": 58, "height": 78, "shapeType": "rect", "color": "#e5e7eb", "filled": True, "bgColor": "#ffffff", "borderRadius": 2},
+			{"id": "starter-card-accent", "kind": "shape", "x": 0, "y": 0, "width": 58, "height": 2.4, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d"},
+			# Product image
+			{"id": "starter-card-image", "kind": "image", "x": 4, "y": 5, "width": 50, "height": 36, "fieldPath": "image"},
+			# Promo badge (hidden when no promo_label)
+			{"id": "starter-card-promo-pill", "kind": "shape", "x": 34, "y": 5, "width": 20, "height": 8, "shapeType": "rect", "color": "#facc15", "filled": True, "bgColor": "#facc15", "borderRadius": 2, "hideWhenEmpty": "promo_label"},
+			{"id": "starter-card-promo", "kind": "field", "x": 34, "y": 5.5, "width": 20, "height": 7, "fieldPath": "promo_label", "label": "Promo", "fontSize": 6, "bold": True, "align": "center", "textColor": "#9f1d1d"},
+			# SKU pill
+			{"id": "starter-card-sku-pill", "kind": "shape", "x": 16, "y": 43, "width": 26, "height": 5.5, "shapeType": "rect", "color": "#c4a484", "filled": True, "bgColor": "#c4a484", "borderRadius": 8},
+			{"id": "starter-card-sku", "kind": "field", "x": 16, "y": 43.5, "width": 26, "height": 4.5, "fieldPath": "barcode", "label": "SKU", "fontSize": 7, "bold": True, "align": "center", "textColor": "#ffffff"},
+			# Title + brand
+			{"id": "starter-card-title", "kind": "field", "x": 3, "y": 50, "width": 52, "height": 9, "fieldPath": "normalized_title", "label": "Normalized Title", "fontSize": 8, "bold": True, "align": "center", "textColor": "#111827"},
+			{"id": "starter-card-brand", "kind": "field", "x": 3, "y": 59, "width": 52, "height": 4, "fieldPath": "brand", "label": "Brand", "fontSize": 6, "align": "center", "textColor": "#6b7280"},
+			# Price pill
+			{"id": "starter-card-price-pill", "kind": "shape", "x": 12, "y": 66, "width": 34, "height": 8, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d", "borderRadius": 8},
+			{"id": "starter-card-price", "kind": "field", "x": 12, "y": 67, "width": 34, "height": 6, "fieldPath": "display_price", "label": "Catalog Price", "fontSize": 11, "bold": True, "align": "center", "textColor": "#ffffff"},
 		],
 	},
 	# ── Delivery Checklist · A4 (armado de pedido / ENTREGAS) ───────────
@@ -1779,10 +1814,13 @@ def ensure_starter_print_templates():
 
 	New entries in `_STARTER_TEMPLATES` are created on every site the next time
 	this runs (after_migrate, provision-tenant, or /logistica/prints open).
-	Existing templates are never overwritten — cashiers can customize freely.
+	Existing templates are never overwritten — unless the starter sets
+	`resync: True` (catalog retail header/card), in which case canvas size +
+	elements are refreshed so seed designs stay current.
 	"""
 	_ensure_source_doctype_select_options()
 	created = []
+	resynced = []
 	for starter in _STARTER_TEMPLATES:
 		exists = frappe.db.exists(
 			"ECommerce Print Template",
@@ -1792,11 +1830,33 @@ def ensure_starter_print_templates():
 				"paper_kind": starter["paper_kind"],
 			},
 		)
-		if exists:
-			continue
-
 		width_mm = starter.get("canvas_width_mm") or _PAPER_SIZE_MM.get(starter["paper_kind"], (210, 297))[0]
 		height_mm = starter.get("canvas_height_mm") or _PAPER_SIZE_MM.get(starter["paper_kind"], (210, 297))[1]
+
+		if exists:
+			if starter.get("resync"):
+				doc = frappe.get_doc("ECommerce Print Template", exists)
+				try:
+					current_els = json.loads(doc.elements_data or "[]")
+				except Exception:
+					current_els = []
+				current_ids = {
+					e.get("id") for e in current_els if isinstance(e, dict) and e.get("id")
+				}
+				marker = starter.get("resync_if_missing_id")
+				# Skip if already on the target design (or customized past the old seed).
+				if marker and marker in current_ids:
+					continue
+				frappe.flags.ignore_permissions = True
+				doc.elements_data = json.dumps(starter["elements"])
+				doc.margin_mm = json.dumps(starter["margin_mm"])
+				doc.canvas_width_mm = width_mm
+				doc.canvas_height_mm = height_mm
+				doc.save(ignore_permissions=True)
+				frappe.flags.ignore_permissions = False
+				resynced.append(doc.name)
+			continue
+
 		want_default = bool(starter.get("is_default"))
 		already_has_default = bool(
 			frappe.db.exists(
@@ -1826,9 +1886,9 @@ def ensure_starter_print_templates():
 			_apply_default(doc.name, doc.source_doctype, doc.paper_kind)
 		created.append(doc.name)
 
-	if created:
+	if created or resynced:
 		frappe.db.commit()
-	return {"created": created, "gifted": created}
+	return {"created": created, "gifted": created, "resynced": resynced}
 
 
 def gift_core_print_templates():
