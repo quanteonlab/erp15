@@ -6673,15 +6673,51 @@ def _is_remote_image_url(url):
 	return u.startswith("http://") or u.startswith("https://")
 
 
-def _should_apply_catalog_image(current_image, incoming_url):
-	"""Fill empty image, or replace a remote hotlink. Keep existing local /files/ thumbs."""
+_CATALOG_IMAGE_MODES = ("blank", "all", "none")
+
+
+def _normalize_catalog_image_mode(image_mode):
+	"""CSV import image policy: blank | all | none (aliases accepted)."""
+	raw = cstr(image_mode or "").strip().lower()
+	if not raw:
+		return "blank"
+	aliases = {
+		"override": "all",
+		"overwrite": "all",
+		"replace": "all",
+		"always": "all",
+		"empty": "blank",
+		"empty_only": "blank",
+		"blank_only": "blank",
+		"if_blank": "blank",
+		"if_empty": "blank",
+		"skip": "none",
+		"off": "none",
+		"never": "none",
+		"0": "none",
+		"false": "none",
+	}
+	raw = aliases.get(raw, raw)
+	return raw if raw in _CATALOG_IMAGE_MODES else "blank"
+
+
+def _should_apply_catalog_image(current_image, incoming_url, image_mode="blank"):
+	"""Whether CSV Imagen / image_url should write Item.image.
+
+	Modes:
+	- blank: only when the item currently has no image
+	- all: always override when CSV provides a URL
+	- none: never apply CSV images
+	"""
 	incoming = cstr(incoming_url or "").strip()
 	if not incoming:
 		return False
-	current = cstr(current_image or "").strip()
-	if not current:
+	mode = _normalize_catalog_image_mode(image_mode)
+	if mode == "none":
+		return False
+	if mode == "all":
 		return True
-	return _is_remote_image_url(current)
+	return not cstr(current_image or "").strip()
 
 
 def _materialize_catalog_import_image(item_code, image_url):
@@ -7053,6 +7089,7 @@ def import_catalog_csv_products(
 	cash_price_list="Efectivo",
 	transfer_price_list="Transferencia",
 	column_map=None,
+	image_mode="blank",
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
@@ -7064,10 +7101,12 @@ def import_catalog_csv_products(
 	Efectivo writes to cash_price_list.
 	source="custom": same dual price lists when cash_price is mapped; column
 	bindings come from column_map.
+	image_mode: blank (only empty Item.image) | all (always override) | none.
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
 
+	image_mode = _normalize_catalog_image_mode(image_mode)
 	resolved_map = {}
 	if source in ("airtable", "custom"):
 		# Dirty clients may send null/"" — keep catalog + payment lists usable.
@@ -7126,6 +7165,7 @@ def import_catalog_csv_products(
 		"barcode_updates": 0,
 		"image_updates": 0,
 		"image_failures": 0,
+		"image_mode": image_mode,
 		"review_created": 0,
 		"import_session": session_name,
 		"errors": [],
@@ -7286,13 +7326,17 @@ def import_catalog_csv_products(
 			# a local 256×256 thumb (same as Product Manager). Broken links
 			# fall back to the remote URL + a warning — never abort the row.
 			pending_image_url = cstr(row.get("image_url") or "").strip()
-			if pending_image_url and _should_apply_catalog_image(item_doc.image, pending_image_url):
+			if pending_image_url and _should_apply_catalog_image(
+				item_doc.image, pending_image_url, image_mode
+			):
 				if not _is_remote_image_url(pending_image_url) and not pending_image_url.startswith(
 					"data:image/"
 				):
 					# Local /files/ path or relative — set directly on the doc.
 					item_doc.image = pending_image_url
 					pending_image_url = ""
+			else:
+				pending_image_url = ""
 
 			if existing:
 				item_doc.save(ignore_permissions=True)

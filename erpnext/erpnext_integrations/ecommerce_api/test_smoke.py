@@ -954,6 +954,85 @@ def suite_5_12_modules_read():
         assert cu_report.get("image_updates", 0) >= 1, cu_report
         img = frappe.db.get_value("Item", sku2, "image") or ""
         assert img.startswith("/files/"), f"expected local thumb, got {img!r}"
+
+        # image_mode: none → skip; blank → fill empty only; all → override
+        sku_img = f"SMOKE-IM-{frappe.generate_hash(length=6)}"
+        img_map = {
+            "item_code": "Code",
+            "item_name": "Title",
+            "item_group": "Cat",
+            "price": "List",
+            "image_url": "Img",
+        }
+        img_csv = (
+            "Code,Title,Cat,List,Img\n"
+            f'{sku_img},Smoke Image Mode,Products,11,"{tiny_png}"\n'
+        )
+        none_rep = ecommerce_api.import_catalog_csv_products(
+            csv_text=img_csv,
+            price_list="Standard Selling",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="custom",
+            column_map=img_map,
+            image_mode="none",
+            file_name="smoke-image-mode-none.csv",
+        )
+        assert none_rep.get("image_mode") == "none", none_rep
+        assert cint(none_rep.get("image_updates") or 0) == 0, none_rep
+        assert not (frappe.db.get_value("Item", sku_img, "image") or ""), "none must leave image empty"
+
+        blank_rep = ecommerce_api.import_catalog_csv_products(
+            csv_text=img_csv,
+            price_list="Standard Selling",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="custom",
+            column_map=img_map,
+            image_mode="blank",
+            file_name="smoke-image-mode-blank.csv",
+        )
+        assert blank_rep.get("image_mode") == "blank", blank_rep
+        assert cint(blank_rep.get("image_updates") or 0) >= 1, blank_rep
+        filled = frappe.db.get_value("Item", sku_img, "image") or ""
+        assert filled.startswith("/files/"), filled
+        frappe.db.set_value("Item", sku_img, "image", "/files/smoke-keep-existing.jpg")
+        blank_keep = ecommerce_api.import_catalog_csv_products(
+            csv_text=img_csv,
+            price_list="Standard Selling",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="custom",
+            column_map=img_map,
+            image_mode="blank",
+            file_name="smoke-image-mode-blank-keep.csv",
+        )
+        assert (frappe.db.get_value("Item", sku_img, "image") or "") == "/files/smoke-keep-existing.jpg"
+        assert cint(blank_keep.get("image_updates") or 0) == 0, blank_keep
+        all_rep = ecommerce_api.import_catalog_csv_products(
+            csv_text=img_csv,
+            price_list="Standard Selling",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="custom",
+            column_map=img_map,
+            image_mode="all",
+            file_name="smoke-image-mode-all.csv",
+        )
+        assert all_rep.get("image_mode") == "all", all_rep
+        assert cint(all_rep.get("image_updates") or 0) >= 1, all_rep
+        overridden = frappe.db.get_value("Item", sku_img, "image") or ""
+        assert overridden.startswith("/files/"), overridden
+        assert overridden != "/files/smoke-keep-existing.jpg", overridden
+
         assert (
             flt(
                 frappe.db.get_value(
@@ -971,8 +1050,14 @@ def suite_5_12_modules_read():
             )
             if name:
                 frappe.delete_doc("Item Price", name, ignore_permissions=True, force=1)
-        if frappe.db.exists("Item", sku2):
-            frappe.delete_doc("Item", sku2, ignore_permissions=True, force=1)
+        for code in (sku2, sku_img):
+            name = frappe.db.get_value(
+                "Item Price", {"item_code": code, "price_list": "Standard Selling", "selling": 1}, "name"
+            )
+            if name:
+                frappe.delete_doc("Item Price", name, ignore_permissions=True, force=1)
+            if frappe.db.exists("Item", code):
+                frappe.delete_doc("Item", code, ignore_permissions=True, force=1)
         frappe.db.commit()
 
     def check_tms():

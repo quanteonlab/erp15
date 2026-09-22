@@ -583,6 +583,25 @@
       "expect": "no_500"
     },
     {
+      "id": "import_catalog_csv_image_mode_null_none",
+      "source": "regression",
+      "bug": "image_mode null/\"\" must default blank; image_mode none must skip images without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "Code,Name,Price,Img\nEDGE-IMG-MODE,Edge Image Mode,99,https://example.invalid/x.jpg\n",
+        "source": "custom",
+        "column_map": "{\"item_code\":\"Code\",\"item_name\":\"Name\",\"price\":\"Price\",\"image_url\":\"Img\"}",
+        "price_list": "Standard Selling",
+        "update_existing": 1,
+        "create_missing_groups": 0,
+        "image_mode": null,
+        "start": 0,
+        "batch_size": 10,
+        "file_name": "edge-image-mode-null.csv"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",
