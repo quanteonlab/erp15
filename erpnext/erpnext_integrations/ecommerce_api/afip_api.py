@@ -476,6 +476,144 @@ def get_afip_settings():
 	return data
 
 
+def _decode_upload_bytes(filedata) -> bytes:
+	import base64
+
+	if filedata is None or filedata == "" or filedata == "null" or filedata == "undefined":
+		frappe.throw(_("Missing file data"), frappe.ValidationError)
+	if not isinstance(filedata, str):
+		frappe.throw(_("filedata must be a base64 string or data-URL"), frappe.ValidationError)
+	raw = filedata.strip()
+	if "," in raw and raw.lower().startswith("data:"):
+		raw = raw.split(",", 1)[1]
+	try:
+		return base64.b64decode(raw)
+	except Exception:
+		frappe.throw(_("Invalid file data (expected base64)"), frappe.ValidationError)
+
+
+@frappe.whitelist()
+def upload_afip_credential(kind=None, filedata=None, filename=None):
+	"""Upload certificate (.crt) or private key (.key) into AFIP Settings.
+
+	Used by Tools → Integrations → AFIP in the Next.js app. `kind` is
+	``certificate`` or ``private_key``. `filedata` is a data-URL or raw base64.
+	"""
+	kind = (kind or "").strip().lower()
+	if kind not in ("certificate", "private_key"):
+		frappe.throw(_("kind must be 'certificate' or 'private_key'"), frappe.ValidationError)
+
+	content = _decode_upload_bytes(filedata)
+	if not content:
+		frappe.throw(_("Empty file"), frappe.ValidationError)
+
+	text_head = content[:80].decode("utf-8", errors="ignore")
+	if kind == "certificate":
+		if "BEGIN CERTIFICATE REQUEST" in text_head:
+			frappe.throw(
+				_("That file is a CSR (.csr). Upload the .crt AFIP/ARCA issued after you submit the CSR."),
+				frappe.ValidationError,
+			)
+		if "BEGIN CERTIFICATE" not in text_head and "BEGIN TRUSTED CERTIFICATE" not in text_head:
+			frappe.throw(_("Certificate must be a PEM .crt file"), frappe.ValidationError)
+		default_name = "afip-certificate.crt"
+	else:
+		if "BEGIN" not in text_head or "PRIVATE KEY" not in text_head:
+			frappe.throw(_("Private key must be a PEM .key / .pem file"), frappe.ValidationError)
+		default_name = "afip-private.key"
+
+	fname = (filename or "").strip() or default_name
+	# Keep Attach private — these are credentials.
+	from frappe.utils.file_manager import remove_file, save_file
+
+	frappe.flags.ignore_permissions = True
+	settings = frappe.get_single("AFIP Settings")
+	old_url = settings.get(kind)
+	if old_url:
+		try:
+			# Detach previous file row if present.
+			old_files = frappe.get_all(
+				"File",
+				filters={
+					"attached_to_doctype": "AFIP Settings",
+					"attached_to_name": "AFIP Settings",
+					"file_url": old_url,
+				},
+				pluck="name",
+				ignore_permissions=True,
+			)
+			for name in old_files:
+				remove_file(fid=name, attached_to_doctype="AFIP Settings", attached_to_name="AFIP Settings")
+		except Exception:
+			pass
+
+	file_doc = save_file(
+		fname,
+		content,
+		"AFIP Settings",
+		"AFIP Settings",
+		is_private=1,
+		df=kind,
+	)
+	settings.set(kind, file_doc.file_url)
+	settings.last_error = None
+	settings.save(ignore_permissions=True)
+	frappe.db.commit()
+	frappe.flags.ignore_permissions = False
+	return get_afip_settings()
+
+
+@frappe.whitelist()
+def clear_afip_credential(kind=None):
+	"""Remove certificate or private_key attach from AFIP Settings."""
+	kind = (kind or "").strip().lower()
+	if kind not in ("certificate", "private_key"):
+		frappe.throw(_("kind must be 'certificate' or 'private_key'"), frappe.ValidationError)
+
+	from frappe.utils.file_manager import remove_file
+
+	frappe.flags.ignore_permissions = True
+	settings = frappe.get_single("AFIP Settings")
+	old_url = settings.get(kind)
+	if old_url:
+		try:
+			old_files = frappe.get_all(
+				"File",
+				filters={
+					"attached_to_doctype": "AFIP Settings",
+					"attached_to_name": "AFIP Settings",
+					"file_url": old_url,
+				},
+				pluck="name",
+				ignore_permissions=True,
+			)
+			for name in old_files:
+				remove_file(fid=name, attached_to_doctype="AFIP Settings", attached_to_name="AFIP Settings")
+		except Exception:
+			pass
+	settings.set(kind, None)
+	settings.save(ignore_permissions=True)
+	frappe.db.commit()
+	frappe.flags.ignore_permissions = False
+	return get_afip_settings()
+
+
+@frappe.whitelist()
+def test_afip_wsaa():
+	"""Real WSAA login smoke-test for the Integrations “Test connection” button."""
+	settings = _get_settings()
+	try:
+		_wsaa_login(settings)
+		frappe.flags.ignore_permissions = True
+		frappe.db.set_value("AFIP Settings", "AFIP Settings", "last_error", None)
+		frappe.db.commit()
+		frappe.flags.ignore_permissions = False
+		return get_afip_status()
+	except Exception as e:
+		_record_error(str(e))
+		raise
+
+
 @frappe.whitelist()
 def save_afip_settings(
 	enabled=None,
@@ -487,9 +625,7 @@ def save_afip_settings(
 	print_qr=None,
 	auto_print_after_sale=None,
 ):
-	"""Patch the non-file AFIP Settings fields (cert/key are uploaded via the
-	Frappe desk Attach fields — file uploads aren't wired through this API).
-	"""
+	"""Patch the non-file AFIP Settings fields. Cert/key: upload_afip_credential."""
 	frappe.flags.ignore_permissions = True
 	settings = frappe.get_single("AFIP Settings")
 	if enabled is not None:

@@ -793,6 +793,30 @@
       "expect": "no_500"
     },
     {
+      "id": "afip_upload_credential_null_filedata",
+      "source": "regression",
+      "bug": "upload_afip_credential with null filedata must ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.upload_afip_credential",
+      "args": {
+        "kind": "certificate",
+        "filedata": null,
+        "filename": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "afip_upload_credential_bad_kind",
+      "source": "regression",
+      "bug": "upload_afip_credential with invalid kind must controlled fail",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.upload_afip_credential",
+      "args": {
+        "kind": "",
+        "filedata": "",
+        "filename": ""
+      },
+      "expect": "fail"
+    },
+    {
       "id": "clear_company_logo_empty_company",
       "source": "regression",
       "bug": "clear_company_logo with empty company resolves default company (or controlled error), never AttributeError",
