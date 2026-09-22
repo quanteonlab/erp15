@@ -5076,7 +5076,7 @@ def _pos_sale_required_item_codes(items: list) -> list[str]:
 	seen = set()
 	for item in items or []:
 		code = (item.get("item_code") if isinstance(item, dict) else None) or ""
-		code = str(code).strip()
+		code = _normalize_pos_caja_item_code(str(code).strip())
 		if not code or code in seen:
 			continue
 		seen.add(code)
@@ -5102,6 +5102,48 @@ def _pos_sale_required_item_codes(items: list) -> list[str]:
 				seen.add(c)
 				codes.append(c)
 	return codes
+
+
+POS_CAJA_ITEM_CODE = "POS-CAJA"
+
+
+def _normalize_pos_caja_item_code(code: str) -> str:
+	"""Map unique cart line codes (POS-CAJA-…) to the shared non-stock Item."""
+	c = (code or "").strip()
+	if c == POS_CAJA_ITEM_CODE or c.startswith(POS_CAJA_ITEM_CODE + "-"):
+		return POS_CAJA_ITEM_CODE
+	return c
+
+
+def _ensure_pos_caja_item() -> None:
+	"""Ensure the shared non-stock Item for ad-hoc POS caja lines exists."""
+	if frappe.db.exists("Item", POS_CAJA_ITEM_CODE):
+		if cint(frappe.db.get_value("Item", POS_CAJA_ITEM_CODE, "disabled")):
+			frappe.db.set_value("Item", POS_CAJA_ITEM_CODE, "disabled", 0, update_modified=False)
+		if cint(frappe.db.get_value("Item", POS_CAJA_ITEM_CODE, "is_stock_item")):
+			frappe.db.set_value("Item", POS_CAJA_ITEM_CODE, "is_stock_item", 0, update_modified=False)
+		return
+
+	item_group = (
+		frappe.db.get_single_value("Stock Settings", "item_group")
+		or (frappe.db.exists("Item Group", "Products") and "Products")
+		or frappe.db.get_value("Item Group", {"is_group": 0}, "name")
+		or "All Item Groups"
+	)
+	frappe.get_doc(
+		{
+			"doctype": "Item",
+			"item_code": POS_CAJA_ITEM_CODE,
+			"item_name": "Artículo de caja",
+			"item_group": item_group,
+			"stock_uom": "Nos",
+			"is_stock_item": 0,
+			"include_item_in_manufacturing": 0,
+			"disabled": 0,
+			"description": "Ítem ad-hoc de POS (bolsas, correcciones, no catalogados).",
+		}
+	).insert(ignore_permissions=True)
+	frappe.db.commit()
 
 
 def _resolve_pos_income_account(company: str) -> str | None:
@@ -5251,6 +5293,7 @@ def create_pos_sale(
 	cash_received=None,
 	pos_session_id=None,
 	company=None,
+	customer=None,
 ):
 	"""
 	Create a POS sale as a submitted Sales Invoice + Payment Entry.
@@ -5313,6 +5356,11 @@ def create_pos_sale(
 
 	# POS may sell an active pack whose component was later disabled (or a
 	# cached inactive SKU). Re-enable so Sales Invoice submit can succeed.
+	# Ad-hoc caja lines (POS-CAJA-*) share one non-stock Item.
+	_ensure_pos_caja_item()
+	for item in items:
+		if isinstance(item, dict) and item.get("item_code"):
+			item["item_code"] = _normalize_pos_caja_item_code(str(item.get("item_code")))
 	required_codes = _pos_sale_required_item_codes(items)
 	missing = [c for c in required_codes if not frappe.db.exists("Item", c)]
 	if missing:
@@ -5345,7 +5393,22 @@ def create_pos_sale(
 			"Warehouse", {"is_group": 0, "company": company}, "name"
 		)
 
-	pos_customer = _resolve_pos_sale_customer(pos_session_id=pos_session_id, warehouse=warehouse)
+	pos_customer = None
+	cust_override = (customer or "").strip()
+	if cust_override:
+		if frappe.db.exists("Customer", cust_override):
+			pos_customer = cust_override
+		else:
+			# Allow lookup by customer_name
+			pos_customer = frappe.db.get_value(
+				"Customer",
+				{"customer_name": cust_override, "disabled": 0},
+				"name",
+			)
+			if not pos_customer:
+				frappe.throw(_("Customer {0} not found").format(cust_override))
+	if not pos_customer:
+		pos_customer = _resolve_pos_sale_customer(pos_session_id=pos_session_id, warehouse=warehouse)
 
 	income_account = _resolve_pos_income_account(company)
 	if not income_account:
