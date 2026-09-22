@@ -812,6 +812,49 @@
       "expect": "no_500"
     },
     {
+      "id": "afip_save_print_qr_bool_true",
+      "source": "regression",
+      "bug": "save_afip_settings print_qr true/1/'true' must persist Check=1 and return boolean true (requires print_qr on AFIP Settings meta — run migrate if field missing)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.save_afip_settings",
+      "args": {
+        "print_qr": true
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "afip_save_print_qr_off_on",
+      "source": "regression",
+      "bug": "print_qr must toggle 0 then 1 after DocType migrate; silent no-op when field absent from meta",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.save_afip_settings",
+      "args": {
+        "print_qr": 0
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "afip_sample_invoice_requires_confirm",
+      "source": "regression",
+      "bug": "test_afip_sample_invoice without confirm must ValidationError (never burn CAE)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.test_afip_sample_invoice",
+      "args": {
+        "confirm": null,
+        "confirm_production": null,
+        "amount": 1
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "afip_sample_invoice_empty_confirm",
+      "source": "regression",
+      "bug": "test_afip_sample_invoice confirm='' must fail controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.test_afip_sample_invoice",
+      "args": {
+        "confirm": "",
+        "amount": "null"
+      },
+      "expect": "fail"
+    },
+    {
       "id": "afip_upload_credential_null_filedata",
       "source": "regression",
       "bug": "upload_afip_credential with null filedata must ValidationError not TypeError",

@@ -1,0 +1,9 @@
+# Optional Python deps for AFIP / ARCA electronic invoicing (vendored pyafipws).
+# Install on the ERPNext bench / container:
+#   bench pip install -r apps/erpnext/erpnext/erpnext_integrations/requirements-afip.txt
+#
+# Pin 1.8.22 — newer PyPI builds (e.g. 1.16) crash on Python 3.11+ (inspect.getargspec).
+pysimplesoap==1.8.22
+qrcode>=6.1
+httplib2>=0.20.4
+future>=0.18.2

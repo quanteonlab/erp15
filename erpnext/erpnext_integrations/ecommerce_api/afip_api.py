@@ -22,11 +22,14 @@ from frappe.utils.file_manager import get_file_path
 
 from erpnext.erpnext_integrations.ecommerce_api.device_link_api import _require_link_token
 
-VENDOR_PATH = os.path.join(
+VENDOR_PKG = os.path.join(
 	os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor", "pyafipws"
 )
-if VENDOR_PATH not in sys.path:
-	sys.path.insert(0, VENDOR_PATH)
+# Parent must be on sys.path so `import pyafipws.*` works (wsaa/wsfev1 use that style).
+VENDOR_PARENT = os.path.dirname(VENDOR_PKG)
+for _p in (VENDOR_PARENT, VENDOR_PKG):
+	if _p not in sys.path:
+		sys.path.insert(0, _p)
 
 
 def _require_link_token_or_session(link_token: str) -> None:
@@ -51,7 +54,7 @@ def _get_settings():
 
 
 def _wsaa_login(settings):
-	from wsaa import WSAA
+	from pyafipws.wsaa import WSAA
 
 	cert = get_file_path(settings.certificate)
 	key = get_file_path(settings.private_key)
@@ -67,11 +70,16 @@ def _wsaa_login(settings):
 	ta = wsaa.Autenticar("wsfe", cert, key, wsdl=wsaa_url)
 	if not ta:
 		frappe.throw(_("WSAA authentication failed: {0}").format(wsaa.Excepcion or wsaa.ErrMsg))
+	frappe.flags.ignore_permissions = True
+	frappe.db.set_value("AFIP Settings", "AFIP Settings", "last_wsaa_login", now_datetime())
+	frappe.db.set_value("AFIP Settings", "AFIP Settings", "last_error", None)
+	frappe.db.commit()
+	frappe.flags.ignore_permissions = False
 	return wsaa
 
 
 def _wsfev1_client(settings):
-	from wsfev1 import WSFEv1
+	from pyafipws.wsfev1 import WSFEv1
 
 	wsaa = _wsaa_login(settings)
 	is_prod = settings.environment == "produccion"
@@ -86,10 +94,6 @@ def _wsfev1_client(settings):
 	wsfe.Token = wsaa.Token
 	wsfe.Sign = wsaa.Sign
 	wsfe.Conectar(wsdl=wsfev1_url)
-
-	frappe.flags.ignore_permissions = True
-	frappe.db.set_value("AFIP Settings", "AFIP Settings", "last_wsaa_login", now_datetime())
-	frappe.db.commit()
 	return wsfe
 
 
@@ -163,7 +167,7 @@ def solicitar_cae(
 
 		if wsfe.ErrMsg:
 			_record_error(wsfe.ErrMsg)
-			frappe.throw(_("AFIP rejected the invoice: {0}").format(wsfe.ErrMsg))
+			frappe.throw(_explain_afip_rejection(wsfe.ErrMsg, tipo_cbte, punto_venta))
 
 		return {
 			"ok": True,
@@ -182,6 +186,34 @@ def solicitar_cae(
 	except Exception as e:
 		_record_error(str(e))
 		frappe.throw(_("AFIP request failed: {0}").format(e))
+
+
+def _explain_afip_rejection(err_msg: str, tipo_cbte: int, punto_venta: int) -> str:
+	"""Turn common WSFEv1 codes into actionable setup hints."""
+	raw = (err_msg or "").strip()
+	hints = []
+	upper = raw.upper()
+	if "10000" in upper or "RESPONSABLE INSCRIPTO" in upper:
+		hints.append(
+			_(
+				"Code 10000: this CUIT is not IVA Responsable Inscripto, so Factura A/B "
+				"are not allowed. Use Default Invoice Type 11 (Factura C) for Monotributo / CF."
+			)
+		)
+	if "10005" in upper or "TIPO RECE" in upper or "PUNTO DE VENTA" in upper:
+		hints.append(
+			_(
+				"Code 10005: Punto de Venta {0} is missing or not type RECE (Web Services) "
+				"in AFIP for this environment. Register it under Regímenes de Facturación → "
+				"Puntos de Venta (tipo “Web Services” / electrónico), then put that number "
+				"in AFIP Settings."
+			).format(punto_venta)
+		)
+	if tipo_cbte in (1, 2, 3, 6, 7, 8) and "10000" in upper:
+		hints.append(_("Current comprobante type is {0} — switch to 11 and retry.").format(tipo_cbte))
+	if hints:
+		return _("AFIP rejected the invoice:\n{0}\n\n{1}").format(raw, "\n".join(hints))
+	return _("AFIP rejected the invoice: {0}").format(raw)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -443,7 +475,7 @@ def get_afip_status():
 	frappe.flags.ignore_permissions = True
 	settings = frappe.get_single("AFIP Settings")
 	return {
-		"enabled": bool(settings.enabled),
+		"enabled": bool(_as_check(settings.enabled)),
 		"environment": settings.environment,
 		"punto_venta": settings.punto_venta,
 		"last_wsaa_login": settings.last_wsaa_login,
@@ -464,16 +496,42 @@ _SETTINGS_FIELDS = (
 	"last_error",
 )
 
+_CHECK_FIELDS = frozenset({"enabled", "print_qr", "auto_print_after_sale"})
+
+
+def _as_check(value) -> int:
+	"""Coerce UI / JSON booleans and Frappe Check values to 0|1.
+
+	``cint('true')`` is 0 in Frappe — treat common truthy strings explicitly.
+	"""
+	if value is True or value == 1:
+		return 1
+	if value is False or value in (None, "", 0):
+		return 0
+	if isinstance(value, str):
+		s = value.strip().lower()
+		if s in ("1", "true", "yes", "on", "y"):
+			return 1
+		if s in ("0", "false", "no", "off", "n", "null", "undefined"):
+			return 0
+	return 1 if cint(value) else 0
+
+
+def _serialize_afip_settings(settings) -> dict:
+	data = {field: settings.get(field) for field in _SETTINGS_FIELDS}
+	for field in _CHECK_FIELDS:
+		data[field] = bool(_as_check(data.get(field)))
+	data["certificate_uploaded"] = bool(settings.certificate)
+	data["private_key_uploaded"] = bool(settings.private_key)
+	return data
+
 
 @frappe.whitelist()
 def get_afip_settings():
 	"""Full config for the Integrations settings panel (no secret file contents)."""
 	frappe.flags.ignore_permissions = True
 	settings = frappe.get_single("AFIP Settings")
-	data = {field: settings.get(field) for field in _SETTINGS_FIELDS}
-	data["certificate_uploaded"] = bool(settings.certificate)
-	data["private_key_uploaded"] = bool(settings.private_key)
-	return data
+	return _serialize_afip_settings(settings)
 
 
 def _decode_upload_bytes(filedata) -> bytes:
@@ -523,7 +581,6 @@ def upload_afip_credential(kind=None, filedata=None, filename=None):
 		default_name = "afip-private.key"
 
 	fname = (filename or "").strip() or default_name
-	# Keep Attach private — these are credentials.
 	from frappe.utils.file_manager import remove_file, save_file
 
 	frappe.flags.ignore_permissions = True
@@ -531,7 +588,6 @@ def upload_afip_credential(kind=None, filedata=None, filename=None):
 	old_url = settings.get(kind)
 	if old_url:
 		try:
-			# Detach previous file row if present.
 			old_files = frappe.get_all(
 				"File",
 				filters={
@@ -598,20 +654,192 @@ def clear_afip_credential(kind=None):
 	return get_afip_settings()
 
 
+_PROBE_INVOICE_TYPES = (
+	(1, "A", "Factura A"),
+	(6, "B", "Factura B"),
+	(11, "C", "Factura C"),
+)
+
+
+def _hint_for_cbte_probe(err: str, tipo_cbte: int) -> str:
+	upper = (err or "").upper()
+	if "10000" in upper or "RESPONSABLE INSCRIPTO" in upper:
+		if tipo_cbte in (1, 6):
+			return _(
+				"CUIT is not IVA Responsable Inscripto — Factura A/B are not allowed. Use Factura C (11) for Monotributo."
+			)
+		return _("CUIT tax condition rejected this comprobante type.")
+	if "10005" in upper or "TIPO RECE" in upper:
+		return _(
+			"Punto de Venta is missing or not type RECE (Web Services). Register it in AFIP and update AFIP Settings."
+		)
+	return ""
+
+
+def _probe_supported_invoice_types(wsfe, punto_venta: int) -> list:
+	"""Ask WSFEv1 CompUltimoAutorizado for A/B/C — does not burn a CAE number."""
+	out = []
+	for code, letter, label in _PROBE_INVOICE_TYPES:
+		entry = {
+			"tipo_cbte": code,
+			"letter": letter,
+			"label": label,
+			"supported": False,
+			"last_nro": None,
+			"error": None,
+			"hint": None,
+		}
+		try:
+			# Clear prior error flags if present.
+			for attr in ("ErrMsg", "Excepcion", "Errores", "Obs"):
+				if hasattr(wsfe, attr):
+					try:
+						setattr(wsfe, attr, "" if attr != "Errores" else [])
+					except Exception:
+						pass
+			last = wsfe.CompUltimoAutorizado(code, punto_venta)
+			err = (getattr(wsfe, "ErrMsg", None) or getattr(wsfe, "Excepcion", None) or "").strip()
+			if err:
+				entry["error"] = err[:500]
+				entry["hint"] = _hint_for_cbte_probe(err, code) or None
+			else:
+				entry["supported"] = True
+				entry["last_nro"] = cint(last or 0)
+		except Exception as e:
+			msg = str(e)
+			entry["error"] = msg[:500]
+			entry["hint"] = _hint_for_cbte_probe(msg, code) or None
+		out.append(entry)
+	return out
+
+
 @frappe.whitelist()
 def test_afip_wsaa():
-	"""Real WSAA login smoke-test for the Integrations “Test connection” button."""
+	"""WSAA login + WSFEv1 probe of Factura A/B/C support for this CUIT + PV.
+
+	Does not issue a CAE. Returns which comprobante types CompUltimoAutorizado accepts.
+	"""
+	try:
+		import pysimplesoap  # noqa: F401
+	except ImportError:
+		frappe.throw(
+			_(
+				"Missing Python package pysimplesoap. On the ERPNext server run: "
+				"bench pip install -r apps/erpnext/erpnext/erpnext_integrations/requirements-afip.txt"
+			)
+		)
 	settings = _get_settings()
 	try:
-		_wsaa_login(settings)
-		frappe.flags.ignore_permissions = True
-		frappe.db.set_value("AFIP Settings", "AFIP Settings", "last_error", None)
-		frappe.db.commit()
-		frappe.flags.ignore_permissions = False
-		return get_afip_status()
+		wsfe = _wsfev1_client(settings)
+		punto_venta = cint(settings.punto_venta)
+		supported = _probe_supported_invoice_types(wsfe, punto_venta)
+		ok_types = [r for r in supported if r.get("supported")]
+		# Prefer a short last_error summary when nothing is authorized.
+		if not ok_types:
+			errs = [r.get("error") for r in supported if r.get("error")]
+			if errs:
+				_record_error(errs[0])
+		status = get_afip_status()
+		status["wsaa_ok"] = True
+		status["wsfev1_ok"] = True
+		status["punto_venta"] = punto_venta
+		status["supported_invoice_types"] = supported
+		status["supported_summary"] = ", ".join(
+			f"{r['letter']}({r['tipo_cbte']})" for r in ok_types
+		) or _("none")
+		return status
 	except Exception as e:
 		_record_error(str(e))
 		raise
+
+
+def _sample_amounts(invoice_type: int, amount: float) -> dict:
+	"""Split a sample total for Factura A/B (with IVA) vs C (no IVA)."""
+	importe_total = round(flt(amount), 2)
+	is_c = invoice_type in (11, 12, 13)
+	if is_c or importe_total <= 0:
+		return {
+			"importe_total": importe_total,
+			"importe_neto": importe_total,
+			"importe_iva": 0.0,
+			"iva_id": 3,
+		}
+	neto = round(importe_total / 1.21, 2)
+	iva = round(importe_total - neto, 2)
+	return {
+		"importe_total": importe_total,
+		"importe_neto": neto,
+		"importe_iva": iva,
+		"iva_id": 5,
+	}
+
+
+@frappe.whitelist()
+def test_afip_sample_invoice(confirm=None, confirm_production=None, amount=1):
+	"""Issue a tiny real AFIP invoice (default $1) and return ticket HTML + QR.
+
+	Burns the next CAE number for the configured punto de venta — works in
+	homologación and producción. Production requires ``confirm_production=1``.
+	"""
+	if not _as_check(confirm):
+		frappe.throw(
+			_("Pass confirm=1 to issue a sample invoice (consumes one CAE number)."),
+			frappe.ValidationError,
+		)
+
+	settings = _get_settings()
+	if settings.environment == "produccion" and not _as_check(confirm_production):
+		frappe.throw(
+			_(
+				"Environment is Production. Pass confirm_production=1 to issue a "
+				"real AFIP invoice for $1 (this cannot be undone)."
+			),
+			frappe.ValidationError,
+		)
+
+	try:
+		amount_f = flt(amount if amount not in (None, "", "null", "undefined") else 1)
+	except Exception:
+		amount_f = 1.0
+	if amount_f <= 0 or amount_f > 100:
+		frappe.throw(_("Sample amount must be between 0.01 and 100"), frappe.ValidationError)
+
+	tipo = cint(settings.default_invoice_type) or 11
+	amts = _sample_amounts(tipo, amount_f)
+	# Authenticated admin call — no device link_token.
+	return print_pos_invoice(
+		link_token=None,
+		invoice_type=tipo,
+		doc_type=99,
+		doc_number=0,
+		customer_name=_("AFIP sample test"),
+		items=[
+			{
+				"description": _("Sample AFIP test ({0})").format(
+					settings.environment or "homologacion"
+				),
+				"qty": 1,
+				"rate": amts["importe_total"],
+			}
+		],
+		importe_total=amts["importe_total"],
+		importe_neto=amts["importe_neto"],
+		importe_iva=amts["importe_iva"],
+		iva_id=amts["iva_id"],
+	)
+
+
+def _ensure_afip_check_fields():
+	"""Fail loud if AFIP Settings meta is stale (print_qr missing after JSON add)."""
+	meta = frappe.get_meta("AFIP Settings")
+	missing = [f for f in _CHECK_FIELDS if not meta.has_field(f)]
+	if missing:
+		frappe.throw(
+			_(
+				"AFIP Settings is missing fields: {0}. Run: bench --site <site> migrate"
+			).format(", ".join(missing)),
+			frappe.ValidationError,
+		)
 
 
 @frappe.whitelist()
@@ -627,9 +855,10 @@ def save_afip_settings(
 ):
 	"""Patch the non-file AFIP Settings fields. Cert/key: upload_afip_credential."""
 	frappe.flags.ignore_permissions = True
+	_ensure_afip_check_fields()
 	settings = frappe.get_single("AFIP Settings")
 	if enabled is not None:
-		settings.enabled = cint(enabled)
+		settings.enabled = _as_check(enabled)
 	if environment in ("homologacion", "produccion"):
 		settings.environment = environment
 	if cuit is not None:
@@ -641,9 +870,19 @@ def save_afip_settings(
 	if default_invoice_type is not None:
 		settings.default_invoice_type = cint(default_invoice_type)
 	if print_qr is not None:
-		settings.print_qr = cint(print_qr)
+		settings.print_qr = _as_check(print_qr)
 	if auto_print_after_sale is not None:
-		settings.auto_print_after_sale = cint(auto_print_after_sale)
+		settings.auto_print_after_sale = _as_check(auto_print_after_sale)
 	settings.save(ignore_permissions=True)
+	# Force Check fields into tabSingles (avoids stale meta / silent drops).
+	if print_qr is not None:
+		frappe.db.set_single_value("AFIP Settings", "print_qr", _as_check(print_qr))
+	if auto_print_after_sale is not None:
+		frappe.db.set_single_value(
+			"AFIP Settings", "auto_print_after_sale", _as_check(auto_print_after_sale)
+		)
+	if enabled is not None:
+		frappe.db.set_single_value("AFIP Settings", "enabled", _as_check(enabled))
 	frappe.db.commit()
+	frappe.clear_cache(doctype="AFIP Settings")
 	return get_afip_settings()
