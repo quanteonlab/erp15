@@ -744,6 +744,18 @@
       "expect": "fail"
     },
     {
+      "id": "preview_airtable_null_csv",
+      "source": "regression",
+      "bug": "preview_catalog_csv_import airtable with null csv_text must controlled empty preview not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.preview_catalog_csv_import",
+      "args": {
+        "csv_text": null,
+        "source": "airtable",
+        "column_map": null
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "clear_company_logo_empty_company",
       "source": "regression",
       "bug": "clear_company_logo with empty company resolves default company (or controlled error), never AttributeError",

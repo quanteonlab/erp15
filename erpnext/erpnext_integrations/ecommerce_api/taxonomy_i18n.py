@@ -398,7 +398,7 @@ def get_catalog_taxonomy(lang: str | None = None) -> dict:
 	groups: dict[str, dict] = {}
 	brands: dict[str, dict] = {}
 
-	group_fields = ["name", "item_group_name", "image"]
+	group_fields = ["name", "item_group_name", "image", "parent_item_group", "is_group"]
 	brand_fields = ["name", "brand", "image"]
 	extra = ["custom_alias_es", "custom_alias_en", "custom_alias_zh", JSON_FIELD, "custom_thumbnail"]
 	for f in extra:
@@ -411,6 +411,10 @@ def get_catalog_taxonomy(lang: str | None = None) -> dict:
 		if row.name == "All Item Groups":
 			continue
 		aliases = collect_aliases(row)
+		parent = cstr(row.get("parent_item_group") or "").strip()
+		path_parent = "" if parent in ("", "All Item Groups") else parent
+		leaf = row.name
+		path = f"{path_parent}>{leaf}" if path_parent else leaf
 		groups[row.name] = {
 			"name": row.name,
 			"label": _row_label(aliases, row, lang),
@@ -419,6 +423,9 @@ def get_catalog_taxonomy(lang: str | None = None) -> dict:
 			"alias_en": aliases.get("en"),
 			"alias_zh": aliases.get("zh"),
 			"image": _resolve_thumbnail(row.get("image"), row.get("custom_thumbnail")),
+			"parent_item_group": path_parent,
+			"is_group": cint(row.get("is_group")),
+			"path": path,
 		}
 
 	for row in frappe.get_all("Brand", fields=brand_fields, ignore_permissions=True):

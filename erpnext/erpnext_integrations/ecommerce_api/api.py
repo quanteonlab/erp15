@@ -211,12 +211,41 @@ def get_products(
 	# Attach barcode data in bulk (single query for all items)
 	_attach_barcodes(items)
 	_attach_receiving_meta(items, price_list)
+	_attach_item_group_meta(items)
 
 	return {
 		"items": items,
 		"total_count": total_count,
 		"has_more": (start + page_length) < total_count,
 	}
+
+
+def _attach_item_group_meta(items):
+	"""Attach parent_item_group + item_group_path (e.g. Queso>Holanda) in-place."""
+	names = sorted({cstr(i.get("item_group") or "").strip() for i in items if i.get("item_group")})
+	if not names:
+		for item in items:
+			item["parent_item_group"] = ""
+			item["item_group_path"] = ""
+			item["item_group_is_group"] = 0
+		return
+
+	rows = frappe.get_all(
+		"Item Group",
+		filters={"name": ["in", names]},
+		fields=["name", "parent_item_group", "is_group"],
+		ignore_permissions=True,
+	)
+	by_name = {r.name: r for r in rows}
+	for item in items:
+		gname = cstr(item.get("item_group") or "").strip()
+		row = by_name.get(gname)
+		parent = cstr((row.parent_item_group if row else "") or "").strip()
+		if parent == "All Item Groups":
+			parent = ""
+		item["parent_item_group"] = parent
+		item["item_group_is_group"] = cint(row.is_group) if row else 0
+		item["item_group_path"] = _item_group_path(parent, gname) if gname else ""
 
 
 def _attach_barcodes(items):
@@ -621,13 +650,28 @@ def get_items_for_label_print(price_list=None, item_codes=None):
 
 @frappe.whitelist(allow_guest=True)
 def get_item_groups():
-	"""Return item groups with parent metadata for category navigation."""
-	return frappe.get_all(
+	"""Return all Item Groups (including is_group parents) with path Parent>Leaf."""
+	rows = frappe.get_all(
 		"Item Group",
-		filters={"is_group": 0},
-		fields=["name", "item_group_name", "parent_item_group", "is_group"],
-		order_by="parent_item_group asc, name asc",
+		fields=["name", "item_group_name", "parent_item_group", "is_group", "image"],
+		order_by="lft asc",
+		ignore_permissions=True,
 	)
+	out = []
+	for row in rows:
+		parent = cstr(row.parent_item_group or "").strip()
+		path_parent = "" if parent in ("", "All Item Groups") else parent
+		out.append(
+			{
+				"name": row.name,
+				"item_group_name": row.item_group_name or row.name,
+				"parent_item_group": parent,
+				"is_group": cint(row.is_group),
+				"image": row.image,
+				"path": _item_group_path(path_parent, row.name),
+			}
+		)
+	return out
 
 
 # ── Promotions ────────────────────────────────────────────────────────────────
@@ -4449,21 +4493,6 @@ def get_invoice(invoice_name):
 # ========================================
 
 @frappe.whitelist(allow_guest=True)
-def get_item_groups():
-	"""
-	Get all item groups in hierarchical structure
-
-	Returns:
-		list: Item groups with parent-child relationships
-	"""
-	return frappe.get_all(
-		"Item Group",
-		fields=["name", "parent_item_group", "is_group", "image"],
-		order_by="name",
-	)
-
-
-@frappe.whitelist(allow_guest=True)
 def get_price_lists():
 	"""
 	Get all price lists
@@ -6313,22 +6342,81 @@ def _parse_catalog_csv(csv_text):
 def _parse_airtable_catalog_csv(csv_text):
 	"""Parse an Airtable "Productos" export (real header row, named columns).
 
-	Produces the same row shape as _parse_catalog_csv, plus two optional keys
-	_parse_catalog_csv rows never set: "cash_price" (Efectivo column) and
-	"image_url" (Imagen column). Remote http(s) URLs are downloaded into a
-	local 256×256 thumb during import when possible; broken links fall back
-	to storing the remote URL and a warning.
+	Produces the same row shape as _parse_catalog_csv, plus optional keys:
+	- cash_price (Efectivo)
+	- image_url (Imagen)
+	- brand (Marca)
+	- disabled from Estado (Agotado → 1, En Stock → 0)
+	- parent_item_group (Clase) when Etiquetas is the leaf category
+
+	Tree: Clase → parent Item Group (is_group=1), Etiquetas → leaf (item_group).
+	If Etiquetas is empty, Clase is used as a flat leaf (legacy behaviour).
+	Title is always Producto (never Clase / Etiquetas).
 	"""
 	column_map = {
 		"item_code": "TAG",
 		"item_name": "Producto",
-		"item_group": "Clase",
+		"item_group": "Etiquetas",
+		"parent_item_group": "Clase",
+		"brand": "Marca",
+		"status": "Estado",
 		"price": "Transferencia",
 		"cash_price": "Efectivo",
 		"image_url": "Imagen",
 	}
 	parsed, total, _headers = _parse_mapped_catalog_csv(csv_text, column_map)
+	for row in parsed:
+		# Title must remain Producto — never swap with Clase/Etiquetas.
+		producto = cstr(row.get("item_name") or "").strip()
+		etiqueta = cstr(row.get("item_group") or "").strip()
+		clase = cstr(row.get("parent_item_group") or "").strip()
+		if producto:
+			row["item_name"] = producto
+			row["title_simplified"] = producto
+
+		if etiqueta and clase and etiqueta != clase:
+			row["item_group"] = etiqueta
+			row["parent_item_group"] = clase
+		elif clase:
+			row["item_group"] = clase
+			row["parent_item_group"] = ""
+		elif etiqueta:
+			row["item_group"] = etiqueta
+			row["parent_item_group"] = ""
+		else:
+			row["item_group"] = row.get("item_group") or "Products"
+			row["parent_item_group"] = ""
+
+		row["disabled"] = _airtable_estado_to_disabled(row.pop("status", None))
 	return parsed, total
+
+
+_AIRTABLE_DISABLED_STATUSES = {
+	"agotado",
+	"out of stock",
+	"out-of-stock",
+	"sin stock",
+	"disabled",
+	"inactivo",
+	"inactive",
+	"no",
+	"0",
+	"false",
+}
+
+
+def _airtable_estado_to_disabled(estado) -> int:
+	"""Map Airtable Estado (En Stock / Agotado / …) → Item.disabled."""
+	raw = cstr(estado or "").strip().lower()
+	if not raw:
+		return 0
+	if raw in _AIRTABLE_DISABLED_STATUSES:
+		return 1
+	# Explicit in-stock / active
+	if raw in ("en stock", "in stock", "disponible", "active", "activo", "yes", "1", "true"):
+		return 0
+	# Unknown → keep enabled (permissive)
+	return 0
 
 
 # Logical fields the custom mapper can bind to a CSV header.
@@ -6336,6 +6424,9 @@ CUSTOM_CATALOG_MAP_FIELDS = (
 	"item_code",
 	"item_name",
 	"item_group",
+	"parent_item_group",
+	"brand",
+	"status",
 	"barcode",
 	"stock_uom",
 	"price",
@@ -6348,15 +6439,31 @@ _CUSTOM_FIELD_ALIASES = {
 	"item_code": ("tag", "sku", "item_code", "item code", "codigo", "código", "code", "item"),
 	"item_name": ("producto", "item_name", "item name", "name", "title", "nombre", "description"),
 	"item_group": (
-		"clase",
+		"etiquetas",
+		"etiqueta",
 		"item_group",
 		"item group",
 		"category",
 		"categoria",
 		"categoría",
+		"subcategory",
+		"subcategoria",
+		"subcategoría",
 		"group",
 		"grupo",
 	),
+	"parent_item_group": (
+		"clase",
+		"parent_item_group",
+		"parent item group",
+		"parent_group",
+		"parent group",
+		"parent category",
+		"categoria padre",
+		"categoría padre",
+	),
+	"brand": ("marca", "brand", "brand_name", "brand name"),
+	"status": ("estado", "status", "stock status", "availability", "disponibilidad"),
 	"barcode": ("barcode", "ean", "upc", "codigo_barras", "código de barras", "barras"),
 	"stock_uom": ("uom", "stock_uom", "unidad", "unit", "um"),
 	"price": ("transferencia", "price", "precio", "rate", "standard selling", "precio lista"),
@@ -6447,7 +6554,26 @@ def _parse_mapped_catalog_csv(csv_text, column_map):
 
 		item_code = cstr(_dict_row_get(row, column_map.get("item_code"))).strip()
 		item_name = cstr(_dict_row_get(row, column_map.get("item_name"))).strip()
-		item_group = cstr(_dict_row_get(row, column_map.get("item_group"))).strip() or "Products"
+		item_group = cstr(_dict_row_get(row, column_map.get("item_group"))).strip()
+		parent_item_group = (
+			cstr(_dict_row_get(row, column_map.get("parent_item_group"))).strip()
+			if column_map.get("parent_item_group")
+			else ""
+		)
+		if not item_group:
+			item_group = parent_item_group or "Products"
+			if parent_item_group and item_group == parent_item_group:
+				parent_item_group = ""
+		brand = (
+			cstr(_dict_row_get(row, column_map.get("brand"))).strip()
+			if column_map.get("brand")
+			else ""
+		)
+		status = (
+			cstr(_dict_row_get(row, column_map.get("status"))).strip()
+			if column_map.get("status")
+			else ""
+		)
 		barcode = cstr(_dict_row_get(row, column_map.get("barcode"))).strip()
 		stock_uom = cstr(_dict_row_get(row, column_map.get("stock_uom"))).strip()
 		price = _safe_float(_dict_row_get(row, column_map.get("price"))) if column_map.get("price") else 0.0
@@ -6473,10 +6599,13 @@ def _parse_mapped_catalog_csv(csv_text, column_map):
 				"line_no": line_no,
 				"item_code": item_code,
 				"item_name": item_name or item_code,
-				"title_simplified": item_name,
+				"title_simplified": item_name or item_code,
 				"barcode": barcode,
 				"stock_uom": stock_uom,
 				"item_group": item_group,
+				"parent_item_group": parent_item_group,
+				"brand": brand,
+				"status": status,
 				"price": price,
 				"cash_price": cash_price,
 				"image_url": image_url,
@@ -6624,6 +6753,19 @@ def _materialize_catalog_import_image(item_code, image_url):
 		return None, str(exc)
 
 
+def _ensure_brand_for_import(brand_name, *, create_missing=1):
+	"""Return Brand name, creating it when allowed. Empty → None."""
+	brand_name = cstr(brand_name or "").strip()
+	if not brand_name:
+		return None
+	if frappe.db.exists("Brand", brand_name):
+		return brand_name
+	if not cint(create_missing):
+		return None
+	frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(ignore_permissions=True)
+	return brand_name
+
+
 def _resolve_uom_for_import(uom):
 	if uom and frappe.db.exists("UOM", uom):
 		return uom
@@ -6632,22 +6774,221 @@ def _resolve_uom_for_import(uom):
 	return frappe.db.get_value("UOM", {}, "name") or "Nos"
 
 
-def _resolve_item_group_for_import(item_group, default_item_group="Products", create_missing_groups=0):
-	if item_group and frappe.db.exists("Item Group", item_group):
-		return item_group
+def _root_item_group_name():
+	if frappe.db.exists("Item Group", "All Item Groups"):
+		return "All Item Groups"
+	return frappe.db.get_value("Item Group", {"is_group": 1}, "name") or "All Item Groups"
 
-	if item_group and cint(create_missing_groups):
-		parent_group = "All Item Groups"
-		if not frappe.db.exists("Item Group", item_group):
+
+def _item_group_path(parent_name, leaf_name):
+	parent = cstr(parent_name or "").strip()
+	leaf = cstr(leaf_name or "").strip()
+	if parent and leaf and parent not in ("All Item Groups",) and parent != leaf:
+		return f"{parent}>{leaf}"
+	return leaf or parent
+
+
+def _holding_leaf_name(parent_name):
+	"""Temporary leaf for items that lived on a group before it was promoted."""
+	base = f"{parent_name} › Otros"
+	if not frappe.db.exists("Item Group", base):
+		return base
+	# Already exists — reuse
+	return base
+
+
+def _ensure_item_group_is_parent(parent_name, *, create_missing=1):
+	"""Ensure ``parent_name`` exists as is_group=1 under All Item Groups.
+
+	If it currently exists as a leaf with Items assigned, move those Items onto a
+	holding leaf ``{parent} › Otros``, promote the node, then reparent the holder.
+	"""
+	parent_name = cstr(parent_name or "").strip()
+	if not parent_name:
+		return None
+	root = _root_item_group_name()
+	create_missing = cint(create_missing)
+
+	if not frappe.db.exists("Item Group", parent_name):
+		if not create_missing:
+			return None
+		frappe.get_doc(
+			{
+				"doctype": "Item Group",
+				"item_group_name": parent_name,
+				"parent_item_group": root,
+				"is_group": 1,
+			}
+		).insert(ignore_permissions=True)
+		return parent_name
+
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Item Group", parent_name)
+	try:
+		if cint(doc.is_group):
+			if not (doc.parent_item_group or "").strip():
+				doc.parent_item_group = root
+				doc.save(ignore_permissions=True)
+			return parent_name
+
+		# Promote leaf → group. Items cannot stay on an is_group=1 node.
+		holding = _holding_leaf_name(parent_name)
+		if not frappe.db.exists("Item Group", holding):
+			if not create_missing:
+				# Cannot promote safely without a place for existing items.
+				return parent_name
 			frappe.get_doc(
 				{
 					"doctype": "Item Group",
-					"item_group_name": item_group,
-					"parent_item_group": parent_group,
+					"item_group_name": holding,
+					"parent_item_group": root,
 					"is_group": 0,
 				}
 			).insert(ignore_permissions=True)
-		return item_group
+
+		frappe.db.sql(
+			"UPDATE `tabItem` SET item_group=%s WHERE item_group=%s",
+			(holding, parent_name),
+		)
+
+		doc.is_group = 1
+		doc.parent_item_group = doc.parent_item_group or root
+		doc.save(ignore_permissions=True)
+
+		holding_doc = frappe.get_doc("Item Group", holding)
+		if holding_doc.parent_item_group != parent_name:
+			holding_doc.parent_item_group = parent_name
+			holding_doc.save(ignore_permissions=True)
+		return parent_name
+	finally:
+		frappe.flags.ignore_permissions = False
+
+
+def _ensure_item_group_leaf(leaf_name, parent_name, *, create_missing=1):
+	"""Ensure a leaf Item Group under ``parent_name``; return the leaf name to assign."""
+	leaf_name = cstr(leaf_name or "").strip()
+	parent_name = cstr(parent_name or "").strip()
+	create_missing = cint(create_missing)
+	if not leaf_name:
+		return None
+
+	def _create_under(name, parent):
+		frappe.get_doc(
+			{
+				"doctype": "Item Group",
+				"item_group_name": name,
+				"parent_item_group": parent,
+				"is_group": 0,
+			}
+		).insert(ignore_permissions=True)
+		return name
+
+	if frappe.db.exists("Item Group", leaf_name):
+		row = frappe.db.get_value(
+			"Item Group",
+			leaf_name,
+			["parent_item_group", "is_group"],
+			as_dict=True,
+		)
+		if cint(row.is_group):
+			# Name taken by a group node — use a composite leaf name.
+			composite = f"{parent_name} › {leaf_name}" if parent_name else f"{leaf_name} › Items"
+			if frappe.db.exists("Item Group", composite):
+				return composite
+			if not create_missing:
+				return None
+			if parent_name:
+				_ensure_item_group_is_parent(parent_name, create_missing=1)
+			return _create_under(composite, parent_name or _root_item_group_name())
+
+		current_parent = cstr(row.parent_item_group or "").strip()
+		if parent_name and current_parent == parent_name:
+			return leaf_name
+		if parent_name and current_parent and current_parent != parent_name:
+			# Avoid reparenting a shared leaf — create a namespaced sibling.
+			composite = f"{parent_name} › {leaf_name}"
+			if frappe.db.exists("Item Group", composite):
+				return composite
+			if not create_missing:
+				return leaf_name
+			_ensure_item_group_is_parent(parent_name, create_missing=1)
+			return _create_under(composite, parent_name)
+		if parent_name and not current_parent:
+			if create_missing:
+				_ensure_item_group_is_parent(parent_name, create_missing=1)
+				frappe.flags.ignore_permissions = True
+				try:
+					doc = frappe.get_doc("Item Group", leaf_name)
+					doc.parent_item_group = parent_name
+					doc.save(ignore_permissions=True)
+				finally:
+					frappe.flags.ignore_permissions = False
+			return leaf_name
+		return leaf_name
+
+	if not create_missing:
+		return None
+	parent = parent_name
+	if parent:
+		_ensure_item_group_is_parent(parent, create_missing=1)
+	else:
+		parent = _root_item_group_name()
+	return _create_under(leaf_name, parent)
+
+
+def _resolve_item_group_for_import(
+	item_group,
+	default_item_group="Products",
+	create_missing_groups=0,
+	parent_item_group=None,
+):
+	"""Resolve (and optionally create) the leaf Item Group for an import row.
+
+	When ``parent_item_group`` is set (Airtable Clase / custom parent map), ensure
+	a tree ``parent (is_group=1) → leaf (is_group=0)`` and return the leaf name.
+	"""
+	leaf = cstr(item_group or "").strip()
+	parent = cstr(parent_item_group or "").strip()
+	create = cint(create_missing_groups)
+
+	if parent and leaf and parent != leaf:
+		ensured_parent = _ensure_item_group_is_parent(parent, create_missing=create)
+		if not ensured_parent and not create:
+			# Parent missing and not allowed to create — fall through to flat leaf.
+			pass
+		else:
+			resolved = _ensure_item_group_leaf(
+				leaf, ensured_parent or parent, create_missing=create
+			)
+			if resolved:
+				return resolved
+			if frappe.db.exists("Item Group", leaf):
+				return leaf
+
+	if leaf and frappe.db.exists("Item Group", leaf):
+		# Existing flat group: if caller asked for a parent, still try to promote.
+		if parent and parent != leaf and create:
+			_ensure_item_group_is_parent(parent, create_missing=1)
+			resolved = _ensure_item_group_leaf(leaf, parent, create_missing=1)
+			if resolved:
+				return resolved
+		return leaf
+
+	if leaf and create:
+		if parent and parent != leaf:
+			_ensure_item_group_is_parent(parent, create_missing=1)
+			resolved = _ensure_item_group_leaf(leaf, parent, create_missing=1)
+			if resolved:
+				return resolved
+		frappe.get_doc(
+			{
+				"doctype": "Item Group",
+				"item_group_name": leaf,
+				"parent_item_group": _root_item_group_name(),
+				"is_group": 0,
+			}
+		).insert(ignore_permissions=True)
+		return leaf
 
 	if default_item_group and frappe.db.exists("Item Group", default_item_group):
 		return default_item_group
@@ -6810,6 +7151,9 @@ def import_catalog_csv_products(
 			"barcode": row.get("barcode"),
 			"stock_uom": row.get("stock_uom"),
 			"item_group": row.get("item_group"),
+			"parent_item_group": row.get("parent_item_group"),
+			"brand": row.get("brand"),
+			"disabled": row.get("disabled"),
 			"price": row.get("price"),
 			"cash_price": row.get("cash_price"),
 			"last_price": row.get("last_price"),
@@ -6882,6 +7226,7 @@ def import_catalog_csv_products(
 				row.get("item_group"),
 				default_item_group=default_item_group,
 				create_missing_groups=create_missing_groups,
+				parent_item_group=row.get("parent_item_group"),
 			)
 		except Exception as exc:
 			report["errors"].append({"line_no": row["line_no"], "errors": [str(exc)]})
@@ -6918,7 +7263,24 @@ def import_catalog_csv_products(
 			item_doc.stock_uom = target_uom
 			item_doc.is_stock_item = 1
 			item_doc.include_item_in_manufacturing = 0
-			item_doc.disabled = 0
+			# Estado (airtable) / status map → disabled; default enabled when unset.
+			if "disabled" in row:
+				item_doc.disabled = 1 if cint(row.get("disabled")) else 0
+			else:
+				item_doc.disabled = 0
+
+			brand_name = _ensure_brand_for_import(row.get("brand"), create_missing=1)
+			if brand_name:
+				item_doc.brand = brand_name
+			elif source == "airtable":
+				# Marca mapped: empty clears brand on re-import.
+				item_doc.brand = None
+			elif source == "custom" and "brand" in row:
+				item_doc.brand = None
+
+			if frappe.db.has_column("Item", "custom_normalized_title"):
+				# Keep catalog display title = Producto (not Etiquetas/Clase).
+				item_doc.custom_normalized_title = item_name
 
 			# Defer remote images until after insert/save so we can materialize
 			# a local 256×256 thumb (same as Product Manager). Broken links

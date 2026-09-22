@@ -23,7 +23,7 @@ import uuid
 import traceback
 
 import frappe
-from frappe.utils import flt, nowdate
+from frappe.utils import cint, flt, nowdate
 
 # ── Tag used to find and delete all smoke-test records ───────────────────────
 TAG = "I014_SMOKE"
@@ -785,11 +785,13 @@ def suite_5_12_modules_read():
         assert isinstance(guide, list) and len(guide) >= 1
 
         # Airtable: Transferencia → Standard Selling (+ Transferencia list),
-        # Efectivo → Efectivo. Regression for empty Price column in PM.
+        # Efectivo → Efectivo. Etiquetas leaf under Clase parent when both set.
         sku = f"SMOKE-AT-{frappe.generate_hash(length=6)}"
+        parent_g = f"SmokeClase-{frappe.generate_hash(length=4)}"
+        leaf_g = f"SmokeEtiq-{frappe.generate_hash(length=4)}"
         at_csv = (
-            "TAG,Producto,Clase,Marca,Estado,Efectivo,Transferencia,Imagen\n"
-            f"{sku},Smoke Airtable Price,Products,,En Stock,8800,9064,\n"
+            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Imagen\n"
+            f"{sku},Smoke Airtable Price,{leaf_g},{parent_g},SmokeBrand,Agotado,8800,9064,\n"
         )
         at_report = ecommerce_api.import_catalog_csv_products(
             csv_text=at_csv,
@@ -798,7 +800,7 @@ def suite_5_12_modules_read():
             transfer_price_list="Transferencia",
             default_item_group="Products",
             update_existing=1,
-            create_missing_groups=0,
+            create_missing_groups=1,
             start=0,
             batch_size=10,
             source="airtable",
@@ -806,6 +808,30 @@ def suite_5_12_modules_read():
         )
         assert at_report.get("created_items", 0) + at_report.get("updated_items", 0) >= 1, at_report
         assert at_report.get("price_updates", 0) >= 2, at_report
+        item_row = frappe.db.get_value(
+            "Item",
+            sku,
+            ["item_name", "item_group", "brand", "disabled", "custom_normalized_title"],
+            as_dict=True,
+        )
+        assert item_row, f"Item {sku} missing"
+        assert item_row.item_name == "Smoke Airtable Price", item_row
+        if frappe.db.has_column("Item", "custom_normalized_title"):
+            assert (item_row.custom_normalized_title or "") == "Smoke Airtable Price", item_row
+        assert item_row.item_group == leaf_g, f"expected leaf {leaf_g}, got {item_row.item_group}"
+        assert item_row.brand == "SmokeBrand", item_row
+        assert cint(item_row.disabled) == 1, item_row
+        parent_of_leaf = frappe.db.get_value("Item Group", leaf_g, "parent_item_group")
+        assert parent_of_leaf == parent_g, f"expected parent {parent_g}, got {parent_of_leaf}"
+        assert cint(frappe.db.get_value("Item Group", parent_g, "is_group")) == 1
+        assert cint(frappe.db.get_value("Item Group", leaf_g, "is_group")) == 0
+        meta = ecommerce_api.get_products(search_term=sku, page_length=5, include_disabled=1)
+        hit = next((i for i in (meta.get("items") or []) if i.get("item_code") == sku), None)
+        assert hit, meta
+        assert hit.get("parent_item_group") == parent_g, hit
+        assert hit.get("item_group_path") == f"{parent_g}>{leaf_g}", hit
+        assert hit.get("item_name") == "Smoke Airtable Price", hit
+        assert hit.get("brand") == "SmokeBrand", hit
         std = flt(
             frappe.db.get_value(
                 "Item Price",
@@ -841,6 +867,14 @@ def suite_5_12_modules_read():
                 frappe.delete_doc("Item Price", name, ignore_permissions=True, force=1)
         if frappe.db.exists("Item", sku):
             frappe.delete_doc("Item", sku, ignore_permissions=True, force=1)
+        if frappe.db.exists("Brand", "SmokeBrand"):
+            frappe.delete_doc("Brand", "SmokeBrand", ignore_permissions=True, force=1)
+        for g in (leaf_g, parent_g, f"{parent_g} › Otros"):
+            if frappe.db.exists("Item Group", g):
+                try:
+                    frappe.delete_doc("Item Group", g, ignore_permissions=True, force=1)
+                except Exception:
+                    pass
 
         # Custom: manual column_map + preview, then import with Standard Selling price.
         sku2 = f"SMOKE-CU-{frappe.generate_hash(length=6)}"
