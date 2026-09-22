@@ -768,6 +768,31 @@
       "expect": "no_500"
     },
     {
+      "id": "afip_print_config_null_token_as_session",
+      "source": "regression",
+      "bug": "get_afip_print_config with null link_token under session must return ok/enabled dict, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.get_afip_print_config",
+      "args": {
+        "link_token": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "afip_print_pos_null_items_coercion",
+      "source": "regression",
+      "bug": "print_pos_invoice with null items/amounts must coerce then controlled fail (disabled/incomplete), never TypeError on items",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.afip_api.print_pos_invoice",
+      "args": {
+        "link_token": null,
+        "items": null,
+        "importe_total": null,
+        "importe_neto": "",
+        "importe_iva": "null",
+        "customer_name": "null"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "clear_company_logo_empty_company",
       "source": "regression",
       "bug": "clear_company_logo with empty company resolves default company (or controlled error), never AttributeError",

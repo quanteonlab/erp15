@@ -306,6 +306,33 @@ def render_ticket_html(settings, cae_result: dict, customer: dict, items: list) 
 """
 
 
+def _coerce_ticket_items(items) -> list:
+	"""Flutter / Next dirty payloads: null, '', 'null', partial rows → list of dicts."""
+	import json as _json
+
+	if items is None or items == "" or items == "null" or items == "undefined":
+		return []
+	if isinstance(items, str):
+		try:
+			items = _json.loads(items) if items.strip() else []
+		except Exception:
+			return []
+	if not isinstance(items, list):
+		return []
+	out = []
+	for it in items:
+		if not isinstance(it, dict):
+			continue
+		out.append(
+			{
+				"description": str(it.get("description") or it.get("item_name") or it.get("name") or ""),
+				"qty": flt(it.get("qty") or 0),
+				"rate": flt(it.get("rate") or 0),
+			}
+		)
+	return out
+
+
 @frappe.whitelist(allow_guest=True)
 def print_pos_invoice(
 	link_token=None,
@@ -321,13 +348,20 @@ def print_pos_invoice(
 ):
 	"""Request a CAE and return ready-to-print ticket HTML in one call.
 
-	`items` is a JSON list of {description, qty, rate}.
+	Company / CUIT / punto de venta / cert come from AFIP Settings (web ERP) —
+	callers only send sale lines + amounts. `items` is a JSON list of
+	{description, qty, rate}.
 	"""
 	_require_link_token_or_session(link_token or "")
 
-	import json as _json
-
-	items = _json.loads(items) if isinstance(items, str) else (items or [])
+	items = _coerce_ticket_items(items)
+	doc_type = cint(doc_type if doc_type not in (None, "", "null") else 99)
+	doc_number = cint(doc_number if doc_number not in (None, "", "null") else 0)
+	importe_total = flt(importe_total or 0)
+	importe_neto = flt(importe_neto or 0)
+	importe_iva = flt(importe_iva or 0)
+	iva_id = cint(iva_id if iva_id not in (None, "", "null") else 5)
+	customer_name = None if customer_name in (None, "", "null", "undefined") else str(customer_name)
 
 	cae_result = solicitar_cae(
 		link_token=link_token,
@@ -358,7 +392,49 @@ def print_pos_invoice(
 		{"name": customer_name, "doc_number": doc_number},
 		items,
 	)
-	return {"ok": True, "html": html, "cae": cae_result}
+	return {
+		"ok": True,
+		"html": html,
+		"cae": cae_result,
+		"qr_url": qr_result["qr_url"],
+		"company_name": settings.company_name,
+		"cuit": settings.cuit,
+		"print_qr": bool(cint(settings.print_qr)),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_afip_print_config(link_token=None):
+	"""Device / POS: whether ARCA/AFIP fiscal tickets are allowed.
+
+	Does not throw when disabled or incomplete — callers decide whether to
+	fall back to a non-fiscal receipt. Company/cert stay on the server.
+	"""
+	_require_link_token_or_session(link_token or "")
+	frappe.flags.ignore_permissions = True
+	settings = frappe.get_single("AFIP Settings")
+	frappe.flags.ignore_permissions = False
+
+	enabled = bool(cint(settings.enabled))
+	ready = bool(
+		enabled
+		and settings.cuit
+		and settings.punto_venta
+		and settings.certificate
+		and settings.private_key
+	)
+	return {
+		"ok": True,
+		"enabled": enabled,
+		"ready": ready,
+		"print_qr": bool(cint(settings.print_qr)),
+		"auto_print_after_sale": bool(cint(settings.auto_print_after_sale)),
+		"environment": settings.environment or "homologacion",
+		"default_invoice_type": cint(settings.default_invoice_type or 11),
+		"company_name": (settings.company_name or "") if enabled else "",
+		"cuit": settings.cuit if enabled else None,
+		"punto_venta": cint(settings.punto_venta) if enabled and settings.punto_venta else None,
+	}
 
 
 @frappe.whitelist()
