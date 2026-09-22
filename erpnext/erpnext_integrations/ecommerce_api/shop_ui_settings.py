@@ -77,7 +77,7 @@ def _normalize_order_tag(raw) -> str:
 def _normalize_pos_display(raw) -> dict:
 	src = raw if isinstance(raw, dict) else {}
 	layout = src.get("productLayout")
-	if layout not in ("grid", "list"):
+	if layout not in ("grid", "list", "tradicional"):
 		layout = "grid"
 	shortcut = src.get("headerToggleShortcut")
 	if not isinstance(shortcut, str) or not shortcut.strip():
