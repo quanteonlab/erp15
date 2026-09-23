@@ -885,6 +885,7 @@ def suite_5_12_modules_read():
         )
         assert override == 0, "auto sync must clear manual override"
 
+<<<<<<< Updated upstream
         synced_b = plr.sync_auto_prices_for_list("Standard Buying", item_codes=[code], force=1)
         assert synced_b.get("updated", 0) >= 1, synced_b
         b_rate = frappe.db.get_value(
@@ -907,6 +908,8 @@ def suite_5_12_modules_read():
         assert meta.get("Transferencia", {}).get("auto") == 1, meta
         assert meta.get("Standard Buying", {}).get("auto") == 1, meta
 
+=======
+>>>>>>> Stashed changes
     def check_catalog_import_reviews():
         from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
         rows = ecommerce_api.list_catalog_import_reviews(status="open", limit=5, start=0)
@@ -956,6 +959,85 @@ def suite_5_12_modules_read():
         )
         assert at_report.get("created_items", 0) + at_report.get("updated_items", 0) >= 1, at_report
         assert at_report.get("price_updates", 0) >= 2, at_report
+        # Agotado → Item.disabled=1 → hidden from catalog get_products
+        assert cint(frappe.db.get_value("Item", sku, "disabled")) == 1, "Agotado must disable Item"
+        hidden = ecommerce_api.get_products(search_term=sku, page_length=5, include_disabled=0)
+        assert not any(i.get("item_code") == sku for i in (hidden.get("items") or [])), hidden
+        shown = ecommerce_api.get_products(search_term=sku, page_length=5, include_disabled=1)
+        assert any(i.get("item_code") == sku for i in (shown.get("items") or [])), shown
+        # Oferta + Cantidad → Pricing Rule (Rate, min_qty)
+        sku_promo = f"SMOKE-ATP-{frappe.generate_hash(length=6)}"
+        leaf_promo = f"SmokePLeaf-{frappe.generate_hash(length=4)}"
+        parent_promo = f"SmokePClase-{frappe.generate_hash(length=4)}"
+        promo_csv = (
+            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\n"
+            f"{sku_promo},Smoke Oferta Item,{leaf_promo},{parent_promo},SmokeBrand,En Stock,1000,1030,800,x2,\n"
+        )
+        promo_report = ecommerce_api.import_catalog_csv_products(
+            csv_text=promo_csv,
+            price_list="Standard Selling",
+            cash_price_list="Efectivo",
+            transfer_price_list="Transferencia",
+            default_item_group="Products",
+            update_existing=1,
+            create_missing_groups=1,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            import_promotions=1,
+            image_mode="none",
+            file_name="smoke-airtable-oferta.csv",
+        )
+        assert cint(promo_report.get("promo_updates") or 0) >= 1, promo_report
+        rule_name = f"AT-{sku_promo}"
+        assert frappe.db.exists("Pricing Rule", rule_name), rule_name
+        rule = frappe.db.get_value(
+            "Pricing Rule",
+            rule_name,
+            ["rate_or_discount", "rate", "min_qty", "disable", "apply_on", "price_or_product_discount"],
+            as_dict=True,
+        )
+        assert rule.rate_or_discount == "Rate", rule
+        assert flt(rule.rate) == 800, rule
+        assert flt(rule.min_qty) == 2, rule
+        assert cint(rule.disable) == 0, rule
+        # Clear Oferta → disable rule
+        clear_csv = (
+            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\n"
+            f"{sku_promo},Smoke Oferta Item,{leaf_promo},{parent_promo},SmokeBrand,En Stock,1000,1030,,,\n"
+        )
+        clear_report = ecommerce_api.import_catalog_csv_products(
+            csv_text=clear_csv,
+            price_list="Standard Selling",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            import_promotions=1,
+            image_mode="none",
+            file_name="smoke-airtable-oferta-clear.csv",
+        )
+        assert cint(clear_report.get("promo_disabled") or 0) >= 1, clear_report
+        assert cint(frappe.db.get_value("Pricing Rule", rule_name, "disable")) == 1
+        # cleanup promo item + rule
+        if frappe.db.exists("Pricing Rule", rule_name):
+            frappe.delete_doc("Pricing Rule", rule_name, ignore_permissions=True, force=1)
+        for pl in ("Standard Selling", "Efectivo", "Transferencia"):
+            pname = frappe.db.get_value(
+                "Item Price", {"item_code": sku_promo, "price_list": pl, "selling": 1}, "name"
+            )
+            if pname:
+                frappe.delete_doc("Item Price", pname, ignore_permissions=True, force=1)
+        if frappe.db.exists("Item", sku_promo):
+            frappe.delete_doc("Item", sku_promo, ignore_permissions=True, force=1)
+        for g in (leaf_promo, parent_promo, f"{parent_promo} › Otros"):
+            if frappe.db.exists("Item Group", g):
+                try:
+                    frappe.delete_doc("Item Group", g, ignore_permissions=True, force=1)
+                except Exception:
+                    pass
+
         item_row = frappe.db.get_value(
             "Item",
             sku,

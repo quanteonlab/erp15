@@ -617,6 +617,25 @@
       "expect": "no_500"
     },
     {
+      "id": "import_catalog_csv_import_promotions_null",
+      "source": "regression",
+      "bug": "import_promotions null must default on; Oferta null must not crash airtable import",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\nEDGE-PROMO,Edge Promo,EdgeLeaf,EdgeParent,,En Stock,100,110,,,\n",
+        "source": "airtable",
+        "price_list": "Standard Selling",
+        "update_existing": 1,
+        "create_missing_groups": 1,
+        "import_promotions": null,
+        "image_mode": "none",
+        "start": 0,
+        "batch_size": 10,
+        "file_name": "edge-import-promotions-null.csv"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",

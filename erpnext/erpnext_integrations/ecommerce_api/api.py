@@ -11,6 +11,7 @@ import frappe
 import csv
 import io
 import os
+import re
 import base64
 import zipfile
 from frappe import _
@@ -1545,7 +1546,13 @@ def _compute_cart_promotions_local(items, price_list=None):
 				progress = (qty / min_qty) * 100 if min_qty else 0
 				if needed > 0 and progress >= thresh:
 					pct = flt(rule.get("discount_percentage") or 0)
-					disc_label = f"{int(pct)}% OFF" if pct else (rule.get("title") or "descuento")
+					offer = flt(rule.get("rate") or 0)
+					if pct:
+						disc_label = f"{int(pct)}% OFF"
+					elif offer > 0:
+						disc_label = f"oferta ${offer:g}"
+					else:
+						disc_label = rule.get("title") or "descuento"
 					upsell_hints.append({
 						"rule_name": rule["name"],
 						"title": rule.get("title") or rule["name"],
@@ -1558,18 +1565,36 @@ def _compute_cart_promotions_local(items, price_list=None):
 			if min_amt > 0 and amount < min_amt:
 				continue
 			discount = 0
+			rod = (rule.get("rate_or_discount") or "").strip().lower()
 			if flt(rule.get("discount_percentage") or 0) > 0:
 				discount = amount * flt(rule.get("discount_percentage")) / 100.0
 			elif flt(rule.get("discount_amount") or 0) > 0:
 				discount = flt(rule.get("discount_amount"))
+			elif rod == "rate" or (
+				flt(rule.get("rate") or 0) > 0
+				and not flt(rule.get("discount_percentage") or 0)
+				and not flt(rule.get("discount_amount") or 0)
+			):
+				# Fixed unit rate (Airtable Oferta): savings vs cart line rate.
+				unit_rate = flt(item.get("rate") or 0)
+				offer = flt(rule.get("rate") or 0)
+				if offer > 0 and unit_rate > offer:
+					discount = (unit_rate - offer) * qty
 			if discount > best_discount:
 				best_discount = discount
 				best_rule = rule
 		if best_rule and best_discount > 0:
 			pct = flt(best_rule.get("discount_percentage") or 0)
+			offer = flt(best_rule.get("rate") or 0)
+			if pct:
+				label = f"{int(pct)}%"
+			elif offer > 0:
+				label = f"${offer:g}"
+			else:
+				label = "PROMO"
 			_put_line_discount(
 				line_map, item, best_discount, best_rule["name"],
-				label=f"{int(pct)}%" if pct else "PROMO",
+				label=label,
 			)
 
 	try:
@@ -6370,6 +6395,7 @@ def _parse_airtable_catalog_csv(csv_text):
 	- brand (Marca)
 	- disabled from Estado (Agotado → 1, En Stock → 0)
 	- parent_item_group (Clase) when Etiquetas is the leaf category
+	- offer_rate (Oferta) + offer_qty (Cantidad, e.g. x2 / xCaja) → Pricing Rule
 
 	Tree: Clase → parent Item Group (is_group=1), Etiquetas → leaf (item_group).
 	If Etiquetas is empty, Clase is used as a flat leaf (legacy behaviour).
@@ -6384,6 +6410,8 @@ def _parse_airtable_catalog_csv(csv_text):
 		"status": "Estado",
 		"price": "Transferencia",
 		"cash_price": "Efectivo",
+		"offer_rate": "Oferta",
+		"offer_qty": "Cantidad",
 		"image_url": "Imagen",
 	}
 	parsed, total, _headers = _parse_mapped_catalog_csv(csv_text, column_map)
@@ -6441,6 +6469,100 @@ def _airtable_estado_to_disabled(estado) -> int:
 	return 0
 
 
+def _airtable_oferta_rule_name(item_code: str) -> str:
+	"""Stable Pricing Rule name for Airtable Oferta rows (re-import upserts)."""
+	code = cstr(item_code or "").strip()
+	return f"AT-{code}"[:140]
+
+
+def _parse_airtable_offer_min_qty(cantidad, item_code=None) -> float:
+	"""Cantidad labels → Pricing Rule.min_qty (x2→2, xCaja→pack, xc/unidad→1)."""
+	raw = cstr(cantidad or "").strip().lower().replace(" ", "")
+	if not raw:
+		return 1.0
+	if raw in ("xc/unidad", "xunidad", "xcunidad", "x1", "1"):
+		return 1.0
+	m = re.match(r"^x?(\d+(?:\.\d+)?)$", raw)
+	if m:
+		return flt(m.group(1)) or 1.0
+	if raw in ("xcaja", "caja", "xbox", "box"):
+		pack = 0.0
+		if item_code and frappe.db.exists("Item", item_code) and frappe.db.has_column(
+			"Item", "custom_pack_qty"
+		):
+			pack = flt(frappe.db.get_value("Item", item_code, "custom_pack_qty") or 0)
+		return pack if pack > 1 else 1.0
+	return 1.0
+
+
+def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qty):
+	"""Create/update/disable Pricing Rule from Airtable Oferta + Cantidad.
+
+	Pattern matches POS promotions API (save_pricing_rule):
+	- apply_on Item Code → applicable_items=[TAG]
+	- price_or_product_discount=Price, rate_or_discount=Rate, rate=Oferta
+	- min_qty from Cantidad (x2 / x3 / xCaja / …)
+	Returns: created | updated | disabled | skipped
+	"""
+	code = cstr(item_code or "").strip()
+	if not code:
+		return "skipped"
+	rule_name = _airtable_oferta_rule_name(code)
+	rate = flt(offer_rate)
+	exists = bool(frappe.db.exists("Pricing Rule", rule_name))
+
+	if rate <= 0:
+		if exists:
+			frappe.db.set_value("Pricing Rule", rule_name, "disable", 1, update_modified=True)
+			return "disabled"
+		return "skipped"
+
+	min_qty = _parse_airtable_offer_min_qty(offer_qty, code)
+	qty_label = cstr(offer_qty or "").strip() or "x1"
+	title = f"Oferta {qty_label} — {(cstr(item_name) or code)[:90]}"
+	currency, company = _default_pricing_currency()
+
+	if exists:
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Pricing Rule", rule_name)
+		frappe.flags.ignore_permissions = False
+		action = "updated"
+	else:
+		doc = frappe.new_doc("Pricing Rule")
+		action = "created"
+
+	doc.title = title
+	doc.selling = 1
+	doc.buying = 0
+	doc.disable = 0
+	doc.apply_on = "Item Code"
+	doc.price_or_product_discount = "Price"
+	doc.rate_or_discount = "Rate"
+	doc.rate = rate
+	doc.discount_percentage = 0
+	doc.discount_amount = 0
+	doc.min_qty = min_qty
+	doc.max_qty = 0
+	doc.min_amt = 0
+	doc.max_amt = 0
+	doc.for_price_list = ""
+	doc.currency = currency
+	if company:
+		doc.company = company
+	doc.rule_description = f"Airtable Oferta {qty_label} @ {rate:g} (min_qty={min_qty:g})"
+	doc.threshold_percentage = 80
+	doc.set("items", [])
+	doc.set("item_groups", [])
+	doc.set("brands", [])
+	doc.append("items", {"item_code": code})
+
+	if action == "created":
+		doc.insert(ignore_permissions=True, set_name=rule_name)
+	else:
+		doc.save(ignore_permissions=True)
+	return action
+
+
 # Logical fields the custom mapper can bind to a CSV header.
 CUSTOM_CATALOG_MAP_FIELDS = (
 	"item_code",
@@ -6453,6 +6575,8 @@ CUSTOM_CATALOG_MAP_FIELDS = (
 	"stock_uom",
 	"price",
 	"cash_price",
+	"offer_rate",
+	"offer_qty",
 	"image_url",
 )
 
@@ -6490,6 +6614,8 @@ _CUSTOM_FIELD_ALIASES = {
 	"stock_uom": ("uom", "stock_uom", "unidad", "unit", "um"),
 	"price": ("transferencia", "price", "precio", "rate", "standard selling", "precio lista"),
 	"cash_price": ("efectivo", "cash", "cash_price", "precio efectivo", "precio_efectivo"),
+	"offer_rate": ("oferta", "offer", "offer_rate", "promo_rate", "promo price", "precio oferta"),
+	"offer_qty": ("cantidad", "offer_qty", "promo_qty", "min_qty", "x", "cantidad oferta"),
 	"image_url": ("imagen", "image", "image_url", "foto", "photo", "url imagen"),
 }
 
@@ -6596,6 +6722,10 @@ def _parse_mapped_catalog_csv(csv_text, column_map):
 			if column_map.get("status")
 			else ""
 		)
+		# Estado / status → Item.disabled (Agotado hide in catalog; En Stock show).
+		disabled = None
+		if column_map.get("status"):
+			disabled = _airtable_estado_to_disabled(status)
 		barcode = cstr(_dict_row_get(row, column_map.get("barcode"))).strip()
 		stock_uom = cstr(_dict_row_get(row, column_map.get("stock_uom"))).strip()
 		price = _safe_float(_dict_row_get(row, column_map.get("price"))) if column_map.get("price") else 0.0
@@ -6603,6 +6733,16 @@ def _parse_mapped_catalog_csv(csv_text, column_map):
 			_safe_float(_dict_row_get(row, column_map.get("cash_price")))
 			if column_map.get("cash_price")
 			else 0.0
+		)
+		offer_rate = (
+			_safe_float(_dict_row_get(row, column_map.get("offer_rate")))
+			if column_map.get("offer_rate")
+			else 0.0
+		)
+		offer_qty = (
+			cstr(_dict_row_get(row, column_map.get("offer_qty"))).strip()
+			if column_map.get("offer_qty")
+			else ""
 		)
 		image_url = cstr(_dict_row_get(row, column_map.get("image_url"))).strip()
 
@@ -6616,26 +6756,29 @@ def _parse_mapped_catalog_csv(csv_text, column_map):
 		elif not item_name:
 			errors.append(f"Missing item_name ({column_map.get('item_name')} column).")
 
-		parsed.append(
-			{
-				"line_no": line_no,
-				"item_code": item_code,
-				"item_name": item_name or item_code,
-				"title_simplified": item_name or item_code,
-				"barcode": barcode,
-				"stock_uom": stock_uom,
-				"item_group": item_group,
-				"parent_item_group": parent_item_group,
-				"brand": brand,
-				"status": status,
-				"price": price,
-				"cash_price": cash_price,
-				"image_url": image_url,
-				"last_price": 0.0,
-				"stock_hint": 0.0,
-				"errors": errors,
-			}
-		)
+		parsed_row = {
+			"line_no": line_no,
+			"item_code": item_code,
+			"item_name": item_name or item_code,
+			"title_simplified": item_name or item_code,
+			"barcode": barcode,
+			"stock_uom": stock_uom,
+			"item_group": item_group,
+			"parent_item_group": parent_item_group,
+			"brand": brand,
+			"status": status,
+			"price": price,
+			"cash_price": cash_price,
+			"offer_rate": offer_rate,
+			"offer_qty": offer_qty,
+			"image_url": image_url,
+			"last_price": 0.0,
+			"stock_hint": 0.0,
+			"errors": errors,
+		}
+		if disabled is not None:
+			parsed_row["disabled"] = disabled
+		parsed.append(parsed_row)
 
 	return parsed, len(data_rows), headers
 
@@ -7112,6 +7255,7 @@ def import_catalog_csv_products(
 	transfer_price_list="Transferencia",
 	column_map=None,
 	image_mode="blank",
+	import_promotions=1,
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
@@ -7124,11 +7268,14 @@ def import_catalog_csv_products(
 	source="custom": mapped price → price_list (+ optional transfer_price_list);
 	cash_price → cash_price_list when mapped.
 	image_mode: blank (only empty Item.image) | all (always override) | none.
+	import_promotions: when 1, Airtable Oferta+Cantidad (or custom offer_rate/
+	offer_qty) upsert Pricing Rules (Rate + min_qty) matching the promotions API.
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
 
 	image_mode = _normalize_catalog_image_mode(image_mode)
+	import_promotions = cint(import_promotions)
 	resolved_map = {}
 	if source in ("airtable", "custom"):
 		# Dirty clients may send null/"" — keep catalog + payment lists usable.
@@ -7188,6 +7335,10 @@ def import_catalog_csv_products(
 		"image_updates": 0,
 		"image_failures": 0,
 		"image_mode": image_mode,
+		"promo_updates": 0,
+		"promo_disabled": 0,
+		"items_enabled": 0,
+		"items_disabled": 0,
 		"review_created": 0,
 		"import_session": session_name,
 		"errors": [],
@@ -7218,6 +7369,8 @@ def import_catalog_csv_products(
 			"disabled": row.get("disabled"),
 			"price": row.get("price"),
 			"cash_price": row.get("cash_price"),
+			"offer_rate": row.get("offer_rate"),
+			"offer_qty": row.get("offer_qty"),
 			"last_price": row.get("last_price"),
 			"stock_hint": row.get("stock_hint"),
 			"errors": row.get("errors") or [],
@@ -7325,10 +7478,11 @@ def import_catalog_csv_products(
 			item_doc.stock_uom = target_uom
 			item_doc.is_stock_item = 1
 			item_doc.include_item_in_manufacturing = 0
-			# Estado (airtable) / status map → disabled; default enabled when unset.
+			# Estado (airtable) / status map → disabled (Agotado hides from catalog).
+			# When status is not mapped, leave existing Item.disabled unchanged on update.
 			if "disabled" in row:
 				item_doc.disabled = 1 if cint(row.get("disabled")) else 0
-			else:
+			elif not existing:
 				item_doc.disabled = 0
 
 			brand_name = _ensure_brand_for_import(row.get("brand"), create_missing=1)
@@ -7365,6 +7519,10 @@ def import_catalog_csv_products(
 			else:
 				item_doc.insert(ignore_permissions=True)
 			live_item = item_doc.item_code
+			if cint(item_doc.disabled):
+				report["items_disabled"] += 1
+			else:
+				report["items_enabled"] += 1
 
 			if pending_image_url:
 				local_url, img_err = _materialize_catalog_import_image(live_item, pending_image_url)
@@ -7519,6 +7677,29 @@ def import_catalog_csv_products(
 							live_item=live_item,
 						)
 						report["review_created"] += 1
+
+			# Airtable Oferta (+ Cantidad) / custom offer_rate → Pricing Rule (Rate).
+			if import_promotions and (
+				source == "airtable" or (source == "custom" and resolved_map.get("offer_rate"))
+			):
+				try:
+					promo_action = _upsert_airtable_oferta_promotion(
+						item_doc.item_code,
+						item_doc.item_name,
+						row.get("offer_rate"),
+						row.get("offer_qty"),
+					)
+					if promo_action in ("created", "updated"):
+						report["promo_updates"] += 1
+					elif promo_action == "disabled":
+						report["promo_disabled"] += 1
+				except Exception as promo_exc:
+					report["warnings"].append(
+						{
+							"line_no": row["line_no"],
+							"message": f"Promotion upsert failed: {promo_exc}",
+						}
+					)
 
 		except Exception as exc:
 			reason = (
