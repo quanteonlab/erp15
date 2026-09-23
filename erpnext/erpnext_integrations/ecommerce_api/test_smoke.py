@@ -1195,6 +1195,7 @@ def suite_5_12_modules_read():
         assert cu_report.get("image_updates", 0) >= 1, cu_report
         img = frappe.db.get_value("Item", sku2, "image") or ""
         assert img.startswith("/files/"), f"expected local thumb, got {img!r}"
+        assert img.lower().endswith(".png"), f"catalog migration thumbs should be PNG (alpha), got {img!r}"
 
         # image_mode: none → skip; blank → fill empty only; all → override
         sku_img = f"SMOKE-IM-{frappe.generate_hash(length=6)}"
@@ -1241,6 +1242,7 @@ def suite_5_12_modules_read():
         assert cint(blank_rep.get("image_updates") or 0) >= 1, blank_rep
         filled = frappe.db.get_value("Item", sku_img, "image") or ""
         assert filled.startswith("/files/"), filled
+        assert filled.lower().endswith(".png"), filled
         frappe.db.set_value("Item", sku_img, "image", "/files/smoke-keep-existing.jpg")
         blank_keep = ecommerce_api.import_catalog_csv_products(
             csv_text=img_csv,
@@ -1272,6 +1274,7 @@ def suite_5_12_modules_read():
         assert cint(all_rep.get("image_updates") or 0) >= 1, all_rep
         overridden = frappe.db.get_value("Item", sku_img, "image") or ""
         assert overridden.startswith("/files/"), overridden
+        assert overridden.lower().endswith(".png"), overridden
         assert overridden != "/files/smoke-keep-existing.jpg", overridden
 
         assert (

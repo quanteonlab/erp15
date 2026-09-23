@@ -1,7 +1,8 @@
-"""Local 256×256 JPEG thumbs for Item.image (i032).
+"""Local 256×256 product thumbs for Item.image (i032).
 
-Default geometry is center-contain: fit the longer side, pad the shorter with
-white. Tall bottles / portrait packs keep the full subject instead of cover-crop.
+Default geometry is center-contain: fit the longer side, pad the shorter.
+JPEG pads with white; PNG (catalog CSV migration) pads with transparent alpha
+so cutout product shots keep their intentional empty background.
 """
 
 from __future__ import annotations
@@ -31,14 +32,19 @@ def sku_image_stem(item_code: str) -> str:
 	return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(item_code))
 
 
-def thumb_filename(item_code: str, variant: str = "final") -> str:
+def _ext_for_format(fmt: str) -> str:
+	return ".png" if str(fmt or "").lower() == "png" else ".jpg"
+
+
+def thumb_filename(item_code: str, variant: str = "final", fmt: str = "jpeg") -> str:
 	stem = sku_image_stem(item_code)
 	kind = (variant or "final").strip().lower()
+	ext = _ext_for_format(fmt)
 	if kind == "temp":
-		return f"{stem}_temp.jpg"
+		return f"{stem}_temp{ext}"
 	if kind in ("temp_crop", "crop"):
-		return f"{stem}_temp_crop.jpg"
-	return f"{stem}.jpg"
+		return f"{stem}_temp_crop{ext}"
+	return f"{stem}{ext}"
 
 
 def unwrap_image_url(url: str) -> str:
@@ -165,6 +171,7 @@ def download_image_bytes(url: str) -> bytes:
 
 
 def _open_rgb(image_bytes: bytes):
+	"""Decode → RGB, flattening alpha on white (JPEG path)."""
 	try:
 		from PIL import Image
 	except ImportError:
@@ -185,6 +192,25 @@ def _open_rgb(image_bytes: bytes):
 	return img.convert("RGB")
 
 
+def _open_rgba(image_bytes: bytes):
+	"""Decode → RGBA, keeping transparency (PNG path)."""
+	try:
+		from PIL import Image
+	except ImportError:
+		frappe.throw(_("Pillow is required for product thumbnails"))
+
+	try:
+		img = Image.open(io.BytesIO(image_bytes))
+		if getattr(img, "n_frames", 1) > 1:
+			img.seek(0)
+		img.load()
+	except Exception:
+		frappe.throw(_("Could not decode image (use png, jpg, webp, gif, or similar)"))
+	if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+		return img.convert("RGBA")
+	return img.convert("RGBA")
+
+
 def _resample_filter():
 	from PIL import Image
 
@@ -192,11 +218,11 @@ def _resample_filter():
 	return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
 
 
-def _center_contain(img, size: int = THUMB_SIZE):
-	"""Fit the longer side into the square; letterbox the shorter with white.
+def _center_contain(img, size: int = THUMB_SIZE, *, transparent: bool = False):
+	"""Fit the longer side into the square; pad the shorter side.
 
-	Tall bottles (and other portrait assets) used to go through cover, which
-	scales to width and chops the top/bottom — contain keeps the whole subject.
+	``transparent=True`` (PNG) uses a clear RGBA canvas so cutouts stay cutouts.
+	Otherwise pads with white RGB (JPEG).
 	"""
 	from PIL import Image
 
@@ -207,14 +233,26 @@ def _center_contain(img, size: int = THUMB_SIZE):
 	nw = max(1, int(round(w * scale)))
 	nh = max(1, int(round(h * scale)))
 	resized = img.resize((nw, nh), _resample_filter())
-	canvas = Image.new("RGB", (size, size), (255, 255, 255))
 	left = (size - nw) // 2
 	top = (size - nh) // 2
+	if transparent:
+		if resized.mode != "RGBA":
+			resized = resized.convert("RGBA")
+		canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+		canvas.paste(resized, (left, top), resized)
+		return canvas
+	if resized.mode == "RGBA":
+		canvas = Image.new("RGB", (size, size), (255, 255, 255))
+		canvas.paste(resized, (left, top), resized)
+		return canvas
+	if resized.mode != "RGB":
+		resized = resized.convert("RGB")
+	canvas = Image.new("RGB", (size, size), (255, 255, 255))
 	canvas.paste(resized, (left, top))
 	return canvas
 
 
-def _apply_relative_crop(img, crop: Dict[str, Any], size: int = THUMB_SIZE):
+def _apply_relative_crop(img, crop: Dict[str, Any], size: int = THUMB_SIZE, *, transparent: bool = False):
 	w, h = img.size
 	try:
 		x = float(crop.get("x", 0))
@@ -240,19 +278,29 @@ def _apply_relative_crop(img, crop: Dict[str, Any], size: int = THUMB_SIZE):
 	bottom = max(top + 1, min(h, bottom))
 
 	cropped = img.crop((left, top, right, bottom))
-	# Contain into the square (same as no-crop path) so a non-square crop
-	# region is not stretched.
-	return _center_contain(cropped, size)
+	return _center_contain(cropped, size, transparent=transparent)
 
 
 def encode_thumb_jpeg(image_bytes: bytes, crop: Optional[Dict[str, Any]] = None) -> bytes:
 	img = _open_rgb(image_bytes)
 	if crop:
-		out = _apply_relative_crop(img, crop)
+		out = _apply_relative_crop(img, crop, transparent=False)
 	else:
-		out = _center_contain(img)
+		out = _center_contain(img, transparent=False)
 	buf = io.BytesIO()
 	out.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+	return buf.getvalue()
+
+
+def encode_thumb_png(image_bytes: bytes, crop: Optional[Dict[str, Any]] = None) -> bytes:
+	"""256×256 PNG with alpha preserved (catalog migration / cutout assets)."""
+	img = _open_rgba(image_bytes)
+	if crop:
+		out = _apply_relative_crop(img, crop, transparent=True)
+	else:
+		out = _center_contain(img, transparent=True)
+	buf = io.BytesIO()
+	out.save(buf, format="PNG", optimize=True)
 	return buf.getvalue()
 
 
@@ -311,23 +359,30 @@ def _delete_other_item_images(item_code: str, keep_fname: str) -> None:
 				pass
 
 
-def _write_item_jpeg(
+def _write_item_thumb(
 	item_code: str,
-	jpeg: bytes,
+	content: bytes,
 	variant: str = "final",
 	*,
+	fmt: str = "jpeg",
 	set_item_image: bool = True,
 	commit: bool = True,
 ) -> str:
-	fname = thumb_filename(item_code, variant)
+	fname = thumb_filename(item_code, variant, fmt=fmt)
 	file_url = f"/files/{fname}"
 	_delete_named_image_file(item_code, fname)
+	# Drop the other extension so Item.image never leaves a stale .jpg next to a new .png.
+	alt_fmt = "jpeg" if str(fmt).lower() == "png" else "png"
+	_delete_named_image_file(item_code, thumb_filename(item_code, variant, fmt=alt_fmt))
 	if variant == "final":
-		_delete_named_image_file(item_code, thumb_filename(item_code, "temp"))
-		_delete_named_image_file(item_code, thumb_filename(item_code, "temp_crop"))
+		for kind in ("temp", "temp_crop"):
+			_delete_named_image_file(item_code, thumb_filename(item_code, kind, fmt=fmt))
+			_delete_named_image_file(item_code, thumb_filename(item_code, kind, fmt=alt_fmt))
 		stem = sku_image_stem(item_code)
 		folder = get_files_path(is_private=False)
-		for path in glob.glob(os.path.join(folder, f"{stem}-thumb*.jpg")):
+		for path in glob.glob(os.path.join(folder, f"{stem}-thumb*.jpg")) + glob.glob(
+			os.path.join(folder, f"{stem}-thumb*.png")
+		):
 			try:
 				os.remove(path)
 			except OSError:
@@ -337,7 +392,7 @@ def _write_item_jpeg(
 	folder = get_files_path(is_private=False)
 	frappe.create_folder(folder)
 	with open(os.path.join(folder, fname), "wb") as out:
-		out.write(jpeg)
+		out.write(content)
 
 	file_doc = frappe.get_doc(
 		{
@@ -347,8 +402,8 @@ def _write_item_jpeg(
 			"attached_to_doctype": "Item",
 			"attached_to_name": item_code,
 			"is_private": 0,
-			"file_size": len(jpeg),
-			"content_hash": get_content_hash(jpeg),
+			"file_size": len(content),
+			"content_hash": get_content_hash(content),
 		}
 	)
 	file_doc.flags.ignore_permissions = True
@@ -363,6 +418,25 @@ def _write_item_jpeg(
 	return file_url
 
 
+# Back-compat alias
+def _write_item_jpeg(
+	item_code: str,
+	jpeg: bytes,
+	variant: str = "final",
+	*,
+	set_item_image: bool = True,
+	commit: bool = True,
+) -> str:
+	return _write_item_thumb(
+		item_code,
+		jpeg,
+		variant=variant,
+		fmt="jpeg",
+		set_item_image=set_item_image,
+		commit=commit,
+	)
+
+
 def materialize_item_thumb(
 	item_code: str,
 	image_bytes: bytes,
@@ -371,41 +445,55 @@ def materialize_item_thumb(
 	commit: bool = True,
 	variant: str = "final",
 	set_item_image: bool = True,
+	fmt: str = "jpeg",
 ) -> str:
-	"""Encode a 256×256 JPEG as /files/{sku}.jpg, _temp.jpg, or _temp_crop.jpg."""
+	"""Encode a 256×256 thumb as /files/{sku}.jpg or .png (and temp variants).
+
+	``fmt="png"`` keeps alpha (catalog CSV migration). Default ``jpeg`` for POS
+	search / crop workflows that still expect a white-backed square.
+	"""
 	if not item_code:
 		frappe.throw(_("Item code required"))
 	if not image_bytes:
 		frappe.throw(_("No image data"))
 
-	jpeg = encode_thumb_jpeg(image_bytes, crop)
-	return _write_item_jpeg(
+	kind = "png" if str(fmt or "").lower() == "png" else "jpeg"
+	payload = encode_thumb_png(image_bytes, crop) if kind == "png" else encode_thumb_jpeg(image_bytes, crop)
+	return _write_item_thumb(
 		item_code,
-		jpeg,
+		payload,
 		variant=variant,
+		fmt=kind,
 		set_item_image=set_item_image,
 		commit=commit,
 	)
 
 
 def promote_item_image_to_final(item_code: str, source_variant: str = "temp_crop", *, commit: bool = True) -> str:
-	"""Copy {sku}_temp_crop.jpg or {sku}_temp.jpg onto {sku}.jpg."""
+	"""Copy {sku}_temp_crop / {sku}_temp onto {sku}.jpg|.png (same format as source)."""
 	folder = get_files_path(is_private=False)
 	order = [source_variant]
 	if source_variant != "temp_crop":
 		order.append("temp_crop")
 	if source_variant != "temp":
 		order.append("temp")
-	jpeg = None
+	payload = None
+	found_fmt = "jpeg"
 	for kind in order:
-		path = os.path.join(folder, thumb_filename(item_code, kind))
-		if os.path.isfile(path):
-			with open(path, "rb") as f:
-				jpeg = f.read()
+		for fmt in ("png", "jpeg"):
+			path = os.path.join(folder, thumb_filename(item_code, kind, fmt=fmt))
+			if os.path.isfile(path):
+				with open(path, "rb") as f:
+					payload = f.read()
+				found_fmt = fmt
+				break
+		if payload:
 			break
-	if not jpeg:
+	if not payload:
 		frappe.throw(_("No temporary image to apply"))
-	return _write_item_jpeg(item_code, jpeg, variant="final", set_item_image=True, commit=commit)
+	return _write_item_thumb(
+		item_code, payload, variant="final", fmt=found_fmt, set_item_image=True, commit=commit
+	)
 
 
 def _normalize_file_url(file_url: str) -> str:

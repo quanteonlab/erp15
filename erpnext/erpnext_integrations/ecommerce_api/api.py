@@ -6887,8 +6887,8 @@ def _should_apply_catalog_image(current_image, incoming_url, image_mode="blank")
 
 def _materialize_catalog_import_image(item_code, image_url):
 	"""
-	Download a remote (or data:) image into a local 256×256 thumb like the
-	Product Manager "Materialize remote images" action.
+	Download a remote (or data:) image into a local 256×256 PNG thumb
+	(transparent pad, alpha preserved) for catalog CSV migration.
 
 	Returns (local_file_url, None) on success, or (None, error_message) on failure.
 	Does not raise — callers treat broken Airtable/CDN links as warnings.
@@ -6948,6 +6948,7 @@ def _materialize_catalog_import_image(item_code, image_url):
 			commit=False,
 			variant="final",
 			set_item_image=True,
+			fmt="png",
 		)
 		return file_url, None
 	except Exception as exc:
