@@ -744,6 +744,13 @@ def suite_5_12_modules_read():
         assert isinstance(payload, dict) and payload.get("company"), payload
         assert payload["company"].get("company_name") or payload["company"].get("name")
         assert payload.get("default_language") in ("en", "es", "zh")
+        currencies = payload.get("currencies") or []
+        assert "ARS" in currencies, currencies
+        # LatAm + Asia should be offered in Settings → Company
+        for code in ("BRL", "CLP", "UYU", "MXN", "CNY", "JPY", "KRW", "INR"):
+            assert code in currencies, (code, currencies)
+        assert currencies[0] == "ARS", currencies[:5]
+        assert payload["company"].get("default_currency"), payload["company"]
 
         # Rename must succeed even when orphan Singles (Shopify Setting / Module shopify
         # not found) would crash core rename_doc — this is the Save Settings failure mode.
@@ -811,8 +818,8 @@ def suite_5_12_modules_read():
         guide = ecommerce_api.get_catalog_csv_column_guide()
         assert isinstance(guide, list) and len(guide) >= 1
 
-        # Airtable: Transferencia → Standard Selling (+ Transferencia list),
-        # Efectivo → Efectivo. Etiquetas leaf under Clase parent when both set.
+        # Airtable: Efectivo → Standard Selling (+ Efectivo list),
+        # Transferencia → Transferencia only. Etiquetas leaf under Clase when both set.
         sku = f"SMOKE-AT-{frappe.generate_hash(length=6)}"
         parent_g = f"SmokeClase-{frappe.generate_hash(length=4)}"
         leaf_g = f"SmokeEtiq-{frappe.generate_hash(length=4)}"
@@ -883,7 +890,7 @@ def suite_5_12_modules_read():
             )
             or 0
         )
-        assert std == 9064, f"Standard Selling missing/wrong: {std}"
+        assert std == 8800, f"Standard Selling (Efectivo main) missing/wrong: {std}"
         assert cash == 8800, f"Efectivo missing/wrong: {cash}"
         assert xfer == 9064, f"Transferencia missing/wrong: {xfer}"
         for pl in ("Standard Selling", "Efectivo", "Transferencia"):

@@ -6343,7 +6343,8 @@ def _parse_airtable_catalog_csv(csv_text):
 	"""Parse an Airtable "Productos" export (real header row, named columns).
 
 	Produces the same row shape as _parse_catalog_csv, plus optional keys:
-	- cash_price (Efectivo)
+	- cash_price (Efectivo) — main catalog / POS price
+	- price (Transferencia) — payment-method alternate only
 	- image_url (Imagen)
 	- brand (Marca)
 	- disabled from Estado (Agotado → 1, En Stock → 0)
@@ -7095,12 +7096,12 @@ def import_catalog_csv_products(
 	Create/update Item + Item Price records from catalog CSV (permissive).
 	source="mingsheng" (default): CSV header text is ignored, only stable
 	column order is used. source="airtable": a real header row (TAG/Producto/
-	Clase/Efectivo/Transferencia/...) is read by name. Transferencia writes
-	to price_list (catalog / Product Manager default, usually Standard
-	Selling) and also to transfer_price_list for payment-method pricing;
-	Efectivo writes to cash_price_list.
-	source="custom": same dual price lists when cash_price is mapped; column
-	bindings come from column_map.
+	Clase/Efectivo/Transferencia/...) is read by name. Efectivo writes to
+	price_list (catalog / Product Manager / POS default, usually Standard
+	Selling) and also to cash_price_list for payment-method pricing;
+	Transferencia writes only to transfer_price_list.
+	source="custom": mapped price → price_list (+ optional transfer_price_list);
+	cash_price → cash_price_list when mapped.
 	image_mode: blank (only empty Item.image) | all (always override) | none.
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
@@ -7390,27 +7391,20 @@ def import_catalog_csv_products(
 					item_doc.save(ignore_permissions=True)
 					report["barcode_updates"] += 1
 
-			# Primary catalog price (Transferencia column for airtable, or
-			# mingsheng / custom price column). Always lands on price_list so
-			# Product Manager / POS default "Standard Selling" shows a Price.
-			price_targets = [price_list]
-			if (
-				source in ("airtable", "custom")
-				and transfer_price_list
-				and transfer_price_list != price_list
-			):
-				price_targets.append(transfer_price_list)
-
-			if flt(row.get("price")) > 0:
-				for target_list in price_targets:
+			# Primary catalog / POS price:
+			# - airtable: Efectivo (cash_price) → price_list (+ cash_price_list)
+			# - mingsheng / custom: price column → price_list (+ optional transfer list)
+			if source == "airtable":
+				# Transferencia only lands on the payment-method list.
+				if transfer_price_list and flt(row.get("price")) > 0:
 					try:
-						if _upsert_item_price(item_doc.item_code, target_list, row["price"]):
+						if _upsert_item_price(item_doc.item_code, transfer_price_list, row["price"]):
 							report["price_updates"] += 1
 					except Exception as price_exc:
 						report["warnings"].append(
 							{
 								"line_no": row["line_no"],
-								"message": f"Price write failed ({target_list}): {price_exc}",
+								"message": f"Price write failed ({transfer_price_list}): {price_exc}",
 							}
 						)
 						cir.enqueue_import_review(
@@ -7425,28 +7419,85 @@ def import_catalog_csv_products(
 						)
 						report["review_created"] += 1
 
-			write_cash = source == "airtable" or (
-				source == "custom" and resolved_map.get("cash_price")
-			)
-			if write_cash and flt(row.get("cash_price")) > 0:
-				try:
-					if _upsert_item_price(item_doc.item_code, cash_price_list, row["cash_price"]):
-						report["price_updates"] += 1
-				except Exception as cash_price_exc:
-					report["warnings"].append(
-						{"line_no": row["line_no"], "message": f"Cash price write failed: {cash_price_exc}"}
-					)
-					cir.enqueue_import_review(
-						session_name,
-						line_no=row.get("line_no"),
-						item_code=item_code,
-						reason_code=cir.REASON_PRICE_WRITE_FAILED,
-						message=str(cash_price_exc),
-						severity="warning",
-						payload=payload,
-						live_item=live_item,
-					)
-					report["review_created"] += 1
+				cash_targets = [price_list]
+				if cash_price_list and cash_price_list != price_list:
+					cash_targets.append(cash_price_list)
+				if flt(row.get("cash_price")) > 0:
+					for target_list in cash_targets:
+						try:
+							if _upsert_item_price(item_doc.item_code, target_list, row["cash_price"]):
+								report["price_updates"] += 1
+						except Exception as cash_price_exc:
+							report["warnings"].append(
+								{
+									"line_no": row["line_no"],
+									"message": f"Cash price write failed ({target_list}): {cash_price_exc}",
+								}
+							)
+							cir.enqueue_import_review(
+								session_name,
+								line_no=row.get("line_no"),
+								item_code=item_code,
+								reason_code=cir.REASON_PRICE_WRITE_FAILED,
+								message=str(cash_price_exc),
+								severity="warning",
+								payload=payload,
+								live_item=live_item,
+							)
+							report["review_created"] += 1
+			else:
+				price_targets = [price_list]
+				if (
+					source == "custom"
+					and transfer_price_list
+					and transfer_price_list != price_list
+				):
+					price_targets.append(transfer_price_list)
+
+				if flt(row.get("price")) > 0:
+					for target_list in price_targets:
+						try:
+							if _upsert_item_price(item_doc.item_code, target_list, row["price"]):
+								report["price_updates"] += 1
+						except Exception as price_exc:
+							report["warnings"].append(
+								{
+									"line_no": row["line_no"],
+									"message": f"Price write failed ({target_list}): {price_exc}",
+								}
+							)
+							cir.enqueue_import_review(
+								session_name,
+								line_no=row.get("line_no"),
+								item_code=item_code,
+								reason_code=cir.REASON_PRICE_WRITE_FAILED,
+								message=str(price_exc),
+								severity="warning",
+								payload=payload,
+								live_item=live_item,
+							)
+							report["review_created"] += 1
+
+				write_cash = source == "custom" and resolved_map.get("cash_price")
+				if write_cash and flt(row.get("cash_price")) > 0:
+					try:
+						if _upsert_item_price(item_doc.item_code, cash_price_list, row["cash_price"]):
+							report["price_updates"] += 1
+					except Exception as cash_price_exc:
+						report["warnings"].append(
+							{"line_no": row["line_no"], "message": f"Cash price write failed: {cash_price_exc}"}
+						)
+						cir.enqueue_import_review(
+							session_name,
+							line_no=row.get("line_no"),
+							item_code=item_code,
+							reason_code=cir.REASON_PRICE_WRITE_FAILED,
+							message=str(cash_price_exc),
+							severity="warning",
+							payload=payload,
+							live_item=live_item,
+						)
+						report["review_created"] += 1
 
 		except Exception as exc:
 			reason = (

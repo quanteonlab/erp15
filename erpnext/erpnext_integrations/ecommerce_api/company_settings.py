@@ -21,6 +21,104 @@ _EDITABLE_FIELDS = (
 	"domain",
 )
 
+# Product default. Enabled on demand so Settings → Company always offers them.
+DEFAULT_CURRENCY = "ARS"
+
+# LatAm + Asia (+ common trade currencies). Order = dropdown priority (ARS first).
+_PREFERRED_CURRENCIES = (
+	# Latin America
+	"ARS",
+	"BOB",
+	"BRL",
+	"CLP",
+	"COP",
+	"CRC",
+	"CUP",
+	"DOP",
+	"GTQ",
+	"HNL",
+	"MXN",
+	"NIO",
+	"PAB",
+	"PEN",
+	"PYG",
+	"UYU",
+	"VEF",
+	"VES",
+	# China & Asia
+	"CNY",
+	"HKD",
+	"TWD",
+	"MOP",
+	"JPY",
+	"KRW",
+	"INR",
+	"IDR",
+	"MYR",
+	"SGD",
+	"THB",
+	"VND",
+	"PHP",
+	"PKR",
+	"BDT",
+	"LKR",
+	"NPR",
+	"MMK",
+	"KHR",
+	"LAK",
+	"MNT",
+	# Common extras (often already enabled from setup wizard)
+	"USD",
+	"EUR",
+	"GBP",
+	"CHF",
+	"AUD",
+	"AED",
+)
+
+
+def _ensure_preferred_currencies() -> list[str]:
+	"""Enable LatAm + Asia currencies; return enabled list with preferred codes first."""
+	changed = False
+	for code in _PREFERRED_CURRENCIES:
+		if frappe.db.exists("Currency", code):
+			if not cint(frappe.db.get_value("Currency", code, "enabled")):
+				frappe.db.set_value("Currency", code, "enabled", 1, update_modified=False)
+				changed = True
+			continue
+		try:
+			frappe.get_doc(
+				{
+					"doctype": "Currency",
+					"currency_name": code,
+					"enabled": 1,
+					"fraction_units": 100,
+					"symbol": code,
+				}
+			).insert(ignore_permissions=True)
+			changed = True
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"ensure currency {code}")
+	if changed:
+		frappe.db.commit()
+
+	enabled = frappe.get_all(
+		"Currency",
+		filters={"enabled": 1},
+		pluck="name",
+		order_by="name asc",
+		ignore_permissions=True,
+	) or []
+	order = {c: i for i, c in enumerate(_PREFERRED_CURRENCIES)}
+	preferred = sorted((c for c in enabled if c in order), key=lambda c: order[c])
+	rest = [c for c in enabled if c not in order]
+	return preferred + rest
+
+
+def list_enabled_currencies() -> list[str]:
+	"""Public helper: preferred currencies enabled + sorted for Settings dropdowns."""
+	return _ensure_preferred_currencies()
+
 
 def _can_manage() -> bool:
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _can_app
@@ -53,7 +151,7 @@ def _company_row(name: str) -> dict:
 		"name": doc.name,
 		"company_name": doc.company_name or doc.name,
 		"abbr": doc.abbr or "",
-		"default_currency": doc.default_currency or "",
+		"default_currency": doc.default_currency or DEFAULT_CURRENCY,
 		"country": doc.country or "",
 		"tax_id": doc.tax_id or "",
 		"phone_no": doc.phone_no or "",
@@ -95,13 +193,7 @@ def get_company_settings(company=None):
 	)
 
 	transfer = get_company_transfer_info(name)
-	currencies = frappe.get_all(
-		"Currency",
-		filters={"enabled": 1},
-		pluck="name",
-		order_by="name asc",
-		ignore_permissions=True,
-	)
+	currencies = list_enabled_currencies()
 	countries = frappe.get_all(
 		"Country",
 		pluck="name",
@@ -230,8 +322,13 @@ def save_company_settings(company=None, settings=None):
 		val = _clean_str(incoming.get(field))
 		if field == "domain":
 			val = _coerce_company_domain(val)
-		if field == "default_currency" and val and not frappe.db.exists("Currency", val):
-			frappe.throw(_("Currency {0} not found").format(val), frappe.ValidationError)
+		if field == "default_currency":
+			if not val:
+				val = DEFAULT_CURRENCY
+			if not frappe.db.exists("Currency", val):
+				frappe.throw(_("Currency {0} not found").format(val), frappe.ValidationError)
+			if not cint(frappe.db.get_value("Currency", val, "enabled")):
+				frappe.db.set_value("Currency", val, "enabled", 1, update_modified=False)
 		if field == "country" and val and not frappe.db.exists("Country", val):
 			frappe.throw(_("Country {0} not found").format(val), frappe.ValidationError)
 		if field == "email" and val and "@" not in val:

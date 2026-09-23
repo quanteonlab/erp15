@@ -344,9 +344,17 @@ def list_pos_profile_meta():
 		order_by="name asc",
 		ignore_permissions=True,
 	)
-	currencies = frappe.get_all(
-		"Currency", filters={"enabled": 1}, pluck="name", order_by="name asc"
-	)
+	currencies = None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.company_settings import (
+			list_enabled_currencies,
+		)
+
+		currencies = list_enabled_currencies()
+	except Exception:
+		currencies = frappe.get_all(
+			"Currency", filters={"enabled": 1}, pluck="name", order_by="name asc"
+		)
 	modes_of_payment = frappe.get_all(
 		"Mode of Payment", filters={"enabled": 1}, pluck="name", order_by="name asc"
 	)
