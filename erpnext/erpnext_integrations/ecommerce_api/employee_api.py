@@ -75,6 +75,16 @@ APP_PERMISSIONS = [
 		"desc_zh": "管理个人销售看板并分享销售员链接。",
 	},
 	{
+		"id": "ops.buying",
+		"group": "operaciones",
+		"label_en": "Buying",
+		"label_es": "Compras",
+		"label_zh": "采购",
+		"desc_en": "Simple purchase orders: expected date, product search, quick create.",
+		"desc_es": "Órdenes de compra simples: fecha esperada, búsqueda y alta rápida de productos.",
+		"desc_zh": "简易采购单：预计到货日、商品搜索与快速建品。",
+	},
+	{
 		"id": "log.reports",
 		"group": "logistica",
 		"label_en": "Reports",
@@ -183,6 +193,16 @@ APP_PERMISSIONS = [
 		"desc_en": "Customers from orders and suppliers from receiving.",
 		"desc_es": "Clientes (pedidos) y proveedores (recepción).",
 		"desc_zh": "订单客户与收货供应商。",
+	},
+	{
+		"id": "tables.compras",
+		"group": "tablas",
+		"label_en": "Purchases",
+		"label_es": "Compras",
+		"label_zh": "采购单",
+		"desc_en": "Purchase orders: ETA, receive/bill pipeline, open value.",
+		"desc_es": "Órdenes de compra: ETA, pipeline recepción/factura, valor abierto.",
+		"desc_zh": "采购单：到货日、收货/开票进度、未收货金额。",
 	},
 	{
 		"id": "tables.employees",
@@ -360,6 +380,9 @@ def _accept_permission_id(key: str) -> str | None:
 	# Legacy single Pedidos permission means every order.
 	if key == "tables.orders":
 		key = "tables.orders.all"
+	# Buying moved from Logistics → Operations.
+	if key == "log.buying":
+		key = "ops.buying"
 	if key in KNOWN_PERMISSION_IDS:
 		return key
 	if key.startswith(ORDER_TAG_PREFIX):
@@ -373,6 +396,7 @@ PERMISSION_TO_ROLES = {
 	"ops.receiving": ["Stock User", "Purchase User"],
 	"ops.delivery": ["Stock User"],
 	"ops.preventa": ["Sales User"],
+	"log.buying": ["Purchase User", "Purchase Manager", "Stock User"],
 	"log.reports": ["Accounts User"],
 	"log.accounting": ["Accounts User"],
 	"log.sections": ["Stock User"],
@@ -384,6 +408,7 @@ PERMISSION_TO_ROLES = {
 	"tables.review": ["Stock User", "Purchase User"],
 	"tables.variants": ["Item Manager"],
 	"tables.crm": ["Sales User"],
+	"tables.compras": ["Purchase User", "Purchase Manager", "Stock User"],
 	"tables.employees": ["HR User"],
 	"tables.cajas": ["Accounts User"],
 	"tables.orders": ["Sales User"],
@@ -412,6 +437,8 @@ _STARTER_REPOSITOR = [
 	"tables.products",
 	"tables.review",
 	"tables.variants",
+	"log.buying",
+	"tables.compras",
 	"log.sections",
 	"tools.labels",
 	"tools.catalog_pdf",
@@ -605,7 +632,9 @@ _COARSE_FLAG = {
 	"tables.review": "receiving",
 	"tables.variants": "receiving",
 	"tables.crm": "receiving",
+	"tables.compras": "receiving",
 	"tables.employees": "receiving",
+	"log.buying": "receiving",
 	"log.sections": "receiving",
 	"log.prints": "receiving",
 	"log.rutas": "receiving",

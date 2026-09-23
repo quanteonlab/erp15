@@ -5323,6 +5323,7 @@ def create_pos_sale(
 	pos_session_id=None,
 	company=None,
 	customer=None,
+	is_return=0,
 ):
 	"""
 	Create a POS sale as a submitted Sales Invoice + Payment Entry.
@@ -5341,6 +5342,7 @@ def create_pos_sale(
 		cashier_id (str): Cashier identifier for audit trail.
 		device_id (str): Device/terminal identifier for audit trail.
 		branch_id (str): Branch identifier — used to resolve warehouse.
+		is_return (int): 1 → credit note (Sales Invoice is_return); skips payment entry.
 
 	Returns:
 		dict: {invoice_id, payment_id, payment_ids, offline_order_uuid, status}
@@ -5356,6 +5358,9 @@ def create_pos_sale(
 
 	if not items:
 		frappe.throw(_("At least one item is required to create a POS sale."))
+
+	# Dirty clients may send null/"null"/"" — treat as normal sale.
+	is_return = 1 if cint(is_return) else 0
 
 	# ── i008: Validate sale_mode and enforce payment method policy ────────────
 	sale_mode = (sale_mode or "WHITE").upper()
@@ -5456,6 +5461,7 @@ def create_pos_sale(
 		f" | cashier:{cashier_id or 'unknown'} | device:{device_id or 'unknown'}"
 		f" | branch:{branch_id or 'unknown'}"
 		f" | sale_mode:{sale_mode} | is_borrador:{is_borrador}"
+		f" | is_return:{is_return}"
 		f" | payments:{pay_summary}"
 	)
 	if cash_received:
@@ -5473,26 +5479,33 @@ def create_pos_sale(
 	for item in items:
 		_linked_box_pack(item.get("item_code"))
 
+	invoice_items = []
+	for item in items:
+		qty = flt(item["qty"])
+		if is_return:
+			qty = -abs(qty) if qty else 0
+		invoice_items.append(
+			{
+				"item_code": item["item_code"],
+				"item_name": item.get("item_name", item["item_code"]),
+				"qty": qty,
+				"rate": flt(item["rate"]),
+				"warehouse": warehouse,
+				"income_account": income_account,
+			}
+		)
+
 	invoice = frappe.get_doc(
 		{
 			"doctype": "Sales Invoice",
 			"customer": pos_customer,
 			"company": company,
 			"is_pos": 0,
+			"is_return": is_return,
 			"posting_date": nowdate(),
 			"due_date": nowdate(),
 			"remarks": remarks_tag,
-			"items": [
-				{
-					"item_code": item["item_code"],
-					"item_name": item.get("item_name", item["item_code"]),
-					"qty": flt(item["qty"]),
-					"rate": flt(item["rate"]),
-					"warehouse": warehouse,
-					"income_account": income_account,
-				}
-				for item in items
-			],
+			"items": invoice_items,
 		}
 	)
 
@@ -5500,7 +5513,10 @@ def create_pos_sale(
 	invoice.calculate_taxes_and_totals()
 
 	# ── Validate grand total matches client expectation (within 1 unit rounding) ──
-	if abs(flt(invoice.grand_total) - flt(total_amount)) > 1:
+	# Credit notes have a negative grand_total; client still sends a positive total.
+	server_total = abs(flt(invoice.grand_total))
+	client_total = abs(flt(total_amount))
+	if abs(server_total - client_total) > 1:
 		frappe.throw(
 			_(
 				"Grand total mismatch: server computed {0}, client sent {1}. "
@@ -5515,38 +5531,42 @@ def create_pos_sale(
 		invoice.submit()
 
 		# Box lines are priced as boxes but stock lives on the unit SKU.
-		from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
-		from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
-			require_valuation_rate,
-		)
-
-		allow_zero_valuation = not require_valuation_rate()
-
-		for item in items:
-			box = _linked_box_pack(item.get("item_code"))
-			if not box or not warehouse:
-				continue
-			issue_qty = flt(item.get("qty")) * box["pack"]
-			if issue_qty <= 0:
-				continue
-			stock_entry = make_stock_entry(
-				item_code=box["unit"],
-				qty=issue_qty,
-				from_warehouse=warehouse,
-				posting_date=nowdate(),
-				purpose="Material Issue",
-				do_not_save=True,
+		# Skip stock issue on credit notes (return SI already adjusts stock when update_stock).
+		if not is_return:
+			from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+			from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+				require_valuation_rate,
 			)
-			if allow_zero_valuation:
-				for row in stock_entry.items:
-					row.allow_zero_valuation_rate = 1
-			stock_entry.insert(ignore_permissions=True)
-			_submit_stock_entry_allowing_negative(stock_entry)
 
-	# ── Create Payment Entry (one per split) ──────────────────────────────────
-	payment_ids = _submit_pos_payments(
-		invoice, pay_rows, receipt_number, remarks_tag, cash_received=cash_received
-	)
+			allow_zero_valuation = not require_valuation_rate()
+
+			for item in items:
+				box = _linked_box_pack(item.get("item_code"))
+				if not box or not warehouse:
+					continue
+				issue_qty = flt(item.get("qty")) * box["pack"]
+				if issue_qty <= 0:
+					continue
+				stock_entry = make_stock_entry(
+					item_code=box["unit"],
+					qty=issue_qty,
+					from_warehouse=warehouse,
+					posting_date=nowdate(),
+					purpose="Material Issue",
+					do_not_save=True,
+				)
+				if allow_zero_valuation:
+					for row in stock_entry.items:
+						row.allow_zero_valuation_rate = 1
+				stock_entry.insert(ignore_permissions=True)
+				_submit_stock_entry_allowing_negative(stock_entry)
+
+	# ── Create Payment Entry (one per split) — skip for credit notes ──────────
+	payment_ids = []
+	if not is_return:
+		payment_ids = _submit_pos_payments(
+			invoice, pay_rows, receipt_number, remarks_tag, cash_received=cash_received
+		)
 	payment_id = payment_ids[0] if payment_ids else ""
 
 	# ── Store payment entry name back on invoice (best-effort) ───────────────
@@ -5564,6 +5584,7 @@ def create_pos_sale(
 		"offline_order_uuid": offline_order_uuid,
 		"sale_mode": sale_mode,
 		"is_borrador": is_borrador,
+		"is_return": is_return,
 		"status": "created",
 	}
 

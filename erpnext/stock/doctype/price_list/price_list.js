@@ -66,10 +66,13 @@ frappe.ui.form.on("Price List", {
 	custom_auto_enabled: function (frm) {
 		if (cint(frm.doc.custom_auto_enabled)) {
 			if (!frm.doc.custom_base_price_list) {
-				frm.set_value("custom_base_price_list", "Standard Buying");
+				frm.set_value("custom_base_price_list", "Standard Selling");
 			}
 			if (frm.doc.name === "Transferencia" && !flt(frm.doc.custom_auto_percent)) {
 				frm.set_value("custom_auto_percent", 3);
+			}
+			if (frm.doc.name === "Standard Buying" && !flt(frm.doc.custom_auto_percent)) {
+				frm.set_value("custom_auto_percent", -35);
 			}
 		}
 		frm.trigger("render_auto_formula");
@@ -96,10 +99,24 @@ frappe.ui.form.on("Price List", {
 		const base = frm.doc.custom_base_price_list || __("(base list)");
 		const pct = flt(frm.doc.custom_auto_percent || 0);
 		const add = flt(frm.doc.custom_auto_add_fixed || 0);
+		const factorPct = 100 + pct;
+		let formulaLine = "";
+		const addAbs = Math.abs(add);
+		const addPart =
+			Math.abs(add) < 0.000001
+				? ""
+				: add < 0
+					? ` − ${frappe.utils.escape_html(String(addAbs))}`
+					: ` + ${frappe.utils.escape_html(String(addAbs))}`;
+		if (Math.abs(add) < 0.000001) {
+			formulaLine = `${frappe.utils.escape_html(String(factorPct))}% ${__("of")} ${frappe.utils.escape_html(base)}`;
+		} else {
+			formulaLine = `(${frappe.utils.escape_html(base)}) × (1 + ${pct}/100)${addPart}`;
+		}
 		const html = `
 			<div class="text-muted" style="padding: 4px 0 8px;">
 				<strong>${__("Charge")}</strong> =
-				(${frappe.utils.escape_html(base)}) × (1 + ${pct}/100) + ${add}
+				${formulaLine}
 				<br/>
 				<span style="font-size: 11px;">
 					${__(

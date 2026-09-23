@@ -579,6 +579,19 @@ def suite_5_10_product_manager():
         code = pm.generate_item_code()
         assert code, "generate_item_code returned empty"
 
+    def check_create_with_nos_single_uom():
+        # UI sends display label ``NOS (single)``; must map to ERP UOM ``Nos``.
+        out = pm.create_product_row(
+            None,
+            {"source_title": "Smoke NOS single UOM", "stock_uom": "NOS (single)"},
+            activate=0,
+        )
+        assert isinstance(out, dict) and out.get("item_code"), f"bad create: {out}"
+        sku = out["item_code"]
+        stock_uom = frappe.db.get_value("Item", sku, "stock_uom")
+        assert stock_uom == "Nos", f"expected Nos, got {stock_uom!r}"
+        frappe.delete_doc("Item", sku, ignore_permissions=True, force=True)
+
     _run("5.10.1 get_pm_context", check_pm_context, "S2")
     _run("5.10.2 get_product_rows page", check_product_rows, "S2")
     _run("5.10.3 list_uoms", check_uoms, "S3")
@@ -586,6 +599,7 @@ def suite_5_10_product_manager():
     _run("5.10.5 get_brand_suggestions", check_brand_suggestions, "S3")
     _run("5.10.6 get_category_list", check_category_list, "S3")
     _run("5.10.7 generate_item_code", check_generate_item_code, "S3")
+    _run("5.10.8 create_product_row NOS (single)→Nos", check_create_with_nos_single_uom, "S3")
 
 
 # ── Suite 5.11 — POS session / cash / admin settings ──────────────────────────
@@ -801,46 +815,58 @@ def suite_5_12_modules_read():
         assert frappe.db.exists("Price List", "Transferencia"), "Transferencia list missing"
         assert frappe.db.has_column("Price List", "custom_auto_enabled")
         assert frappe.db.has_column("Item Price", "custom_manual_override")
+
+        # Transferencia = 103% of Standard Selling
         rule = plr.get_auto_rule("Transferencia")
         assert rule, rule
-        assert rule["base_price_list"] == "Standard Buying", rule
+        assert rule["base_price_list"] == "Standard Selling", rule
         assert flt(rule["percent"]) == 3.0, rule
         assert flt(plr.apply_auto_formula(100, 3, 0)) == 103.0
 
-        # Seed a buying rate and sync → Transferencia auto (blue / not override)
+        # Standard Buying = 65% of Standard Selling
+        buy_rule = plr.get_auto_rule("Standard Buying")
+        assert buy_rule, buy_rule
+        assert buy_rule["base_price_list"] == "Standard Selling", buy_rule
+        assert flt(buy_rule["percent"]) == -35.0, buy_rule
+        assert abs(flt(plr.apply_auto_formula(100, -35, 0)) - 65.0) < 0.01
+
+        # Seed Standard Selling and sync → Transferencia + Standard Buying auto
         code = frappe.db.get_value("Item", {"disabled": 0}, "name")
         assert code, "need at least one Item"
-        buying_pl = "Standard Buying"
-        if not frappe.db.exists("Price List", buying_pl):
+        selling_pl = "Standard Selling"
+        if not frappe.db.exists("Price List", selling_pl):
             frappe.get_doc(
                 {
                     "doctype": "Price List",
-                    "price_list_name": buying_pl,
+                    "price_list_name": selling_pl,
                     "enabled": 1,
-                    "buying": 1,
-                    "selling": 0,
+                    "buying": 0,
+                    "selling": 1,
                     "currency": "ARS",
                 }
             ).insert(ignore_permissions=True)
         existing = frappe.db.get_value(
-            "Item Price", {"item_code": code, "price_list": buying_pl}, "name"
+            "Item Price", {"item_code": code, "price_list": selling_pl}, "name"
         )
         if existing:
             frappe.db.set_value("Item Price", existing, "price_list_rate", 200)
+            if frappe.db.has_column("Item Price", "custom_manual_override"):
+                frappe.db.set_value("Item Price", existing, "custom_manual_override", 0)
         else:
             frappe.get_doc(
                 {
                     "doctype": "Item Price",
                     "item_code": code,
-                    "price_list": buying_pl,
-                    "buying": 1,
-                    "selling": 0,
+                    "price_list": selling_pl,
+                    "buying": 0,
+                    "selling": 1,
                     "price_list_rate": 200,
                 }
             ).insert(ignore_permissions=True)
         frappe.db.commit()
-        synced = plr.sync_auto_prices_for_list("Transferencia", item_codes=[code], force=1)
-        assert synced.get("updated", 0) >= 1, synced
+
+        synced_t = plr.sync_auto_prices_for_list("Transferencia", item_codes=[code], force=1)
+        assert synced_t.get("updated", 0) >= 1, synced_t
         t_rate = frappe.db.get_value(
             "Item Price",
             {"item_code": code, "price_list": "Transferencia"},
@@ -856,6 +882,30 @@ def suite_5_12_modules_read():
             or 0
         )
         assert override == 0, "auto sync must clear manual override"
+
+        synced_b = plr.sync_auto_prices_for_list("Standard Buying", item_codes=[code], force=1)
+        assert synced_b.get("updated", 0) >= 1, synced_b
+        b_rate = frappe.db.get_value(
+            "Item Price",
+            {"item_code": code, "price_list": "Standard Buying"},
+            "price_list_rate",
+        )
+        assert abs(flt(b_rate) - 130.0) < 0.01, (b_rate, "expected 200*0.65=130")
+        b_override = cint(
+            frappe.db.get_value(
+                "Item Price",
+                {"item_code": code, "price_list": "Standard Buying"},
+                "custom_manual_override",
+            )
+            or 0
+        )
+        assert b_override == 0, "buying auto sync must clear manual override"
+
+        meta = plr.selling_price_meta_map([code]).get(code) or {}
+        assert meta.get("Transferencia", {}).get("auto") == 1, meta
+        assert meta.get("Standard Buying", {}).get("auto") == 1, meta
+
+    def check_catalog_import_reviews():
         from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
         rows = ecommerce_api.list_catalog_import_reviews(status="open", limit=5, start=0)
         assert isinstance(rows, list)
@@ -1171,6 +1221,24 @@ def suite_5_12_modules_read():
         prods = cpa.list_party_products(party_type="Customer", party=cust, page_length=5)
         assert prods.get("ok") and isinstance(prods.get("products"), list), f"bad products: {prods}"
 
+    def check_buying():
+        from erpnext.erpnext_integrations.ecommerce_api import buying_api as ba
+        listed = ba.list_purchase_orders(page_length=5)
+        assert listed.get("ok") and isinstance(listed.get("rows"), list), f"bad PO list: {listed}"
+        # Controlled validation — empty create must not 500
+        try:
+            ba.create_purchase_order(supplier="", items=[])
+            raise AssertionError("expected ValidationError for empty PO")
+        except Exception as exc:
+            assert "ValidationError" in type(exc).__name__ or "supplier" in str(exc).lower() or "item" in str(exc).lower(), exc
+        try:
+            ba.get_purchase_order_detail(name="")
+            raise AssertionError("expected ValidationError for empty PO name")
+        except Exception as exc:
+            assert "ValidationError" in type(exc).__name__ or "name" in str(exc).lower(), exc
+        if listed.get("rows"):
+            detail = ba.get_purchase_order_detail(name=listed["rows"][0]["name"])
+            assert detail.get("ok") and detail.get("order") and isinstance(detail["order"].get("lines"), list)
     if frappe.db.exists("DocType", "Preventa Lead Consulta") or frappe.db.exists("DocType", "Preventa Settings"):
         _run("5.12.1 preventa settings + board", check_preventa, "S3")
     else:
@@ -1180,7 +1248,7 @@ def suite_5_12_modules_read():
     _run("5.12.4 get_floors", check_floors, "S3")
     _run("5.12.5 list_print_templates", check_print, "S3")
     _run("5.12.5b get/save company settings (rename + orphan Shopify Single)", check_company_settings, "S2")
-    _run("5.12.5d price list auto rules (Transferencia = Standard Buying +3%)", check_price_list_auto_rules, "S2")
+    _run("5.12.5d price list auto rules (Transferencia=103% Standard Selling; Buying=65%)", check_price_list_auto_rules, "S2")
     if frappe.db.exists("DocType", "Catalog Import Session"):
         _run("5.12.5c catalog import reviews + permissive enqueue", check_catalog_import_reviews, "S2")
     else:
@@ -1190,6 +1258,7 @@ def suite_5_12_modules_read():
     _run("5.12.8 search_tags", check_tags, "S3")
     _run("5.12.9 get_openapi_spec", check_openapi, "S3")
     _run("5.12.10 crm party invoices/payments/products", check_crm_party, "S3")
+    _run("5.12.11 buying list + empty create validation", check_buying, "S3")
 
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────

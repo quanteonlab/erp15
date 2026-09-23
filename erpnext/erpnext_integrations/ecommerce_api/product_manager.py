@@ -77,7 +77,7 @@ def _upsert_item_price_buying(item_code: str, rate: float) -> None:
         doc.insert(ignore_permissions=True)
         log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
 
-    # Refresh dependent auto lists (e.g. Transferencia = Standard Buying + 3%).
+    # Refresh dependent auto lists (e.g. Transferencia from this buying base).
     try:
         from erpnext.erpnext_integrations.ecommerce_api.price_list_rules import (
             sync_auto_prices_from_base,
@@ -130,6 +130,16 @@ def _upsert_item_price(
         )
         doc.insert(ignore_permissions=True)
         log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
+
+    # db.set_value skips doc hooks — refresh Transferencia / Standard Buying, etc.
+    try:
+        from erpnext.erpnext_integrations.ecommerce_api.price_list_rules import (
+            sync_auto_prices_from_base,
+        )
+
+        sync_auto_prices_from_base(pl, item_codes=[item_code])
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "sync_auto_prices_from_base after selling")
 
 
 def _default_price_list() -> str:
@@ -436,6 +446,31 @@ def _ensure_uom(name: str) -> str | None:
         }
     ).insert(ignore_permissions=True)
     return uom_name
+
+
+# UI stock-UOM labels (products / receiving / buying) → ERPNext UOM master names.
+_STOCK_UOM_ALIASES = {
+    "nos": "Nos",
+    "nos (single)": "Nos",
+    "nos(single)": "Nos",
+    "unit": "Nos",
+    "box": "CAJA",
+    "caja": "CAJA",
+    "weight": "WEIGHT",
+    "por peso": "WEIGHT",
+    "porpeso": "WEIGHT",
+}
+
+
+def _normalize_stock_uom(name: str | None) -> str:
+    """Map display labels like ``NOS (single)`` to real UOM rows (``Nos``)."""
+    raw = (name or "").strip()
+    if not raw:
+        return _ensure_uom("Nos") or "Nos"
+    mapped = _STOCK_UOM_ALIASES.get(raw.lower())
+    target = mapped or raw
+    ensured = _ensure_uom(target)
+    return ensured or target
 
 
 @frappe.whitelist()
@@ -1151,11 +1186,11 @@ def get_product_rows(
             last_purchase = flt(row.pop("last_purchase_rate", None) or 0)
             valuation = flt(row.pop("valuation_rate", None) or 0)
             if buying > 0:
-                # Written Standard Buying → black (not estimated).
+                # From Standard Buying list; blue when auto (65% selling), black if manual.
                 row["cost_price"] = buying
                 row["cost_from_buying"] = 1
             else:
-                # Never overwritten: last purchase / valuation estimate → blue in UI.
+                # Last purchase / valuation estimate → blue in UI (no buying price).
                 estimate = last_purchase if last_purchase > 0 else valuation
                 row["cost_price"] = estimate if estimate > 0 else None
                 row["cost_from_buying"] = 0
@@ -1363,7 +1398,7 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
 
         if "stock_uom" in changes:
             uom_name = (changes.get("stock_uom") or "").strip()
-            updates["stock_uom"] = _ensure_uom(uom_name) if uom_name else None
+            updates["stock_uom"] = _normalize_stock_uom(uom_name) if uom_name else None
 
         history: list[tuple[str, object, object]] = []
 
@@ -1531,7 +1566,7 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
 
     is_active = 1 if cint(activate) else cint(changes.get("is_active") or 0)
     item_group = (changes.get("source_category") or "").strip() or _default_item_group()
-    stock_uom = (changes.get("stock_uom") or "").strip() or "Nos"
+    stock_uom = _normalize_stock_uom(changes.get("stock_uom"))
 
     if not frappe.db.exists("Item Group", item_group):
         item_group = _default_item_group()

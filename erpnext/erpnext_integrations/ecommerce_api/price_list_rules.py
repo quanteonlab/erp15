@@ -3,9 +3,11 @@
 Configured on the Price List form in ERPNext desk (custom fields):
   custom_auto_enabled, custom_base_price_list, custom_auto_percent, custom_auto_add_fixed
 
-Default gift: Transferencia = Standard Buying × (1 + 3%) when auto is on and the
-Item Price has not been manually overridden (custom_manual_override=0 → blue in UI;
-override=1 → black/bold).
+Default gifts:
+  - Transferencia (selling) = Standard Selling x 103%  (percent=+3)
+  - Standard Buying         = Standard Selling x 65%   (percent=-35)
+
+Item Price custom_manual_override=0 -> blue in UI; override=1 -> black/bold.
 """
 
 from __future__ import annotations
@@ -16,8 +18,12 @@ from frappe.utils import cint, flt
 
 DEFAULT_CURRENCY = "ARS"
 TRANSFER_LIST = "Transferencia"
-DEFAULT_BASE_LIST = "Standard Buying"
+SELLING_LIST = "Standard Selling"
+BUYING_LIST = "Standard Buying"
+DEFAULT_BASE_LIST = SELLING_LIST
 DEFAULT_TRANSFER_PERCENT = 3.0
+# Standard Buying = Standard Selling x 0.65 -> percent = -35
+DEFAULT_BUYING_PERCENT = -35.0
 
 
 def ensure_price_list_rule_fields() -> None:
@@ -54,7 +60,7 @@ def ensure_price_list_rule_fields() -> None:
 					"insert_after": "custom_auto_enabled",
 					"depends_on": "eval:doc.custom_auto_enabled",
 					"mandatory_depends_on": "eval:doc.custom_auto_enabled",
-					"description": "Source list for autoconfig (e.g. Standard Buying).",
+					"description": "Source list for autoconfig (e.g. Standard Selling).",
 				},
 				{
 					"fieldname": "custom_auto_percent",
@@ -63,7 +69,7 @@ def ensure_price_list_rule_fields() -> None:
 					"insert_after": "custom_base_price_list",
 					"depends_on": "eval:doc.custom_auto_enabled",
 					"default": "0",
-					"description": "e.g. 3 → charge base × 1.03",
+					"description": "e.g. 3 → 103% of base; -35 → 65% of base",
 				},
 				{
 					"fieldname": "column_break_auto_rules",
@@ -77,7 +83,11 @@ def ensure_price_list_rule_fields() -> None:
 					"insert_after": "column_break_auto_rules",
 					"depends_on": "eval:doc.custom_auto_enabled",
 					"default": "0",
-					"description": "Added after the percent markup (per unit).",
+					"non_negative": 0,
+					"description": (
+						"Added after the percent markup (per unit). "
+						"May be negative to subtract (discount)."
+					),
 				},
 				{
 					"fieldname": "custom_auto_formula_html",
@@ -103,35 +113,90 @@ def ensure_price_list_rule_fields() -> None:
 		},
 		ignore_validate=True,
 	)
+	# Allow negative fixed amounts on existing installs (Currency defaults can block "-").
+	cf = frappe.db.get_value(
+		"Custom Field",
+		{"dt": "Price List", "fieldname": "custom_auto_add_fixed"},
+		"name",
+	)
+	if cf:
+		frappe.db.set_value(
+			"Custom Field",
+			cf,
+			{
+				"non_negative": 0,
+				"description": (
+					"Added after the percent markup (per unit). "
+					"May be negative to subtract (discount)."
+				),
+			},
+			update_modified=False,
+		)
 	frappe.clear_cache(doctype="Price List")
 	frappe.clear_cache(doctype="Item Price")
 
 
 def ensure_transferencia_auto_defaults() -> None:
-	"""Create/enable Transferencia selling list: Standard Buying + 3% (default)."""
+	"""Create/enable Transferencia: Standard Selling × 103%; Standard Buying: × 65%."""
 	ensure_price_list_rule_fields()
 	currency = (
 		frappe.db.get_single_value("Global Defaults", "default_currency")
 		or DEFAULT_CURRENCY
 	)
-	if not frappe.db.exists("Price List", DEFAULT_BASE_LIST):
+
+	# Ensure Standard Selling exists (source for both defaults).
+	if not frappe.db.exists("Price List", SELLING_LIST):
 		frappe.get_doc(
 			{
 				"doctype": "Price List",
-				"price_list_name": DEFAULT_BASE_LIST,
+				"price_list_name": SELLING_LIST,
 				"enabled": 1,
-				"buying": 1,
-				"selling": 0,
+				"buying": 0,
+				"selling": 1,
 				"currency": currency,
 			}
 		).insert(ignore_permissions=True)
 
+	# Standard Buying = 65% of Standard Selling.
+	if not frappe.db.exists("Price List", BUYING_LIST):
+		frappe.get_doc(
+			{
+				"doctype": "Price List",
+				"price_list_name": BUYING_LIST,
+				"enabled": 1,
+				"buying": 1,
+				"selling": 0,
+				"currency": currency,
+				"custom_auto_enabled": 1,
+				"custom_base_price_list": SELLING_LIST,
+				"custom_auto_percent": DEFAULT_BUYING_PERCENT,
+				"custom_auto_add_fixed": 0,
+			}
+		).insert(ignore_permissions=True)
+	else:
+		buy = frappe.get_doc("Price List", BUYING_LIST)
+		base = (buy.get("custom_base_price_list") or "").strip()
+		# Seed or migrate empty / unset auto config.
+		if not base:
+			buy.custom_auto_enabled = 1
+			buy.custom_base_price_list = SELLING_LIST
+			buy.custom_auto_percent = DEFAULT_BUYING_PERCENT
+			buy.custom_auto_add_fixed = 0
+			buy.buying = 1
+			buy.enabled = 1
+			if not buy.currency:
+				buy.currency = currency
+			buy.save(ignore_permissions=True)
+
+	# Transferencia = 103% of Standard Selling.
 	if frappe.db.exists("Price List", TRANSFER_LIST):
 		doc = frappe.get_doc("Price List", TRANSFER_LIST)
-		# Only seed defaults when auto was never configured (base empty).
-		if not (doc.get("custom_base_price_list") or "").strip():
+		base = (doc.get("custom_base_price_list") or "").strip()
+		# Seed empty, or migrate legacy "Standard Buying + 3%" default.
+		legacy = base == BUYING_LIST and abs(flt(doc.get("custom_auto_percent")) - 3.0) < 0.01
+		if not base or legacy:
 			doc.custom_auto_enabled = 1
-			doc.custom_base_price_list = DEFAULT_BASE_LIST
+			doc.custom_base_price_list = SELLING_LIST
 			doc.custom_auto_percent = DEFAULT_TRANSFER_PERCENT
 			doc.custom_auto_add_fixed = 0
 			doc.selling = 1
@@ -151,7 +216,7 @@ def ensure_transferencia_auto_defaults() -> None:
 			"selling": 1,
 			"currency": currency,
 			"custom_auto_enabled": 1,
-			"custom_base_price_list": DEFAULT_BASE_LIST,
+			"custom_base_price_list": SELLING_LIST,
 			"custom_auto_percent": DEFAULT_TRANSFER_PERCENT,
 			"custom_auto_add_fixed": 0,
 		}
@@ -389,6 +454,7 @@ def mark_item_price_manual_override(item_code: str, price_list: str) -> None:
 def selling_price_meta_map(item_codes: list) -> dict:
 	"""item_code → { price_list → { rate, manual_override, auto } }.
 
+	Includes selling **and** buying lists (Cost / Standard Buying).
 	``auto=1`` means derived by an auto rule and not manually overridden → blue UI.
 	"""
 	if not item_codes:
@@ -406,7 +472,7 @@ def selling_price_meta_map(item_codes: list) -> dict:
 			{override_select}
 		FROM `tabItem Price`
 		WHERE item_code IN ({ph})
-		  AND selling = 1
+		  AND (selling = 1 OR buying = 1)
 		GROUP BY item_code, price_list
 		""",
 		tuple(item_codes),
@@ -472,7 +538,7 @@ def get_price_list_rules(price_list=None):
 
 @frappe.whitelist()
 def run_sync_auto_prices(price_list=None, item_codes=None, force=0):
-	"""Whitelisted: sync one list, or all dependents of Standard Buying when omitted."""
+	"""Whitelisted: sync one list, or all auto-enabled lists when omitted."""
 	ensure_price_list_rule_fields()
 	if price_list:
 		return sync_auto_prices_for_list(price_list, item_codes=item_codes, force=force)

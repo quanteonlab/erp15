@@ -201,6 +201,21 @@
       "source": "seed"
     },
     {
+      "id": "create_pos_sale_null_is_return",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_pos_sale",
+      "args": {
+        "offline_order_uuid": "edge-null-is-return",
+        "receipt_number": "EDGE-RET",
+        "items": null,
+        "total_amount": null,
+        "is_return": null,
+        "sale_mode": "WHITE"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "is_return=null from CRM +credit dirty payload must not TypeError; coerce to 0"
+    },
+    {
       "id": "create_pos_sale_dirty_line",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_pos_sale",
       "args": {
@@ -887,6 +902,177 @@
         "company": ""
       },
       "expect": "no_500"
+    },
+    {
+      "id": "price_list_rules_get_null",
+      "source": "regression",
+      "bug": "get_price_list_rules with null price_list returns all rules or empty, never 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.get_price_list_rules",
+      "args": {
+        "price_list": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "price_list_rules_sync_empty",
+      "source": "regression",
+      "bug": "run_sync_auto_prices with empty price_list / null items is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.run_sync_auto_prices",
+      "args": {
+        "price_list": "",
+        "item_codes": null,
+        "force": 0
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "price_list_rules_sync_transferencia_null_items",
+      "source": "regression",
+      "bug": "sync Transferencia (103% Standard Selling) with null item_codes must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.run_sync_auto_prices",
+      "args": {
+        "price_list": "Transferencia",
+        "item_codes": null,
+        "force": 0
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "price_list_rules_sync_buying_empty_codes",
+      "source": "regression",
+      "bug": "sync Standard Buying (65% Standard Selling) with empty item_codes list must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.run_sync_auto_prices",
+      "args": {
+        "price_list": "Standard Buying",
+        "item_codes": [],
+        "force": 0
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "crm_get_invoice_detail_null",
+      "source": "regression",
+      "bug": "get_party_invoice_detail with null name is controlled ValidationError, not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.get_party_invoice_detail",
+      "args": {
+        "invoice_name": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "crm_search_invoices_null_party",
+      "source": "regression",
+      "bug": "search_party_invoices with null party is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.search_party_invoices",
+      "args": {
+        "party_type": "Customer",
+        "party": null,
+        "search_term": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "crm_create_credit_note_empty_items",
+      "source": "regression",
+      "bug": "create_party_credit_note with null/empty items is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.create_party_credit_note",
+      "args": {
+        "customer": null,
+        "return_against": null,
+        "items": null,
+        "reason": "",
+        "reason_code": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_create_po_null_items",
+      "source": "regression",
+      "bug": "create_purchase_order with null supplier/items is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
+      "args": {
+        "supplier": null,
+        "schedule_date": null,
+        "items": null,
+        "submit": 0,
+        "notes": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_create_po_empty_items",
+      "source": "regression",
+      "bug": "create_purchase_order with empty items list is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
+      "args": {
+        "supplier": "",
+        "schedule_date": "",
+        "items": [],
+        "submit": "0"
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_list_po_null",
+      "source": "regression",
+      "bug": "list_purchase_orders tolerates null supplier/start",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_purchase_orders",
+      "args": {
+        "supplier": null,
+        "start": null,
+        "page_length": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_list_po_search_null",
+      "source": "regression",
+      "bug": "list_purchase_orders tolerates null search/pipeline",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_purchase_orders",
+      "args": {
+        "supplier": null,
+        "start": null,
+        "page_length": null,
+        "status": null,
+        "pipeline": null,
+        "search": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_get_po_detail_null",
+      "source": "regression",
+      "bug": "get_purchase_order_detail with null name is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.get_purchase_order_detail",
+      "args": {
+        "name": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_get_po_detail_empty",
+      "source": "regression",
+      "bug": "get_purchase_order_detail with empty name is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.get_purchase_order_detail",
+      "args": {
+        "name": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "create_product_row_nos_single_uom",
+      "source": "regression",
+      "bug": "LinkValidationError: Could not find Default Unit of Measure: NOS (single) — map UI label to Nos",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.create_product_row",
+      "args": {
+        "item_code": null,
+        "changes": {
+          "source_title": "Edge UOM NOS (single)",
+          "stock_uom": "NOS (single)"
+        },
+        "activate": 0
+      },
+      "expect": "ok"
     }
   ]
 }
