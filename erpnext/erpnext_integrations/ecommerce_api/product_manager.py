@@ -63,19 +63,73 @@ def _upsert_item_price_buying(item_code: str, rate: float) -> None:
         old = frappe.db.get_value("Item Price", existing, "price_list_rate")
         frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
         log_field_changes("Item Price", existing, [("price_list_rate", old, rate)])
-        return
-    doc = frappe.get_doc(
-        {
-            "doctype": "Item Price",
-            "item_code": item_code,
-            "price_list": pl,
-            "buying": 1,
-            "selling": 0,
-            "price_list_rate": rate,
-        }
+    else:
+        doc = frappe.get_doc(
+            {
+                "doctype": "Item Price",
+                "item_code": item_code,
+                "price_list": pl,
+                "buying": 1,
+                "selling": 0,
+                "price_list_rate": rate,
+            }
+        )
+        doc.insert(ignore_permissions=True)
+        log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
+
+    # Refresh dependent auto lists (e.g. Transferencia = Standard Buying + 3%).
+    try:
+        from erpnext.erpnext_integrations.ecommerce_api.price_list_rules import (
+            sync_auto_prices_from_base,
+        )
+
+        sync_auto_prices_from_base(pl, item_codes=[item_code])
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "sync_auto_prices_from_base after buying")
+
+
+def _upsert_item_price(
+    item_code: str,
+    rate: float,
+    price_list: str | None = None,
+    *,
+    manual_override: bool = True,
+) -> None:
+    from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
+    pl = price_list or _default_price_list()
+    existing = frappe.db.get_value(
+        "Item Price",
+        {"item_code": item_code, "price_list": pl, "selling": 1},
+        "name",
     )
-    doc.insert(ignore_permissions=True)
-    log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
+    values = {"price_list_rate": rate}
+    if frappe.db.has_column("Item Price", "custom_manual_override") and manual_override:
+        values["custom_manual_override"] = 1
+    if existing:
+        old = frappe.db.get_value("Item Price", existing, "price_list_rate")
+        frappe.db.set_value("Item Price", existing, values)
+        log_field_changes("Item Price", existing, [("price_list_rate", old, rate)])
+    else:
+        doc = frappe.get_doc(
+            {
+                "doctype": "Item Price",
+                "item_code": item_code,
+                "price_list": pl,
+                "selling": 1,
+                "price_list_rate": rate,
+                **(
+                    {"custom_manual_override": 1}
+                    if (
+                        frappe.db.has_column("Item Price", "custom_manual_override")
+                        and manual_override
+                    )
+                    else {}
+                ),
+            }
+        )
+        doc.insert(ignore_permissions=True)
+        log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
 
 
 def _default_price_list() -> str:
@@ -1093,23 +1147,35 @@ def get_product_rows(
             row["tags"] = item_tags
             row["is_active"] = 0 if row.pop("_disabled", 0) else 1
             row.pop("_raw_norm", None)
-            row.pop("last_purchase_rate", None)
-            row.pop("valuation_rate", None)
             buying = flt(row.pop("buying_price", None) or 0)
+            last_purchase = flt(row.pop("last_purchase_rate", None) or 0)
+            valuation = flt(row.pop("valuation_rate", None) or 0)
             if buying > 0:
+                # Written Standard Buying → black (not estimated).
                 row["cost_price"] = buying
                 row["cost_from_buying"] = 1
             else:
-                row["cost_price"] = None
+                # Never overwritten: last purchase / valuation estimate → blue in UI.
+                estimate = last_purchase if last_purchase > 0 else valuation
+                row["cost_price"] = estimate if estimate > 0 else None
                 row["cost_from_buying"] = 0
 
     # Always attach selling prices by list so the grid can show one column per list.
     if rows:
         codes = [r["client_sku"] for r in rows]
         by_item = _selling_prices_map(codes)
+        try:
+            from erpnext.erpnext_integrations.ecommerce_api.price_list_rules import (
+                selling_price_meta_map,
+            )
+
+            meta_by_item = selling_price_meta_map(codes)
+        except Exception:
+            meta_by_item = {}
         attr_by_item = _item_attributes_map(codes)
         for row in rows:
             row["prices"] = by_item.get(row["client_sku"], {})
+            row["price_meta"] = meta_by_item.get(row["client_sku"], {})
             row["attributes"] = attr_by_item.get(row["client_sku"], {})
 
     count_vals = {k: v for k, v in values.items() if k not in ("page_length", "offset")}

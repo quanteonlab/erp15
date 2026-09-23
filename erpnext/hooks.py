@@ -67,6 +67,8 @@ after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.print_templates_api.gift_core_print_templates",
 	"erpnext.erpnext_integrations.ecommerce_api.taxonomy_i18n.ensure_taxonomy_i18n",
 	"erpnext.erpnext_integrations.ecommerce_api.silkos_branding.ensure_silkos_branding",
+	"erpnext.erpnext_integrations.ecommerce_api.price_list_rules.ensure_price_list_rule_fields",
+	"erpnext.erpnext_integrations.ecommerce_api.price_list_rules.ensure_transferencia_auto_defaults",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"
@@ -337,6 +339,10 @@ doc_events = {
 			"erpnext.support.doctype.service_level_agreement.service_level_agreement.apply",
 			"erpnext.setup.doctype.transaction_deletion_record.transaction_deletion_record.check_for_running_deletion_job",
 		],
+	},
+	"Item Price": {
+		"on_update": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.on_item_price_update",
+		"after_insert": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.on_item_price_update",
 	},
 	tuple(period_closing_doctypes): {
 		"validate": "erpnext.accounts.doctype.accounting_period.accounting_period.validate_accounting_period_on_doc_save",

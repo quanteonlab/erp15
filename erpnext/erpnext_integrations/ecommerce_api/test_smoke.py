@@ -793,7 +793,69 @@ def suite_5_12_modules_read():
         cleared = cs.clear_company_logo(company=old_name)
         assert not ((cleared.get("company") or {}).get("company_logo") or ""), cleared
 
-    def check_catalog_import_reviews():
+    def check_price_list_auto_rules():
+        from erpnext.erpnext_integrations.ecommerce_api import price_list_rules as plr
+
+        plr.ensure_price_list_rule_fields()
+        plr.ensure_transferencia_auto_defaults()
+        assert frappe.db.exists("Price List", "Transferencia"), "Transferencia list missing"
+        assert frappe.db.has_column("Price List", "custom_auto_enabled")
+        assert frappe.db.has_column("Item Price", "custom_manual_override")
+        rule = plr.get_auto_rule("Transferencia")
+        assert rule, rule
+        assert rule["base_price_list"] == "Standard Buying", rule
+        assert flt(rule["percent"]) == 3.0, rule
+        assert flt(plr.apply_auto_formula(100, 3, 0)) == 103.0
+
+        # Seed a buying rate and sync → Transferencia auto (blue / not override)
+        code = frappe.db.get_value("Item", {"disabled": 0}, "name")
+        assert code, "need at least one Item"
+        buying_pl = "Standard Buying"
+        if not frappe.db.exists("Price List", buying_pl):
+            frappe.get_doc(
+                {
+                    "doctype": "Price List",
+                    "price_list_name": buying_pl,
+                    "enabled": 1,
+                    "buying": 1,
+                    "selling": 0,
+                    "currency": "ARS",
+                }
+            ).insert(ignore_permissions=True)
+        existing = frappe.db.get_value(
+            "Item Price", {"item_code": code, "price_list": buying_pl}, "name"
+        )
+        if existing:
+            frappe.db.set_value("Item Price", existing, "price_list_rate", 200)
+        else:
+            frappe.get_doc(
+                {
+                    "doctype": "Item Price",
+                    "item_code": code,
+                    "price_list": buying_pl,
+                    "buying": 1,
+                    "selling": 0,
+                    "price_list_rate": 200,
+                }
+            ).insert(ignore_permissions=True)
+        frappe.db.commit()
+        synced = plr.sync_auto_prices_for_list("Transferencia", item_codes=[code], force=1)
+        assert synced.get("updated", 0) >= 1, synced
+        t_rate = frappe.db.get_value(
+            "Item Price",
+            {"item_code": code, "price_list": "Transferencia"},
+            "price_list_rate",
+        )
+        assert abs(flt(t_rate) - 206.0) < 0.01, (t_rate, "expected 200*1.03=206")
+        override = cint(
+            frappe.db.get_value(
+                "Item Price",
+                {"item_code": code, "price_list": "Transferencia"},
+                "custom_manual_override",
+            )
+            or 0
+        )
+        assert override == 0, "auto sync must clear manual override"
         from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
         rows = ecommerce_api.list_catalog_import_reviews(status="open", limit=5, start=0)
         assert isinstance(rows, list)
@@ -1118,6 +1180,7 @@ def suite_5_12_modules_read():
     _run("5.12.4 get_floors", check_floors, "S3")
     _run("5.12.5 list_print_templates", check_print, "S3")
     _run("5.12.5b get/save company settings (rename + orphan Shopify Single)", check_company_settings, "S2")
+    _run("5.12.5d price list auto rules (Transferencia = Standard Buying +3%)", check_price_list_auto_rules, "S2")
     if frappe.db.exists("DocType", "Catalog Import Session"):
         _run("5.12.5c catalog import reviews + permissive enqueue", check_catalog_import_reviews, "S2")
     else:
