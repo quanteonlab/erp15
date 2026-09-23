@@ -269,7 +269,7 @@
       },
       "expect": "error",
       "source": "regression",
-      "bug": "move_lead with null lead/to_stage must return controlled ValidationError, not TypeError; contacted stage still requires a contact channel unless values supplies one"
+      "bug": "move_lead with null lead/to_stage must return controlled ValidationError, not TypeError; contacted has no contact gate (qualified still does)"
     },
     {
       "id": "list_leads_admin_null_filters",

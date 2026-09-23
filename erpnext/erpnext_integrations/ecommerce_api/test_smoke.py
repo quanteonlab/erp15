@@ -687,7 +687,7 @@ def suite_5_12_modules_read():
                     frappe.delete_doc("Lead", name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
-        # move_lead stage gate: contacted needs a contact channel; values can fill it in-call
+        # move_lead: soft rules return needs_confirm; force=1 overrides; hard mode throws
         gate = frappe.new_doc("Lead")
         gate.lead_name = "Smoke Stage Gate"
         gate.lead_owner = frappe.session.user
@@ -696,21 +696,37 @@ def suite_5_12_modules_read():
         gate.insert(ignore_permissions=True)
         frappe.db.commit()
         try:
-            try:
-                pa.move_lead(lead=gate.name, to_stage="contacted")
-                assert False, "move_lead to contacted without contact must raise ValidationError"
-            except frappe.ValidationError as exc:
-                msg = str(exc)
-                assert "mobile_no" not in msg.lower() or "Mobile" in msg, msg
-                assert "Add " in msg or "Mobile" in msg or "Phone" in msg or "Email" in msg, msg
-            out = pa.move_lead(
-                lead=gate.name,
-                to_stage="contacted",
-                values={"mobile_no": "+5491112345678"},
-            )
+            out = pa.move_lead(lead=gate.name, to_stage="contacted")
             assert out and out.get("ok") and out.get("stage") == "contacted", out
-            assert frappe.db.get_value("Lead", gate.name, "custom_preventa_stage") == "contacted"
-            assert frappe.db.get_value("Lead", gate.name, "mobile_no")
+
+            soft = pa.move_lead(lead=gate.name, to_stage="qualified")
+            assert soft and soft.get("ok") is False and soft.get("needs_confirm"), soft
+            assert soft.get("missing_labels"), soft
+
+            forced = pa.move_lead(lead=gate.name, to_stage="qualified", force=1)
+            assert forced and forced.get("ok") and forced.get("stage") == "qualified", forced
+            assert frappe.db.get_value("Lead", gate.name, "custom_preventa_stage") == "qualified"
+
+            # Hard mode still throws
+            pa.save_preventa_settings(soft_stage_rules=0)
+            try:
+                hard = frappe.new_doc("Lead")
+                hard.lead_name = "Smoke Hard Gate"
+                hard.lead_owner = frappe.session.user
+                hard.custom_preventa_stage = "contacted"
+                hard.flags.ignore_permissions = True
+                hard.insert(ignore_permissions=True)
+                frappe.db.commit()
+                try:
+                    pa.move_lead(lead=hard.name, to_stage="qualified")
+                    assert False, "hard soft_stage_rules=0 must ValidationError"
+                except frappe.ValidationError:
+                    pass
+                finally:
+                    if frappe.db.exists("Lead", hard.name):
+                        frappe.delete_doc("Lead", hard.name, ignore_permissions=True, force=True)
+            finally:
+                pa.save_preventa_settings(soft_stage_rules=1)
         finally:
             if frappe.db.exists("Lead", gate.name):
                 frappe.delete_doc("Lead", gate.name, ignore_permissions=True, force=True)

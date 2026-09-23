@@ -151,8 +151,9 @@ PREVENTA_SETTINGS_DEFAULTS = {
 		"tax_id": "hidden",
 	},
 	"stage_requirements": {
+		# prospect: name or company is enough to sit on the board
 		"prospect": [["lead_name", "company_name"]],
-		"contacted": [["mobile_no", "whatsapp_no", "phone", "email_id"]],
+		# contacted: no gate — sellers often mark “I reached out” before CRM has a channel
 		"qualified": [["company_name"], ["mobile_no", "whatsapp_no", "phone", "email_id"]],
 		"proposition": [["address_line1"], ["city"]],
 	},
@@ -166,6 +167,9 @@ PREVENTA_SETTINGS_DEFAULTS = {
 		{"key": "lost", "label": "Perdido", "is_lost": True},
 	],
 	"auto_convert_on_won": False,
+	# Soft rules: unmet stage requirements return needs_confirm instead of hard block;
+	# seller can force the move after an explicit confirm.
+	"soft_stage_rules": True,
 	# Stage key that triggers a best-effort core Opportunity on entry, or None.
 	"create_opportunity_on_stage": None,
 }
@@ -180,6 +184,12 @@ def _load_preventa_settings() -> dict:
 		stored = frappe.parse_json(doc.columns_json) if doc.columns_json else {}
 		if isinstance(stored, dict):
 			settings.update(stored)
+	# Legacy: contacted used to require a contact channel; that blocked Kanban drops.
+	reqs = settings.get("stage_requirements")
+	if isinstance(reqs, dict) and "contacted" in reqs:
+		reqs = dict(reqs)
+		reqs.pop("contacted", None)
+		settings["stage_requirements"] = reqs
 	return settings
 
 
@@ -196,6 +206,7 @@ def save_preventa_settings(
 	default_columns_template=None,
 	auto_convert_on_won=None,
 	create_opportunity_on_stage=None,
+	soft_stage_rules=None,
 ):
 	_require_app_permission("tools.settings")
 	current = _load_preventa_settings()
@@ -206,6 +217,7 @@ def save_preventa_settings(
 		"default_columns_template": default_columns_template,
 		"auto_convert_on_won": auto_convert_on_won,
 		"create_opportunity_on_stage": create_opportunity_on_stage,
+		"soft_stage_rules": soft_stage_rules,
 	}
 	for key, value in raw.items():
 		if value is None:
@@ -215,7 +227,7 @@ def save_preventa_settings(
 				value = frappe.parse_json(value)
 			except Exception:
 				pass
-		if key == "auto_convert_on_won":
+		if key in ("auto_convert_on_won", "soft_stage_rules"):
 			value = frappe.parse_json(value) if isinstance(value, str) else bool(value)
 		current[key] = value
 
@@ -487,7 +499,17 @@ def get_my_board(owner_user=None):
 	if is_self:
 		_touch_lastseen(owner_user)
 
-	return {"columns": columns, "leads": leads_out, "owner_user": owner_user}
+	reqs = settings.get("stage_requirements") or {}
+	return {
+		"columns": columns,
+		"leads": leads_out,
+		"owner_user": owner_user,
+		"stage_rules": {
+			"soft": bool(settings.get("soft_stage_rules", True)),
+			"requirements": reqs,
+			"can_manage": _can_app("tools.settings"),
+		},
+	}
 
 
 def _consulta_aggregate(lead_names: list) -> dict:
@@ -589,12 +611,18 @@ def add_lead_note(lead, note):
 
 
 @frappe.whitelist(allow_guest=True)
-def move_lead(lead, to_stage, lost_reason=None, values=None):
+def move_lead(lead, to_stage, lost_reason=None, values=None, force=0):
 	"""Move a Lead to a board stage. Optional `values` are applied first so
-	drawer edits (phone/email/…) satisfy stage gates in the same request."""
+	drawer edits (phone/email/…) satisfy stage gates in the same request.
+
+	When ``soft_stage_rules`` is on and requirements are missing, returns
+	``{ok: false, needs_confirm: true, …}`` instead of throwing — caller may
+	retry with ``force=1`` after an explicit confirm. Hard mode still throws.
+	"""
 	ensure_preventa_custom_fields()
 	lead = (lead or "").strip() if isinstance(lead, str) else str(lead or "").strip()
 	to_stage = (to_stage or "").strip() if isinstance(to_stage, str) else str(to_stage or "").strip()
+	force = cint(force)
 	if not lead:
 		frappe.throw(_("Lead is required"))
 	if not to_stage:
@@ -616,15 +644,31 @@ def move_lead(lead, to_stage, lost_reason=None, values=None):
 		_apply_lead_values(doc, values)
 
 	settings = _load_preventa_settings()
+	columns = _load_board_columns(doc.lead_owner or _acting_user())
+	col = next((c for c in columns if c.get("key") == to_stage), {}) or {}
+	stage_label = (col.get("label") or to_stage).strip() or to_stage
+
 	reqs = (settings.get("stage_requirements") or {}).get(to_stage) or []
 	missing = _missing_requirement_groups(doc, reqs)
-	if missing:
-		frappe.throw(
-			_("Add {1} before moving to “{0}”.").format(to_stage, _format_missing_groups(missing))
+	soft = bool(settings.get("soft_stage_rules", True))
+	if missing and not force:
+		msg = _("Add {1} before moving to “{0}”.").format(
+			stage_label, _format_missing_groups(missing)
 		)
-
-	columns = _load_board_columns(doc.lead_owner or _acting_user())
-	col = next((c for c in columns if c.get("key") == to_stage), {})
+		if soft:
+			return {
+				"ok": False,
+				"needs_confirm": True,
+				"soft": True,
+				"to_stage": to_stage,
+				"to_stage_label": stage_label,
+				"missing": missing,
+				"missing_labels": _format_missing_groups(missing),
+				"message": msg,
+			}
+		frappe.throw(msg)
+	if missing and force and not soft:
+		frappe.throw(_("Cannot force stage move while soft stage rules are off"))
 
 	old_stage = doc.custom_preventa_stage
 	doc.custom_preventa_stage = to_stage
@@ -636,11 +680,20 @@ def move_lead(lead, to_stage, lost_reason=None, values=None):
 	frappe.db.commit()
 
 	try:
-		_log_preventa_event("stage_change", lead=doc.name, payload={"from": old_stage, "to": to_stage})
+		_log_preventa_event(
+			"stage_change",
+			lead=doc.name,
+			payload={
+				"from": old_stage,
+				"to": to_stage,
+				"forced": bool(force and missing),
+				"missing": missing if force and missing else None,
+			},
+		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Preventa stage_change event failed")
 
-	result = {"ok": True, "name": doc.name, "stage": to_stage}
+	result = {"ok": True, "name": doc.name, "stage": to_stage, "forced": bool(force and missing)}
 
 	if col.get("is_won") and settings.get("auto_convert_on_won"):
 		try:
