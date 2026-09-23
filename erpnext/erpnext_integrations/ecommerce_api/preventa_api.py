@@ -349,6 +349,31 @@ def _require_any_permission(pids: list) -> None:
 	frappe.throw(_("Not permitted ({0})").format(" / ".join(pids)))
 
 
+def _field_label(fid: str) -> str:
+	labels = {
+		"lead_name": _("Name"),
+		"company_name": _("Company"),
+		"mobile_no": _("Mobile"),
+		"whatsapp_no": _("WhatsApp"),
+		"phone": _("Phone"),
+		"email_id": _("Email"),
+		"address_line1": _("Address"),
+		"city": _("City"),
+		"state": _("State"),
+		"pincode": _("Zip"),
+		"country": _("Country"),
+		"tax_id": _("Tax ID"),
+	}
+	return str(labels.get(fid) or fid)
+
+
+def _format_missing_groups(missing: list) -> str:
+	parts = []
+	for group in missing:
+		parts.append(_(" or ").join(_field_label(f) for f in group))
+	return "; ".join(parts)
+
+
 def _field_filled(doc, fid: str) -> bool:
 	"""True when the Preventa field id has a non-empty value on the Lead."""
 	attr = LEAD_FIELD_MAP.get(fid, fid)
@@ -594,8 +619,9 @@ def move_lead(lead, to_stage, lost_reason=None, values=None):
 	reqs = (settings.get("stage_requirements") or {}).get(to_stage) or []
 	missing = _missing_requirement_groups(doc, reqs)
 	if missing:
-		labels = "; ".join(" o ".join(g) for g in missing)
-		frappe.throw(_("Missing required field(s) to enter '{0}': {1}").format(to_stage, labels))
+		frappe.throw(
+			_("Add {1} before moving to “{0}”.").format(to_stage, _format_missing_groups(missing))
+		)
 
 	columns = _load_board_columns(doc.lead_owner or _acting_user())
 	col = next((c for c in columns if c.get("key") == to_stage), {})

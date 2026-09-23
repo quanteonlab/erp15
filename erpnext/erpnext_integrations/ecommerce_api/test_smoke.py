@@ -699,8 +699,10 @@ def suite_5_12_modules_read():
             try:
                 pa.move_lead(lead=gate.name, to_stage="contacted")
                 assert False, "move_lead to contacted without contact must raise ValidationError"
-            except frappe.ValidationError:
-                pass
+            except frappe.ValidationError as exc:
+                msg = str(exc)
+                assert "mobile_no" not in msg.lower() or "Mobile" in msg, msg
+                assert "Add " in msg or "Mobile" in msg or "Phone" in msg or "Email" in msg, msg
             out = pa.move_lead(
                 lead=gate.name,
                 to_stage="contacted",
