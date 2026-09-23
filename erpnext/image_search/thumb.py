@@ -1,4 +1,8 @@
-"""Local 256×256 JPEG thumbs for Item.image (i032)."""
+"""Local 256×256 JPEG thumbs for Item.image (i032).
+
+Default geometry is center-contain: fit the longer side, pad the shorter with
+white. Tall bottles / portrait packs keep the full subject instead of cover-crop.
+"""
 
 from __future__ import annotations
 
@@ -188,17 +192,26 @@ def _resample_filter():
 	return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
 
 
-def _center_cover(img, size: int = THUMB_SIZE):
+def _center_contain(img, size: int = THUMB_SIZE):
+	"""Fit the longer side into the square; letterbox the shorter with white.
+
+	Tall bottles (and other portrait assets) used to go through cover, which
+	scales to width and chops the top/bottom — contain keeps the whole subject.
+	"""
+	from PIL import Image
+
 	w, h = img.size
 	if w <= 0 or h <= 0:
 		frappe.throw(_("Invalid image dimensions"))
-	scale = max(size / w, size / h)
+	scale = min(size / w, size / h)
 	nw = max(1, int(round(w * scale)))
 	nh = max(1, int(round(h * scale)))
 	resized = img.resize((nw, nh), _resample_filter())
-	left = (nw - size) // 2
-	top = (nh - size) // 2
-	return resized.crop((left, top, left + size, top + size))
+	canvas = Image.new("RGB", (size, size), (255, 255, 255))
+	left = (size - nw) // 2
+	top = (size - nh) // 2
+	canvas.paste(resized, (left, top))
+	return canvas
 
 
 def _apply_relative_crop(img, crop: Dict[str, Any], size: int = THUMB_SIZE):
@@ -227,7 +240,9 @@ def _apply_relative_crop(img, crop: Dict[str, Any], size: int = THUMB_SIZE):
 	bottom = max(top + 1, min(h, bottom))
 
 	cropped = img.crop((left, top, right, bottom))
-	return cropped.resize((size, size), _resample_filter())
+	# Contain into the square (same as no-crop path) so a non-square crop
+	# region is not stretched.
+	return _center_contain(cropped, size)
 
 
 def encode_thumb_jpeg(image_bytes: bytes, crop: Optional[Dict[str, Any]] = None) -> bytes:
@@ -235,7 +250,7 @@ def encode_thumb_jpeg(image_bytes: bytes, crop: Optional[Dict[str, Any]] = None)
 	if crop:
 		out = _apply_relative_crop(img, crop)
 	else:
-		out = _center_cover(img)
+		out = _center_contain(img)
 	buf = io.BytesIO()
 	out.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
 	return buf.getvalue()
