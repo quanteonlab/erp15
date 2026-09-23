@@ -732,6 +732,31 @@ def suite_5_12_modules_read():
                 frappe.delete_doc("Lead", gate.name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+        # convert_lead_to_customer: Customer.after_insert already marks Lead Converted;
+        # must not TimestampMismatchError on a second Lead.save().
+        conv = frappe.new_doc("Lead")
+        conv.lead_name = "Smoke Convert Lead"
+        conv.lead_owner = frappe.session.user
+        conv.flags.ignore_permissions = True
+        conv.insert(ignore_permissions=True)
+        frappe.db.commit()
+        cust_name = None
+        try:
+            out = pa.convert_lead_to_customer(lead=conv.name, customer_type="Individual")
+            assert out and out.get("ok") and out.get("customer"), out
+            cust_name = out["customer"]
+            assert frappe.db.exists("Customer", cust_name)
+            assert frappe.db.get_value("Lead", conv.name, "status") == "Converted"
+            # Idempotent second call
+            again = pa.convert_lead_to_customer(lead=conv.name, customer_type="Individual")
+            assert again and again.get("customer") == cust_name, again
+        finally:
+            if cust_name and frappe.db.exists("Customer", cust_name):
+                frappe.delete_doc("Customer", cust_name, ignore_permissions=True, force=True)
+            if frappe.db.exists("Lead", conv.name):
+                frappe.delete_doc("Lead", conv.name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_employees():
         from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
         perms = ea.list_app_permissions()
@@ -901,7 +926,6 @@ def suite_5_12_modules_read():
         )
         assert override == 0, "auto sync must clear manual override"
 
-<<<<<<< Updated upstream
         synced_b = plr.sync_auto_prices_for_list("Standard Buying", item_codes=[code], force=1)
         assert synced_b.get("updated", 0) >= 1, synced_b
         b_rate = frappe.db.get_value(
@@ -924,8 +948,6 @@ def suite_5_12_modules_read():
         assert meta.get("Transferencia", {}).get("auto") == 1, meta
         assert meta.get("Standard Buying", {}).get("auto") == 1, meta
 
-=======
->>>>>>> Stashed changes
     def check_catalog_import_reviews():
         from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
         rows = ecommerce_api.list_catalog_import_reviews(status="open", limit=5, start=0)

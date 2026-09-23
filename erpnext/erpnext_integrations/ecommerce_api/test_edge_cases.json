@@ -272,6 +272,19 @@
       "bug": "move_lead with null lead/to_stage must return controlled ValidationError, not TypeError; contacted has no contact gate (qualified still does)"
     },
     {
+      "id": "convert_lead_null_lead",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.convert_lead_to_customer",
+      "args": {
+        "lead": null,
+        "customer_type": null,
+        "customer_group": null,
+        "tax_id": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "convert_lead_to_customer must not TimestampMismatchError after Customer.insert marks Lead Converted; null lead = controlled DoesNotExist/ValidationError"
+    },
+    {
       "id": "list_leads_admin_null_filters",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.list_leads_admin",
       "args": {

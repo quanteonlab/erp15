@@ -1086,6 +1086,14 @@ def _do_convert_lead(
 	lead_doc = frappe.get_doc("Lead", lead)
 	frappe.flags.ignore_permissions = False
 
+	# Idempotent: Customer.after_insert already sets Lead.status=Converted via db.set_value.
+	existing = frappe.db.get_value("Customer", {"lead_name": lead}, "name")
+	if existing:
+		if lead_doc.status != "Converted":
+			frappe.db.set_value("Lead", lead, "status", "Converted", update_modified=False)
+			frappe.db.commit()
+		return {"customer": existing, "contact": None, "address": None, "already_converted": True}
+
 	settings = _load_preventa_settings()
 	provided = {"customer_type": customer_type, "tax_id": tax_id, "customer_group": customer_group}
 	missing = []
@@ -1139,9 +1147,10 @@ def _do_convert_lead(
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"Preventa address creation failed for {lead}")
 
-	lead_doc.status = "Converted"
-	lead_doc.flags.ignore_permissions = True
-	lead_doc.save(ignore_permissions=True)
+	# Do NOT lead_doc.save() here: Customer.update_lead_status already db.set_value'd
+	# status=Converted, which bumps Lead.modified and triggers TimestampMismatchError.
+	if frappe.db.get_value("Lead", lead, "status") != "Converted":
+		frappe.db.set_value("Lead", lead, "status", "Converted", update_modified=False)
 	frappe.db.commit()
 
 	return {"customer": target.name, "contact": contact_name, "address": address_name}
@@ -1151,6 +1160,9 @@ def _do_convert_lead(
 def convert_lead_to_customer(
 	lead, customer_group=None, customer_type=None, tax_id=None, create_contact=1, create_address=1
 ):
+	lead = ("" if lead is None else str(lead)).strip()
+	if not lead:
+		frappe.throw(_("Lead is required"))
 	frappe.flags.ignore_permissions = True
 	lead_owner = frappe.db.get_value("Lead", lead, "lead_owner")
 	frappe.flags.ignore_permissions = False
@@ -1466,6 +1478,8 @@ def get_lead_timeline(lead):
 		if m:
 			missing_by_stage[stage_key] = m
 
+	customer = frappe.db.get_value("Customer", {"lead_name": lead}, "name")
+
 	return {
 		"lead": {
 			"name": doc.name,
@@ -1475,6 +1489,7 @@ def get_lead_timeline(lead):
 			"status": doc.status,
 			"stage": doc.custom_preventa_stage,
 			"stage_since": doc.custom_preventa_stage_since,
+			"customer": customer,
 			"fields": fields_out,
 		},
 		"notes": notes,
