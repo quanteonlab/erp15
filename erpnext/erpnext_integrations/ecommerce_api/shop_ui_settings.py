@@ -193,6 +193,10 @@ def _normalize_catalog_display(raw) -> dict:
 		"cardBorderRadius": _as_int(src.get("cardBorderRadius"), 8, 0, 32),
 		"noImageTilesAtEnd": _as_bool(src.get("noImageTilesAtEnd"), True),
 		"catalogTemplate": _normalize_catalog_template(src.get("catalogTemplate")),
+		"showPaymentMethodPrices": _as_bool(src.get("showPaymentMethodPrices"), False),
+		# Commerce catalog: qty-gated Oferta/BOGO badges vs unit red/strike.
+		"showQtyPromoBadges": _as_bool(src.get("showQtyPromoBadges"), True),
+		"showUnitPromoStrike": _as_bool(src.get("showUnitPromoStrike"), True),
 		"headerPreset": _normalize_header_preset(src.get("headerPreset")),
 		"headerSearchBackgroundColor": _as_hex(src.get("headerSearchBackgroundColor"), ""),
 		"headerSearchTextColor": _as_hex(src.get("headerSearchTextColor"), ""),

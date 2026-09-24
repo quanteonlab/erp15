@@ -53,7 +53,11 @@ def _load_action_policy(cfg: dict) -> dict:
 
 
 def _acting_user() -> str:
-	return (frappe.get_request_header("X-ERP-Acting-User") or "").strip() or frappe.session.user
+	try:
+		header = frappe.get_request_header("X-ERP-Acting-User")
+	except RuntimeError:
+		header = None
+	return (header or "").strip() or frappe.session.user
 
 
 def _parse_json(raw, default):

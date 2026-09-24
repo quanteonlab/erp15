@@ -438,6 +438,254 @@ def get_pending_deliveries(date=None, company=None):
 	return {"deliveries": out}
 
 
+def _is_desk_admin_user():
+	roles = set(frappe.get_roles(frappe.session.user))
+	return bool(roles & {"Administrator", "System Manager"})
+
+
+def _require_rutas_order_pin(pin=None):
+	"""Gate claim/create-order actions on Rutas.
+
+	When ``require_pin_for_order_actions`` is on:
+	- desk admins (Administrator / System Manager) skip the PIN
+	- if Admin PIN is configured, require a valid PIN
+	- if Admin PIN is not configured, only desk admins may proceed (safer than open)
+	"""
+	settings = _load_tms_settings()
+	if not settings.get("require_pin_for_order_actions", True):
+		return
+
+	if _is_desk_admin_user():
+		return
+
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+		_pin_configured,
+		_verify_pin_value,
+	)
+
+	if not _pin_configured():
+		frappe.throw(
+			_("Admin PIN is not configured. Only System Manager can claim or create orders on Routes."),
+			frappe.PermissionError,
+		)
+
+	if not pin or not _verify_pin_value(str(pin).strip()):
+		frappe.throw(_("Incorrect Admin PIN"), frappe.AuthenticationError)
+
+
+def _list_claimable_preorders(company=None):
+	"""Confirmed guest preorders (Orden/Preparado) that still lack a Delivery Note."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		GUEST_PREORDER_REMARKS_TAG,
+		_delivery_note_for_sales_order,
+		_guest_preorder_tag_fieldname,
+		_is_guest_preorder_sales_order,
+	)
+
+	tag_fn = _guest_preorder_tag_fieldname()
+	if not tag_fn:
+		return []
+
+	filters = {
+		tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"],
+		"docstatus": 1,
+		"status": ["in", ["To Deliver and Bill", "To Deliver", "Preparado", "Orden"]],
+	}
+	if company:
+		filters["company"] = company
+
+	orders = frappe.get_all(
+		"Sales Order",
+		filters=filters,
+		fields=[
+			"name",
+			"customer",
+			"customer_name",
+			"shipping_address_name",
+			"customer_address",
+			"grand_total",
+			"transaction_date",
+			"delivery_date",
+			"status",
+			tag_fn,
+		],
+		order_by="transaction_date asc, creation asc",
+		limit_page_length=200,
+		ignore_permissions=True,
+	)
+
+	out = []
+	for o in orders:
+		if not _is_guest_preorder_sales_order(o):
+			continue
+		if _delivery_note_for_sales_order(o.name):
+			continue
+		# Skip already-in-delivery / completed display statuses
+		display = str(o.status or "")
+		if display in ("En Delivery", "Completado", "Closed", "Completed"):
+			continue
+		address_name = o.shipping_address_name or o.customer_address
+		out.append(
+			{
+				"kind": "preorder",
+				"preorder_name": o.name,
+				"delivery_note": None,
+				"customer": o.customer,
+				"customer_name": o.customer_name,
+				"address": address_name,
+				"grand_total": o.grand_total,
+				"posting_date": o.transaction_date or o.delivery_date,
+				"status": display,
+				"item_count": 0,
+				"qty_total": 0,
+				"geocoded": False,
+				"lat": None,
+				"lng": None,
+				"previous_attempt": False,
+			}
+		)
+	return out
+
+
+@frappe.whitelist(allow_guest=True)
+def list_claimable_orders(date=None, company=None):
+	"""Pending submitted DNs not on active trips, plus confirmed guest preorders without a DN."""
+	pending = get_pending_deliveries(date=date, company=company)
+	deliveries = []
+	for d in pending.get("deliveries") or []:
+		row = dict(d)
+		row["kind"] = "delivery_note"
+		row["preorder_name"] = None
+		deliveries.append(row)
+
+	preorders = _list_claimable_preorders(company=company)
+	# Attach geo for preorders that have an address
+	address_names = list({p["address"] for p in preorders if p.get("address")})
+	geo_by_address = {}
+	if address_names:
+		for row in frappe.get_all(
+			"Address",
+			filters={"name": ["in", address_names]},
+			fields=["name", "custom_latitude", "custom_longitude"],
+			ignore_permissions=True,
+		):
+			geo_by_address[row.name] = row
+	for p in preorders:
+		geo = geo_by_address.get(p.get("address")) or {}
+		p["geocoded"] = bool(geo.get("custom_latitude"))
+		p["lat"] = geo.get("custom_latitude")
+		p["lng"] = geo.get("custom_longitude")
+
+	return {"orders": deliveries + preorders, "deliveries": deliveries, "preorders": preorders}
+
+
+@frappe.whitelist(allow_guest=True)
+def claim_orders_to_trip(
+	delivery_notes=None,
+	preorder_names=None,
+	trip=None,
+	driver=None,
+	vehicle=None,
+	pickup_warehouse=None,
+	date=None,
+	company=None,
+	pin=None,
+):
+	"""Create remitos for claimable preorders, then add all DNs to a trip (or create one)."""
+	def _as_name_list(raw):
+		if raw is None:
+			return []
+		if isinstance(raw, str):
+			raw = raw.strip()
+			if not raw or raw in ("null", "undefined", "None"):
+				return []
+			try:
+				parsed = frappe.parse_json(raw)
+			except Exception:
+				# Single name as bare string
+				return [raw] if raw else []
+			raw = parsed
+		if not isinstance(raw, (list, tuple)):
+			return [raw] if raw else []
+		return [n for n in raw if n not in (None, "", "null", "undefined")]
+
+	_require_rutas_order_pin(pin)
+
+	delivery_notes = _as_name_list(delivery_notes)
+	preorder_names = _as_name_list(preorder_names)
+
+	if not delivery_notes and not preorder_names:
+		frappe.throw(_("Select at least one order to claim."))
+
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_delivery_note_for_sales_order,
+		_is_guest_preorder_sales_order,
+	)
+	from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+
+	created_dns = []
+	for so_name in preorder_names:
+		if not frappe.db.exists("Sales Order", so_name):
+			frappe.throw(_("Sales Order {0} not found").format(so_name))
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+		if not _is_guest_preorder_sales_order(so):
+			frappe.throw(_("Not a Guest Preorder: {0}").format(so_name))
+		if so.docstatus != 1:
+			frappe.throw(_("Confirm the order before claiming: {0}").format(so_name))
+
+		dn_name = _delivery_note_for_sales_order(so_name)
+		if not dn_name:
+			dn = make_delivery_note(so_name)
+			default_warehouse = frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
+			if default_warehouse:
+				for row in dn.items:
+					row.warehouse = default_warehouse
+				dn.set_warehouse = default_warehouse
+			dn.insert(ignore_permissions=True)
+			dn.flags.ignore_permissions = True
+			dn.submit()
+			dn_name = dn.name
+			frappe.db.commit()
+		try:
+			frappe.db.set_value("Sales Order", so_name, "status", "En Delivery")
+			frappe.db.commit()
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "claim_orders_to_trip status")
+		created_dns.append(dn_name)
+
+	all_dns = list(dict.fromkeys([*delivery_notes, *created_dns]))
+	if not all_dns:
+		frappe.throw(_("No delivery notes to add to the trip."))
+
+	if trip:
+		map_data = add_stops_to_trip(trip, all_dns)
+		return {
+			"trip": trip,
+			"delivery_notes": all_dns,
+			"created_delivery_notes": created_dns,
+			"map": map_data,
+		}
+
+	day = date or str(getdate())
+	created = create_trip(
+		date=day,
+		driver=driver,
+		vehicle=vehicle,
+		delivery_note_names=all_dns,
+		company=company,
+		pickup_warehouse=pickup_warehouse,
+	)
+	return {
+		"trip": created.get("trip"),
+		"delivery_notes": all_dns,
+		"created_delivery_notes": created_dns,
+		"status": created.get("status"),
+		"stop_count": created.get("stop_count"),
+	}
+
+
 @frappe.whitelist(allow_guest=True)
 def geocode_address(address_name):
 	address = frappe.db.get_value(
@@ -881,6 +1129,7 @@ TMS_SETTINGS_DEFAULTS = {
 	"require_photo_on_not_home": True,
 	"allow_driver_reorder": False,
 	"allow_driver_delivery_request": True,
+	"require_pin_for_order_actions": True,
 	"print_template_delivery": None,
 	"print_template_payment": None,
 	"tracking_code_length": 8,
@@ -911,6 +1160,7 @@ def save_tms_settings(
 	require_photo_on_not_home=None,
 	allow_driver_reorder=None,
 	allow_driver_delivery_request=None,
+	require_pin_for_order_actions=None,
 	print_template_delivery=None,
 	print_template_payment=None,
 	tracking_code_length=None,
@@ -922,11 +1172,17 @@ def save_tms_settings(
 		"require_photo_on_not_home": require_photo_on_not_home,
 		"allow_driver_reorder": allow_driver_reorder,
 		"allow_driver_delivery_request": allow_driver_delivery_request,
+		"require_pin_for_order_actions": require_pin_for_order_actions,
 		"print_template_delivery": print_template_delivery,
 		"print_template_payment": print_template_payment,
 		"tracking_code_length": tracking_code_length,
 	}
-	bool_keys = {"require_photo_on_not_home", "allow_driver_reorder", "allow_driver_delivery_request"}
+	bool_keys = {
+		"require_photo_on_not_home",
+		"allow_driver_reorder",
+		"allow_driver_delivery_request",
+		"require_pin_for_order_actions",
+	}
 	for key, value in raw.items():
 		if value is None:
 			continue
@@ -949,6 +1205,119 @@ def save_tms_settings(
 	frappe.db.commit()
 
 	return current
+
+
+# ---------------------------------------------------------------------------
+# Delivery Zones (dispatcher planning regions — stored as settings blob)
+# ---------------------------------------------------------------------------
+
+TMS_ZONES_SCOPE = "settings.tms_zones"
+
+_ZONE_DEFAULT_COLORS = [
+	"#6366f1",
+	"#16a34a",
+	"#ea580c",
+	"#db2777",
+	"#0891b2",
+	"#ca8a04",
+]
+
+
+def _load_tms_zones():
+	zones = []
+	if frappe.db.exists("Table Extra Schema", TMS_ZONES_SCOPE):
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Table Extra Schema", TMS_ZONES_SCOPE)
+		frappe.flags.ignore_permissions = False
+		stored = frappe.parse_json(doc.columns_json) if doc.columns_json else {}
+		if isinstance(stored, dict) and isinstance(stored.get("zones"), list):
+			zones = stored["zones"]
+		elif isinstance(stored, list):
+			zones = stored
+	return {"zones": zones}
+
+
+def _save_tms_zones(zones):
+	payload = frappe.as_json({"zones": zones})
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", TMS_ZONES_SCOPE):
+		doc = frappe.get_doc("Table Extra Schema", TMS_ZONES_SCOPE)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc(
+			{"doctype": "Table Extra Schema", "scope": TMS_ZONES_SCOPE, "columns_json": payload}
+		)
+		doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return {"zones": zones}
+
+
+def _normalize_zone(raw, existing=None):
+	existing = existing or {}
+	if isinstance(raw, str):
+		raw = frappe.parse_json(raw) or {}
+	if not isinstance(raw, dict):
+		frappe.throw(_("Invalid zone payload"))
+	code = str(raw.get("code") or existing.get("code") or "").strip().upper()
+	name = str(raw.get("name") or existing.get("name") or "").strip()
+	if not code:
+		frappe.throw(_("Zone code is required."))
+	if not name:
+		name = code
+	visit_days = raw.get("visit_days")
+	if isinstance(visit_days, str):
+		visit_days = [d.strip() for d in visit_days.split(",") if d.strip()]
+	if visit_days is None:
+		visit_days = existing.get("visit_days") or []
+	vehicles = raw.get("vehicles")
+	if isinstance(vehicles, str):
+		vehicles = [v.strip() for v in vehicles.split(",") if v.strip()]
+	if vehicles is None:
+		vehicles = existing.get("vehicles") or []
+	return {
+		"code": code,
+		"name": name,
+		"color": str(raw.get("color") or existing.get("color") or _ZONE_DEFAULT_COLORS[0]),
+		"type": str(raw.get("type") or existing.get("type") or "delivery"),
+		"visit_days": list(visit_days or []),
+		"vehicles": list(vehicles or []),
+		"notes": str(raw.get("notes") or existing.get("notes") or ""),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_tms_zones():
+	return _load_tms_zones()
+
+
+@frappe.whitelist(allow_guest=True)
+def save_tms_zone(zone=None):
+	"""Create or update a zone by code."""
+	data = _load_tms_zones()
+	zones = list(data.get("zones") or [])
+	incoming = _normalize_zone(zone)
+	found = False
+	for i, z in enumerate(zones):
+		if str(z.get("code") or "").upper() == incoming["code"]:
+			zones[i] = _normalize_zone(incoming, z)
+			found = True
+			break
+	if not found:
+		if not incoming.get("color"):
+			incoming["color"] = _ZONE_DEFAULT_COLORS[len(zones) % len(_ZONE_DEFAULT_COLORS)]
+		zones.append(incoming)
+	return _save_tms_zones(zones)
+
+
+@frappe.whitelist(allow_guest=True)
+def delete_tms_zone(code=None):
+	code = str(code or "").strip().upper()
+	if not code:
+		frappe.throw(_("Zone code is required."))
+	data = _load_tms_zones()
+	zones = [z for z in (data.get("zones") or []) if str(z.get("code") or "").upper() != code]
+	return _save_tms_zones(zones)
 
 
 # ---------------------------------------------------------------------------
@@ -1058,16 +1427,13 @@ def seed_tms_demo(reset=False):
 	Pass reset=True to delete existing TMS demo docs first.
 
 	Creates:
-	  - 2 Drivers (each with Employee + geocoded home Address)
-	  - 2 Vehicles
-	  - 10 Customers with geocoded, zone-tagged shipping Addresses
-	  - 10 submitted Delivery Notes (one per customer; 2 with a
-	    requested_delivery_date for day-ahead planning demos)
-	  - 1 Guest Preorder Sales Order per customer, confirmed (Tables > Pedidos
-	    consistency - independent of the Delivery Note above, not derived from it)
+	  - 5 Drivers (each with Employee + geocoded home Address)
+	  - 5 Vehicles
+	  - 25 Customers with geocoded, zone-tagged shipping Addresses across BA
+	  - Delivery Notes + guest preorders per customer
+	  - 4 planning Zones (Norte / Centro / Sur / Oeste)
 	  - Company.custom_default_warehouse set (depot demo)
-	  - 1 published trip (3 of the DNs) with a delivered stop (tracking code
-	    + POD), a cliente-debe stop, and a driver login User
+	  - 1 published trip with POD / cliente-debe demos + driver login User
 	"""
 	reset = frappe.parse_json(reset) if isinstance(reset, str) else bool(reset)
 	company = "library"
@@ -1112,6 +1478,9 @@ def seed_tms_demo(reset=False):
 	drivers_seed = [
 		{"full_name": "TMS Demo Carlos Ramírez", "cell": "011-4444-0001", "lat": -34.6100, "lng": -58.4200, "addr_line": "Av. Rivadavia 5000, Flores"},
 		{"full_name": "TMS Demo María González", "cell": "011-4444-0002", "lat": -34.5900, "lng": -58.4500, "addr_line": "Triunvirato 3200, Villa del Parque"},
+		{"full_name": "TMS Demo Nelson Wang", "cell": "011-4444-0003", "lat": -34.6037, "lng": -58.3816, "addr_line": "Av. Corrientes 1200, Centro"},
+		{"full_name": "TMS Demo Lucía Fernández", "cell": "011-4444-0004", "lat": -34.5750, "lng": -58.4350, "addr_line": "Av. Santa Fe 4500, Palermo"},
+		{"full_name": "TMS Demo Martín Pérez", "cell": "011-4444-0005", "lat": -34.6300, "lng": -58.4600, "addr_line": "Av. Directorio 1800, Flores"},
 	]
 	for d in drivers_seed:
 		exists = frappe.get_all("Driver", filters={"full_name": d["full_name"]}, ignore_permissions=True)
@@ -1162,6 +1531,9 @@ def seed_tms_demo(reset=False):
 	vehicles_seed = [
 		{"plate": "TMS-001-AA", "make": "Ford", "model": "Transit", "fuel": "Diesel"},
 		{"plate": "TMS-002-BB", "make": "Volkswagen", "model": "Caddy", "fuel": "Diesel"},
+		{"plate": "TMS-003-CC", "make": "Renault", "model": "Kangoo", "fuel": "Petrol"},
+		{"plate": "TMS-004-DD", "make": "Mercedes", "model": "Sprinter", "fuel": "Diesel"},
+		{"plate": "TMS-005-EE", "make": "Fiat", "model": "Fiorino", "fuel": "Petrol"},
 	]
 	for v in vehicles_seed:
 		if frappe.db.exists("Vehicle", {"license_plate": v["plate"]}):
@@ -1191,6 +1563,21 @@ def seed_tms_demo(reset=False):
 		{"name": "TMS Demo Cliente 8", "area": "Boedo", "addr": "Av. Boedo 1100", "lat": -34.6280, "lng": -58.4160, "zone": "Sur"},
 		{"name": "TMS Demo Cliente 9", "area": "Almagro", "addr": "Av. Corrientes 4200", "lat": -34.6060, "lng": -58.4210, "zone": "Centro"},
 		{"name": "TMS Demo Cliente 10", "area": "Núñez", "addr": "Av. Cabildo 4200", "lat": -34.5450, "lng": -58.4630, "zone": "Norte"},
+		{"name": "TMS Demo Cliente 11", "area": "Colegiales", "addr": "Av. Federico Lacroze 2400", "lat": -34.5738, "lng": -58.4492, "zone": "Norte"},
+		{"name": "TMS Demo Cliente 12", "area": "Villa Crespo", "addr": "Av. Corrientes 5400", "lat": -34.5985, "lng": -58.4378, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 13", "area": "Barracas", "addr": "Av. Montes de Oca 900", "lat": -34.6405, "lng": -58.3745, "zone": "Sur"},
+		{"name": "TMS Demo Cliente 14", "area": "La Boca", "addr": "Av. Almirante Brown 700", "lat": -34.6345, "lng": -58.3630, "zone": "Sur"},
+		{"name": "TMS Demo Cliente 15", "area": "Puerto Madero", "addr": "Juana Manso 500", "lat": -34.6118, "lng": -58.3632, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 16", "area": "Retiro", "addr": "Av. del Libertador 600", "lat": -34.5895, "lng": -58.3738, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 17", "area": "Palermo Hollywood", "addr": "Honduras 5600", "lat": -34.5830, "lng": -58.4325, "zone": "Norte"},
+		{"name": "TMS Demo Cliente 18", "area": "Villa Devoto", "addr": "Av. San Martín 6500", "lat": -34.6030, "lng": -58.5120, "zone": "Oeste"},
+		{"name": "TMS Demo Cliente 19", "area": "Mataderos", "addr": "Av. Eva Perón 5500", "lat": -34.6550, "lng": -58.5020, "zone": "Oeste"},
+		{"name": "TMS Demo Cliente 20", "area": "Liniers", "addr": "Av. Rivadavia 11400", "lat": -34.6395, "lng": -58.5235, "zone": "Oeste"},
+		{"name": "TMS Demo Cliente 21", "area": "Constitución", "addr": "Av. Brasil 800", "lat": -34.6275, "lng": -58.3805, "zone": "Sur"},
+		{"name": "TMS Demo Cliente 22", "area": "San Cristóbal", "addr": "Av. Independencia 2800", "lat": -34.6228, "lng": -58.4005, "zone": "Sur"},
+		{"name": "TMS Demo Cliente 23", "area": "Balvanera", "addr": "Av. Corrientes 2200", "lat": -34.6040, "lng": -58.3965, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 24", "area": "Once", "addr": "Av. Pueyrredón 500", "lat": -34.6085, "lng": -58.4055, "zone": "Centro"},
+		{"name": "TMS Demo Cliente 25", "area": "Chacarita", "addr": "Av. Elcano 3200", "lat": -34.5865, "lng": -58.4545, "zone": "Norte"},
 	]
 	for c in customers_seed:
 		if not frappe.db.exists("Customer", c["name"]):
@@ -1337,6 +1724,7 @@ def seed_tms_demo(reset=False):
 			guest_name=c["name"],
 			is_delivery=1,
 			guest_notes="TMS demo - pedido de referencia",
+			cashier_id="TMS Demo",
 		)
 		confirm_guest_preorder(res["preorder_name"])
 		created.append(f"Guest Preorder: {res['preorder_name']} ({c['name']})")
@@ -1425,6 +1813,21 @@ def seed_tms_demo(reset=False):
 		trip.flags.ignore_validate_update_after_submit = True
 		trip.save(ignore_permissions=True)
 		created.append(f"Delivery Trip: {trip.name} (published, 1 delivered + 1 cliente-debe stop)")
+
+	# ── 10. Delivery zones (Buenos Aires planning regions) ─────────────────────
+	zones_seed = [
+		{"code": "NORTE", "name": "Zona Norte", "color": "#6366f1", "type": "delivery", "visit_days": ["Mon", "Wed", "Fri"], "vehicles": ["TMS-001-AA", "TMS-003-CC"]},
+		{"code": "CENTRO", "name": "Zona Centro", "color": "#16a34a", "type": "delivery", "visit_days": ["Tue", "Thu", "Sat"], "vehicles": ["TMS-002-BB"]},
+		{"code": "SUR", "name": "Zona Sur", "color": "#ea580c", "type": "delivery", "visit_days": ["Mon", "Thu"], "vehicles": ["TMS-004-DD"]},
+		{"code": "OESTE", "name": "Zona Oeste", "color": "#db2777", "type": "delivery", "visit_days": ["Wed", "Fri"], "vehicles": ["TMS-005-EE"]},
+	]
+	existing_zones = {str(z.get("code") or "").upper() for z in (_load_tms_zones().get("zones") or [])}
+	for z in zones_seed:
+		if z["code"] in existing_zones:
+			skipped.append(f"Zone: {z['code']}")
+			continue
+		save_tms_zone(z)
+		created.append(f"Zone: {z['code']}")
 
 	frappe.db.commit()
 	return {"created": created, "skipped": skipped}

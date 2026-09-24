@@ -1105,6 +1105,78 @@
         "activate": 0
       },
       "expect": "ok"
+    },
+    {
+      "id": "tms_claim_orders_null_pin_empty_lists",
+      "source": "regression",
+      "bug": "claim_orders_to_trip with null pin and empty lists must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.claim_orders_to_trip",
+      "args": {
+        "delivery_notes": null,
+        "preorder_names": null,
+        "trip": null,
+        "pin": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "tms_claim_orders_empty_string_pin",
+      "source": "regression",
+      "bug": "claim_orders_to_trip with empty pin / empty arrays is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.claim_orders_to_trip",
+      "args": {
+        "delivery_notes": [],
+        "preorder_names": "",
+        "trip": "",
+        "pin": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "tms_list_claimable_orders_null_date",
+      "source": "regression",
+      "bug": "list_claimable_orders with null date is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_claimable_orders",
+      "args": {
+        "date": null,
+        "company": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "create_guest_preorder_missing_item",
+      "source": "regression",
+      "bug": "create_guest_preorder with unknown item_code must not 404 Link crash — controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [
+          {
+            "item_code": "MISSING-ITEM-XYZ-26319",
+            "qty": 1,
+            "rate": 10
+          }
+        ],
+        "guest_name": "edge"
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "tms_list_zones_ok",
+      "source": "regression",
+      "bug": "list_tms_zones returns zones list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_tms_zones",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "tms_save_zone_null",
+      "source": "regression",
+      "bug": "save_tms_zone with null zone is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_zone",
+      "args": {
+        "zone": null
+      },
+      "expect": "no_500"
     }
   ]
 }

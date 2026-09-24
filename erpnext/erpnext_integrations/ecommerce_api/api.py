@@ -3118,6 +3118,33 @@ def create_guest_preorder(
 	if not items:
 		frappe.throw(_("Cart is empty"))
 
+	# Resolve / validate lines early (before request-bound helpers) so missing
+	# SKUs return a controlled ValidationError instead of Link DoesNotExist 404.
+	missing = []
+	resolved_rows = []
+	for item in items:
+		if not isinstance(item, dict):
+			continue
+		item_code = str(item.get("item_code") or "").strip()
+		qty = flt(item.get("qty", 1))
+		rate = flt(item.get("rate", 0))
+		if not item_code:
+			continue
+		if not frappe.db.exists("Item", item_code):
+			alts = _item_codes_for_barcode(item_code)
+			if alts:
+				item_code = alts[0]
+			else:
+				missing.append(item_code)
+				continue
+		resolved_rows.append({"item_code": item_code, "qty": qty, "rate": rate})
+
+	if missing:
+		frappe.throw(_("Item(s) not found: {0}").format(", ".join(missing)), frappe.ValidationError)
+
+	if not resolved_rows:
+		frappe.throw(_("Cart is empty"))
+
 	# Resolve defaults
 	if not company:
 		from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
@@ -3195,14 +3222,10 @@ def create_guest_preorder(
 	else:
 		so.terms = tag_text
 
-	# Add items
-	for item in items:
-		item_code = item.get("item_code")
-		qty = flt(item.get("qty", 1))
-		rate = flt(item.get("rate", 0))
-
-		if not item_code:
-			continue
+	for row in resolved_rows:
+		item_code = row["item_code"]
+		qty = row["qty"]
+		rate = row["rate"]
 
 		# Get item rate if not provided or zero (mirrors create_order logic)
 		if not rate:

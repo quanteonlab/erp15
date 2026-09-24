@@ -1310,6 +1310,15 @@ def suite_5_12_modules_read():
         assert ctx is not None
         settings = tms.get_tms_settings()
         assert settings is not None
+        assert "require_pin_for_order_actions" in settings
+        claimable = tms.list_claimable_orders()
+        assert isinstance(claimable, dict) and isinstance(claimable.get("orders"), list)
+        # Empty claim must raise a controlled error (not TypeError/500)
+        try:
+            tms.claim_orders_to_trip(delivery_notes=[], preorder_names=[], pin=None)
+            raise AssertionError("expected error for empty claim")
+        except Exception as exc:
+            assert "ValidationError" in type(exc).__name__ or "select" in str(exc).lower() or "pin" in str(exc).lower() or "Admin" in str(exc) or "Incorrect" in str(exc), exc
 
     def check_shop_ui():
         from erpnext.erpnext_integrations.ecommerce_api import shop_ui_settings as sui
