@@ -1140,7 +1140,14 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
       "args": {
         "supplier": null,
-        "items": [{"item_code": null, "qty": null, "rate": null, "cost_edited": 1}],
+        "items": [
+          {
+            "item_code": null,
+            "qty": null,
+            "rate": null,
+            "cost_edited": 1
+          }
+        ],
         "submit": 0
       },
       "expect": "no_500"
@@ -1211,6 +1218,29 @@
           }
         ],
         "guest_name": "edge"
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "create_guest_preorder_notes_only",
+      "source": "regression",
+      "bug": "create_guest_preorder with empty items + guest_notes must create draft SO (catalog chat inquiry)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge notes-only inquiry",
+        "guest_name": "edge"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "create_guest_preorder_empty_no_notes",
+      "source": "regression",
+      "bug": "create_guest_preorder with empty items and no notes is controlled empty-cart error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": ""
       },
       "expect": "no_500"
     },
@@ -1396,6 +1426,67 @@
         "content": null
       },
       "expect": "fail"
+    },
+    {
+      "id": "tms_pending_deliveries_null_date",
+      "source": "regression",
+      "bug": "get_pending_deliveries with null date must default as_of=today and return deliveries list (due<=as_of queue), never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_pending_deliveries",
+      "args": {
+        "date": null,
+        "company": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_pending_deliveries_empty_date",
+      "source": "regression",
+      "bug": "get_pending_deliveries with empty date string must coerce like null (as-of today backlog)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_pending_deliveries",
+      "args": {
+        "date": "",
+        "company": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "buying_set_pipeline_null_name",
+      "source": "regression",
+      "bug": "set_purchase_order_pipeline with null name must return controlled error, not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.set_purchase_order_pipeline",
+      "args": {
+        "name": null,
+        "target_pipeline": "to_receive"
+      },
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "id": "buying_set_pipeline_auto_only_partial",
+      "source": "regression",
+      "bug": "Cannot force Partial from status bar — clear ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.set_purchase_order_pipeline",
+      "args": {
+        "name": "",
+        "target_pipeline": "partial"
+      },
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "id": "preorder_set_status_invalid",
+      "source": "regression",
+      "bug": "Invalid target status must throw controlled message for toast",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "NotARealStatus"
+      },
+      "expect": {
+        "ok": false
+      }
     }
   ]
 }

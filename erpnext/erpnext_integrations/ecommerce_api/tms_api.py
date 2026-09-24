@@ -355,16 +355,25 @@ def get_planner_context(company=None):
 
 @frappe.whitelist(allow_guest=True)
 def get_pending_deliveries(date=None, company=None):
-	"""Unassigned remitos ready for routing.
+	"""Unassigned remitos ready for routing (reduced-bureaucracy queue).
 
-	``date`` is an *as-of* / planning day (not an exclusive day bucket): include
-	every submitted DN whose posting/target date is on or before that day and
-	not already on an active trip. Yesterday's unshipped work still shows when
-	planning "today".
+	``date`` is an *as-of* ceiling — not an exclusive day bucket. Include every
+	submitted DN that is not on an active trip whose **target ship date**
+	(Sales Order ``delivery_date``, else DN ``posting_date``) is on or before
+	``as_of``. Yesterday's unshipped work still shows when planning "today";
+	future-dated work stays out until its target day.
 	"""
 	assigned_notes = _assigned_delivery_note_names()
-	as_of = getdate(date) if date else getdate()
-	# Keep the backlog usable — last ~4 months through as_of.
+	raw_date = date
+	if isinstance(raw_date, str):
+		raw_date = raw_date.strip()
+		if raw_date.lower() in ("", "null", "undefined", "none"):
+			raw_date = None
+	try:
+		as_of = getdate(raw_date) if raw_date else getdate()
+	except Exception:
+		as_of = getdate()
+	# Lookback only on posting_date (fetch window). Due ≤ as_of is applied below.
 	from frappe.utils import add_days
 
 	since = add_days(as_of, -120)
@@ -372,12 +381,12 @@ def get_pending_deliveries(date=None, company=None):
 	filters = {
 		"docstatus": 1,
 		"is_return": 0,
-		"posting_date": ["between", [since, as_of]],
+		"posting_date": [">=", since],
 	}
 	if assigned_notes:
 		filters["name"] = ["not in", assigned_notes]
-	if company:
-		filters["company"] = company
+	if company and str(company).strip() and str(company).strip().lower() not in ("null", "undefined", "none"):
+		filters["company"] = str(company).strip()
 
 	notes = frappe.get_all(
 		"Delivery Note",
@@ -393,7 +402,7 @@ def get_pending_deliveries(date=None, company=None):
 			"status",
 		],
 		order_by="posting_date asc, creation asc",
-		limit_page_length=400,
+		limit_page_length=500,
 		ignore_permissions=True,
 	)
 
@@ -469,6 +478,9 @@ def get_pending_deliveries(date=None, company=None):
 		else:
 			due = n.posting_date
 		due_d = getdate(due) if due else as_of
+		# Not ready yet — target ship day is after the planning as-of.
+		if due_d > as_of:
+			continue
 		overdue = due_d < as_of
 
 		display = _rutas_order_display_status(
@@ -486,7 +498,7 @@ def get_pending_deliveries(date=None, company=None):
 				"address": address_name,
 				"grand_total": n.grand_total,
 				"posting_date": n.posting_date,
-				"due_date": due_d,
+				"due_date": str(due_d),
 				"overdue": overdue,
 				"status": display,
 				"dn_status": n.status,
@@ -502,6 +514,8 @@ def get_pending_deliveries(date=None, company=None):
 			}
 		)
 
+	# Overdue / oldest target dates first so the dispatcher clears the backlog.
+	out.sort(key=lambda r: (r.get("due_date") or "", r.get("delivery_note") or ""))
 	return {"deliveries": out, "as_of": str(as_of)}
 
 
@@ -942,6 +956,21 @@ def publish_trip(trip_name):
 	trip.flags.ignore_permissions = True
 	trip.submit()
 	frappe.db.commit()
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		emit_ecommerce_webhook(
+			"planned",
+			{
+				"trip": trip.name,
+				"driver": trip.driver,
+				"vehicle": trip.vehicle,
+				"stop_count": len(trip.delivery_stops or []),
+			},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook planned")
 
 	return {"trip": trip.name, "status": trip.status}
 
@@ -2085,6 +2114,28 @@ def driver_record_stop_outcome(
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)
 	frappe.db.commit()
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		if outcome == "Delivered":
+			evt = "delivered"
+		elif outcome == "Not Home":
+			evt = "failed"
+		else:
+			evt = "failed"
+		emit_ecommerce_webhook(
+			evt,
+			{
+				"trip": trip_name,
+				"stop_idx": stop_idx,
+				"outcome": outcome,
+				"customer": stop.customer,
+				"delivery_note": stop.delivery_note,
+			},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook stop outcome")
 
 	return get_trip_map_data(trip_name)
 

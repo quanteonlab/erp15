@@ -2419,6 +2419,16 @@ def create_customer(
 		contact.insert(ignore_permissions=True)
 		frappe.db.commit()
 
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		emit_ecommerce_webhook(
+			"customer_created",
+			{"customer": customer.name, "customer_name": customer.customer_name},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook customer_created")
+
 	return customer.as_dict()
 
 
@@ -3138,14 +3148,16 @@ def create_guest_preorder(
 		import json
 		items = json.loads(items)
 
-	if not items:
+	notes_only = bool(cstr(guest_notes or "").strip()) and not items
+
+	if not items and not notes_only:
 		frappe.throw(_("Cart is empty"))
 
 	# Resolve / validate lines early (before request-bound helpers) so missing
 	# SKUs return a controlled ValidationError instead of Link DoesNotExist 404.
 	missing = []
 	resolved_rows = []
-	for item in items:
+	for item in items or []:
 		if not isinstance(item, dict):
 			continue
 		item_code = str(item.get("item_code") or "").strip()
@@ -3165,7 +3177,7 @@ def create_guest_preorder(
 	if missing:
 		frappe.throw(_("Item(s) not found: {0}").format(", ".join(missing)), frappe.ValidationError)
 
-	if not resolved_rows:
+	if not resolved_rows and not notes_only:
 		frappe.throw(_("Cart is empty"))
 
 	# Resolve defaults
@@ -3277,12 +3289,16 @@ def create_guest_preorder(
 	so.conversion_rate = 1
 	so.price_list_currency = price_list_currency
 	so.plc_conversion_rate = 1
-	so.run_method("calculate_taxes_and_totals")
+	if resolved_rows:
+		so.run_method("calculate_taxes_and_totals")
 
 	# Save as Draft (Consulta). Stamp the acting cashier so Pedidos propios can match.
 	if acting and frappe.db.exists("User", acting):
 		so.owner = acting
-	so.insert(ignore_permissions=True)
+	# Notes-only inquiries have no item rows — skip mandatory child-table / item checks.
+	if notes_only:
+		so.flags.ignore_validate = True
+	so.insert(ignore_permissions=True, ignore_mandatory=notes_only)
 	if acting and frappe.db.exists("User", acting) and so.owner != acting:
 		so.db_set("owner", acting)
 
@@ -3309,6 +3325,21 @@ def create_guest_preorder(
 		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so.name}")
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		emit_ecommerce_webhook(
+			"order_created",
+			{
+				"preorder_name": so.name,
+				"customer": so.customer,
+				"grand_total": flt(so.grand_total),
+				"currency": so.currency,
+			},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook order_created")
 
 	return {
 		"preorder_name": so.name,
@@ -3628,13 +3659,15 @@ def _erp_status_for_display(display_status):
 	}.get(display_status)
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def set_guest_preorder_status(preorder_name, target_status):
 	"""
 	Unified status transition for the custom workflow.
 
 	Accepts target_status as one of: Consulta, Orden, Preparado, En Delivery, Completado.
-	Consulta reverts a submitted order back to Draft.
+	Consulta reverts a submitted order back to Draft (cancel + amend).
+	Backward moves among submitted custom statuses use db_set so SilkOS
+	update_status does not block with an opaque error.
 	"""
 	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
@@ -3642,7 +3675,9 @@ def set_guest_preorder_status(preorder_name, target_status):
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
+	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
+	frappe.flags.ignore_permissions = False
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
 	_require_guest_preorder_visible(so)
@@ -3650,11 +3685,21 @@ def set_guest_preorder_status(preorder_name, target_status):
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot change status of a cancelled order"))
 
+	current = _display_status(so)
+	current_base = "Completado" if str(current).startswith("Completado") else current
+
 	# Revert to Consulta (Draft)
 	if target_status == "Consulta":
 		if so.docstatus == 1:
-			so.flags.ignore_permissions = True
-			so.cancel()
+			try:
+				so.flags.ignore_permissions = True
+				so.cancel()
+			except Exception as e:
+				frappe.throw(
+					_("Cannot go back to Consulta from {0}: {1}").format(
+						current_base, frappe.utils.cstr(e)
+					)
+				)
 			# Create a new draft copy
 			new_so = frappe.copy_doc(so)
 			new_so.amended_from = so.name
@@ -3667,20 +3712,38 @@ def set_guest_preorder_status(preorder_name, target_status):
 
 	# Submit draft if needed for forward transitions
 	if so.docstatus == 0:
-		so.submit()
-		so.reload()
+		try:
+			so.flags.ignore_permissions = True
+			so.submit()
+			so.reload()
+		except Exception as e:
+			frappe.throw(
+				_("Cannot move from Consulta to {0}: submit failed — {1}").format(
+					target_status, frappe.utils.cstr(e)
+				)
+			)
 
 	erp_status = _erp_status_for_display(target_status)
 	if not erp_status:
 		frappe.throw(_("Invalid target status"))
 
-	# Completado is allowed even when SilkOS would block update_status
-	# (not fully delivered/billed). Persist the workflow marker directly.
-	# Other custom steps (Preparado / En Delivery) also use db_set.
-	if erp_status in ("To Deliver and Bill",):
-		so.update_status(erp_status)
-	else:
-		so.db_set("status", erp_status)
+	# Completado / Preparado / En Delivery: always db_set (custom workflow markers).
+	# Orden ("To Deliver and Bill"): try update_status first; on failure fall back to
+	# db_set so going back from Preparado/En Delivery/Completado works.
+	try:
+		if erp_status == "To Deliver and Bill":
+			try:
+				so.update_status(erp_status)
+			except Exception:
+				so.db_set("status", erp_status, update_modified=True)
+		else:
+			so.db_set("status", erp_status, update_modified=True)
+	except Exception as e:
+		frappe.throw(
+			_("Cannot change status from {0} to {1}: {2}").format(
+				current_base, target_status, frappe.utils.cstr(e)
+			)
+		)
 
 	so.reload()
 	return get_guest_preorder(preorder_name)
@@ -3708,13 +3771,29 @@ def confirm_guest_preorder(preorder_name):
 
 	so.update_status("To Deliver and Bill")
 	so.reload()
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		emit_ecommerce_webhook(
+			"order_confirmed",
+			{"preorder_name": so.name, "customer": so.customer, "status": so.status},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook order_confirmed")
 	return get_guest_preorder(preorder_name)
 
 
 @frappe.whitelist()
 def mark_prepared_guest_preorder(preorder_name):
 	"""Mark a guest preorder as Preparado (custom workflow step)."""
-	return set_guest_preorder_status(preorder_name, "Preparado")
+	result = set_guest_preorder_status(preorder_name, "Preparado")
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		emit_ecommerce_webhook("order_prepared", {"preorder_name": preorder_name})
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook order_prepared")
+	return result
 
 
 @frappe.whitelist()

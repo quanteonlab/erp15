@@ -450,6 +450,12 @@ def _submit_remito_for_so(so_name: str) -> str | None:
 		frappe.db.set_value("Sales Order", so_name, "status", "En Delivery")
 	except Exception:
 		pass
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		emit_ecommerce_webhook("remito_created", {"delivery_note": dn.name, "sales_order": so_name})
+	except Exception:
+		pass
 	return dn.name
 
 
@@ -465,6 +471,28 @@ def _confirm_so_for_csv(so_name: str) -> None:
 		so.update_status("To Deliver and Bill")
 	except Exception:
 		pass
+
+
+def _append_logistics_tags_to_so(so_name: str, tag_parts: list) -> None:
+	"""Write ventana/op_type/csv_order_code… as sibling remark tags (not inside guest_notes)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _update_guest_preorder_tag
+
+	if not so_name or not tag_parts:
+		return
+	try:
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+		for part in tag_parts:
+			part = str(part or "").strip()
+			if ":" not in part:
+				continue
+			key, val = part.split(":", 1)
+			_update_guest_preorder_tag(so, key.strip(), val.strip())
+		so.flags.ignore_permissions = True
+		so.save(ignore_permissions=True)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "tms_orders_csv._append_logistics_tags_to_so")
 
 
 def _cancel_csv_order(order_code: str, row_num: int) -> dict:
@@ -616,7 +644,7 @@ def _import_order_group(order_code: str, group_rows: list[dict], company: str | 
 		update_guest_preorder_items,
 	)
 
-	# Logistics tags
+	# Logistics tags (separate from human guest_notes / consulta comment)
 	notes_parts = []
 	for key, tag in (
 		("window1", "ventana1"),
@@ -634,9 +662,9 @@ def _import_order_group(order_code: str, group_rows: list[dict], company: str | 
 		if val:
 			notes_parts.append(f"{tag}:{val.replace('|', ' ')[:200]}")
 	notes_parts.append(f"{_CSV_ORDER_TAG}:{order_code}")
+	# Human consultation comment — keep as guest_notes only (not mixed into logistics)
 	guest_notes = _cell(row0, "notes")
-	if guest_notes:
-		notes_parts.append(f"notes:{guest_notes.replace('|', ' ')[:200]}")
+	logistics_blob = " | ".join(notes_parts)
 
 	order_date = _cell(row0, "order_date") or nowdate()
 	try:
@@ -659,17 +687,21 @@ def _import_order_group(order_code: str, group_rows: list[dict], company: str | 
 			except Exception:
 				pass
 			try:
+				# Human consulta comment only in guest_notes; logistics as sibling tags
+				# appended after save via remarks key:value parts.
 				update_guest_preorder_details(
 					existing_so,
 					{
 						"customer": customer,
-						"guest_notes": " | ".join(notes_parts),
+						"guest_notes": guest_notes or None,
 						"guest_address": _cell(row0, "street") or None,
 						"is_delivery": 1,
 					},
 				)
 			except Exception:
 				pass
+			if logistics_blob:
+				_append_logistics_tags_to_so(existing_so, notes_parts)
 			so_name = existing_so
 		else:
 			res = create_guest_preorder(
@@ -680,12 +712,14 @@ def _import_order_group(order_code: str, group_rows: list[dict], company: str | 
 				guest_phone=_cell(row0, "phone") or None,
 				guest_email=_cell(row0, "email") or None,
 				guest_address=_cell(row0, "street") or None,
-				guest_notes=" | ".join(notes_parts),
+				guest_notes=guest_notes or None,
 				is_delivery=1,
 				delivery_date=order_date,
 				cashier_id="Rutas CSV",
 			)
 			so_name = res["preorder_name"]
+			if logistics_blob:
+				_append_logistics_tags_to_so(so_name, notes_parts)
 			_confirm_so_for_csv(so_name)
 
 		if address:

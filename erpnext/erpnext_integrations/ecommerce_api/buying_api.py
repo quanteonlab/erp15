@@ -220,6 +220,207 @@ def create_purchase_order(
 
 
 @frappe.whitelist(allow_guest=True)
+def update_purchase_order(
+	name=None,
+	schedule_date=None,
+	items=None,
+	notes=None,
+	submit=0,
+):
+	"""Update a draft Purchase Order (lines / ETA). Submitted docs must be amended in desk."""
+	name = _as_str(name)
+	if not name:
+		frappe.throw(_("name is required"))
+	if not frappe.db.exists("Purchase Order", name):
+		frappe.throw(_("Purchase Order {0} not found").format(name))
+
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Purchase Order", name)
+	frappe.flags.ignore_permissions = False
+	if cint(doc.docstatus) != 0:
+		frappe.throw(_("Only draft purchase orders can be edited here"))
+
+	sched = _as_str(schedule_date)
+	if sched:
+		try:
+			doc.schedule_date = str(getdate(sched))
+		except Exception:
+			pass
+
+	clean = _parse_items(items)
+	if clean:
+		doc.set("items", [])
+		for row in clean:
+			line = {
+				"item_code": row["item_code"],
+				"qty": row["qty"],
+				"rate": row["rate"],
+				"schedule_date": row["schedule_date"] or doc.schedule_date,
+			}
+			if row.get("uom"):
+				line["uom"] = row["uom"]
+			if row.get("description"):
+				line["description"] = row["description"]
+			doc.append("items", line)
+
+	if not doc.items:
+		frappe.throw(_("Add at least one item"))
+
+	if not doc.title:
+		doc.title = (
+			frappe.db.get_value("Supplier", doc.supplier, "supplier_name") or doc.supplier or name
+		)
+	if not doc.status:
+		doc.status = "Draft"
+
+	doc.save(ignore_permissions=True)
+
+	note = _as_str(notes)
+	if note:
+		try:
+			doc.add_comment("Comment", note)
+		except Exception:
+			pass
+
+	cost_updates = _apply_buying_cost_updates(
+		supplier=doc.supplier,
+		po_name=doc.name,
+		rows=clean or [],
+		transaction_date=str(doc.transaction_date or nowdate()),
+	)
+
+	do_submit = 1 if cint(submit) else 0
+	if do_submit:
+		try:
+			doc.submit()
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "buying_api.update_purchase_order submit")
+			frappe.db.commit()
+			return {
+				"ok": True,
+				"name": doc.name,
+				"docstatus": cint(doc.docstatus),
+				"submitted": 0,
+				"grand_total": flt(doc.grand_total),
+				"cost_updates": cost_updates,
+				"warning": _("Saved as draft — submit failed"),
+			}
+
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"name": doc.name,
+		"docstatus": cint(doc.docstatus),
+		"submitted": do_submit,
+		"grand_total": flt(doc.grand_total),
+		"cost_updates": cost_updates,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def set_purchase_order_pipeline(name=None, target_pipeline=None):
+	"""
+	Attempt a pipeline move for Tables → Compras status bar.
+
+	Selectable targets today:
+	  - draft → to_receive (submit)
+	  - to_receive / partial / to_bill / done / overdue → draft (cancel; may fail if linked)
+
+	partial / to_bill / done / overdue cannot be forced manually — return a clear reason.
+	"""
+	name = _as_str(name)
+	target = _as_str(target_pipeline).lower()
+	if not name:
+		frappe.throw(_("name is required"))
+	if not target:
+		frappe.throw(_("target_pipeline is required"))
+	if not frappe.db.exists("Purchase Order", name):
+		frappe.throw(_("Purchase Order {0} not found").format(name))
+
+	allowed_manual = {"draft", "to_receive"}
+	auto_only = {
+		"partial": _(
+			"Partial is set automatically when a Purchase Receipt receives some qty. "
+			"Create / submit a Purchase Receipt instead."
+		),
+		"to_bill": _(
+			"To Bill means the PO is fully received but not invoiced. "
+			"Create a Purchase Invoice against this order."
+		),
+		"done": _(
+			"Done means received and billed (or closed). "
+			"Complete receiving and billing documents in ERP — cannot jump here from the status bar."
+		),
+		"overdue": _(
+			"Overdue is computed from the expected delivery date while qty is still pending. "
+			"Change the ETA or receive goods — it is not a manual status."
+		),
+		"cancelled": _("Cancelled documents cannot be selected from the pipeline bar."),
+	}
+
+	if target in auto_only:
+		frappe.throw(auto_only[target])
+	if target not in allowed_manual:
+		frappe.throw(_("Unknown pipeline step: {0}").format(target))
+
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Purchase Order", name)
+	frappe.flags.ignore_permissions = False
+
+	current = _pipeline_label(
+		cint(doc.docstatus),
+		doc.status or "",
+		flt(doc.per_received),
+		flt(doc.per_billed),
+		None,
+	)
+
+	if target == current:
+		return get_purchase_order_detail(name)
+
+	if target == "to_receive":
+		if cint(doc.docstatus) == 0:
+			try:
+				doc.flags.ignore_permissions = True
+				doc.submit()
+			except Exception as e:
+				frappe.throw(
+					_("Cannot move from Draft to To Receive: submit failed — {0}").format(
+						frappe.utils.cstr(e)
+					)
+				)
+			frappe.db.commit()
+			return get_purchase_order_detail(name)
+		if cint(doc.docstatus) == 1:
+			# Already submitted — pipeline may read as partial/to_bill/done/overdue
+			frappe.throw(
+				_(
+					"Cannot force To Receive from {0}. "
+					"This PO is already submitted; receiving/billing progress drives the pipeline."
+				).format(current)
+			)
+		frappe.throw(_("Cannot submit a cancelled Purchase Order"))
+
+	# target == draft
+	if cint(doc.docstatus) == 0:
+		return get_purchase_order_detail(name)
+	if cint(doc.docstatus) == 2:
+		frappe.throw(_("Purchase Order is already cancelled"))
+	try:
+		doc.flags.ignore_permissions = True
+		doc.cancel()
+	except Exception as e:
+		frappe.throw(
+			_(
+				"Cannot go back to Draft from {0}: cancel failed — {1}. "
+				"Linked receipts or invoices usually block this; amend or reverse them in ERP first."
+			).format(current, frappe.utils.cstr(e))
+		)
+	frappe.db.commit()
+	return get_purchase_order_detail(name)
+
+
+@frappe.whitelist(allow_guest=True)
 def list_item_buying_cost_trail(item_code=None, limit=40):
 	"""Audit trail: PO lines (supplier/date/qty/rate) + Standard Buying price versions."""
 	code = _as_str(item_code)

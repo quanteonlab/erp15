@@ -1681,6 +1681,15 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
     frappe.db.commit()
 
     modified = frappe.db.get_value("Item", candidate_code, "modified")
+    try:
+        from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+        emit_ecommerce_webhook(
+            "item_created",
+            {"item_code": candidate_code, "item_name": title, "item_group": item_group},
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "webhook item_created")
     return {
         "ok": True,
         "item_code": candidate_code,
