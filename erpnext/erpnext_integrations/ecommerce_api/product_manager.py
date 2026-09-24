@@ -10,7 +10,7 @@ import secrets
 import frappe
 from frappe import _
 from frappe.utils.background_jobs import enqueue
-from frappe.utils import cint, flt, get_datetime, nowtime, today
+from frappe.utils import cint, cstr, flt, get_datetime, nowtime, today
 
 
 # ---------------------------------------------------------------------------
@@ -1725,7 +1725,8 @@ def set_active_bulk(item_codes, is_active):
 
 
 @frappe.whitelist()
-def upload_item_image(item_code, filedata, filename="image.jpg"):
+def upload_item_image(item_code, filedata, filename="image.png"):
+    """Upload base64 image; server re-encodes to 256×256 (PNG first, JPEG fallback)."""
     frappe.has_permission("Item", "write", throw=True)
     if not filedata:
         frappe.throw(_("No file data"))
@@ -1748,6 +1749,8 @@ def crop_item_image(item_code, crop, candidate_name=None, filedata=None):
 
     Prefer candidate_name (re-download remote) or filedata (upload).
     If both empty, recrop from current local Item.image (/files/ only).
+
+    Local write prefers PNG (keeps alpha from bg-removal); falls back to JPEG.
     """
     frappe.has_permission("Item", "write", throw=True)
     if isinstance(crop, str):
@@ -1777,7 +1780,8 @@ def crop_item_image(item_code, crop, candidate_name=None, filedata=None):
         image_bytes = download_image_bytes(candidate.image_url)
         selected_candidate = candidate_name
     elif filedata:
-        raw = filedata.split(",", 1)[1] if "," in filedata else filedata
+        filedata_str = filedata if isinstance(filedata, str) else ""
+        raw = filedata_str.split(",", 1)[1] if "," in filedata_str else filedata_str
         image_bytes = base64.b64decode(raw)
     else:
         current = frappe.db.get_value("Item", item_code, "image")
@@ -1874,6 +1878,111 @@ def materialize_remote_item_images(limit=20, dry_run=0):
         "dry_run": 0,
         "total": total,
         "converted": converted,
+        "errors": errors[:50],
+    }
+
+
+def _local_jpeg_item_image_where(column="image") -> str:
+    """Local (non-hotlink) Item.image values that are still JPEG files."""
+    col = column if column in ("image", "website_image") else "image"
+    hotlink = _remote_hotlink_image_where(col).strip()
+    return f"""
+        IFNULL({col}, '') != ''
+        AND (
+            LOWER(IFNULL({col}, '')) LIKE '%%.jpg'
+            OR LOWER(IFNULL({col}, '')) LIKE '%%.jpeg'
+            OR LOWER(IFNULL({col}, '')) LIKE '%%.jpg?%%'
+            OR LOWER(IFNULL({col}, '')) LIKE '%%.jpeg?%%'
+        )
+        AND NOT ({hotlink})
+    """
+
+
+@frappe.whitelist()
+def remove_white_bg_item_images(limit=50, dry_run=0, threshold=248):
+    """
+    Batch: local Item JPEG thumbs → flood-fill near-white edges to alpha, rewrite as PNG.
+
+    Converts /files/{sku}.jpg into /files/{sku}.png so catalog / POS show transparency
+    instead of a solid white box. Processes one batch; UI may loop on ``remaining``.
+    """
+    frappe.has_permission("Item", "write", throw=True)
+
+    from erpnext.image_search.thumb import (
+        materialize_item_thumb,
+        read_local_file_bytes,
+        remove_near_white_background,
+    )
+
+    limit_val = cint(limit) if limit not in (None, "", 0, "0") else 50
+    if limit_val <= 0:
+        limit_val = 50
+    if limit_val > 200:
+        limit_val = 200
+    dry = cint(dry_run) == 1
+    thr = cint(threshold) if threshold not in (None, "") else 248
+    if thr <= 0:
+        thr = 248
+    if thr > 255:
+        thr = 255
+
+    jpeg_where = _local_jpeg_item_image_where("image")
+    total = cint(frappe.db.sql(f"SELECT COUNT(*) FROM `tabItem` WHERE {jpeg_where}")[0][0])
+
+    if dry:
+        return {
+            "ok": True,
+            "dry_run": 1,
+            "total": total,
+            "converted": 0,
+            "skipped": 0,
+            "remaining": total,
+            "errors": [],
+        }
+
+    item_rows = frappe.db.sql(
+        f"""
+        SELECT name, image
+        FROM `tabItem`
+        WHERE {jpeg_where}
+        ORDER BY modified DESC
+        LIMIT %s
+        """,
+        (limit_val,),
+        as_dict=True,
+    )
+
+    converted = 0
+    skipped = 0
+    errors = []
+    for row in item_rows:
+        item_code = row.name
+        try:
+            raw = read_local_file_bytes(row.image)
+            cleaned = remove_near_white_background(raw, threshold=thr)
+            materialize_item_thumb(item_code, cleaned, crop=None, commit=True, fmt="png")
+            converted += 1
+        except Exception as exc:
+            msg = cstr(exc)
+            errors.append({"item_code": item_code, "error": msg})
+            # Stale /files/*.jpg pointers block the queue forever — drop them so remaining falls.
+            low = msg.lower()
+            if "not found" in low or "not a local file" in low or "could not decode" in low:
+                try:
+                    frappe.db.set_value("Item", item_code, "image", None)
+                    frappe.db.commit()
+                    skipped += 1
+                except Exception:
+                    pass
+
+    remaining = cint(frappe.db.sql(f"SELECT COUNT(*) FROM `tabItem` WHERE {jpeg_where}")[0][0])
+    return {
+        "ok": True,
+        "dry_run": 0,
+        "total": total,
+        "converted": converted,
+        "skipped": skipped,
+        "remaining": remaining,
         "errors": errors[:50],
     }
 

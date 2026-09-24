@@ -16,6 +16,7 @@
   "section_break_2",
   "canvas_width_mm",
   "canvas_height_mm",
+  "canvas_background_color",
   "margin_mm",
   "column_break_3",
   "elements_data",
@@ -86,6 +87,12 @@
    "fieldname": "canvas_height_mm",
    "fieldtype": "Float",
    "label": "Canvas Height (mm)"
+  },
+  {
+   "description": "Empty = transparent (page/catalog background shows through). Hex color otherwise.",
+   "fieldname": "canvas_background_color",
+   "fieldtype": "Data",
+   "label": "Canvas Background Color"
   },
   {
    "default": "[10, 10, 10, 10]",

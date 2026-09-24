@@ -563,6 +563,12 @@ def suite_5_10_product_manager():
         uoms = pm.list_uoms()
         assert uoms is not None
 
+    def check_remove_white_bg_dry():
+        assert hasattr(pm, "remove_white_bg_item_images"), "remove_white_bg_item_images missing"
+        out = pm.remove_white_bg_item_images(limit=1, dry_run=1)
+        assert isinstance(out, dict) and out.get("ok"), f"bad dry_run: {out}"
+        assert "total" in out and "remaining" in out
+
     def check_attr_names():
         names = pm.list_item_attribute_names()
         assert names is not None
@@ -600,6 +606,7 @@ def suite_5_10_product_manager():
     _run("5.10.6 get_category_list", check_category_list, "S3")
     _run("5.10.7 generate_item_code", check_generate_item_code, "S3")
     _run("5.10.8 create_product_row NOS (single)→Nos", check_create_with_nos_single_uom, "S3")
+    _run("5.10.9 remove_white_bg_item_images dry_run", check_remove_white_bg_dry, "S3")
 
 
 # ── Suite 5.11 — POS session / cash / admin settings ──────────────────────────
@@ -809,9 +816,29 @@ def suite_5_12_modules_read():
         assert currencies[0] == "ARS", currencies[:5]
         assert payload["company"].get("default_currency"), payload["company"]
 
+        # Currency change must persist across reload (Company + Global Defaults).
+        # ERPNext validate_currency / account-currency checks used to abort doc.save
+        # so Dollar→ARS looked saved in the UI then snapped back on reload.
+        company = payload["company"]
+        old_currency = company.get("default_currency") or "ARS"
+        other = "USD" if old_currency != "USD" else "EUR"
+        switched = cs.save_company_settings(
+            company=company["name"],
+            settings={**company, "default_currency": other},
+        )
+        assert switched["company"]["default_currency"] == other, switched["company"]
+        assert frappe.db.get_value("Company", company["name"], "default_currency") == other
+        assert frappe.db.get_single_value("Global Defaults", "default_currency") == other
+        restored_cur = cs.save_company_settings(
+            company=company["name"],
+            settings={**switched["company"], "default_currency": old_currency},
+        )
+        assert restored_cur["company"]["default_currency"] == old_currency, restored_cur["company"]
+        assert frappe.db.get_value("Company", company["name"], "default_currency") == old_currency
+
         # Rename must succeed even when orphan Singles (Shopify Setting / Module shopify
         # not found) would crash core rename_doc — this is the Save Settings failure mode.
-        company = payload["company"]
+        company = restored_cur["company"]
         old_name = company["name"]
         tmp_name = f"{old_name}__smoke_ren"
         if frappe.db.exists("Company", tmp_name):

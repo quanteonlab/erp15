@@ -161,6 +161,14 @@ def _apply_default(template_id, source_doctype, paper_kind):
 	frappe.db.set_value("ECommerce Print Template", template_id, "is_default", 1)
 
 
+def _normalize_canvas_background(val) -> str:
+	"""Empty / transparent / none → '' (see-through). Otherwise keep a color string."""
+	raw = str(val or "").strip()
+	if not raw or raw.lower() in ("transparent", "none", "null", "undefined"):
+		return ""
+	return raw[:40]
+
+
 def _doc_to_dict(doc):
 	return {
 		"id": doc.name,
@@ -172,6 +180,9 @@ def _doc_to_dict(doc):
 		"company": doc.company,
 		"canvasWidthMm": doc.canvas_width_mm,
 		"canvasHeightMm": doc.canvas_height_mm,
+		"canvasBackgroundColor": _normalize_canvas_background(
+			getattr(doc, "canvas_background_color", None)
+		),
 		"marginMm": json.loads(doc.margin_mm or "[10,10,10,10]"),
 		"elements": json.loads(doc.elements_data or "[]"),
 		"notes": json.loads(doc.notes_data or "[]"),
@@ -250,6 +261,7 @@ def save_print_template(
 	margin_mm=None,
 	canvas_width_mm=None,
 	canvas_height_mm=None,
+	canvas_background_color=None,
 	company=None,
 	template_id=None,
 ):
@@ -260,6 +272,9 @@ def save_print_template(
 	margin_json = margin_mm if isinstance(margin_mm, str) else json.dumps(margin_mm or [10, 10, 10, 10])
 	make_default = bool(frappe.utils.cint(is_default))
 	active = resolve_company(company) if _has_company_column() else None
+	# Explicit None = leave existing; otherwise normalize (incl. "" → transparent).
+	bg_provided = canvas_background_color is not None
+	bg_value = _normalize_canvas_background(canvas_background_color) if bg_provided else None
 
 	# Match strictly by template_id (never by name): several drafts/production copies are
 	# allowed to share a name within the same source_doctype+paper_kind scope, so falling
@@ -279,6 +294,8 @@ def save_print_template(
 			doc.canvas_width_mm = float(canvas_width_mm)
 		if canvas_height_mm is not None:
 			doc.canvas_height_mm = float(canvas_height_mm)
+		if bg_provided:
+			doc.canvas_background_color = bg_value or None
 		doc.margin_mm = margin_json
 		if active:
 			doc.company = active
@@ -300,6 +317,8 @@ def save_print_template(
 		doc.canvas_width_mm = float(canvas_width_mm)
 	if canvas_height_mm is not None:
 		doc.canvas_height_mm = float(canvas_height_mm)
+	if bg_provided:
+		doc.canvas_background_color = bg_value or None
 	doc.margin_mm = margin_json
 	if active:
 		doc.company = active
@@ -1631,30 +1650,28 @@ _STARTER_TEMPLATES = [
 		"paper_kind": "A4",
 		"is_default": True,
 		"resync": True,
-		# Force resync once so existing sites pick up larger heading + cream page.
-		"resync_if_missing_id": "starter-hdr-heading-lg",
-		"canvas_width_mm": 190,
+		# Full A4 width (210mm) so export scales edge-to-edge without empty side gutters.
+		"resync_if_missing_id": "starter-hdr-a4-fullwidth",
+		"canvas_width_mm": 210,
 		"canvas_height_mm": 46,
+		"canvas_background_color": "",
 		"margin_mm": [0, 0, 0, 0],
 		"elements": [
-			# Page cream fill behind header chrome
 			{
-				"id": "starter-hdr-page-bg",
+				"id": "starter-hdr-a4-fullwidth",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
-				"width": 190,
-				"height": 46,
+				"width": 0.1,
+				"height": 0.1,
 				"shapeType": "rect",
-				"color": "#f3e9c8",
-				"filled": True,
-				"bgColor": "#f3e9c8",
+				"color": "transparent",
+				"filled": False,
 			},
-			# Red circle behind the white/light logo (same accent as deadline pill + rule)
 			{
 				"id": "starter-hdr-logo-circle",
 				"kind": "shape",
-				"x": 4,
+				"x": 6,
 				"y": 4,
 				"width": 24,
 				"height": 24,
@@ -1664,26 +1681,23 @@ _STARTER_TEMPLATES = [
 				"bgColor": "#9f1d1d",
 				"borderRadius": 999,
 			},
-			# Logo (seeded public brand asset; field `logo` overrides when set)
 			{
 				"id": "starter-hdr-logo",
 				"kind": "image",
-				"x": 5,
+				"x": 7,
 				"y": 6,
 				"width": 22,
 				"height": 20,
 				"fieldPath": "logo",
 				"staticSrc": "/brand/abin-logo.png",
 			},
-			{"id": "starter-hdr-eyebrow", "kind": "field", "x": 34, "y": 4, "width": 90, "height": 5, "fieldPath": "eyebrow", "label": "Eyebrow", "fontSize": 7, "bold": True, "align": "left", "textColor": "#6b7280"},
-			{"id": "starter-hdr-heading-lg", "kind": "field", "x": 34, "y": 10, "width": 94, "height": 18, "fieldPath": "heading", "label": "Heading", "fontSize": 36, "bold": True, "align": "left", "textColor": "#111827"},
-			# Right meta column
-			{"id": "starter-hdr-deadline-pill", "kind": "shape", "x": 130, "y": 4, "width": 56, "height": 7, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d", "borderRadius": 8},
-			{"id": "starter-hdr-deadline", "kind": "field", "x": 130, "y": 4.5, "width": 56, "height": 6, "fieldPath": "deadline_label", "label": "Deadline", "fontSize": 7, "bold": True, "align": "center", "textColor": "#ffffff"},
-			{"id": "starter-hdr-date", "kind": "field", "x": 128, "y": 13, "width": 58, "height": 5, "fieldPath": "export_date", "label": "Date", "fontSize": 7, "bold": True, "align": "right", "textColor": "#6b7280"},
-			{"id": "starter-hdr-count", "kind": "field", "x": 128, "y": 19, "width": 58, "height": 5, "fieldPath": "product_count", "label": "Count", "fontSize": 7, "bold": True, "align": "right", "textColor": "#6b7280"},
-			# Brand accent rule
-			{"id": "starter-hdr-rule", "kind": "shape", "x": 2, "y": 38, "width": 186, "height": 2.2, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d"},
+			{"id": "starter-hdr-eyebrow", "kind": "field", "x": 36, "y": 4, "width": 100, "height": 5, "fieldPath": "eyebrow", "label": "Eyebrow", "fontSize": 7, "bold": True, "align": "left", "textColor": "#6b7280"},
+			{"id": "starter-hdr-heading-lg", "kind": "field", "x": 36, "y": 10, "width": 108, "height": 18, "fieldPath": "heading", "label": "Heading", "fontSize": 36, "bold": True, "align": "left", "textColor": "#111827"},
+			{"id": "starter-hdr-deadline-pill", "kind": "shape", "x": 150, "y": 4, "width": 54, "height": 7, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d", "borderRadius": 8},
+			{"id": "starter-hdr-deadline", "kind": "field", "x": 150, "y": 4.5, "width": 54, "height": 6, "fieldPath": "deadline_label", "label": "Deadline", "fontSize": 7, "bold": True, "align": "center", "textColor": "#ffffff"},
+			{"id": "starter-hdr-date", "kind": "field", "x": 148, "y": 13, "width": 56, "height": 5, "fieldPath": "export_date", "label": "Date", "fontSize": 7, "bold": True, "align": "right", "textColor": "#6b7280"},
+			{"id": "starter-hdr-count", "kind": "field", "x": 148, "y": 19, "width": 56, "height": 5, "fieldPath": "product_count", "label": "Count", "fontSize": 7, "bold": True, "align": "right", "textColor": "#6b7280"},
+			{"id": "starter-hdr-rule", "kind": "shape", "x": 0, "y": 38, "width": 210, "height": 2.2, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d"},
 		],
 	},
 	# ── Staff Cred. (ID card, Labels-style) ────────────────────────────
@@ -1715,13 +1729,25 @@ _STARTER_TEMPLATES = [
 		"paper_kind": "Catalog Card",
 		"is_default": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-card-accent",
+		# Transparent canvas — no white frame slab over the catalog page background.
+		"resync_if_missing_id": "starter-card-transparent-canvas",
 		"canvas_width_mm": 58,
 		"canvas_height_mm": 78,
+		"canvas_background_color": "",
 		"margin_mm": [0, 0, 0, 0],
 		"elements": [
-			# Card frame + brand top accent
-			{"id": "starter-card-frame", "kind": "shape", "x": 0, "y": 0, "width": 58, "height": 78, "shapeType": "rect", "color": "#e5e7eb", "filled": True, "bgColor": "#ffffff", "borderRadius": 2},
+			{
+				"id": "starter-card-transparent-canvas",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			},
+			# Brand top accent only (no white card frame)
 			{"id": "starter-card-accent", "kind": "shape", "x": 0, "y": 0, "width": 58, "height": 2.4, "shapeType": "rect", "color": "#9f1d1d", "filled": True, "bgColor": "#9f1d1d"},
 			# Product image
 			{"id": "starter-card-image", "kind": "image", "x": 4, "y": 5, "width": 50, "height": 36, "fieldPath": "image"},
@@ -1880,6 +1906,10 @@ def ensure_starter_print_templates():
 				doc.margin_mm = json.dumps(starter["margin_mm"])
 				doc.canvas_width_mm = width_mm
 				doc.canvas_height_mm = height_mm
+				if "canvas_background_color" in starter:
+					doc.canvas_background_color = _normalize_canvas_background(
+						starter.get("canvas_background_color")
+					) or None
 				doc.save(ignore_permissions=True)
 				frappe.flags.ignore_permissions = False
 				resynced.append(doc.name)
@@ -1909,6 +1939,10 @@ def ensure_starter_print_templates():
 		doc.notes_data = "[]"
 		doc.canvas_width_mm = width_mm
 		doc.canvas_height_mm = height_mm
+		if "canvas_background_color" in starter:
+			doc.canvas_background_color = _normalize_canvas_background(
+				starter.get("canvas_background_color")
+			) or None
 		doc.insert(ignore_permissions=True)
 		if make_default:
 			_apply_default(doc.name, doc.source_doctype, doc.paper_kind)

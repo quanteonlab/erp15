@@ -368,6 +368,26 @@
       "expect": "ok"
     },
     {
+      "id": "save_print_template_transparent_canvas_bg",
+      "source": "regression",
+      "bug": "Catalog card/header canvas_background_color empty must save as transparent (no TypeError); white default was painting ugly slabs over PDF page cream",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.save_print_template",
+      "args": {
+        "template_name": "__edge_transparent_canvas_bg",
+        "source_doctype": "Item",
+        "paper_kind": "Catalog Card",
+        "elements_data": "[]",
+        "notes_data": "[]",
+        "status": "Draft",
+        "is_default": 0,
+        "margin_mm": "[0,0,0,0]",
+        "canvas_width_mm": 58,
+        "canvas_height_mm": 78,
+        "canvas_background_color": ""
+      },
+      "expect": "ok"
+    },
+    {
       "id": "gift_core_print_templates_idempotent",
       "source": "regression",
       "bug": "after_migrate gift_core_print_templates must not crash / must return created list",
@@ -453,6 +473,21 @@
         "settings": null
       },
       "expect": "no_500"
+    },
+    {
+      "id": "save_company_settings_currency_ars",
+      "source": "regression",
+      "bug": "Dollar→ARS must persist: ERPNext validate_default_accounts/validate_currency used to abort save so reload snapped back",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.company_settings.save_company_settings",
+      "args": {
+        "company": null,
+        "settings": {
+          "default_currency": "ARS",
+          "default_language": "es",
+          "multi_company_enabled": 0
+        }
+      },
+      "expect": "ok"
     },
     {
       "id": "save_company_settings_shopify_domain_coerce",
@@ -1487,6 +1522,43 @@
       "expect": {
         "ok": false
       }
+    },
+    {
+      "id": "preorder_consulta_missing_so",
+      "source": "regression",
+      "bug": "Orden→Consulta must not 500 on missing SO; cancel path needs sales_invoice.mapper shim for ecommerce_integrations",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Consulta"
+      },
+      "expect": {
+        "ok": false
+      }
+    },
+    {
+      "id": "remove_white_bg_null_limit_dry",
+      "source": "regression",
+      "bug": "remove_white_bg_item_images must coerce null/empty limit and dry_run without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.remove_white_bg_item_images",
+      "args": {
+        "limit": null,
+        "dry_run": "1",
+        "threshold": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "crop_item_image_null_crop",
+      "source": "regression",
+      "bug": "crop_item_image must reject null crop with controlled error (not TypeError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.crop_item_image",
+      "args": {
+        "item_code": "",
+        "crop": null,
+        "filedata": null
+      },
+      "expect": "fail"
     }
   ]
 }

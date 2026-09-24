@@ -6986,7 +6986,7 @@ def _ensure_price_list(price_list_name):
 			"price_list_name": price_list_name,
 			"enabled": 1,
 			"selling": 1,
-			"currency": frappe.defaults.get_global_default("currency") or "USD",
+			"currency": frappe.defaults.get_global_default("currency") or "ARS",
 		}
 	).insert(ignore_permissions=True)
 

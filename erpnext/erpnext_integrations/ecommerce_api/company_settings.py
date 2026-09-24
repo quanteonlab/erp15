@@ -217,6 +217,91 @@ def _clean_str(val, max_len: int = 140) -> str:
 	return str(val or "").strip()[:max_len]
 
 
+def _sync_global_default_currency(currency: str) -> None:
+	"""Keep Global Defaults + defaults cache aligned with Company currency."""
+	currency = (currency or "").strip() or DEFAULT_CURRENCY
+	try:
+		current = frappe.db.get_single_value("Global Defaults", "default_currency")
+		if current != currency:
+			frappe.db.set_value("Global Defaults", None, "default_currency", currency)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "sync Global Defaults currency")
+	try:
+		# System Settings / tabDefaultValue — used by get_global_default("currency")
+		if frappe.defaults.get_global_default("currency") != currency:
+			frappe.defaults.set_global_default("currency", currency)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "sync global default currency")
+
+
+def _sync_price_list_currencies(old_currency: str, new_currency: str) -> None:
+	"""Retarget selling/buying lists that still use the previous company currency."""
+	old_currency = (old_currency or "").strip()
+	new_currency = (new_currency or "").strip() or DEFAULT_CURRENCY
+	if not old_currency or old_currency == new_currency:
+		return
+	for name in frappe.get_all(
+		"Price List",
+		filters={"currency": old_currency},
+		pluck="name",
+		ignore_permissions=True,
+	) or []:
+		frappe.db.set_value("Price List", name, "currency", new_currency, update_modified=False)
+
+
+def _apply_company_currency(company: str, new_currency: str) -> bool:
+	"""Persist Company.default_currency so Settings → Company survives reload.
+
+	ERPNext blocks currency changes when:
+	- default accounts still use the old Account.account_currency, or
+	- submitted sales/purchase docs exist (validate_currency).
+
+	Tools Settings is the product path to fix wizard USD defaults on live shops,
+	so we align CoA account currencies first, then write Company + Global Defaults
+	via db.set_value (avoids the transaction lock while keeping books' historical
+	invoice currency unchanged).
+	"""
+	new_currency = _clean_str(new_currency) or DEFAULT_CURRENCY
+	if not frappe.db.exists("Currency", new_currency):
+		frappe.throw(_("Currency {0} not found").format(new_currency), frappe.ValidationError)
+	if not cint(frappe.db.get_value("Currency", new_currency, "enabled")):
+		frappe.db.set_value("Currency", new_currency, "enabled", 1, update_modified=False)
+
+	old_currency = frappe.db.get_value("Company", company, "default_currency") or ""
+	if old_currency == new_currency:
+		_sync_global_default_currency(new_currency)
+		return False
+
+	# Align chart accounts that still mirror the previous company currency (or blank).
+	if old_currency:
+		frappe.db.sql(
+			"""
+			update `tabAccount`
+			set account_currency = %s
+			where company = %s
+			  and ifnull(account_currency, '') in (%s, '')
+			""",
+			(new_currency, company, old_currency),
+		)
+	else:
+		frappe.db.sql(
+			"""
+			update `tabAccount`
+			set account_currency = %s
+			where company = %s
+			  and ifnull(account_currency, '') = ''
+			""",
+			(new_currency, company),
+		)
+
+	frappe.db.set_value("Company", company, "default_currency", new_currency)
+	_sync_global_default_currency(new_currency)
+	_sync_price_list_currencies(old_currency, new_currency)
+	frappe.clear_cache(doctype="Company")
+	frappe.clear_cache(doctype="Account")
+	return True
+
+
 def _coerce_company_domain(val: str) -> str:
 	"""Company.domain is free text historically, but invalid values (e.g. 'shopify')
 	are confusing. Prefer known Domain DocType names; otherwise keep blank."""
@@ -316,19 +401,20 @@ def save_company_settings(company=None, settings=None):
 		frappe.flags.ignore_permissions = False
 
 	changed = False
+	currency_to_set = None
+	if "default_currency" in incoming:
+		currency_to_set = _clean_str(incoming.get("default_currency")) or DEFAULT_CURRENCY
+
 	for field in _EDITABLE_FIELDS:
 		if field not in incoming:
+			continue
+		if field == "default_currency":
+			# Applied via _apply_company_currency after save — doc.save() would
+			# otherwise fail validate_default_accounts / validate_currency.
 			continue
 		val = _clean_str(incoming.get(field))
 		if field == "domain":
 			val = _coerce_company_domain(val)
-		if field == "default_currency":
-			if not val:
-				val = DEFAULT_CURRENCY
-			if not frappe.db.exists("Currency", val):
-				frappe.throw(_("Currency {0} not found").format(val), frappe.ValidationError)
-			if not cint(frappe.db.get_value("Currency", val, "enabled")):
-				frappe.db.set_value("Currency", val, "enabled", 1, update_modified=False)
 		if field == "country" and val and not frappe.db.exists("Country", val):
 			frappe.throw(_("Country {0} not found").format(val), frappe.ValidationError)
 		if field == "email" and val and "@" not in val:
@@ -340,6 +426,13 @@ def save_company_settings(company=None, settings=None):
 	if changed:
 		doc.save(ignore_permissions=True)
 		frappe.db.commit()
+
+	if currency_to_set is not None:
+		if _apply_company_currency(name, currency_to_set):
+			frappe.db.commit()
+		else:
+			# Still flush Global Defaults when already matching (e.g. empty → ARS).
+			frappe.db.commit()
 
 	# Shop-wide locale / multi-company (Table Extra Schema via shop_ui_settings).
 	locale_patch = {}

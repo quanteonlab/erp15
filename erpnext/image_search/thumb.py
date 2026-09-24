@@ -1,8 +1,8 @@
 """Local 256×256 product thumbs for Item.image (i032).
 
 Default geometry is center-contain: fit the longer side, pad the shorter.
-JPEG pads with white; PNG (catalog CSV migration) pads with transparent alpha
-so cutout product shots keep their intentional empty background.
+``materialize_item_thumb`` defaults to PNG (transparent pad / alpha kept), with
+JPEG fallback if PNG encode fails. Explicit ``fmt="jpeg"`` still pads with white.
 """
 
 from __future__ import annotations
@@ -304,6 +304,86 @@ def encode_thumb_png(image_bytes: bytes, crop: Optional[Dict[str, Any]] = None) 
 	return buf.getvalue()
 
 
+def remove_near_white_background(
+	image_bytes: bytes,
+	*,
+	threshold: int = 248,
+	feather: int = 18,
+) -> bytes:
+	"""Flood-fill near-white pixels from the edges → transparent PNG (full resolution).
+
+	Studio / JPEG product shots that sit on a solid white pad become cutouts so
+	catalog cards and the POS image viewer show the checkerboard, not a white box.
+	Interior near-white (labels, highlights) is left alone unless connected to the edge.
+	"""
+	from collections import deque
+
+	from PIL import Image
+
+	try:
+		img = Image.open(io.BytesIO(image_bytes))
+		if getattr(img, "n_frames", 1) > 1:
+			img.seek(0)
+		img.load()
+	except Exception:
+		frappe.throw(_("Could not decode image (use png, jpg, webp, gif, or similar)"))
+
+	rgba = img.convert("RGBA")
+	w, h = rgba.size
+	if w <= 0 or h <= 0:
+		frappe.throw(_("Invalid image dimensions"))
+
+	thr = max(1, min(255, int(threshold)))
+	feather_n = max(0, min(thr, int(feather)))
+	low = thr - feather_n
+
+	px = rgba.load()
+	# 0 = unseen, 1 = queued/visited as background candidate
+	seen = bytearray(w * h)
+	queue: deque = deque()
+
+	def _maybe_queue(x: int, y: int) -> None:
+		if x < 0 or y < 0 or x >= w or y >= h:
+			return
+		idx = y * w + x
+		if seen[idx]:
+			return
+		r, g, b, _a = px[x, y]
+		# Connected component only through near-white / soft-white pixels.
+		if min(r, g, b) < low:
+			return
+		seen[idx] = 1
+		queue.append((x, y))
+
+	for x in range(w):
+		_maybe_queue(x, 0)
+		_maybe_queue(x, h - 1)
+	for y in range(h):
+		_maybe_queue(0, y)
+		_maybe_queue(w - 1, y)
+
+	while queue:
+		x, y = queue.popleft()
+		r, g, b, _a = px[x, y]
+		m = min(r, g, b)
+		if m >= thr:
+			alpha = 0
+		elif feather_n <= 0 or m <= low:
+			alpha = 255
+		else:
+			alpha = int(round(255 * (thr - m) / float(feather_n)))
+		px[x, y] = (r, g, b, alpha)
+		if alpha < 255:
+			_maybe_queue(x - 1, y)
+			_maybe_queue(x + 1, y)
+			_maybe_queue(x, y - 1)
+			_maybe_queue(x, y + 1)
+
+	buf = io.BytesIO()
+	rgba.save(buf, format="PNG", optimize=True)
+	return buf.getvalue()
+
+
 def _delete_named_image_file(item_code: str, fname: str) -> None:
 	"""Remove one SKU image filename (File rows + disk), nothing else."""
 	file_url = f"/files/{fname}"
@@ -445,28 +525,46 @@ def materialize_item_thumb(
 	commit: bool = True,
 	variant: str = "final",
 	set_item_image: bool = True,
-	fmt: str = "jpeg",
+	fmt: str = "auto",
 ) -> str:
-	"""Encode a 256×256 thumb as /files/{sku}.jpg or .png (and temp variants).
+	"""Encode a 256×256 thumb as /files/{sku}.png or .jpg (and temp variants).
 
-	``fmt="png"`` keeps alpha (catalog CSV migration). Default ``jpeg`` for POS
-	search / crop workflows that still expect a white-backed square.
+	Default ``fmt="auto"``: try PNG first (keeps alpha / cutouts), fall back to JPEG
+	if PNG encode fails. Pass ``fmt="png"`` or ``fmt="jpeg"`` to force one format.
 	"""
 	if not item_code:
 		frappe.throw(_("Item code required"))
 	if not image_bytes:
 		frappe.throw(_("No image data"))
 
-	kind = "png" if str(fmt or "").lower() == "png" else "jpeg"
-	payload = encode_thumb_png(image_bytes, crop) if kind == "png" else encode_thumb_jpeg(image_bytes, crop)
-	return _write_item_thumb(
-		item_code,
-		payload,
-		variant=variant,
-		fmt=kind,
-		set_item_image=set_item_image,
-		commit=commit,
-	)
+	requested = str(fmt or "auto").lower().strip()
+	if requested in ("jpg", "jpeg"):
+		order = ("jpeg",)
+	elif requested == "png":
+		order = ("png",)
+	else:
+		# auto — prefer PNG locally, JPEG only if PNG cannot be produced
+		order = ("png", "jpeg")
+
+	last_exc: Optional[Exception] = None
+	for kind in order:
+		try:
+			payload = encode_thumb_png(image_bytes, crop) if kind == "png" else encode_thumb_jpeg(image_bytes, crop)
+			return _write_item_thumb(
+				item_code,
+				payload,
+				variant=variant,
+				fmt=kind,
+				set_item_image=set_item_image,
+				commit=commit,
+			)
+		except Exception as exc:
+			last_exc = exc
+			continue
+	if last_exc:
+		raise last_exc
+	frappe.throw(_("Could not materialize item thumb"))
+	return ""
 
 
 def promote_item_image_to_final(item_code: str, source_variant: str = "temp_crop", *, commit: bool = True) -> str:
@@ -514,7 +612,12 @@ def _normalize_file_url(file_url: str) -> str:
 
 
 def read_local_file_bytes(file_url: str) -> bytes:
-	"""Read bytes for a site-relative /files/ or /private/files/ URL."""
+	"""Read bytes for a site-relative /files/ or /private/files/ URL.
+
+	When the exact path is missing, try the sibling extension (``.png`` first,
+	then ``.jpg`` / ``.jpeg``) so rematerialized PNG thumbs still resolve from
+	stale ``Item.image`` JPEG URLs and vice versa.
+	"""
 	import os
 	from urllib.parse import unquote
 
@@ -524,42 +627,61 @@ def read_local_file_bytes(file_url: str) -> bytes:
 	if not url.startswith("/"):
 		frappe.throw(_("Not a local file URL"))
 
-	file_doc = frappe.db.get_value("File", {"file_url": url}, "name")
-	if not file_doc:
-		fname = unquote(url.rsplit("/", 1)[-1])
-		matches = frappe.get_all(
-			"File",
-			filters={"file_name": fname},
-			pluck="name",
-			limit=5,
-			ignore_permissions=True,
-		)
-		file_doc = matches[0] if matches else None
+	def _candidates(u: str) -> list[str]:
+		out = [u]
+		lower = u.lower()
+		if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+			stem = u.rsplit(".", 1)[0]
+			out = [f"{stem}.png", u]
+		elif lower.endswith(".png"):
+			stem = u.rsplit(".", 1)[0]
+			out = [u, f"{stem}.jpg", f"{stem}.jpeg"]
+		# de-dupe preserve order
+		seen = set()
+		ordered = []
+		for item in out:
+			if item not in seen:
+				seen.add(item)
+				ordered.append(item)
+		return ordered
 
-	if file_doc:
-		frappe.flags.ignore_permissions = True
-		try:
-			doc = frappe.get_doc("File", file_doc)
-			content = doc.get_content()
-		finally:
-			frappe.flags.ignore_permissions = False
-		if isinstance(content, str):
-			content = content.encode("utf-8")
-		if content:
-			return content
+	for candidate in _candidates(url):
+		file_doc = frappe.db.get_value("File", {"file_url": candidate}, "name")
+		if not file_doc:
+			fname = unquote(candidate.rsplit("/", 1)[-1])
+			matches = frappe.get_all(
+				"File",
+				filters={"file_name": fname},
+				pluck="name",
+				limit=5,
+				ignore_permissions=True,
+			)
+			file_doc = matches[0] if matches else None
 
-	rel = url.lstrip("/")
-	path = None
-	if rel.startswith("files/"):
-		path = get_files_path(rel[len("files/") :], is_private=False)
-	elif rel.startswith("private/files/"):
-		path = get_files_path(rel[len("private/files/") :], is_private=True)
-	else:
-		frappe.throw(_("Unsupported local file path"))
+		if file_doc:
+			frappe.flags.ignore_permissions = True
+			try:
+				doc = frappe.get_doc("File", file_doc)
+				content = doc.get_content()
+			finally:
+				frappe.flags.ignore_permissions = False
+			if isinstance(content, str):
+				content = content.encode("utf-8")
+			if content:
+				return content
 
-	if path and os.path.isfile(path):
-		with open(path, "rb") as f:
-			return f.read()
+		rel = candidate.lstrip("/")
+		path = None
+		if rel.startswith("files/"):
+			path = get_files_path(rel[len("files/") :], is_private=False)
+		elif rel.startswith("private/files/"):
+			path = get_files_path(rel[len("private/files/") :], is_private=True)
+		else:
+			continue
+
+		if path and os.path.isfile(path):
+			with open(path, "rb") as f:
+				return f.read()
 
 	frappe.throw(_("Local image file not found"))
 
