@@ -36,7 +36,7 @@ def _ext_for_format(fmt: str) -> str:
 	return ".png" if str(fmt or "").lower() == "png" else ".jpg"
 
 
-def thumb_filename(item_code: str, variant: str = "final", fmt: str = "jpeg") -> str:
+def thumb_filename(item_code: str, variant: str = "final", fmt: str = "png") -> str:
 	stem = sku_image_stem(item_code)
 	kind = (variant or "final").strip().lower()
 	ext = _ext_for_format(fmt)
@@ -410,7 +410,7 @@ def _delete_named_image_file(item_code: str, fname: str) -> None:
 
 
 def _delete_other_item_images(item_code: str, keep_fname: str) -> None:
-	"""Drop leftover image attachments so Item.image is only /files/{sku}.jpg."""
+	"""Drop leftover image attachments so Item.image is only /files/{sku}.png|.jpg."""
 	image_exts = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif")
 	existing = frappe.get_all(
 		"File",
@@ -444,7 +444,7 @@ def _write_item_thumb(
 	content: bytes,
 	variant: str = "final",
 	*,
-	fmt: str = "jpeg",
+	fmt: str = "png",
 	set_item_image: bool = True,
 	commit: bool = True,
 ) -> str:
