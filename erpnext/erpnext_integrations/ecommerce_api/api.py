@@ -8228,7 +8228,7 @@ def upload_item_image_mobile(item_code=None, image_base64=None, filename=None):
 			# Try to detect from bytes magic number
 			ext = _detect_image_format(image_bytes)
 			if not ext:
-				ext = ".jpg"  # Default
+				ext = ".png"  # Prefer PNG so catalog cutouts keep transparency
 			filename = f"{resolved_code}{ext}"
 		
 		ext = ext.lower()
