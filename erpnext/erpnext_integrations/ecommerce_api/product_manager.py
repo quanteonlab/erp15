@@ -3815,6 +3815,24 @@ def remove_note_block(scope, block_id):
     return _impl(scope, block_id)
 
 
+@frappe.whitelist(allow_guest=True)
+def get_doc_activity(doctype=None, name=None, limit=50):
+    from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+        get_doc_activity as _impl,
+    )
+
+    return _impl(doctype=doctype, name=name, limit=limit)
+
+
+@frappe.whitelist(allow_guest=True)
+def add_doc_comment(doctype=None, name=None, content=None):
+    from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+        add_doc_comment as _impl,
+    )
+
+    return _impl(doctype=doctype, name=name, content=content)
+
+
 @frappe.whitelist()
 def get_shop_ui_settings():
     from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (

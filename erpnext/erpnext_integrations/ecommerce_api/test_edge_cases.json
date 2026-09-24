@@ -649,6 +649,26 @@
       "expect": "no_500"
     },
     {
+      "id": "import_catalog_csv_promo_style_null",
+      "source": "regression",
+      "bug": "promo_style null/\"\" must default pack; dirty style must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\nEDGE-PSTYLE,Edge Pack Style,EdgeLeaf2,EdgeParent2,,En Stock,100,110,80,x3,\n",
+        "source": "airtable",
+        "price_list": "Standard Selling",
+        "update_existing": 1,
+        "create_missing_groups": 1,
+        "import_promotions": 1,
+        "promo_style": null,
+        "image_mode": "none",
+        "start": 0,
+        "batch_size": 10,
+        "file_name": "edge-promo-style-null.csv"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",
@@ -1092,6 +1112,40 @@
       "expect": "no_500"
     },
     {
+      "id": "buying_cost_trail_null_item",
+      "source": "regression",
+      "bug": "list_item_buying_cost_trail with null item_code is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_item_buying_cost_trail",
+      "args": {
+        "item_code": null,
+        "limit": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_cost_trail_empty_item",
+      "source": "regression",
+      "bug": "list_item_buying_cost_trail with empty item_code is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_item_buying_cost_trail",
+      "args": {
+        "item_code": "",
+        "limit": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_create_po_cost_edited_null_rate",
+      "source": "regression",
+      "bug": "create_purchase_order cost_edited with null rate does not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
+      "args": {
+        "supplier": null,
+        "items": [{"item_code": null, "qty": null, "rate": null, "cost_edited": 1}],
+        "submit": 0
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "create_product_row_nos_single_uom",
       "source": "regression",
       "bug": "LinkValidationError: Could not find Default Unit of Measure: NOS (single) — map UI label to Nos",
@@ -1177,6 +1231,171 @@
         "zone": null
       },
       "expect": "no_500"
+    },
+    {
+      "id": "rutas_orders_csv_null_text",
+      "source": "regression",
+      "bug": "import_rutas_orders_csv with null csv_text must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.import_rutas_orders_csv",
+      "args": {
+        "csv_text": null,
+        "pin": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "rutas_orders_csv_header_only",
+      "source": "regression",
+      "bug": "import_rutas_orders_csv with header-only CSV returns report not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.import_rutas_orders_csv",
+      "args": {
+        "csv_text": "Código de Cliente,Nombre,Calle y Número,Ciudad,Provincia/Estado,Latitud,Longitud,Teléfono (con código de país),Email del cliente,Código de Orden,Fecha de Orden,Tipo de Operación (E/R),Código de Producto,Descripción del Producto,Cantidad de Producto,Peso,Volumen,Dinero,Duración (min),Ventana horaria 1,Ventana horaria 2,Notas,Agrupador,Email del vendedor o seller,Eliminar Orden (Si - No - Vacío),Vehículo,Habilidades\n",
+        "pin": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "rutas_orders_csv_delete_null_code",
+      "source": "regression",
+      "bug": "Eliminar=Si with null/blank Código de Orden is controlled per-row error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.import_rutas_orders_csv",
+      "args": {
+        "csv_text": "Código de Cliente,Nombre,Calle y Número,Ciudad,Provincia/Estado,Latitud,Longitud,Teléfono (con código de país),Email del cliente,Código de Orden,Fecha de Orden,Tipo de Operación (E/R),Código de Producto,Descripción del Producto,Cantidad de Producto,Peso,Volumen,Dinero,Duración (min),Ventana horaria 1,Ventana horaria 2,Notas,Agrupador,Email del vendedor o seller,Eliminar Orden (Si - No - Vacío),Vehículo,Habilidades\n,,,,,,,,,null,,,,,,,,,,,,,,,Si,,\n",
+        "pin": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "rutas_orders_csv_template_ok",
+      "source": "regression",
+      "bug": "get_rutas_orders_csv_template returns csv_text",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_rutas_orders_csv_template",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "sms_get_settings_ok",
+      "source": "regression",
+      "bug": "get_sms_settings must return provider dict without auth token plaintext",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sms_api.get_sms_settings",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "sms_save_null_token_keeps_existing",
+      "source": "regression",
+      "bug": "save_sms_settings with null auth_token must not wipe Password field / not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sms_api.save_sms_settings",
+      "args": {
+        "enabled": null,
+        "provider": null,
+        "account_sid": null,
+        "auth_token": null,
+        "from_number": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "sms_send_test_null_to",
+      "source": "regression",
+      "bug": "send_test_sms with null to_number must ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sms_api.send_test_sms",
+      "args": {
+        "to_number": null,
+        "message": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "sms_send_test_empty_to",
+      "source": "regression",
+      "bug": "send_test_sms with empty to_number must controlled fail",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sms_api.send_test_sms",
+      "args": {
+        "to_number": "",
+        "message": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "google_get_api_settings_ok",
+      "source": "regression",
+      "bug": "get_google_api_settings returns maps/translation flags without crashing",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.google_api.get_google_api_settings",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "google_save_null_keys_ok",
+      "source": "regression",
+      "bug": "save_google_api_settings with null keys must not wipe/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.google_api.save_google_api_settings",
+      "args": {
+        "maps_enabled": null,
+        "maps_api_key": null,
+        "translation_api_key": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "google_test_translate_without_key",
+      "source": "regression",
+      "bug": "test_google_translation without key must ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.google_api.test_google_translation",
+      "args": {
+        "text": null,
+        "source_lang": null,
+        "target_lang": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "doc_activity_null_doctype",
+      "source": "regression",
+      "bug": "get_doc_activity with null doctype/name must ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.get_doc_activity",
+      "args": {
+        "doctype": null,
+        "name": null,
+        "limit": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "doc_activity_empty_name",
+      "source": "regression",
+      "bug": "get_doc_activity with empty name must controlled fail",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.get_doc_activity",
+      "args": {
+        "doctype": "Item",
+        "name": "",
+        "limit": 10
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "doc_activity_add_comment_empty",
+      "source": "regression",
+      "bug": "add_doc_comment with empty content must ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.add_doc_comment",
+      "args": {
+        "doctype": "Item",
+        "name": "DOES-NOT-EXIST",
+        "content": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "doc_activity_add_comment_null",
+      "source": "regression",
+      "bug": "add_doc_comment with null args must ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.add_doc_comment",
+      "args": {
+        "doctype": null,
+        "name": null,
+        "content": null
+      },
+      "expect": "fail"
     }
   ]
 }

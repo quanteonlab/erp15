@@ -1540,7 +1540,32 @@ def _compute_cart_promotions_local(items, price_list=None):
 				continue
 			min_qty = flt(rule.get("min_qty") or 0)
 			min_amt = flt(rule.get("min_amt") or 0)
-			if min_qty > 0 and qty < min_qty:
+			promo_style = _promo_style_from_rule(rule)
+			rod = (rule.get("rate_or_discount") or "").strip().lower()
+			is_rate_rule = rod == "rate" or (
+				flt(rule.get("rate") or 0) > 0
+				and not flt(rule.get("discount_percentage") or 0)
+				and not flt(rule.get("discount_amount") or 0)
+			)
+			# Pack Rate: upsell toward next complete pack (not "all units once N").
+			if is_rate_rule and promo_style == "pack" and min_qty > 1:
+				packs = int(qty // min_qty) if min_qty else 0
+				if packs < 1:
+					needed = min_qty - qty
+					thresh = flt(rule.get("threshold_percentage") or 80)
+					progress = (qty / min_qty) * 100 if min_qty else 0
+					offer = flt(rule.get("rate") or 0)
+					if needed > 0 and progress >= thresh:
+						upsell_hints.append({
+							"rule_name": rule["name"],
+							"title": rule.get("title") or rule["name"],
+							"message": f"Agregá {int(needed)} más para {cint(min_qty)}x @ ${offer:g}",
+							"items_needed": [item_code],
+							"qty_needed": needed,
+							"progress_pct": min(progress, 99),
+						})
+					continue
+			elif min_qty > 0 and qty < min_qty:
 				needed = min_qty - qty
 				thresh = flt(rule.get("threshold_percentage") or 80)
 				progress = (qty / min_qty) * 100 if min_qty else 0
@@ -1565,29 +1590,27 @@ def _compute_cart_promotions_local(items, price_list=None):
 			if min_amt > 0 and amount < min_amt:
 				continue
 			discount = 0
-			rod = (rule.get("rate_or_discount") or "").strip().lower()
 			if flt(rule.get("discount_percentage") or 0) > 0:
 				discount = amount * flt(rule.get("discount_percentage")) / 100.0
 			elif flt(rule.get("discount_amount") or 0) > 0:
 				discount = flt(rule.get("discount_amount"))
-			elif rod == "rate" or (
-				flt(rule.get("rate") or 0) > 0
-				and not flt(rule.get("discount_percentage") or 0)
-				and not flt(rule.get("discount_amount") or 0)
-			):
-				# Fixed unit rate (Airtable Oferta): savings vs cart line rate.
+			elif is_rate_rule:
+				# Fixed unit rate (Airtable Oferta): pack or threshold savings.
 				unit_rate = flt(item.get("rate") or 0)
 				offer = flt(rule.get("rate") or 0)
-				if offer > 0 and unit_rate > offer:
-					discount = (unit_rate - offer) * qty
+				discount = _rate_rule_discount(unit_rate, offer, qty, min_qty, promo_style)
 			if discount > best_discount:
 				best_discount = discount
 				best_rule = rule
 		if best_rule and best_discount > 0:
 			pct = flt(best_rule.get("discount_percentage") or 0)
 			offer = flt(best_rule.get("rate") or 0)
+			style = _promo_style_from_rule(best_rule)
+			mq = flt(best_rule.get("min_qty") or 0)
 			if pct:
 				label = f"{int(pct)}%"
+			elif offer > 0 and style == "pack" and mq > 1:
+				label = f"{cint(mq)}x ${offer:g}"
 			elif offer > 0:
 				label = f"${offer:g}"
 			else:
@@ -6498,6 +6521,31 @@ def _airtable_oferta_rule_name(item_code: str) -> str:
 	return f"AT-{code}"[:140]
 
 
+# Catalog CSV Oferta styles:
+# - pack (default): complete packs of N at Oferta; remainder at list (buy 8, N=3 → 2×3 oferta + 2 list)
+# - threshold: once qty >= N, all units at Oferta (legacy "desde xN")
+_CATALOG_PROMO_STYLES = ("pack", "threshold")
+_PROMO_STYLE_MARKER_RE = re.compile(r"\[promo_style=(pack|threshold)\]", re.I)
+
+
+def _normalize_catalog_promo_style(promo_style) -> str:
+	raw = cstr(promo_style or "").strip().lower()
+	if raw in ("threshold", "desde", "min_qty", "all_units", "fixed"):
+		return "threshold"
+	# Default (and anything dirty/empty) → pack Nx
+	return "pack"
+
+
+def _promo_style_from_rule(rule) -> str:
+	"""Read style marker from Pricing Rule.rule_description; legacy → threshold."""
+	desc = cstr((rule or {}).get("rule_description") or "")
+	m = _PROMO_STYLE_MARKER_RE.search(desc)
+	if m:
+		return m.group(1).lower()
+	# Pre-marker Airtable Rate rules behaved as threshold (all units once min_qty met).
+	return "threshold"
+
+
 def _parse_airtable_offer_min_qty(cantidad, item_code=None) -> float:
 	"""Cantidad labels → Pricing Rule.min_qty (x2→2, xCaja→pack, xc/unidad→1)."""
 	raw = cstr(cantidad or "").strip().lower().replace(" ", "")
@@ -6518,13 +6566,38 @@ def _parse_airtable_offer_min_qty(cantidad, item_code=None) -> float:
 	return 1.0
 
 
-def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qty):
+def _rate_rule_discount(unit_rate, offer, qty, min_qty, promo_style) -> float:
+	"""Savings for a Price/Rate rule under pack or threshold style."""
+	unit_rate = flt(unit_rate)
+	offer = flt(offer)
+	qty = flt(qty)
+	min_qty = flt(min_qty)
+	style = cstr(promo_style or "").strip().lower()
+	if style not in _CATALOG_PROMO_STYLES:
+		style = "threshold"
+	if offer <= 0 or unit_rate <= offer or qty <= 0:
+		return 0.0
+	if style == "pack":
+		if min_qty <= 0:
+			return 0.0
+		packs = int(qty // min_qty)
+		if packs < 1:
+			return 0.0
+		return (unit_rate - offer) * packs * min_qty
+	# threshold: all units at offer once qty meets min_qty
+	if min_qty > 0 and qty < min_qty:
+		return 0.0
+	return (unit_rate - offer) * qty
+
+
+def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qty, promo_style="pack"):
 	"""Create/update/disable Pricing Rule from Airtable Oferta + Cantidad.
 
-	Pattern matches POS promotions API (save_pricing_rule):
-	- apply_on Item Code → applicable_items=[TAG]
-	- price_or_product_discount=Price, rate_or_discount=Rate, rate=Oferta
-	- min_qty from Cantidad (x2 / x3 / xCaja / …)
+	promo_style:
+	- pack (default): N units at Oferta per complete pack; remainder list price
+	- threshold: once qty >= N, every unit at Oferta
+
+	Stored as Price + Rate with [promo_style=…] in rule_description for cart/catalog.
 	Returns: created | updated | disabled | skipped
 	"""
 	code = cstr(item_code or "").strip()
@@ -6533,6 +6606,7 @@ def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qt
 	rule_name = _airtable_oferta_rule_name(code)
 	rate = flt(offer_rate)
 	exists = bool(frappe.db.exists("Pricing Rule", rule_name))
+	style = _normalize_catalog_promo_style(promo_style)
 
 	if rate <= 0:
 		if exists:
@@ -6542,7 +6616,12 @@ def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qt
 
 	min_qty = _parse_airtable_offer_min_qty(offer_qty, code)
 	qty_label = cstr(offer_qty or "").strip() or "x1"
-	title = f"Oferta {qty_label} — {(cstr(item_name) or code)[:90]}"
+	if style == "pack" and min_qty > 1:
+		title = f"Oferta {cint(min_qty)}x — {(cstr(item_name) or code)[:90]}"
+	elif style == "threshold" and min_qty > 1:
+		title = f"Oferta desde {qty_label} — {(cstr(item_name) or code)[:90]}"
+	else:
+		title = f"Oferta {qty_label} — {(cstr(item_name) or code)[:90]}"
 	currency, company = _default_pricing_currency()
 
 	if exists:
@@ -6572,7 +6651,9 @@ def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qt
 	doc.currency = currency
 	if company:
 		doc.company = company
-	doc.rule_description = f"Airtable Oferta {qty_label} @ {rate:g} (min_qty={min_qty:g})"
+	doc.rule_description = (
+		f"Airtable Oferta {qty_label} @ {rate:g} (min_qty={min_qty:g}) [promo_style={style}]"
+	)
 	doc.threshold_percentage = 80
 	doc.set("items", [])
 	doc.set("item_groups", [])
@@ -7280,6 +7361,7 @@ def import_catalog_csv_products(
 	column_map=None,
 	image_mode="blank",
 	import_promotions=1,
+	promo_style="pack",
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
@@ -7293,13 +7375,15 @@ def import_catalog_csv_products(
 	cash_price → cash_price_list when mapped.
 	image_mode: blank (only empty Item.image) | all (always override) | none.
 	import_promotions: when 1, Airtable Oferta+Cantidad (or custom offer_rate/
-	offer_qty) upsert Pricing Rules (Rate + min_qty) matching the promotions API.
+	offer_qty) upsert Pricing Rules (Rate + min_qty).
+	promo_style: pack (default, Nx packs at Oferta) | threshold (all units once min_qty).
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
 
 	image_mode = _normalize_catalog_image_mode(image_mode)
 	import_promotions = cint(import_promotions)
+	promo_style = _normalize_catalog_promo_style(promo_style)
 	resolved_map = {}
 	if source in ("airtable", "custom"):
 		# Dirty clients may send null/"" — keep catalog + payment lists usable.
@@ -7359,6 +7443,7 @@ def import_catalog_csv_products(
 		"image_updates": 0,
 		"image_failures": 0,
 		"image_mode": image_mode,
+		"promo_style": promo_style,
 		"promo_updates": 0,
 		"promo_disabled": 0,
 		"items_enabled": 0,
@@ -7712,6 +7797,7 @@ def import_catalog_csv_products(
 						item_doc.item_name,
 						row.get("offer_rate"),
 						row.get("offer_qty"),
+						promo_style=promo_style,
 					)
 					if promo_action in ("created", "updated"):
 						report["promo_updates"] += 1

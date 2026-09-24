@@ -355,15 +355,29 @@ def get_planner_context(company=None):
 
 @frappe.whitelist(allow_guest=True)
 def get_pending_deliveries(date=None, company=None):
-	assigned_notes = _assigned_delivery_note_names()
+	"""Unassigned remitos ready for routing.
 
-	filters = {"docstatus": 1, "is_return": 0}
+	``date`` is an *as-of* / planning day (not an exclusive day bucket): include
+	every submitted DN whose posting/target date is on or before that day and
+	not already on an active trip. Yesterday's unshipped work still shows when
+	planning "today".
+	"""
+	assigned_notes = _assigned_delivery_note_names()
+	as_of = getdate(date) if date else getdate()
+	# Keep the backlog usable — last ~4 months through as_of.
+	from frappe.utils import add_days
+
+	since = add_days(as_of, -120)
+
+	filters = {
+		"docstatus": 1,
+		"is_return": 0,
+		"posting_date": ["between", [since, as_of]],
+	}
 	if assigned_notes:
 		filters["name"] = ["not in", assigned_notes]
 	if company:
 		filters["company"] = company
-	if date:
-		filters["posting_date"] = getdate(date)
 
 	notes = frappe.get_all(
 		"Delivery Note",
@@ -376,8 +390,10 @@ def get_pending_deliveries(date=None, company=None):
 			"customer_address",
 			"grand_total",
 			"posting_date",
+			"status",
 		],
-		order_by="posting_date asc",
+		order_by="posting_date asc, creation asc",
+		limit_page_length=400,
 		ignore_permissions=True,
 	)
 
@@ -392,13 +408,40 @@ def get_pending_deliveries(date=None, company=None):
 		):
 			item_counts[row.parent] = {"item_count": row.item_count, "qty_total": row.qty_total}
 
-	address_names = list({n.shipping_address_name or n.customer_address for n in notes if (n.shipping_address_name or n.customer_address)})
+	# Linked Sales Order status (guest preorder workflow) when present
+	so_by_dn = {}
+	if names:
+		for row in frappe.db.sql(
+			"""
+			select parent as dn, against_sales_order as so
+			from `tabDelivery Note Item`
+			where parent in %(names)s and ifnull(against_sales_order, '') != ''
+			group by parent
+			""",
+			{"names": names},
+			as_dict=True,
+		):
+			so_by_dn[row.dn] = row.so
+	so_status = {}
+	so_names = list({v for v in so_by_dn.values() if v})
+	if so_names:
+		for row in frappe.get_all(
+			"Sales Order",
+			filters={"name": ["in", so_names]},
+			fields=["name", "status", "delivery_date"],
+			ignore_permissions=True,
+		):
+			so_status[row.name] = row
+
+	address_names = list(
+		{n.shipping_address_name or n.customer_address for n in notes if (n.shipping_address_name or n.customer_address)}
+	)
 	geo_by_address = {}
 	if address_names:
 		for row in frappe.get_all(
 			"Address",
 			filters={"name": ["in", address_names]},
-			fields=["name", "custom_latitude", "custom_longitude"],
+			fields=["name", "custom_latitude", "custom_longitude", "custom_zone"],
 			ignore_permissions=True,
 		):
 			geo_by_address[row.name] = row
@@ -418,6 +461,23 @@ def get_pending_deliveries(date=None, company=None):
 	for n in notes:
 		address_name = n.shipping_address_name or n.customer_address
 		geo = geo_by_address.get(address_name) or {}
+		so_name = so_by_dn.get(n.name)
+		so = so_status.get(so_name) if so_name else None
+		due = None
+		if so and so.get("delivery_date"):
+			due = so.get("delivery_date")
+		else:
+			due = n.posting_date
+		due_d = getdate(due) if due else as_of
+		overdue = due_d < as_of
+
+		display = _rutas_order_display_status(
+			dn_status=n.status,
+			so_status=(so.get("status") if so else None),
+			previous_attempt=n.name in previous_attempts,
+			overdue=overdue,
+		)
+
 		out.append(
 			{
 				"delivery_note": n.name,
@@ -426,16 +486,44 @@ def get_pending_deliveries(date=None, company=None):
 				"address": address_name,
 				"grand_total": n.grand_total,
 				"posting_date": n.posting_date,
+				"due_date": due_d,
+				"overdue": overdue,
+				"status": display,
+				"dn_status": n.status,
+				"so_status": (so.get("status") if so else None),
+				"sales_order": so_name,
 				"item_count": (item_counts.get(n.name) or {}).get("item_count", 0),
 				"qty_total": (item_counts.get(n.name) or {}).get("qty_total", 0),
 				"geocoded": bool(geo.get("custom_latitude")),
 				"lat": geo.get("custom_latitude"),
 				"lng": geo.get("custom_longitude"),
+				"zone": geo.get("custom_zone") or None,
 				"previous_attempt": n.name in previous_attempts,
 			}
 		)
 
-	return {"deliveries": out}
+	return {"deliveries": out, "as_of": str(as_of)}
+
+
+def _rutas_order_display_status(dn_status=None, so_status=None, previous_attempt=False, overdue=False):
+	"""Coarse status for the Rutas Órdenes table / filters."""
+	if previous_attempt:
+		return "retry"
+	so = str(so_status or "").strip()
+	if so in ("Preparado",):
+		return "prepared"
+	if so in ("Orden", "To Deliver and Bill", "To Deliver"):
+		return "pending"
+	if so in ("En Delivery",):
+		return "in_delivery"
+	if so in ("Completado", "Completed", "Closed"):
+		return "completed"
+	dn = str(dn_status or "").strip()
+	if dn in ("Completed", "Closed"):
+		return "completed"
+	if overdue:
+		return "overdue"
+	return "pending"
 
 
 def _is_desk_admin_user():
@@ -1318,6 +1406,29 @@ def delete_tms_zone(code=None):
 	data = _load_tms_zones()
 	zones = [z for z in (data.get("zones") or []) if str(z.get("code") or "").upper() != code]
 	return _save_tms_zones(zones)
+
+
+# ---------------------------------------------------------------------------
+# Rutas orders CSV (Pedido + Remito import)
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist(allow_guest=True)
+def get_rutas_orders_csv_template():
+	from erpnext.erpnext_integrations.ecommerce_api.tms_orders_csv import (
+		get_rutas_orders_csv_template as _impl,
+	)
+
+	return _impl()
+
+
+@frappe.whitelist(allow_guest=True)
+def import_rutas_orders_csv(csv_text=None, pin=None, company=None):
+	from erpnext.erpnext_integrations.ecommerce_api.tms_orders_csv import (
+		import_rutas_orders_csv as _impl,
+	)
+
+	return _impl(csv_text=csv_text, pin=pin, company=company)
 
 
 # ---------------------------------------------------------------------------

@@ -462,13 +462,104 @@ def _gift_map_for_row(doctype: str, row: dict) -> dict[str, str]:
 	)
 
 
-def _auto_translate(text: str, source_lang: str, target_lang: str) -> str | None:
-	"""Best-effort free translation (MyMemory). Failures return None."""
+def _google_translate(
+	text: str,
+	source_lang: str,
+	target_lang: str,
+	*,
+	api_key: str | None = None,
+) -> str | None:
+	"""Google Cloud Translation API v2. Returns None on failure."""
 	text = cstr(text).strip()
 	src = _normalize_lang(source_lang) or "es"
 	tgt = _normalize_lang(target_lang)
 	if not text or not tgt or src == tgt:
 		return text if text else None
+	key = cstr(api_key or "").strip()
+	if not key:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.google_api import (
+				get_google_translation_api_key,
+			)
+
+			key = get_google_translation_api_key()
+		except Exception:
+			key = ""
+	if not key:
+		return None
+
+	# Map our short codes to Google language codes.
+	lang_map = {"zh": "zh-CN", "es": "es", "en": "en", "pt": "pt"}
+	g_src = lang_map.get(src, src)
+	g_tgt = lang_map.get(tgt, tgt)
+
+	body = json.dumps(
+		{"q": text[:4500], "source": g_src, "target": g_tgt, "format": "text"}
+	).encode("utf-8")
+	url = f"https://translation.googleapis.com/language/translate/v2?key={quote(key)}"
+	req = Request(
+		url,
+		data=body,
+		method="POST",
+		headers={"Content-Type": "application/json", "Accept": "application/json"},
+	)
+	try:
+		with urlopen(req, timeout=12) as resp:
+			payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+		translations = ((payload.get("data") or {}).get("translations")) or []
+		if not translations:
+			return None
+		translated = cstr(translations[0].get("translatedText") or "").strip()
+		if not translated or translated.lower() == text.lower():
+			return None
+		# Clear last error on success
+		try:
+			if frappe.db.exists("DocType", "Ecommerce Google API Settings"):
+				frappe.db.set_value(
+					"Ecommerce Google API Settings",
+					"Ecommerce Google API Settings",
+					"last_translate_error",
+					None,
+					update_modified=False,
+				)
+		except Exception:
+			pass
+		return translated
+	except Exception as e:
+		err = cstr(getattr(e, "reason", None) or e)[:1900]
+		try:
+			if hasattr(e, "read"):
+				raw = e.read().decode("utf-8", errors="replace")
+				parsed = json.loads(raw) if raw else {}
+				err = cstr(((parsed.get("error") or {}).get("message")) or raw or err)[:1900]
+		except Exception:
+			pass
+		try:
+			if frappe.db.exists("DocType", "Ecommerce Google API Settings"):
+				frappe.db.set_value(
+					"Ecommerce Google API Settings",
+					"Ecommerce Google API Settings",
+					"last_translate_error",
+					err,
+					update_modified=False,
+				)
+		except Exception:
+			pass
+		return None
+
+
+def _auto_translate(text: str, source_lang: str, target_lang: str) -> str | None:
+	"""Prefer Google Translation when configured; else MyMemory (best-effort)."""
+	text = cstr(text).strip()
+	src = _normalize_lang(source_lang) or "es"
+	tgt = _normalize_lang(target_lang)
+	if not text or not tgt or src == tgt:
+		return text if text else None
+
+	via_google = _google_translate(text, src, tgt)
+	if via_google:
+		return via_google
+
 	# Brand-like tokens (mostly Latin proper nouns) — keep as-is for CJK only when short.
 	if tgt != "zh" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .&'\-]{0,40}", text):
 		# Still try translate for common words; MyMemory handles brands poorly → keep

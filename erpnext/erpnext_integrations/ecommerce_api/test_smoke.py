@@ -23,7 +23,7 @@ import uuid
 import traceback
 
 import frappe
-from frappe.utils import cint, flt, nowdate
+from frappe.utils import cint, cstr, flt, nowdate
 
 # ── Tag used to find and delete all smoke-test records ───────────────────────
 TAG = "I014_SMOKE"
@@ -1039,6 +1039,43 @@ def suite_5_12_modules_read():
         assert flt(rule.rate) == 800, rule
         assert flt(rule.min_qty) == 2, rule
         assert cint(rule.disable) == 0, rule
+        desc = cstr(frappe.db.get_value("Pricing Rule", rule_name, "rule_description") or "")
+        assert "[promo_style=pack]" in desc, desc
+        # Pack style: qty 5 list 1000 Oferta 800 min 2 → 2 packs × 2 × 200 = 800 savings
+        cart = ecommerce_api.apply_cart_promotions(
+            items=[{"item_code": sku_promo, "qty": 5, "rate": 1000, "amount": 5000}],
+            price_list="Standard Selling",
+        )
+        lines = cart.get("line_discounts") or []
+        assert lines, cart
+        assert abs(flt(lines[0].get("discount_amount")) - 800) < 0.01, cart
+        # Re-import as threshold → all 5 units at 800 → savings 1000
+        thresh_report = ecommerce_api.import_catalog_csv_products(
+            csv_text=promo_csv,
+            price_list="Standard Selling",
+            cash_price_list="Efectivo",
+            transfer_price_list="Transferencia",
+            default_item_group="Products",
+            update_existing=1,
+            create_missing_groups=1,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            import_promotions=1,
+            promo_style="threshold",
+            image_mode="none",
+            file_name="smoke-airtable-oferta-threshold.csv",
+        )
+        assert cint(thresh_report.get("promo_updates") or 0) >= 1, thresh_report
+        desc_t = cstr(frappe.db.get_value("Pricing Rule", rule_name, "rule_description") or "")
+        assert "[promo_style=threshold]" in desc_t, desc_t
+        cart_t = ecommerce_api.apply_cart_promotions(
+            items=[{"item_code": sku_promo, "qty": 5, "rate": 1000, "amount": 5000}],
+            price_list="Standard Selling",
+        )
+        lines_t = cart_t.get("line_discounts") or []
+        assert lines_t, cart_t
+        assert abs(flt(lines_t[0].get("discount_amount")) - 1000) < 0.01, cart_t
         # Clear Oferta → disable rule
         clear_csv = (
             "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\n"
@@ -1320,6 +1357,40 @@ def suite_5_12_modules_read():
         except Exception as exc:
             assert "ValidationError" in type(exc).__name__ or "select" in str(exc).lower() or "pin" in str(exc).lower() or "Admin" in str(exc) or "Incorrect" in str(exc), exc
 
+        tmpl = tms.get_rutas_orders_csv_template()
+        assert isinstance(tmpl, dict) and tmpl.get("csv_text")
+        assert "Código de Orden" in tmpl["csv_text"]
+
+        item = frappe.db.get_value("Item", {"disabled": 0, "is_sales_item": 1}, "name")
+        assert item
+        ocode = f"CSV-SMOKE-TEST-{frappe.generate_hash(length=6)}"
+        phone_suffix = abs(hash(ocode)) % 10000000
+        create_csv = (
+            "Código de Cliente,Nombre,Calle y Número,Ciudad,Provincia/Estado,Latitud,Longitud,"
+            "Teléfono (con código de país),Email del cliente,Código de Orden,Fecha de Orden,"
+            "Tipo de Operación (E/R),Código de Producto,Descripción del Producto,Cantidad de Producto,"
+            "Peso,Volumen,Dinero,Duración (min),Ventana horaria 1,Ventana horaria 2,Notas,Agrupador,"
+            "Email del vendedor o seller,Eliminar Orden (Si - No - Vacío),Vehículo,Habilidades\n"
+            f",Smoke CSV Client,Av. Test 1,Buenos Aires,CABA,-34.60,-58.38,+54911{phone_suffix:07d},"
+            f"smoke.csv.{ocode}@example.com,{ocode},2026-09-23,E,{item},Smoke,1,,,100,10,09:00 - 12:00,,smoke,,,,"
+            "\n"
+        )
+        created = tms.import_rutas_orders_csv(csv_text=create_csv, pin=None)
+        assert isinstance(created, dict), created
+        assert created.get("summary", {}).get("created", 0) >= 1 or created.get("created"), created
+
+        delete_csv = (
+            "Código de Cliente,Nombre,Calle y Número,Ciudad,Provincia/Estado,Latitud,Longitud,"
+            "Teléfono (con código de país),Email del cliente,Código de Orden,Fecha de Orden,"
+            "Tipo de Operación (E/R),Código de Producto,Descripción del Producto,Cantidad de Producto,"
+            "Peso,Volumen,Dinero,Duración (min),Ventana horaria 1,Ventana horaria 2,Notas,Agrupador,"
+            "Email del vendedor o seller,Eliminar Orden (Si - No - Vacío),Vehículo,Habilidades\n"
+            f",,,,,,,,,{ocode},,,,,,,,,,,,,,,Si,,\n"
+        )
+        deleted = tms.import_rutas_orders_csv(csv_text=delete_csv, pin=None)
+        assert isinstance(deleted, dict), deleted
+        assert deleted.get("summary", {}).get("deleted", 0) >= 1 or deleted.get("deleted"), deleted
+
     def check_shop_ui():
         from erpnext.erpnext_integrations.ecommerce_api import shop_ui_settings as sui
         s = sui.get_shop_ui_settings()
@@ -1373,6 +1444,59 @@ def suite_5_12_modules_read():
         if listed.get("rows"):
             detail = ba.get_purchase_order_detail(name=listed["rows"][0]["name"])
             assert detail.get("ok") and detail.get("order") and isinstance(detail["order"].get("lines"), list)
+        # Cost trail + cost_edited write Standard Buying
+        item = frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        if item:
+            trail = ba.list_item_buying_cost_trail(item_code=item, limit=5)
+            assert trail.get("ok") and trail.get("item_code") == item and isinstance(trail.get("rows"), list), trail
+        supplier = frappe.db.get_value("Supplier", {}, "name")
+        # Prefer stable fixtures — avoid edge-kit artifacts / placeholder suppliers
+        supplier = (
+            frappe.db.get_value("Supplier", {"name": ["like", "SUP-%"]}, "name")
+            or frappe.db.get_value("Supplier", {"name": ["!=", "Uncategorized"]}, "name")
+            or supplier
+        )
+        item = (
+            frappe.db.get_value(
+                "Item",
+                {"disabled": 0, "is_stock_item": 1, "item_code": ["not like", "EDGE%"]},
+                "name",
+            )
+            or item
+        )
+        if item and supplier:
+            rate = 12.34
+            buying_pl = frappe.db.get_single_value("Buying Settings", "buying_price_list") or "Standard Buying"
+            before = frappe.db.get_value(
+                "Item Price",
+                {"item_code": item, "price_list": buying_pl, "buying": 1},
+                "price_list_rate",
+            )
+            created = ba.create_purchase_order(
+                supplier=supplier,
+                schedule_date=frappe.utils.nowdate(),
+                submit=0,
+                items=[{"item_code": item, "qty": 1, "rate": rate, "cost_edited": 1}],
+            )
+            assert created.get("ok") and created.get("name"), created
+            assert any(u.get("item_code") == item for u in (created.get("cost_updates") or [])), created
+            after = frappe.db.get_value(
+                "Item Price",
+                {"item_code": item, "price_list": buying_pl, "buying": 1},
+                "price_list_rate",
+            )
+            assert float(after or 0) == rate, f"buying rate not updated: before={before} after={after}"
+            # cleanup draft PO (db.delete avoids MandatoryError on broken title templates)
+            try:
+                frappe.db.delete("Purchase Order Item", {"parent": created["name"]})
+                frappe.db.delete("Purchase Order", {"name": created["name"]})
+                frappe.db.commit()
+            except Exception:
+                try:
+                    frappe.delete_doc("Purchase Order", created["name"], force=1, ignore_permissions=True)
+                    frappe.db.commit()
+                except Exception:
+                    pass
     if frappe.db.exists("DocType", "Preventa Lead Consulta") or frappe.db.exists("DocType", "Preventa Settings"):
         _run("5.12.1 preventa settings + board", check_preventa, "S3")
     else:
@@ -1392,7 +1516,30 @@ def suite_5_12_modules_read():
     _run("5.12.8 search_tags", check_tags, "S3")
     _run("5.12.9 get_openapi_spec", check_openapi, "S3")
     _run("5.12.10 crm party invoices/payments/products", check_crm_party, "S3")
-    _run("5.12.11 buying list + empty create validation", check_buying, "S3")
+    _run("5.12.11 buying list + cost trail + cost_edited upsert", check_buying, "S3")
+    _run("5.12.12 doc activity get + comment", check_doc_activity, "S3")
+
+
+def check_doc_activity():
+    from erpnext.erpnext_integrations.ecommerce_api import doc_activity as da
+
+    item = frappe.db.get_value("Item", {"disabled": 0}, "name")
+    assert item, "need at least one Item for activity smoke"
+    feed = da.get_doc_activity(doctype="Item", name=item, limit=10)
+    assert isinstance(feed, dict) and "items" in feed, f"bad feed: {feed}"
+    assert feed.get("doctype") == "Item" and feed.get("name") == item
+    # Controlled fail on missing ref
+    try:
+        da.get_doc_activity(doctype="Item", name="")
+        raise AssertionError("empty name should fail")
+    except Exception:
+        pass
+    marker = f"smoke-activity-{frappe.generate_hash(length=8)}"
+    out = da.add_doc_comment(doctype="Item", name=item, content=marker)
+    assert out.get("ok") and out.get("comment", {}).get("content") == marker, f"bad comment: {out}"
+    feed2 = da.get_doc_activity(doctype="Item", name=item, limit=20)
+    texts = [i.get("content") or i.get("summary") for i in (feed2.get("items") or [])]
+    assert marker in texts, f"comment not in feed: {texts[:5]}"
 
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────

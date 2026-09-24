@@ -61,9 +61,55 @@ def _parse_items(items):
 				"uom": _as_str(raw.get("uom")) or None,
 				"schedule_date": _as_str(raw.get("schedule_date")) or None,
 				"description": _as_str(raw.get("notes") or raw.get("description")) or None,
+				"cost_edited": 1 if cint(raw.get("cost_edited")) else 0,
 			}
 		)
 	return clean
+
+
+def _apply_buying_cost_updates(*, supplier: str, po_name: str, rows: list[dict], transaction_date: str):
+	"""When the UI marks cost_edited, write Standard Buying and a readable Item comment."""
+	from erpnext.erpnext_integrations.ecommerce_api.product_manager import _upsert_item_price_buying
+
+	supplier_label = (
+		frappe.db.get_value("Supplier", supplier, "supplier_name") if supplier else None
+	) or supplier
+	updated = []
+	for row in rows:
+		if not row.get("cost_edited"):
+			continue
+		rate = flt(row.get("rate"))
+		if rate <= 0:
+			continue
+		code = row["item_code"]
+		buying_pl = (
+			frappe.db.get_single_value("Buying Settings", "buying_price_list") or "Standard Buying"
+		)
+		old = frappe.db.get_value(
+			"Item Price",
+			{"item_code": code, "price_list": buying_pl, "buying": 1},
+			"price_list_rate",
+		)
+		_upsert_item_price_buying(code, rate)
+		note = _(
+			"Compras: costo {0} → {1} · proveedor {2} · OC {3} · fecha {4} · qty {5}"
+		).format(
+			flt(old) if old is not None else "—",
+			rate,
+			supplier_label,
+			po_name,
+			transaction_date,
+			flt(row.get("qty")),
+		)
+		try:
+			frappe.flags.ignore_permissions = True
+			frappe.get_doc("Item", code).add_comment("Comment", note)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "buying_api.item_cost_comment")
+		finally:
+			frappe.flags.ignore_permissions = False
+		updated.append({"item_code": code, "rate": rate, "previous_rate": flt(old) if old is not None else None})
+	return updated
 
 
 @frappe.whitelist(allow_guest=True)
@@ -112,6 +158,11 @@ def create_purchase_order(
 			line["description"] = row["description"]
 		po_items.append(line)
 
+	supplier_label = (
+		frappe.db.get_value("Supplier", supplier, "supplier_name") or supplier
+	)
+	# title + status are reqd on this site; set before insert so mandatory
+	# validation cannot fail if validate/set_title_field is skipped mid-request.
 	doc = frappe.get_doc(
 		{
 			"doctype": "Purchase Order",
@@ -119,22 +170,30 @@ def create_purchase_order(
 			"company": company,
 			"transaction_date": nowdate(),
 			"schedule_date": sched,
+			"status": "Draft",
+			"title": supplier_label,
 			"items": po_items,
 		}
 	)
+	doc.flags.ignore_validate = False
 	doc.insert(ignore_permissions=True)
 	if note:
 		try:
 			doc.add_comment("Comment", note)
 		except Exception:
 			pass
+
+	cost_updates = _apply_buying_cost_updates(
+		supplier=supplier,
+		po_name=doc.name,
+		rows=clean,
+		transaction_date=str(doc.transaction_date or nowdate()),
+	)
+
 	if do_submit:
 		try:
 			doc.submit()
 		except Exception:
-			frappe.db.rollback()
-			# Keep as draft if submit fails (missing accounts, etc.)
-			doc = frappe.get_doc("Purchase Order", doc.name)
 			frappe.log_error(frappe.get_traceback(), "buying_api.create_purchase_order submit")
 			frappe.db.commit()
 			return {
@@ -143,6 +202,7 @@ def create_purchase_order(
 				"docstatus": cint(doc.docstatus),
 				"submitted": 0,
 				"grand_total": flt(doc.grand_total),
+				"cost_updates": cost_updates,
 				"warning": _("Saved as draft — submit failed (check accounts / permissions)"),
 			}
 
@@ -155,6 +215,113 @@ def create_purchase_order(
 		"grand_total": flt(doc.grand_total),
 		"supplier": doc.supplier,
 		"schedule_date": str(doc.schedule_date) if doc.schedule_date else sched,
+		"cost_updates": cost_updates,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_item_buying_cost_trail(item_code=None, limit=40):
+	"""Audit trail: PO lines (supplier/date/qty/rate) + Standard Buying price versions."""
+	code = _as_str(item_code)
+	if not code:
+		frappe.throw(_("item_code is required"))
+	if not frappe.db.exists("Item", code):
+		frappe.throw(_("Item {0} not found").format(code))
+	limit = _as_int(limit, 40, lo=1, hi=200)
+
+	buying_pl = (
+		frappe.db.get_single_value("Buying Settings", "buying_price_list") or "Standard Buying"
+	)
+	standard = frappe.db.get_value(
+		"Item Price",
+		{"item_code": code, "price_list": buying_pl, "buying": 1},
+		"price_list_rate",
+	)
+
+	rows = []
+	# Purchase Order Item history (provider + date + prices)
+	po_rows = frappe.db.sql(
+		"""
+		SELECT
+			poi.parent AS purchase_order,
+			po.supplier AS supplier,
+			po.supplier_name AS supplier_name,
+			po.transaction_date AS date,
+			poi.qty AS qty,
+			poi.rate AS rate,
+			po.owner AS who
+		FROM `tabPurchase Order Item` poi
+		INNER JOIN `tabPurchase Order` po ON po.name = poi.parent
+		WHERE poi.item_code = %s
+			AND po.docstatus < 2
+		ORDER BY po.transaction_date DESC, po.creation DESC
+		LIMIT %s
+		""",
+		(code, limit),
+		as_dict=True,
+	)
+	for r in po_rows:
+		rows.append(
+			{
+				"source": "purchase_order",
+				"purchase_order": r.purchase_order,
+				"supplier": r.supplier,
+				"supplier_name": r.supplier_name,
+				"date": str(r.date) if r.date else None,
+				"qty": flt(r.qty),
+				"rate": flt(r.rate),
+				"previous_rate": None,
+				"who": r.who,
+				"note": None,
+			}
+		)
+
+	# Standard Buying Item Price version history
+	ip_name = frappe.db.get_value(
+		"Item Price",
+		{"item_code": code, "price_list": buying_pl, "buying": 1},
+		"name",
+	)
+	if ip_name:
+		versions = frappe.get_all(
+			"Version",
+			filters={"ref_doctype": "Item Price", "docname": ip_name},
+			fields=["name", "owner", "creation", "data"],
+			order_by="creation desc",
+			limit=limit,
+			ignore_permissions=True,
+		)
+		for v in versions:
+			try:
+				data = json.loads(v.data) if isinstance(v.data, str) else (v.data or {})
+			except Exception:
+				continue
+			for ch in data.get("changed") or []:
+				if not isinstance(ch, (list, tuple)) or len(ch) < 3:
+					continue
+				if ch[0] != "price_list_rate":
+					continue
+				rows.append(
+					{
+						"source": "standard_buying",
+						"purchase_order": None,
+						"supplier": None,
+						"supplier_name": None,
+						"date": str(v.creation)[:10] if v.creation else None,
+						"qty": None,
+						"rate": flt(ch[2]) if ch[2] not in (None, "") else 0,
+						"previous_rate": flt(ch[1]) if ch[1] not in (None, "") else None,
+						"who": v.owner,
+						"note": _("Standard Buying updated"),
+					}
+				)
+
+	rows.sort(key=lambda r: r.get("date") or "", reverse=True)
+	return {
+		"ok": True,
+		"item_code": code,
+		"standard_buying": flt(standard) if standard is not None else None,
+		"rows": rows[:limit],
 	}
 
 
