@@ -797,3 +797,133 @@ def get_purchase_order_detail(name=None):
 	)[0]
 	base["lines"] = lines
 	return {"ok": True, "order": base}
+
+
+# Parent fields: transaction amount → matching base_* (1:1 after retag).
+_PO_BASE_MIRROR = (
+	("total", "base_total"),
+	("net_total", "base_net_total"),
+	("total_taxes_and_charges", "base_total_taxes_and_charges"),
+	("grand_total", "base_grand_total"),
+	("rounding_adjustment", "base_rounding_adjustment"),
+	("rounded_total", "base_rounded_total"),
+	("taxes_and_charges_added", "base_taxes_and_charges_added"),
+	("taxes_and_charges_deducted", "base_taxes_and_charges_deducted"),
+	("discount_amount", "base_discount_amount"),
+)
+
+_PO_ITEM_BASE_MIRROR = (
+	("rate", "base_rate"),
+	("amount", "base_amount"),
+	("net_rate", "base_net_rate"),
+	("net_amount", "base_net_amount"),
+)
+
+
+def _retag_one_po(name: str, currency: str) -> None:
+	"""Retag a PO's currency without FX — amounts stay the same number."""
+	fields = [
+		"currency",
+		"conversion_rate",
+		"price_list_currency",
+		"plc_conversion_rate",
+		"party_account_currency",
+	]
+	for txn, base in _PO_BASE_MIRROR:
+		fields.extend([txn, base])
+	# Deduplicate while preserving order
+	seen = set()
+	fields = [f for f in fields if not (f in seen or seen.add(f))]
+	fields = [f for f in fields if frappe.db.has_column("Purchase Order", f)]
+
+	row = frappe.db.get_value("Purchase Order", name, fields, as_dict=True)
+	if not row:
+		return
+
+	updates = {
+		"currency": currency,
+		"conversion_rate": 1.0,
+	}
+	if "plc_conversion_rate" in row:
+		updates["plc_conversion_rate"] = 1.0
+	if "price_list_currency" in row:
+		updates["price_list_currency"] = currency
+	if "party_account_currency" in row:
+		updates["party_account_currency"] = currency
+
+	for txn, base in _PO_BASE_MIRROR:
+		if base in row and txn in row:
+			updates[base] = flt(row.get(txn))
+
+	frappe.db.set_value("Purchase Order", name, updates, update_modified=True)
+
+	item_fields = ["name"]
+	for txn, base in _PO_ITEM_BASE_MIRROR:
+		if frappe.db.has_column("Purchase Order Item", txn):
+			item_fields.append(txn)
+		if frappe.db.has_column("Purchase Order Item", base):
+			item_fields.append(base)
+	item_fields = list(dict.fromkeys(item_fields))
+
+	items = frappe.get_all(
+		"Purchase Order Item",
+		filters={"parent": name},
+		fields=item_fields,
+		ignore_permissions=True,
+	)
+	for it in items:
+		item_upd = {}
+		for txn, base in _PO_ITEM_BASE_MIRROR:
+			if base in it and txn in it:
+				item_upd[base] = flt(it.get(txn))
+		if item_upd:
+			frappe.db.set_value("Purchase Order Item", it.name, item_upd, update_modified=False)
+
+
+@frappe.whitelist(allow_guest=True)
+def force_retag_po_currency(currency=None, company=None):
+	"""Force all Purchase Orders to ``currency`` without converting amounts.
+
+	Example: USD 30 → ARS 30 (same number). Sets conversion_rate=1 and mirrors
+	base_* totals from transaction amounts. Skips cancelled POs and those
+	already in the target currency.
+	"""
+	company = resolve_company(company) or frappe.db.get_value("Company", {}, "name")
+	currency = _as_str(currency)
+	if not currency and company:
+		currency = _as_str(frappe.db.get_value("Company", company, "default_currency"))
+	if not currency:
+		currency = "ARS"
+	if not frappe.db.exists("Currency", currency):
+		frappe.throw(_("Currency {0} not found").format(currency), frappe.ValidationError)
+	if not cint(frappe.db.get_value("Currency", currency, "enabled")):
+		frappe.db.set_value("Currency", currency, "enabled", 1, update_modified=False)
+
+	filters = {"docstatus": ["<", 2], "currency": ["!=", currency]}
+	if company:
+		filters["company"] = company
+
+	names = frappe.get_all(
+		"Purchase Order",
+		filters=filters,
+		pluck="name",
+		ignore_permissions=True,
+	)
+	updated = 0
+	for name in names:
+		_retag_one_po(name, currency)
+		updated += 1
+
+	already_filters = {"docstatus": ["<", 2], "currency": currency}
+	if company:
+		already_filters["company"] = company
+	already = frappe.db.count("Purchase Order", filters=already_filters)
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"currency": currency,
+		"company": company,
+		"updated": updated,
+		"already": already,
+		"total_active": updated + already,
+	}

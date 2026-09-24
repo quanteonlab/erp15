@@ -1471,6 +1471,7 @@ def suite_5_12_modules_read():
         if listed.get("rows"):
             detail = ba.get_purchase_order_detail(name=listed["rows"][0]["name"])
             assert detail.get("ok") and detail.get("order") and isinstance(detail["order"].get("lines"), list)
+<<<<<<< Updated upstream
         # Cost trail + cost_edited write Standard Buying
         item = frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
         if item:
@@ -1524,6 +1525,62 @@ def suite_5_12_modules_read():
                     frappe.db.commit()
                 except Exception:
                     pass
+=======
+
+        # force_retag_po_currency: null → company default; bogus → controlled error
+        null_out = ba.force_retag_po_currency(currency=None)
+        assert null_out and null_out.get("ok") and null_out.get("currency"), null_out
+        assert "updated" in null_out and "already" in null_out, null_out
+        try:
+            ba.force_retag_po_currency(currency="__no_such_currency__")
+            raise AssertionError("expected ValidationError for unknown currency")
+        except Exception as exc:
+            assert "ValidationError" in type(exc).__name__ or "currency" in str(exc).lower(), exc
+
+        # One-shot: create a USD draft PO, retag to ARS without changing grand_total, delete
+        suppliers = frappe.get_all("Supplier", pluck="name", limit_page_length=1, ignore_permissions=True)
+        items = frappe.get_all(
+            "Item",
+            filters={"disabled": 0, "is_purchase_item": 1},
+            pluck="name",
+            limit_page_length=1,
+            ignore_permissions=True,
+        )
+        if suppliers and items and frappe.db.exists("Currency", "USD") and frappe.db.exists("Currency", "ARS"):
+            po = frappe.get_doc(
+                {
+                    "doctype": "Purchase Order",
+                    "supplier": suppliers[0],
+                    "company": frappe.db.get_value("Company", {}, "name"),
+                    "currency": "USD",
+                    "conversion_rate": 1,
+                    "transaction_date": frappe.utils.nowdate(),
+                    "schedule_date": frappe.utils.nowdate(),
+                    "items": [
+                        {
+                            "item_code": items[0],
+                            "qty": 1,
+                            "rate": 30,
+                            "schedule_date": frappe.utils.nowdate(),
+                        }
+                    ],
+                }
+            )
+            po.flags.ignore_permissions = True
+            po.insert(ignore_permissions=True)
+            frappe.db.commit()
+            try:
+                before = flt(frappe.db.get_value("Purchase Order", po.name, "grand_total"))
+                tagged = ba.force_retag_po_currency(currency="ARS", company=po.company)
+                assert tagged.get("ok"), tagged
+                after_cur = frappe.db.get_value("Purchase Order", po.name, "currency")
+                after_total = flt(frappe.db.get_value("Purchase Order", po.name, "grand_total"))
+                assert after_cur == "ARS", after_cur
+                assert abs(after_total - before) < 0.01, (before, after_total)
+            finally:
+                frappe.delete_doc("Purchase Order", po.name, ignore_permissions=True, force=True)
+                frappe.db.commit()
+>>>>>>> Stashed changes
     if frappe.db.exists("DocType", "Preventa Lead Consulta") or frappe.db.exists("DocType", "Preventa Settings"):
         _run("5.12.1 preventa settings + board", check_preventa, "S3")
     else:

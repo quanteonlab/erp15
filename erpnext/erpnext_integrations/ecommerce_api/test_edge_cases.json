@@ -1147,6 +1147,7 @@
       "expect": "no_500"
     },
     {
+<<<<<<< Updated upstream
       "id": "buying_cost_trail_null_item",
       "source": "regression",
       "bug": "list_item_buying_cost_trail with null item_code is controlled ValidationError",
@@ -1186,6 +1187,28 @@
         "submit": 0
       },
       "expect": "no_500"
+=======
+      "id": "buying_force_retag_po_currency_null",
+      "source": "regression",
+      "bug": "force_retag_po_currency with null currency must fall back to company default (no FX retag), not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.force_retag_po_currency",
+      "args": {
+        "currency": null,
+        "company": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "buying_force_retag_po_currency_bogus",
+      "source": "regression",
+      "bug": "force_retag_po_currency with unknown currency is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.force_retag_po_currency",
+      "args": {
+        "currency": "__no_such_currency__",
+        "company": null
+      },
+      "expect": "error"
+>>>>>>> Stashed changes
     },
     {
       "id": "create_product_row_nos_single_uom",
