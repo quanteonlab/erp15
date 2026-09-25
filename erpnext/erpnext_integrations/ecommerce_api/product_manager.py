@@ -4006,6 +4006,15 @@ def clear_company_logo(company=None):
 
 
 @frappe.whitelist()
+def force_rebase_docs_currency(company=None, currency=None):
+    from erpnext.erpnext_integrations.ecommerce_api.company_settings import (
+        force_rebase_docs_currency as _impl,
+    )
+
+    return _impl(company=company, currency=currency)
+
+
+@frappe.whitelist()
 def get_inquiry_automation_settings():
     from erpnext.erpnext_integrations.ecommerce_api.inquiry_automation_settings import (
         get_inquiry_automation_settings as _impl,

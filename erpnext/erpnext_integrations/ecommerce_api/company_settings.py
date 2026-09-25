@@ -543,3 +543,175 @@ def clear_company_logo(company=None):
 	frappe.db.set_value("Company", name, "company_logo", None)
 	frappe.db.commit()
 	return get_company_settings(company=name)
+
+
+# Parent numeric fields: transaction currency → company/base (1:1 after rebase).
+_PARENT_BASE_MAP = {
+	"Purchase Order": (
+		("total", "base_total"),
+		("net_total", "base_net_total"),
+		("taxes_and_charges_added", "base_taxes_and_charges_added"),
+		("taxes_and_charges_deducted", "base_taxes_and_charges_deducted"),
+		("total_taxes_and_charges", "base_total_taxes_and_charges"),
+		("discount_amount", "base_discount_amount"),
+		("grand_total", "base_grand_total"),
+		("rounding_adjustment", "base_rounding_adjustment"),
+		("rounded_total", "base_rounded_total"),
+		("tax_withholding_net_total", "base_tax_withholding_net_total"),
+	),
+	"Sales Order": (
+		("total", "base_total"),
+		("net_total", "base_net_total"),
+		("total_taxes_and_charges", "base_total_taxes_and_charges"),
+		("discount_amount", "base_discount_amount"),
+		("grand_total", "base_grand_total"),
+		("rounding_adjustment", "base_rounding_adjustment"),
+		("rounded_total", "base_rounded_total"),
+	),
+}
+
+_ITEM_BASE_MAP = {
+	"Purchase Order Item": (
+		("rate", "base_rate"),
+		("amount", "base_amount"),
+		("net_rate", "base_net_rate"),
+		("net_amount", "base_net_amount"),
+		("price_list_rate", "base_price_list_rate"),
+		("rate_with_margin", "base_rate_with_margin"),
+	),
+	"Sales Order Item": (
+		("rate", "base_rate"),
+		("amount", "base_amount"),
+		("net_rate", "base_net_rate"),
+		("net_amount", "base_net_amount"),
+		("price_list_rate", "base_price_list_rate"),
+		("rate_with_margin", "base_rate_with_margin"),
+	),
+}
+
+_PARENT_ITEM = {
+	"Purchase Order": "Purchase Order Item",
+	"Sales Order": "Sales Order Item",
+}
+
+
+def _table_columns(doctype: str) -> set[str]:
+	"""Column names present on the DocType's SQL table."""
+	try:
+		rows = frappe.db.sql(f"SHOW COLUMNS FROM `tab{doctype}`", as_dict=True) or []
+	except Exception:
+		return set()
+	return {r.get("Field") for r in rows if r.get("Field")}
+
+
+def _rebase_doctype_currency(doctype: str, company: str, currency: str) -> int:
+	"""Relabel currency on all company docs of `doctype` without FX conversion.
+
+	Keeps transaction amounts; sets conversion_rate / plc_conversion_rate to 1 and
+	copies amount → base_amount (and siblings) so company-currency totals match.
+	"""
+	cols = _table_columns(doctype)
+	if "currency" not in cols or "company" not in cols:
+		return 0
+
+	to_update = frappe.db.sql(
+		f"""
+		select name from `tab{doctype}`
+		where company = %s and ifnull(currency, '') != %s
+		""",
+		(company, currency),
+	)
+	names = [r[0] for r in (to_update or [])]
+	if not names:
+		return 0
+
+	set_parts = ["currency = %s", "conversion_rate = 1"]
+	params: list = [currency]
+	if "price_list_currency" in cols:
+		set_parts.append("price_list_currency = %s")
+		params.append(currency)
+	if "plc_conversion_rate" in cols:
+		set_parts.append("plc_conversion_rate = 1")
+
+	for src, dst in _PARENT_BASE_MAP.get(doctype, ()):
+		if src in cols and dst in cols:
+			set_parts.append(f"`{dst}` = `{src}`")
+
+	# Chunk IN lists for large tenants.
+	for i in range(0, len(names), 200):
+		chunk = names[i : i + 200]
+		placeholders = ", ".join(["%s"] * len(chunk))
+		frappe.db.sql(
+			f"""
+			update `tab{doctype}`
+			set {", ".join(set_parts)}
+			where name in ({placeholders})
+			""",
+			tuple(params + chunk),
+		)
+
+	item_dt = _PARENT_ITEM.get(doctype)
+	if item_dt:
+		item_cols = _table_columns(item_dt)
+		item_sets = []
+		for src, dst in _ITEM_BASE_MAP.get(item_dt, ()):
+			if src in item_cols and dst in item_cols:
+				item_sets.append(f"`{dst}` = `{src}`")
+		if item_sets:
+			for i in range(0, len(names), 200):
+				chunk = names[i : i + 200]
+				placeholders = ", ".join(["%s"] * len(chunk))
+				frappe.db.sql(
+					f"""
+					update `tab{item_dt}`
+					set {", ".join(item_sets)}
+					where parent in ({placeholders})
+					""",
+					tuple(chunk),
+				)
+
+	return len(names)
+
+
+@frappe.whitelist()
+def force_rebase_docs_currency(company=None, currency=None):
+	"""Force-convert Sales Orders + Purchase Orders to `currency` without FX.
+
+	Example: USD 30 → ARS 30 (same numbers, new coin). Does not touch prices or
+	exchange-rate tables — only document currency labels + base_* mirrors.
+	"""
+	if not _can_manage():
+		frappe.throw(_("Not permitted ({0})").format("tools.settings"), frappe.PermissionError)
+
+	name = _resolve_target_company(company)
+	target = _clean_str(currency) or (
+		frappe.db.get_value("Company", name, "default_currency") or DEFAULT_CURRENCY
+	)
+	if not frappe.db.exists("Currency", target):
+		frappe.throw(_("Currency {0} not found").format(target), frappe.ValidationError)
+	if not cint(frappe.db.get_value("Currency", target, "enabled")):
+		frappe.db.set_value("Currency", target, "enabled", 1, update_modified=False)
+
+	# Keep company default in sync so new docs match the rebase target.
+	_apply_company_currency(name, target)
+
+	counts = {}
+	for dt in ("Purchase Order", "Sales Order"):
+		counts[dt] = _rebase_doctype_currency(dt, name, target)
+
+	frappe.db.commit()
+	frappe.clear_cache(doctype="Purchase Order")
+	frappe.clear_cache(doctype="Sales Order")
+
+	return {
+		"ok": True,
+		"company": name,
+		"currency": target,
+		"purchase_orders": counts.get("Purchase Order", 0),
+		"sales_orders": counts.get("Sales Order", 0),
+		"message": _("Relabeled {0} purchase orders and {1} sales orders to {2}").format(
+			counts.get("Purchase Order", 0),
+			counts.get("Sales Order", 0),
+			target,
+		),
+	}

@@ -454,6 +454,17 @@
       "expect": "error"
     },
     {
+      "id": "force_rebase_docs_currency_ok",
+      "source": "regression",
+      "bug": "Settings → Company needs force_rebase_docs_currency to relabel SO/PO currency without FX (30 USD → 30 ARS)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.company_settings.force_rebase_docs_currency",
+      "args": {
+        "company": null,
+        "currency": "ARS"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "get_company_settings_ok",
       "source": "regression",
       "bug": "Company settings panel needs get_company_settings to return profile + locale without crashing",
