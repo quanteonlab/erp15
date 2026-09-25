@@ -255,6 +255,23 @@ def _default_new_stage_key(settings: dict | None = None) -> str:
 	return cols[0]["key"] if cols else "prospect"
 
 
+def _won_stage_key(owner_user=None, settings=None) -> str:
+	"""Kanban column key for acquired clients (Cliente / is_won)."""
+	cols = []
+	if owner_user:
+		try:
+			cols = _load_board_columns(owner_user) or []
+		except Exception:
+			cols = []
+	if not cols:
+		settings = settings or _load_preventa_settings()
+		cols = settings.get("default_columns_template") or []
+	for col in cols:
+		if col.get("is_won"):
+			return col.get("key") or "customer"
+	return "customer"
+
+
 # ---------------------------------------------------------------------------
 # Per-seller board columns (Table Extra Schema reuse, one row per owner)
 # ---------------------------------------------------------------------------
@@ -442,6 +459,14 @@ def get_my_board(owner_user=None):
 	is_self = owner_user == _acting_user()
 	_require_self_or_crm(owner_user)
 	ensure_preventa_custom_fields()
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+			ensure_client_access_custom_fields,
+		)
+
+		ensure_client_access_custom_fields()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "client access fields ensure failed")
 
 	columns = _load_board_columns(owner_user)
 	settings = _load_preventa_settings()
@@ -450,11 +475,13 @@ def get_my_board(owner_user=None):
 
 	lead_rows = frappe.get_all(
 		"Lead",
-		filters={"lead_owner": owner_user, "status": ["not in", ["Converted", "Do Not Contact"]]},
+		# Keep Converted leads on the board (Cliente column). Only hide DNC.
+		filters={"lead_owner": owner_user, "status": ["!=", "Do Not Contact"]},
 		fields=[
 			"name", "lead_name", "company_name", "mobile_no", "whatsapp_no", "phone", "email_id",
 			"city", "state", "country", "custom_address_line1", "custom_pincode",
 			"custom_preventa_stage", "custom_preventa_stage_since", "modified", "status",
+			"custom_client_access_pin", "custom_client_phone_e164",
 		],
 		order_by="modified desc",
 		limit_page_length=500,
@@ -463,6 +490,16 @@ def get_my_board(owner_user=None):
 	names = [r.name for r in lead_rows]
 	tags_map = tags_map_for_docs("Lead", names) if names else {}
 	consulta_by_lead = _consulta_aggregate(names)
+	customer_by_lead = {}
+	if names:
+		for crow in frappe.get_all(
+			"Customer",
+			filters={"lead_name": ["in", names]},
+			fields=["name", "lead_name"],
+			ignore_permissions=True,
+		):
+			if crow.lead_name and crow.lead_name not in customer_by_lead:
+				customer_by_lead[crow.lead_name] = crow.name
 
 	leads_out = []
 	for r in lead_rows:
@@ -480,14 +517,25 @@ def get_my_board(owner_user=None):
 		if linked and (not last_activity or linked > last_activity):
 			last_activity = linked
 		unread = bool(prior_seen and last_activity and last_activity > prior_seen)
+		stage = r.custom_preventa_stage or _default_new_stage_key(settings)
+		# Converted leads without a won stage still belong in Cliente.
+		if r.status == "Converted":
+			won = _won_stage_key(owner_user, settings)
+			won_keys = {c.get("key") for c in columns if c.get("is_won")}
+			if not stage or (won_keys and stage not in won_keys and stage != won):
+				stage = won
 		leads_out.append(
 			{
 				"name": r.name,
 				"lead_name": r.lead_name,
 				"company_name": r.company_name,
-				"stage": r.custom_preventa_stage or _default_new_stage_key(settings),
+				"stage": stage,
 				"stage_since": r.custom_preventa_stage_since,
 				"modified": r.modified,
+				"status": r.status,
+				"customer": customer_by_lead.get(r.name),
+				"client_access_pin": r.get("custom_client_access_pin"),
+				"client_phone_e164": r.get("custom_client_phone_e164"),
 				"fields": fields_out,
 				"tags": tags_map.get(r.name, []),
 				"consulta_count": agg["cnt"],
@@ -1089,8 +1137,15 @@ def _do_convert_lead(
 	# Idempotent: Customer.after_insert already sets Lead.status=Converted via db.set_value.
 	existing = frappe.db.get_value("Customer", {"lead_name": lead}, "name")
 	if existing:
+		updates = {}
 		if lead_doc.status != "Converted":
-			frappe.db.set_value("Lead", lead, "status", "Converted", update_modified=False)
+			updates["status"] = "Converted"
+		won_stage = _won_stage_key(lead_doc.lead_owner)
+		if frappe.db.get_value("Lead", lead, "custom_preventa_stage") != won_stage:
+			updates["custom_preventa_stage"] = won_stage
+			updates["custom_preventa_stage_since"] = now_datetime()
+		if updates:
+			frappe.db.set_value("Lead", lead, updates, update_modified=False)
 			frappe.db.commit()
 		return {"customer": existing, "contact": None, "address": None, "already_converted": True}
 
@@ -1149,8 +1204,16 @@ def _do_convert_lead(
 
 	# Do NOT lead_doc.save() here: Customer.update_lead_status already db.set_value'd
 	# status=Converted, which bumps Lead.modified and triggers TimestampMismatchError.
+	won_stage = _won_stage_key(lead_doc.lead_owner)
+	updates = {}
 	if frappe.db.get_value("Lead", lead, "status") != "Converted":
-		frappe.db.set_value("Lead", lead, "status", "Converted", update_modified=False)
+		updates["status"] = "Converted"
+	# Keep the card on the Preventa board under Cliente (is_won column).
+	if frappe.db.get_value("Lead", lead, "custom_preventa_stage") != won_stage:
+		updates["custom_preventa_stage"] = won_stage
+		updates["custom_preventa_stage_since"] = now_datetime()
+	if updates:
+		frappe.db.set_value("Lead", lead, updates, update_modified=False)
 	frappe.db.commit()
 
 	return {"customer": target.name, "contact": contact_name, "address": address_name}
@@ -1348,6 +1411,14 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 	"""Admin CRM lead list — same card shape as get_my_board (incl. nested `fields`)."""
 	_require_app_permission("tables.crm")
 	ensure_preventa_custom_fields()
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+			ensure_client_access_custom_fields,
+		)
+
+		ensure_client_access_custom_fields()
+	except Exception:
+		pass
 	if isinstance(filters, str):
 		filters = frappe.parse_json(filters)
 	filters = filters if isinstance(filters, dict) else {}
@@ -1371,17 +1442,21 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 	settings = _load_preventa_settings()
 	layout = settings.get("field_layout") or {}
 
+	lead_fields = [
+		"name", "lead_name", "company_name", "lead_owner", "status",
+		"custom_preventa_stage", "custom_preventa_stage_since",
+		"mobile_no", "whatsapp_no", "phone", "email_id",
+		"city", "state", "country", "custom_address_line1", "custom_pincode",
+		"modified",
+	]
+	if frappe.db.has_column("Lead", "custom_client_access_pin"):
+		lead_fields.extend(["custom_client_access_pin", "custom_client_phone_e164"])
+
 	rows = frappe.get_all(
 		"Lead",
 		filters=query_filters,
 		or_filters=or_filters,
-		fields=[
-			"name", "lead_name", "company_name", "lead_owner", "status",
-			"custom_preventa_stage", "custom_preventa_stage_since",
-			"mobile_no", "whatsapp_no", "phone", "email_id",
-			"city", "state", "country", "custom_address_line1", "custom_pincode",
-			"modified",
-		],
+		fields=lead_fields,
 		order_by="modified desc",
 		start=cint(start),
 		page_length=cint(page_length),
@@ -1420,6 +1495,8 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 				"consulta_count": agg["cnt"],
 				"last_activity": last_activity,
 				"unread": False,
+				"client_access_pin": r.get("custom_client_access_pin"),
+				"client_phone_e164": r.get("custom_client_phone_e164"),
 			}
 		)
 
@@ -1490,6 +1567,8 @@ def get_lead_timeline(lead):
 			"stage": doc.custom_preventa_stage,
 			"stage_since": doc.custom_preventa_stage_since,
 			"customer": customer,
+			"client_access_pin": getattr(doc, "custom_client_access_pin", None),
+			"client_phone_e164": getattr(doc, "custom_client_phone_e164", None),
 			"fields": fields_out,
 		},
 		"notes": notes,

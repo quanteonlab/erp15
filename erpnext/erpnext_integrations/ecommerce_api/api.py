@@ -2281,6 +2281,188 @@ def get_customer(customer_name=None, email=None):
 
 
 CONSUMIDOR_FINAL_NAME = "Consumidor Final"
+UNCATEGORIZED_CUSTOMER_NAME = "Uncategorized"
+UNCATEGORIZED_SUPPLIER_NAME = "Uncategorized"
+
+
+def _normalize_phone_digits(value) -> str:
+	return re.sub(r"\D", "", str(value or ""))
+
+
+def _customer_bucket_names_lower() -> set:
+	return {
+		CONSUMIDOR_FINAL_NAME.lower(),
+		UNCATEGORIZED_CUSTOMER_NAME.lower(),
+	}
+
+
+def _is_bucket_customer(name=None, customer_name=None) -> bool:
+	buckets = _customer_bucket_names_lower()
+	for raw in (customer_name, name):
+		label = (raw or "").strip().lower()
+		if label and label in buckets:
+			return True
+	return False
+
+
+def _phones_match(a: str, b: str) -> bool:
+	"""True when both digit strings are non-empty and one equals / ends with the other."""
+	if not a or not b:
+		return False
+	if a == b:
+		return True
+	# Require at least 6 overlapping digits to avoid short false positives.
+	if len(a) < 6 or len(b) < 6:
+		return False
+	return a.endswith(b) or b.endswith(a) or a[-8:] == b[-8:]
+
+
+def _find_customer_by_phone(phone) -> str | None:
+	"""Match an existing Customer by non-empty mobile. Empty phones never match."""
+	digits = _normalize_phone_digits(phone)
+	if len(digits) < 6:
+		return None
+	tail = digits[-8:]
+	rows = frappe.get_all(
+		"Customer",
+		filters={"disabled": 0},
+		or_filters=[["mobile_no", "like", f"%{tail}%"]],
+		fields=["name", "customer_name", "mobile_no"],
+		order_by="modified desc",
+		limit_page_length=40,
+		ignore_permissions=True,
+	)
+	exact = []
+	fuzzy = []
+	for r in rows:
+		mob = _normalize_phone_digits(r.mobile_no)
+		if not mob:
+			continue
+		if _is_bucket_customer(r.name, r.customer_name):
+			continue
+		if mob == digits:
+			exact.append(r.name)
+		elif _phones_match(mob, digits):
+			fuzzy.append(r.name)
+	candidates = exact or fuzzy
+	# Ambiguous → leave as Consumidor Final; staff can relate manually.
+	uniq = list(dict.fromkeys(candidates))
+	return uniq[0] if len(uniq) == 1 else None
+
+
+def _find_customer_by_local(address) -> str | None:
+	"""Match Customer by primary Address line (guest location / local), non-empty only."""
+	addr = str(address or "").strip().lower()
+	if len(addr) < 5:
+		return None
+	rows = frappe.db.sql(
+		"""
+		SELECT dl.link_name AS customer, a.address_line1
+		FROM `tabAddress` a
+		INNER JOIN `tabDynamic Link` dl
+			ON dl.parent = a.name AND dl.parenttype = 'Address'
+		WHERE dl.link_doctype = 'Customer'
+		  AND a.address_line1 IS NOT NULL
+		  AND TRIM(a.address_line1) != ''
+		  AND LOWER(TRIM(a.address_line1)) = %s
+		LIMIT 5
+		""",
+		(addr,),
+		as_dict=True,
+	)
+	uniq = []
+	for r in rows:
+		name = r.get("customer")
+		if not name:
+			continue
+		cname = frappe.db.get_value("Customer", name, "customer_name")
+		if _is_bucket_customer(name, cname):
+			continue
+		if name not in uniq:
+			uniq.append(name)
+	return uniq[0] if len(uniq) == 1 else None
+
+
+def _resolve_consulta_customer(explicit=None, guest_phone=None, guest_address=None) -> str:
+	"""Prefer explicit Customer, else phone / local match, else Consumidor Final."""
+	explicit = ("" if explicit is None else str(explicit)).strip()
+	if explicit:
+		if not frappe.db.exists("Customer", explicit):
+			frappe.throw(_("Customer {0} not found").format(explicit))
+		return explicit
+	matched = _find_customer_by_phone(guest_phone)
+	if matched:
+		return matched
+	matched = _find_customer_by_local(guest_address)
+	if matched:
+		return matched
+	return _get_or_create_consumidor_final()
+
+
+@frappe.whitelist(allow_guest=True)
+def match_customers_for_consulta(guest_phone=None, guest_address=None, page_length=10):
+	"""Suggest existing Customers for a consulta (phone first, then local/address).
+
+	Empty phone/address never match empty Customer fields. Used by staff UI to
+	auto-suggest or manually confirm a link.
+	"""
+	limit = max(1, min(cint(page_length) or 10, 40))
+	out = []
+	seen = set()
+
+	def _append(name, reason):
+		if not name or name in seen:
+			return
+		seen.add(name)
+		row = frappe.db.get_value(
+			"Customer",
+			name,
+			["name", "customer_name", "mobile_no", "email_id"],
+			as_dict=True,
+		)
+		if not row or _is_bucket_customer(row.name, row.customer_name):
+			return
+		out.append(
+			{
+				"name": row.name,
+				"customer_name": row.customer_name,
+				"phone": row.mobile_no,
+				"email": row.email_id,
+				"match_reason": reason,
+			}
+		)
+
+	phone_hit = _find_customer_by_phone(guest_phone)
+	if phone_hit:
+		_append(phone_hit, "phone")
+	else:
+		digits = _normalize_phone_digits(guest_phone)
+		if len(digits) >= 6:
+			tail = digits[-8:]
+			rows = frappe.get_all(
+				"Customer",
+				filters={"disabled": 0},
+				or_filters=[["mobile_no", "like", f"%{tail}%"]],
+				fields=["name", "customer_name", "mobile_no"],
+				order_by="modified desc",
+				limit_page_length=limit,
+				ignore_permissions=True,
+			)
+			for r in rows:
+				mob = _normalize_phone_digits(r.mobile_no)
+				if not mob or _is_bucket_customer(r.name, r.customer_name):
+					continue
+				if _phones_match(mob, digits):
+					_append(r.name, "phone")
+				if len(out) >= limit:
+					break
+
+	if len(out) < limit:
+		local_hit = _find_customer_by_local(guest_address)
+		if local_hit:
+			_append(local_hit, "local")
+
+	return {"customers": out[:limit]}
 
 
 def _resolve_pos_sale_customer(pos_session_id=None, warehouse=None):
@@ -2432,10 +2614,6 @@ def create_customer(
 	return customer.as_dict()
 
 
-UNCATEGORIZED_CUSTOMER_NAME = "Uncategorized"
-UNCATEGORIZED_SUPPLIER_NAME = "Uncategorized"
-
-
 def _default_customer_group_and_territory():
 	customer_group = (
 		frappe.db.get_single_value("Selling Settings", "customer_group")
@@ -2541,6 +2719,14 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	"""Typeahead / CRM list for Customer (name + customer_name + mobile)."""
 	if cint(ensure_buckets):
 		ensure_crm_party_buckets()
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+			ensure_client_access_custom_fields,
+		)
+
+		ensure_client_access_custom_fields()
+	except Exception:
+		pass
 
 	term = (search_term or "").strip()
 	limit = max(1, min(cint(page_length) or 20, 100))
@@ -2558,7 +2744,18 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 		"Customer",
 		filters=filters,
 		or_filters=or_filters,
-		fields=["name", "customer_name", "mobile_no", "email_id", "customer_group", "territory"],
+		fields=[
+			"name",
+			"customer_name",
+			"mobile_no",
+			"email_id",
+			"customer_group",
+			"territory",
+			"custom_client_access_pin",
+			"custom_client_phone_e164",
+		]
+		if frappe.db.has_column("Customer", "custom_client_access_pin")
+		else ["name", "customer_name", "mobile_no", "email_id", "customer_group", "territory"],
 		order_by="customer_name asc",
 		limit_page_length=limit,
 		ignore_permissions=True,
@@ -2572,6 +2769,8 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"email": r.email_id,
 				"customer_group": r.customer_group,
 				"territory": r.territory,
+				"client_access_pin": getattr(r, "custom_client_access_pin", None),
+				"client_phone_e164": getattr(r, "custom_client_phone_e164", None),
 				"is_bucket": (r.customer_name or r.name or "")
 				in (CONSUMIDOR_FINAL_NAME, UNCATEGORIZED_CUSTOMER_NAME),
 			}
@@ -3130,6 +3329,8 @@ def create_guest_preorder(
 	order_tag=None,
 	seller_ref_user=None,
 	cashier_id=None,
+	pin_allowed_countries=None,
+	send_client_pin=1,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -3194,9 +3395,12 @@ def create_guest_preorder(
 	if not company:
 		frappe.throw(_("No Company configured"))
 
-	if customer and not frappe.db.exists("Customer", customer):
-		frappe.throw(_("Customer {0} not found").format(customer))
-	customer = customer or _get_or_create_consumidor_final()
+	# Explicit customer wins; otherwise match by phone / local (non-empty only).
+	customer = _resolve_consulta_customer(
+		explicit=customer,
+		guest_phone=guest_phone,
+		guest_address=guest_address,
+	)
 	company_currency = frappe.db.get_value("Company", company, "default_currency") or "ARS"
 	price_list_currency = (
 		frappe.db.get_value("Price List", price_list, "currency") if price_list else None
@@ -3325,8 +3529,29 @@ def create_guest_preorder(
 
 	send_consulta_notification(so.name, guest_name=guest_name, guest_phone=guest_phone)
 
+	# Client access PIN (Twilio WhatsApp/SMS) — check "never seen" BEFORE lead sync
+	# so the brand-new Lead created below does not count as "already known".
+	client_access = None
+	if cstr(guest_phone or "").strip():
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				issue_client_access_pin,
+			)
+
+			client_access = issue_client_access_pin(
+				guest_phone=guest_phone,
+				guest_name=guest_name,
+				guest_email=guest_email,
+				customer=so.customer,
+				allowed_countries=pin_allowed_countries,
+				send=cint(send_client_pin),
+			)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so.name}")
+
 	# Best-effort Pre-venta bridge: never let a Lead-sync problem affect the
 	# guest preorder response (see local_docs/proposals/i033_preventa_sales_kanban.md).
+	lead_name = None
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import sync_lead_from_guest_preorder
 
@@ -3337,6 +3562,21 @@ def create_guest_preorder(
 			guest_email=guest_email,
 			seller_ref_user=seller_ref_user,
 		)
+		lead_name = frappe.db.get_value(
+			"Preventa Lead Consulta", {"sales_order": so.name}, "lead"
+		)
+		if lead_name and client_access and client_access.get("pin"):
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				_stamp_party,
+			)
+
+			_stamp_party(
+				"Lead",
+				lead_name,
+				client_access.get("pin"),
+				client_access.get("phone_e164") or guest_phone,
+			)
+			frappe.db.commit()
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so.name}")
 
@@ -3355,13 +3595,23 @@ def create_guest_preorder(
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "webhook order_created")
 
-	return {
+	payload = {
 		"preorder_name": so.name,
 		"estimated_total": flt(so.grand_total),
 		"currency": so.currency,
 		"status": so.status,
 		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
 	}
+	if client_access and client_access.get("ok"):
+		payload["client_access"] = {
+			"pin": client_access.get("pin"),
+			"phone_e164": client_access.get("phone_e164"),
+			"is_new_number": client_access.get("is_new_number"),
+			"portal_path": client_access.get("portal_path") or "/cliente",
+			"sent": (client_access.get("send") or {}).get("sent"),
+			"channel": (client_access.get("send") or {}).get("channel"),
+		}
+	return payload
 
 
 @frappe.whitelist()
@@ -3904,6 +4154,29 @@ def update_guest_preorder_details(preorder_name, data=None):
 			_update_guest_preorder_tag(so, tag_key, str(data.get(data_key) or "").strip())
 			guest_tags_touched = True
 
+	# Auto-relate when still on a bucket customer and phone/local now match someone.
+	if not data.get("customer"):
+		cname = frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer
+		if _is_bucket_customer(so.customer, cname):
+			phone = (
+				str(data.get("guest_phone")).strip()
+				if "guest_phone" in data
+				else (_parse_remarks_tags(_guest_preorder_tag_text(so)).get("guest_phone") or "")
+			)
+			address = (
+				str(data.get("guest_address")).strip()
+				if "guest_address" in data
+				else (_parse_remarks_tags(_guest_preorder_tag_text(so)).get("guest_address") or "")
+			)
+			matched = _resolve_consulta_customer(
+				explicit=None, guest_phone=phone, guest_address=address
+			)
+			if matched and matched != so.customer and not _is_bucket_customer(
+				matched, frappe.db.get_value("Customer", matched, "customer_name")
+			):
+				so.customer = matched
+				_update_guest_preorder_tag(so, "customer", matched)
+
 	if data.get("cashier_user") is not None:
 		if not _can_view_all_guest_preorders():
 			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
@@ -3916,13 +4189,15 @@ def update_guest_preorder_details(preorder_name, data=None):
 		updates = {}
 		if data.get("delivery_date"):
 			updates["delivery_date"] = so.delivery_date
-		if data.get("customer"):
+		# Persist customer when explicitly set or auto-matched from phone/local.
+		if data.get("customer") or so.customer:
 			updates["customer"] = so.customer
 		tag_fn = _guest_preorder_tag_fieldname()
 		if tag_fn and (
 			data.get("customer")
 			or data.get("cashier_user") is not None
 			or guest_tags_touched
+			or so.customer
 		):
 			updates[tag_fn] = getattr(so, tag_fn, None)
 		if updates:

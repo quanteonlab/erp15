@@ -527,6 +527,40 @@ def suite_5_9_master_data():
         rows = api.get_guest_preorders_list(page_length=5)
         assert rows is not None
 
+    def check_consulta_phone_match():
+        """Non-empty phone on a known Customer auto-links the consulta (empty phones never match)."""
+        phone = "5491100112233"
+        cust = None
+        so_name = None
+        try:
+            cust = api.create_customer(
+                customer_name=f"Smoke Match Cust {frappe.generate_hash(length=6)}",
+                phone=phone,
+            )
+            cust_name = cust.get("name") if isinstance(cust, dict) else cust
+            assert cust_name and frappe.db.exists("Customer", cust_name)
+            empty = api.match_customers_for_consulta(guest_phone="", guest_address="")
+            assert isinstance(empty, dict) and empty.get("customers") == []
+            hits = api.match_customers_for_consulta(guest_phone=phone)
+            assert any(c.get("name") == cust_name for c in (hits.get("customers") or [])), hits
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke phone match consulta",
+                guest_phone=phone,
+                guest_name="Smoke Guest",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            assert frappe.db.get_value("Sales Order", so_name, "customer") == cust_name
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            if cust:
+                cname = cust.get("name") if isinstance(cust, dict) else cust
+                if cname and frappe.db.exists("Customer", cname):
+                    frappe.delete_doc("Customer", cname, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     _run("5.9.1 get_item_groups", check_item_groups, "S3")
     _run("5.9.2 get_price_lists", check_price_lists, "S3")
     _run("5.9.3 get_warehouses", check_warehouses, "S3")
@@ -538,6 +572,7 @@ def suite_5_9_master_data():
     _run("5.9.9 search_items", check_search_items, "S3")
     _run("5.9.10 get_items_for_label_print", check_labels, "S3")
     _run("5.9.11 get_guest_preorders_list", check_guest_preorders_list, "S3")
+    _run("5.9.12 consulta phone→customer match", check_consulta_phone_match, "S2")
 
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────
@@ -754,6 +789,14 @@ def suite_5_12_modules_read():
             cust_name = out["customer"]
             assert frappe.db.exists("Customer", cust_name)
             assert frappe.db.get_value("Lead", conv.name, "status") == "Converted"
+            assert frappe.db.get_value("Lead", conv.name, "custom_preventa_stage") == "customer"
+            # Converted leads must remain on the Preventa board under Cliente.
+            board_after = pa.get_my_board()
+            names_on_board = {l.get("name") for l in (board_after.get("leads") or [])}
+            assert conv.name in names_on_board, "converted lead vanished from Preventa board"
+            card = next(l for l in board_after["leads"] if l["name"] == conv.name)
+            assert card.get("stage") == "customer", card
+            assert card.get("customer") == cust_name, card
             # Idempotent second call
             again = pa.convert_lead_to_customer(lead=conv.name, customer_type="Individual")
             assert again and again.get("customer") == cust_name, again

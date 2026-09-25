@@ -1347,6 +1347,52 @@
       "expect": "ok"
     },
     {
+      "id": "match_customers_for_consulta_null_empty",
+      "source": "regression",
+      "bug": "match_customers_for_consulta with null/empty phone and local must not match empty Customer phones; controlled empty list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.match_customers_for_consulta",
+      "args": {
+        "guest_phone": null,
+        "guest_address": "",
+        "page_length": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "match_customers_for_consulta_blank_phone",
+      "source": "regression",
+      "bug": "blank guest_phone must not TypeError and must not false-match empty mobiles",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.match_customers_for_consulta",
+      "args": {
+        "guest_phone": "   ",
+        "guest_address": "   "
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "issue_client_access_pin_null_phone",
+      "source": "regression",
+      "bug": "issue_client_access_pin with null phone returns controlled ok:false, no TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.issue_client_access_pin",
+      "args": {
+        "guest_phone": null,
+        "allowed_countries": null,
+        "send": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_consultas_by_client_access_null",
+      "source": "regression",
+      "bug": "list_consultas_by_client_access null phone/pin is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.list_consultas_by_client_access",
+      "args": {
+        "phone": null,
+        "pin": null
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "update_guest_preorder_details_guest_fields_null",
       "source": "regression",
       "bug": "update_guest_preorder_details with null guest_* fields must not TypeError",
