@@ -1067,17 +1067,23 @@ def suite_5_12_modules_read():
         assert flt(rule.min_qty) == 2, rule
         assert cint(rule.disable) == 0, rule
         desc = cstr(frappe.db.get_value("Pricing Rule", rule_name, "rule_description") or "")
-        assert "[promo_style=pack]" in desc, desc
-        # Pack style: qty 5 list 1000 Oferta 800 min 2 → 2 packs × 2 × 200 = 800 savings
+        assert "[promo_style=threshold]" in desc, desc
+        # Threshold default: qty 5 list 1000 Oferta 800 min 2 → all 5 @ 800 → savings 1000
         cart = ecommerce_api.apply_cart_promotions(
             items=[{"item_code": sku_promo, "qty": 5, "rate": 1000, "amount": 5000}],
             price_list="Standard Selling",
         )
         lines = cart.get("line_discounts") or []
         assert lines, cart
-        assert abs(flt(lines[0].get("discount_amount")) - 800) < 0.01, cart
-        # Re-import as threshold → all 5 units at 800 → savings 1000
-        thresh_report = ecommerce_api.import_catalog_csv_products(
+        assert abs(flt(lines[0].get("discount_amount")) - 1000) < 0.01, cart
+        # qty 1 < min 2 → no discount
+        cart_low = ecommerce_api.apply_cart_promotions(
+            items=[{"item_code": sku_promo, "qty": 1, "rate": 1000, "amount": 1000}],
+            price_list="Standard Selling",
+        )
+        assert not (cart_low.get("line_discounts") or []), cart_low
+        # Re-import as pack → qty 5 min 2 → 2 packs × 2 × 200 = 800 savings
+        pack_report = ecommerce_api.import_catalog_csv_products(
             csv_text=promo_csv,
             price_list="Standard Selling",
             cash_price_list="Efectivo",
@@ -1089,20 +1095,51 @@ def suite_5_12_modules_read():
             batch_size=10,
             source="airtable",
             import_promotions=1,
-            promo_style="threshold",
+            promo_style="pack",
             image_mode="none",
-            file_name="smoke-airtable-oferta-threshold.csv",
+            file_name="smoke-airtable-oferta-pack.csv",
         )
-        assert cint(thresh_report.get("promo_updates") or 0) >= 1, thresh_report
-        desc_t = cstr(frappe.db.get_value("Pricing Rule", rule_name, "rule_description") or "")
-        assert "[promo_style=threshold]" in desc_t, desc_t
-        cart_t = ecommerce_api.apply_cart_promotions(
+        assert cint(pack_report.get("promo_updates") or 0) >= 1, pack_report
+        desc_p = cstr(frappe.db.get_value("Pricing Rule", rule_name, "rule_description") or "")
+        assert "[promo_style=pack]" in desc_p, desc_p
+        cart_p = ecommerce_api.apply_cart_promotions(
             items=[{"item_code": sku_promo, "qty": 5, "rate": 1000, "amount": 5000}],
             price_list="Standard Selling",
         )
-        lines_t = cart_t.get("line_discounts") or []
-        assert lines_t, cart_t
-        assert abs(flt(lines_t[0].get("discount_amount")) - 1000) < 0.01, cart_t
+        lines_p = cart_p.get("line_discounts") or []
+        assert lines_p, cart_p
+        assert abs(flt(lines_p[0].get("discount_amount")) - 800) < 0.01, cart_p
+        # xCaja → min_qty 4 (default box); threshold savings on qty 5
+        sku_caja = f"SMOKE-ATC-{frappe.generate_hash(length=6)}"
+        caja_csv = (
+            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\n"
+            f"{sku_caja},Smoke Caja Item,{leaf_promo},{parent_promo},SmokeBrand,En Stock,1000,1030,900,xCaja,\n"
+        )
+        caja_report = ecommerce_api.import_catalog_csv_products(
+            csv_text=caja_csv,
+            price_list="Standard Selling",
+            cash_price_list="Efectivo",
+            transfer_price_list="Transferencia",
+            default_item_group="Products",
+            update_existing=1,
+            create_missing_groups=1,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            import_promotions=1,
+            image_mode="none",
+            file_name="smoke-airtable-oferta-xcaja.csv",
+        )
+        assert cint(caja_report.get("promo_updates") or 0) >= 1, caja_report
+        rule_caja = f"AT-{sku_caja}"
+        assert flt(frappe.db.get_value("Pricing Rule", rule_caja, "min_qty")) == 4, rule_caja
+        cart_caja = ecommerce_api.apply_cart_promotions(
+            items=[{"item_code": sku_caja, "qty": 5, "rate": 1000, "amount": 5000}],
+            price_list="Standard Selling",
+        )
+        lines_caja = cart_caja.get("line_discounts") or []
+        assert lines_caja, cart_caja
+        assert abs(flt(lines_caja[0].get("discount_amount")) - 500) < 0.01, cart_caja
         # Clear Oferta → disable rule
         clear_csv = (
             "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\n"
@@ -1122,17 +1159,19 @@ def suite_5_12_modules_read():
         )
         assert cint(clear_report.get("promo_disabled") or 0) >= 1, clear_report
         assert cint(frappe.db.get_value("Pricing Rule", rule_name, "disable")) == 1
-        # cleanup promo item + rule
-        if frappe.db.exists("Pricing Rule", rule_name):
-            frappe.delete_doc("Pricing Rule", rule_name, ignore_permissions=True, force=1)
-        for pl in ("Standard Selling", "Efectivo", "Transferencia"):
-            pname = frappe.db.get_value(
-                "Item Price", {"item_code": sku_promo, "price_list": pl, "selling": 1}, "name"
-            )
-            if pname:
-                frappe.delete_doc("Item Price", pname, ignore_permissions=True, force=1)
-        if frappe.db.exists("Item", sku_promo):
-            frappe.delete_doc("Item", sku_promo, ignore_permissions=True, force=1)
+        # cleanup promo items + rules
+        for rn in (rule_name, rule_caja):
+            if frappe.db.exists("Pricing Rule", rn):
+                frappe.delete_doc("Pricing Rule", rn, ignore_permissions=True, force=1)
+        for sk in (sku_promo, sku_caja):
+            for pl in ("Standard Selling", "Efectivo", "Transferencia"):
+                pname = frappe.db.get_value(
+                    "Item Price", {"item_code": sk, "price_list": pl, "selling": 1}, "name"
+                )
+                if pname:
+                    frappe.delete_doc("Item Price", pname, ignore_permissions=True, force=1)
+            if frappe.db.exists("Item", sk):
+                frappe.delete_doc("Item", sk, ignore_permissions=True, force=1)
         for g in (leaf_promo, parent_promo, f"{parent_promo} › Otros"):
             if frappe.db.exists("Item Group", g):
                 try:
@@ -1471,7 +1510,6 @@ def suite_5_12_modules_read():
         if listed.get("rows"):
             detail = ba.get_purchase_order_detail(name=listed["rows"][0]["name"])
             assert detail.get("ok") and detail.get("order") and isinstance(detail["order"].get("lines"), list)
-<<<<<<< Updated upstream
         # Cost trail + cost_edited write Standard Buying
         item = frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
         if item:
@@ -1525,7 +1563,6 @@ def suite_5_12_modules_read():
                     frappe.db.commit()
                 except Exception:
                     pass
-=======
 
         # force_retag_po_currency: null → company default; bogus → controlled error
         null_out = ba.force_retag_po_currency(currency=None)
@@ -1580,7 +1617,6 @@ def suite_5_12_modules_read():
             finally:
                 frappe.delete_doc("Purchase Order", po.name, ignore_permissions=True, force=True)
                 frappe.db.commit()
->>>>>>> Stashed changes
     if frappe.db.exists("DocType", "Preventa Lead Consulta") or frappe.db.exists("DocType", "Preventa Settings"):
         _run("5.12.1 preventa settings + board", check_preventa, "S3")
     else:

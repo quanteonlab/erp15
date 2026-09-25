@@ -3120,6 +3120,9 @@ def create_guest_preorder(
 	company=None,
 	guest_address=None,
 	guest_notes=None,
+	guest_cuil=None,
+	guest_preferred_hours=None,
+	guest_observation=None,
 	is_delivery=0,
 	paid_amount=None,
 	mode_of_payment=None,
@@ -3148,7 +3151,10 @@ def create_guest_preorder(
 		import json
 		items = json.loads(items)
 
-	notes_only = bool(cstr(guest_notes or "").strip()) and not items
+	notes_only = (
+		bool(cstr(guest_notes or "").strip())
+		or bool(cstr(guest_observation or "").strip())
+	) and not items
 
 	if not items and not notes_only:
 		frappe.throw(_("Cart is empty"))
@@ -3230,6 +3236,14 @@ def create_guest_preorder(
 		remarks_parts.append(f"guest_address:{_sanitize_guest_tag(guest_address)}")
 	if guest_notes:
 		remarks_parts.append(f"guest_notes:{_sanitize_guest_tag(guest_notes)}")
+	if guest_cuil:
+		remarks_parts.append(f"guest_cuil:{_sanitize_guest_tag(guest_cuil)}")
+	if guest_preferred_hours:
+		remarks_parts.append(
+			f"guest_preferred_hours:{_sanitize_guest_tag(guest_preferred_hours)}"
+		)
+	if guest_observation:
+		remarks_parts.append(f"guest_observation:{_sanitize_guest_tag(guest_observation)}")
 	if mode_of_payment:
 		remarks_parts.append(f"guest_pay_method:{_sanitize_guest_tag(mode_of_payment)}")
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
@@ -3500,8 +3514,12 @@ def get_guest_preorder(preorder_name):
 		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
 		"guest_name": tags.get("guest_name") or None,
 		"guest_phone": tags.get("guest_phone") or None,
+		"guest_email": tags.get("guest_email") or None,
 		"guest_address": tags.get("guest_address") or None,
 		"guest_notes": tags.get("guest_notes") or None,
+		"guest_cuil": tags.get("guest_cuil") or None,
+		"guest_preferred_hours": tags.get("guest_preferred_hours") or None,
+		"guest_observation": tags.get("guest_observation") or None,
 		"is_delivery": tags.get("delivery") == "1",
 		"transaction_date": so.transaction_date,
 		"delivery_date": so.delivery_date,
@@ -3838,6 +3856,8 @@ def update_guest_preorder_details(preorder_name, data=None):
 	  paid_amount?,       # Absolute advance_paid target
 	  new_name?,          # Rename Sales Order
 	  cashier_user?,      # Assign/reassign POS cashier (tables.orders)
+	  guest_name?, guest_phone?, guest_email?, guest_address?,
+	  guest_notes?, guest_cuil?, guest_preferred_hours?, guest_observation?,
 	}
 	"""
 	if isinstance(data, str):
@@ -3868,6 +3888,22 @@ def update_guest_preorder_details(preorder_name, data=None):
 		so.customer = customer
 		_update_guest_preorder_tag(so, "customer", customer)
 
+	guest_tag_keys = (
+		("guest_name", "guest_name"),
+		("guest_phone", "guest_phone"),
+		("guest_email", "guest_email"),
+		("guest_address", "guest_address"),
+		("guest_notes", "guest_notes"),
+		("guest_cuil", "guest_cuil"),
+		("guest_preferred_hours", "guest_preferred_hours"),
+		("guest_observation", "guest_observation"),
+	)
+	guest_tags_touched = False
+	for data_key, tag_key in guest_tag_keys:
+		if data_key in data:
+			_update_guest_preorder_tag(so, tag_key, str(data.get(data_key) or "").strip())
+			guest_tags_touched = True
+
 	if data.get("cashier_user") is not None:
 		if not _can_view_all_guest_preorders():
 			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
@@ -3883,7 +3919,11 @@ def update_guest_preorder_details(preorder_name, data=None):
 		if data.get("customer"):
 			updates["customer"] = so.customer
 		tag_fn = _guest_preorder_tag_fieldname()
-		if tag_fn and (data.get("customer") or data.get("cashier_user") is not None):
+		if tag_fn and (
+			data.get("customer")
+			or data.get("cashier_user") is not None
+			or guest_tags_touched
+		):
 			updates[tag_fn] = getattr(so, tag_fn, None)
 		if updates:
 			frappe.db.set_value("Sales Order", current_name, updates)
@@ -6601,18 +6641,22 @@ def _airtable_oferta_rule_name(item_code: str) -> str:
 
 
 # Catalog CSV Oferta styles:
-# - pack (default): complete packs of N at Oferta; remainder at list (buy 8, N=3 → 2×3 oferta + 2 list)
-# - threshold: once qty >= N, all units at Oferta (legacy "desde xN")
+# - threshold (default): once qty >= N, all units at Oferta (x2 + x10 → pick best tier)
+# - pack: complete packs of N at Oferta; remainder at list (buy 8, N=3 → 2×3 oferta + 2 list)
 _CATALOG_PROMO_STYLES = ("pack", "threshold")
 _PROMO_STYLE_MARKER_RE = re.compile(r"\[promo_style=(pack|threshold)\]", re.I)
+# Airtable "xCaja" default box size; override via Item.custom_pack_qty or edit Pricing Rule.min_qty.
+_AIRTABLE_XCAJA_DEFAULT_QTY = 4.0
 
 
 def _normalize_catalog_promo_style(promo_style) -> str:
 	raw = cstr(promo_style or "").strip().lower()
+	if raw in ("pack", "packs", "nx", "nxm"):
+		return "pack"
 	if raw in ("threshold", "desde", "min_qty", "all_units", "fixed"):
 		return "threshold"
-	# Default (and anything dirty/empty) → pack Nx
-	return "pack"
+	# Default (and anything dirty/empty) → threshold (>=N all units at Oferta)
+	return "threshold"
 
 
 def _promo_style_from_rule(rule) -> str:
@@ -6626,7 +6670,7 @@ def _promo_style_from_rule(rule) -> str:
 
 
 def _parse_airtable_offer_min_qty(cantidad, item_code=None) -> float:
-	"""Cantidad labels → Pricing Rule.min_qty (x2→2, xCaja→pack, xc/unidad→1)."""
+	"""Cantidad labels → Pricing Rule.min_qty (x2→2, xCaja→4 or Item pack, xc/unidad→1)."""
 	raw = cstr(cantidad or "").strip().lower().replace(" ", "")
 	if not raw:
 		return 1.0
@@ -6641,7 +6685,8 @@ def _parse_airtable_offer_min_qty(cantidad, item_code=None) -> float:
 			"Item", "custom_pack_qty"
 		):
 			pack = flt(frappe.db.get_value("Item", item_code, "custom_pack_qty") or 0)
-		return pack if pack > 1 else 1.0
+		# Default caja = 4; use Item pack when already set (>1); editable later on the Oferta rule.
+		return pack if pack > 1 else _AIRTABLE_XCAJA_DEFAULT_QTY
 	return 1.0
 
 
@@ -6669,12 +6714,12 @@ def _rate_rule_discount(unit_rate, offer, qty, min_qty, promo_style) -> float:
 	return (unit_rate - offer) * qty
 
 
-def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qty, promo_style="pack"):
+def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qty, promo_style="threshold"):
 	"""Create/update/disable Pricing Rule from Airtable Oferta + Cantidad.
 
 	promo_style:
-	- pack (default): N units at Oferta per complete pack; remainder list price
-	- threshold: once qty >= N, every unit at Oferta
+	- threshold (default): once qty >= N, every unit at Oferta (x2 / x10 tiers stack via best rule)
+	- pack: N units at Oferta per complete pack; remainder list price
 
 	Stored as Price + Rate with [promo_style=…] in rule_description for cart/catalog.
 	Returns: created | updated | disabled | skipped
@@ -7440,7 +7485,7 @@ def import_catalog_csv_products(
 	column_map=None,
 	image_mode="blank",
 	import_promotions=1,
-	promo_style="pack",
+	promo_style="threshold",
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
@@ -7455,7 +7500,8 @@ def import_catalog_csv_products(
 	image_mode: blank (only empty Item.image) | all (always override) | none.
 	import_promotions: when 1, Airtable Oferta+Cantidad (or custom offer_rate/
 	offer_qty) upsert Pricing Rules (Rate + min_qty).
-	promo_style: pack (default, Nx packs at Oferta) | threshold (all units once min_qty).
+	promo_style: threshold (default, all units at Oferta once qty >= N; xCaja→4)
+	| pack (Nx complete packs at Oferta).
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir

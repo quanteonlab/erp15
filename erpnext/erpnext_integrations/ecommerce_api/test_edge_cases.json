@@ -686,7 +686,7 @@
     {
       "id": "import_catalog_csv_promo_style_null",
       "source": "regression",
-      "bug": "promo_style null/\"\" must default pack; dirty style must not TypeError",
+      "bug": "promo_style null/\"\" must default threshold (>=N all at Oferta); dirty style must not TypeError",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
       "args": {
         "csv_text": "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\nEDGE-PSTYLE,Edge Pack Style,EdgeLeaf2,EdgeParent2,,En Stock,100,110,80,x3,\n",
@@ -700,6 +700,25 @@
         "start": 0,
         "batch_size": 10,
         "file_name": "edge-promo-style-null.csv"
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "parse_airtable_offer_xcaja_default_4",
+      "source": "regression",
+      "bug": "xCaja Cantidad must resolve to min_qty>=4 (not 1) when Item has no custom_pack_qty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\nEDGE-XCAJA,Edge XCaja,EdgeLeafXc,EdgeParentXc,,En Stock,100,110,90,xCaja,\n",
+        "source": "airtable",
+        "price_list": "Standard Selling",
+        "update_existing": 1,
+        "create_missing_groups": 1,
+        "import_promotions": 1,
+        "image_mode": "none",
+        "start": 0,
+        "batch_size": 10,
+        "file_name": "edge-xcaja-default.csv"
       },
       "expect": "no_500"
     },
@@ -1147,7 +1166,6 @@
       "expect": "no_500"
     },
     {
-<<<<<<< Updated upstream
       "id": "buying_cost_trail_null_item",
       "source": "regression",
       "bug": "list_item_buying_cost_trail with null item_code is controlled ValidationError",
@@ -1187,7 +1205,8 @@
         "submit": 0
       },
       "expect": "no_500"
-=======
+    },
+    {
       "id": "buying_force_retag_po_currency_null",
       "source": "regression",
       "bug": "force_retag_po_currency with null currency must fall back to company default (no FX retag), not TypeError/500",
@@ -1208,7 +1227,6 @@
         "company": null
       },
       "expect": "error"
->>>>>>> Stashed changes
     },
     {
       "id": "create_product_row_nos_single_uom",
@@ -1299,6 +1317,41 @@
       "args": {
         "items": [],
         "guest_notes": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "create_guest_preorder_extra_fields_null",
+      "source": "regression",
+      "bug": "create_guest_preorder with null guest_cuil / preferred_hours / observation must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge extra fields null",
+        "guest_cuil": null,
+        "guest_preferred_hours": null,
+        "guest_observation": null,
+        "guest_address": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "update_guest_preorder_details_guest_fields_null",
+      "source": "regression",
+      "bug": "update_guest_preorder_details with null guest_* fields must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_details",
+      "args": {
+        "preorder_name": "",
+        "data": {
+          "guest_name": null,
+          "guest_phone": null,
+          "guest_email": null,
+          "guest_address": null,
+          "guest_notes": null,
+          "guest_cuil": null,
+          "guest_preferred_hours": null,
+          "guest_observation": null
+        }
       },
       "expect": "no_500"
     },
