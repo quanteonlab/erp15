@@ -122,6 +122,8 @@ def _normalize_pos_display(raw) -> dict:
 		"orderPrintAllowUnpaid": _as_bool(src.get("orderPrintAllowUnpaid"), True),
 		"orderPrintWarnMissingDn": _as_bool(src.get("orderPrintWarnMissingDn"), True),
 		"orderPrintAllowMissingDn": _as_bool(src.get("orderPrintAllowMissingDn"), True),
+		# Default False: client usually orders by qty; warehouse reweighs (armado "Peso real").
+		"orderPrintClientKnowsWeight": _as_bool(src.get("orderPrintClientKnowsWeight"), False),
 		# Kept for forward-compat if clients send them; personal prefs stay client-local.
 		"headerToggleShortcut": shortcut.strip(),
 	}

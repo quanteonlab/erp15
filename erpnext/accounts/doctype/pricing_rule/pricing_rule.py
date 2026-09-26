@@ -451,8 +451,11 @@ def get_pricing_rule_for_item(args, doc=None, for_validate=False):
 				pricing_rule.apply_rule_on_other_items = (
 					get_pricing_rule_items(pricing_rule, other_items=fetch_other_item) or []
 				)
+			elif isinstance(pricing_rule, dict):
+				# get_pricing_rules may return dict rows — attribute access crashes.
+				pricing_rule = frappe._dict(pricing_rule)
 
-			if pricing_rule.coupon_code_based == 1:
+			if pricing_rule.get("coupon_code_based") == 1:
 				if not args.coupon_code:
 					continue
 				coupon_code = frappe.db.get_value(

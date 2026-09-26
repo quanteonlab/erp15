@@ -457,14 +457,24 @@ _STARTER_VENTAS = [
 	"ops.preventa",
 	"ops.catalog",
 	"tables.orders",
+	"tables.orders.all",
+	"tables.crm",
 	"tools.catalog_pdf",
 ]
+# Field driver / conductor app — assigned trips + PoD, not full route planning.
+_STARTER_DRIVER = [
+	"ops.delivery",
+]
+# Alias of ventas for EN-labeled sites / Vista previa “Sales”.
+_STARTER_SALES = list(_STARTER_VENTAS)
 
 
 STARTER_STAFF_GROUPS = [
 	{"employee_group_name": "repositor", "permissions": list(_STARTER_REPOSITOR)},
 	{"employee_group_name": "caja", "permissions": list(_STARTER_CAJA)},
 	{"employee_group_name": "ventas", "permissions": list(_STARTER_VENTAS)},
+	{"employee_group_name": "Sales", "permissions": list(_STARTER_SALES)},
+	{"employee_group_name": "Driver", "permissions": list(_STARTER_DRIVER)},
 	{
 		"employee_group_name": "admin",
 		"permissions": sorted(KNOWN_PERMISSION_IDS),

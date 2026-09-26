@@ -14,6 +14,7 @@ import os
 import re
 import base64
 import zipfile
+from contextlib import contextmanager
 from frappe import _
 from frappe.utils import (
 	cint,
@@ -2399,6 +2400,56 @@ def _resolve_consulta_customer(explicit=None, guest_phone=None, guest_address=No
 	return _get_or_create_consumidor_final()
 
 
+def _party_linked_docs(party_type, party, parenttype):
+	"""Return Address/Contact names linked to a party via Dynamic Link."""
+	if not party:
+		return []
+	return frappe.get_all(
+		"Dynamic Link",
+		filters={"link_doctype": party_type, "link_name": party, "parenttype": parenttype},
+		pluck="parent",
+		ignore_permissions=True,
+	) or []
+
+
+def _resync_so_party_links(so):
+	"""Drop or replace contact/address that belong to the previous customer.
+
+	Relacionar Consulta → Cliente fails with HTTP 417
+	"Contact Person does not belong to …" when the draft still carries
+	Consumidor Final's contact after ``so.customer`` is changed.
+
+	Returns True if any party-link field was changed.
+	"""
+	customer = cstr(getattr(so, "customer", None) or "").strip()
+	if not customer:
+		return False
+
+	contacts = set(_party_linked_docs("Customer", customer, "Contact"))
+	addresses = set(_party_linked_docs("Customer", customer, "Address"))
+	changed = False
+
+	contact = cstr(getattr(so, "contact_person", None) or "").strip()
+	if contact and contact not in contacts:
+		so.contact_person = next(iter(contacts), None)
+		for field in ("contact_display", "contact_mobile", "contact_email", "contact_phone"):
+			if hasattr(so, field):
+				so.set(field, None)
+		changed = True
+
+	billing = cstr(getattr(so, "customer_address", None) or "").strip()
+	if billing and billing not in addresses:
+		so.customer_address = None
+		changed = True
+
+	shipping = cstr(getattr(so, "shipping_address_name", None) or "").strip()
+	if shipping and shipping not in addresses:
+		so.shipping_address_name = None
+		changed = True
+
+	return changed
+
+
 @frappe.whitelist(allow_guest=True)
 def match_customers_for_consulta(guest_phone=None, guest_address=None, page_length=10):
 	"""Suggest existing Customers for a consulta (phone first, then local/address).
@@ -2727,9 +2778,17 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 		ensure_client_access_custom_fields()
 	except Exception:
 		pass
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+			ensure_preferred_delivery_hours,
+		)
+
+		ensure_preferred_delivery_hours()
+	except Exception:
+		pass
 
 	term = (search_term or "").strip()
-	limit = max(1, min(cint(page_length) or 20, 100))
+	limit = max(1, min(cint(page_length) or 20, 200))
 	filters = {"disabled": 0}
 	or_filters = None
 	if term:
@@ -2738,24 +2797,31 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 			["name", "like", like],
 			["customer_name", "like", like],
 			["mobile_no", "like", like],
+			["tax_id", "like", like],
 		]
+
+	base_fields = [
+		"name",
+		"customer_name",
+		"mobile_no",
+		"email_id",
+		"customer_group",
+		"territory",
+		"tax_id",
+		"tax_category",
+		"primary_address",
+		"customer_primary_address",
+	]
+	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		base_fields += ["custom_client_access_pin", "custom_client_phone_e164"]
+	if frappe.db.has_column("Customer", "custom_preferred_hours"):
+		base_fields.append("custom_preferred_hours")
 
 	rows = frappe.get_all(
 		"Customer",
 		filters=filters,
 		or_filters=or_filters,
-		fields=[
-			"name",
-			"customer_name",
-			"mobile_no",
-			"email_id",
-			"customer_group",
-			"territory",
-			"custom_client_access_pin",
-			"custom_client_phone_e164",
-		]
-		if frappe.db.has_column("Customer", "custom_client_access_pin")
-		else ["name", "customer_name", "mobile_no", "email_id", "customer_group", "territory"],
+		fields=base_fields,
 		order_by="customer_name asc",
 		limit_page_length=limit,
 		ignore_permissions=True,
@@ -2769,6 +2835,11 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"email": r.email_id,
 				"customer_group": r.customer_group,
 				"territory": r.territory,
+				"tax_id": r.tax_id,
+				"tax_category": r.tax_category,
+				"primary_address": r.primary_address,
+				"customer_primary_address": r.customer_primary_address,
+				"preferred_hours": getattr(r, "custom_preferred_hours", None),
 				"client_access_pin": getattr(r, "custom_client_access_pin", None),
 				"client_phone_e164": getattr(r, "custom_client_phone_e164", None),
 				"is_bucket": (r.customer_name or r.name or "")
@@ -2855,6 +2926,55 @@ def search_suppliers(search_term="", page_length=20, ensure_buckets=0):
 
 
 @frappe.whitelist(allow_guest=True)
+def list_crm_customer_options():
+	"""CRM clients table: territories, tax categories, preferred delivery hours (by priority)."""
+	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+		list_preferred_delivery_hours,
+	)
+
+	hours = list_preferred_delivery_hours(include_disabled=0)
+	territories = frappe.get_all(
+		"Territory",
+		fields=["name"],
+		order_by="name asc",
+		ignore_permissions=True,
+	)
+	tax_categories = []
+	if frappe.db.exists("DocType", "Tax Category"):
+		tax_categories = frappe.get_all(
+			"Tax Category",
+			fields=["name"],
+			order_by="name asc",
+			ignore_permissions=True,
+		)
+	return {
+		"preferred_hours": hours.get("hours") or [],
+		"territories": [r.name for r in territories],
+		"tax_categories": [r.name for r in tax_categories],
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_preferred_delivery_hours(include_disabled=0):
+	"""Proxy — Preferred Delivery Hours sorted by priority."""
+	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+		list_preferred_delivery_hours as _list,
+	)
+
+	return _list(include_disabled=include_disabled)
+
+
+@frappe.whitelist(allow_guest=True)
+def save_preferred_delivery_hours(hours=None):
+	"""Proxy — edit Preferred Delivery Hours master list from CRM."""
+	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+		save_preferred_delivery_hours as _save,
+	)
+
+	return _save(hours=hours)
+
+
+@frappe.whitelist(allow_guest=True)
 def update_customer(customer_name, **kwargs):
 	"""
 	Update customer details
@@ -2877,17 +2997,52 @@ def update_customer(customer_name, **kwargs):
 	allowed_fields = [
 		"customer_name", "customer_group", "territory", "customer_type",
 		"default_currency", "default_price_list", "default_sales_partner",
-		"mobile_no", "email_id",
+		"mobile_no", "email_id", "tax_id", "tax_category",
 	]
+	if frappe.db.has_column("Customer", "custom_preferred_hours"):
+		allowed_fields.append("custom_preferred_hours")
+		# Frontend may send preferred_hours alias
+		if "preferred_hours" in kwargs and "custom_preferred_hours" not in kwargs:
+			kwargs["custom_preferred_hours"] = kwargs.get("preferred_hours")
 
 	for field, value in kwargs.items():
 		if field in allowed_fields:
 			customer.set(field, value)
 
+	# Optional primary address line update (CRM editable Address column)
+	addr_line = kwargs.get("address_line1")
+	if addr_line is not None:
+		_update_customer_primary_address_line(customer, cstr(addr_line).strip())
+
 	customer.save(ignore_permissions=True)
 	frappe.db.commit()
 
 	return customer.as_dict()
+
+
+def _update_customer_primary_address_line(customer, address_line1: str):
+	"""Create or patch the customer's primary Address.address_line1."""
+	addr_name = customer.customer_primary_address
+	if addr_name and frappe.db.exists("Address", addr_name):
+		frappe.db.set_value("Address", addr_name, "address_line1", address_line1 or "")
+		customer.primary_address = frappe.db.get_value("Address", addr_name, "address_line1")
+		return
+	if not address_line1:
+		return
+	addr = frappe.get_doc(
+		{
+			"doctype": "Address",
+			"address_title": customer.customer_name or customer.name,
+			"address_type": "Billing",
+			"address_line1": address_line1,
+			"city": "-",
+			"country": frappe.db.get_default("country") or "Argentina",
+			"links": [{"link_doctype": "Customer", "link_name": customer.name}],
+		}
+	)
+	addr.insert(ignore_permissions=True)
+	customer.customer_primary_address = addr.name
+	customer.primary_address = address_line1
 
 
 @frappe.whitelist(allow_guest=True)
@@ -3236,6 +3391,335 @@ def _guest_preorder_tag_text(so_or_dict):
 
 def _cashier_from_guest_preorder(so_or_dict):
 	return _parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("cashier") or None
+
+
+def _delivery_date_forced_from_tags(so_or_dict) -> bool:
+	return (_parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("delivery_forced") or "") in (
+		"1",
+		"true",
+		"yes",
+	)
+
+
+def _weekday_base_label(raw) -> str:
+	"""Normalize ``Mon``, ``Mon(1 Man)``, ``Lunes`` → ``Mon``..``Sun``."""
+	s = cstr(raw or "").strip()
+	if not s:
+		return ""
+	head = s.split("(", 1)[0].strip()
+	aliases = {
+		"mon": "Mon",
+		"tue": "Tue",
+		"wed": "Wed",
+		"thu": "Thu",
+		"fri": "Fri",
+		"sat": "Sat",
+		"sun": "Sun",
+		"lun": "Mon",
+		"mar": "Tue",
+		"mie": "Wed",
+		"mié": "Wed",
+		"jue": "Thu",
+		"vie": "Fri",
+		"sab": "Sat",
+		"sáb": "Sat",
+		"dom": "Sun",
+		"lu": "Mon",
+		"ma": "Tue",
+		"mi": "Wed",
+		"ju": "Thu",
+		"vi": "Fri",
+		"sa": "Sat",
+		"do": "Sun",
+	}
+	key = head[:3].lower() if len(head) >= 3 else head.lower()
+	mapped = aliases.get(key) or aliases.get(head.lower())
+	if mapped:
+		return mapped
+	title = head[:3].title() if len(head) >= 3 else head.title()
+	if title in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
+		return title
+	return ""
+
+
+def _customer_address_zone_map(customer_names):
+	"""Batch: customer → {address, territory, zone} (zone prefers Address.custom_zone)."""
+	out = {}
+	names = list({cstr(c).strip() for c in (customer_names or []) if cstr(c).strip()})
+	if not names:
+		return out
+	customers = frappe.get_all(
+		"Customer",
+		filters={"name": ["in", names]},
+		fields=["name", "territory", "customer_primary_address", "primary_address"],
+		ignore_permissions=True,
+	)
+	addr_names = [c.customer_primary_address for c in customers if c.customer_primary_address]
+	addr_by_name = {}
+	if addr_names:
+		addr_fields = ["name", "address_line1", "address_line2", "city"]
+		if frappe.db.has_column("Address", "custom_zone"):
+			addr_fields.append("custom_zone")
+		for row in frappe.get_all(
+			"Address",
+			filters={"name": ["in", addr_names]},
+			fields=addr_fields,
+			ignore_permissions=True,
+		):
+			addr_by_name[row.name] = row
+
+	for c in customers:
+		addr = addr_by_name.get(c.customer_primary_address) or {}
+		bits = [
+			cstr(addr.get("address_line1") or "").strip(),
+			cstr(addr.get("address_line2") or "").strip(),
+			cstr(addr.get("city") or "").strip(),
+		]
+		street = ", ".join(b for b in bits if b and b != "-")
+		primary = cstr(c.primary_address or "").replace("<br>", ", ").replace("<br/>", ", ").strip()
+		zone = cstr(addr.get("custom_zone") or "").strip() or cstr(c.territory or "").strip() or None
+		out[c.name] = {
+			"address": street or primary or None,
+			"territory": cstr(c.territory or "").strip() or None,
+			"zone": zone,
+		}
+	return out
+
+
+def _tms_zone_visit_days(zone_label):
+	label = cstr(zone_label or "").strip()
+	if not label:
+		return []
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _load_tms_zones
+
+		zones = _load_tms_zones() or []
+	except Exception:
+		return []
+	lu = label.upper()
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		code = cstr(z.get("code") or "").strip()
+		name = cstr(z.get("name") or "").strip()
+		if code.upper() == lu or name.upper() == lu or lu in name.upper() or (code and code.upper() in lu):
+			raw_days = z.get("visit_days") or []
+			bases = []
+			for d in raw_days:
+				b = _weekday_base_label(d)
+				if b and b not in bases:
+					bases.append(b)
+			return bases
+	return []
+
+
+def _auto_delivery_date_for_zone(zone_label, as_of=None):
+	days = _tms_zone_visit_days(zone_label)
+	if not days:
+		return None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _next_due_on_weekdays
+
+		due = _next_due_on_weekdays(getdate(as_of) if as_of else getdate(), days)
+		return str(due) if due else None
+	except Exception:
+		return None
+
+
+def _zone_matching_weekday(weekday_label, prefer=None):
+	"""Pick a TMS zone that visits ``weekday_label`` (Mon..Sun), preferring ``prefer``."""
+	wanted = _weekday_base_label(weekday_label)
+	if not wanted:
+		return None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _load_tms_zones
+
+		zones = _load_tms_zones() or []
+	except Exception:
+		return None
+	prefer_u = cstr(prefer or "").strip().upper()
+	matches = []
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		days = [_weekday_base_label(d) for d in (z.get("visit_days") or [])]
+		if wanted not in days:
+			continue
+		code = cstr(z.get("code") or "").strip()
+		name = cstr(z.get("name") or "").strip()
+		label = code or name
+		if prefer_u and (code.upper() == prefer_u or name.upper() == prefer_u):
+			return label
+		matches.append(label)
+	return matches[0] if matches else None
+
+
+def _set_customer_zone_and_address(customer, *, territory=None, zone=None, address_line1=None):
+	"""Update Customer.territory / primary address / Address.custom_zone."""
+	cust_name = cstr(customer or "").strip()
+	if not cust_name or not frappe.db.exists("Customer", cust_name):
+		frappe.throw(_("Customer {0} not found").format(cust_name or "?"))
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Customer", cust_name)
+	frappe.flags.ignore_permissions = False
+	if territory is not None:
+		doc.territory = cstr(territory or "").strip() or doc.territory
+	zone_val = cstr(zone if zone is not None else territory or "").strip()
+	if address_line1 is not None:
+		_update_customer_primary_address_line(doc, cstr(address_line1).strip())
+	doc.save(ignore_permissions=True)
+	if zone_val:
+		addr_name = doc.customer_primary_address
+		if addr_name and frappe.db.exists("Address", addr_name) and frappe.db.has_column(
+			"Address", "custom_zone"
+		):
+			frappe.db.set_value("Address", addr_name, "custom_zone", zone_val, update_modified=True)
+		# Keep territory aligned with delivery zona when CRM territory is empty or zone-like.
+		if not doc.territory or doc.territory == "All Territories":
+			if frappe.db.exists("Territory", zone_val):
+				frappe.db.set_value("Customer", cust_name, "territory", zone_val, update_modified=True)
+			elif territory is not None and cstr(territory).strip():
+				pass
+			else:
+				# Store zone label on territory only when Territory master has it.
+				pass
+	return _customer_address_zone_map([cust_name]).get(cust_name) or {}
+
+
+def _item_line_weight_fields(item_code, line_uom=None):
+	stock_uom, weight_per_unit, weight_uom = "", 0.0, ""
+	unit = ""
+	try:
+		fields = ["stock_uom", "weight_per_unit", "weight_uom"]
+		if frappe.db.has_column("Item", "custom_unit"):
+			fields.append("custom_unit")
+		row = frappe.db.get_value("Item", item_code, fields, as_dict=True) if item_code else None
+		if row:
+			stock_uom = row.get("stock_uom") or ""
+			weight_per_unit = float(row.get("weight_per_unit") or 0)
+			weight_uom = row.get("weight_uom") or ""
+			unit = row.get("custom_unit") or ""
+	except Exception:
+		pass
+	sell_uom = cstr(line_uom or "").strip() or stock_uom
+	uoms = {
+		cstr(stock_uom).strip().lower(),
+		cstr(weight_uom).strip().lower(),
+		cstr(unit).strip().lower(),
+		cstr(sell_uom).strip().lower(),
+	}
+	weight_tokens = {
+		"weight",
+		"por peso",
+		"porpeso",
+		"kg",
+		"kgs",
+		"g",
+		"gr",
+		"gram",
+		"grams",
+		"l",
+		"lt",
+		"ml",
+		"milliliter",
+	}
+	is_weight_based = bool(uoms & weight_tokens)
+	return {
+		# Prefer the Sales Order line UOM so Pedidos "Tipo de peso" persists after save.
+		"stock_uom": sell_uom or stock_uom,
+		"uom": sell_uom or stock_uom,
+		"item_stock_uom": stock_uom,
+		"weight_uom": weight_uom,
+		"weight_per_unit": weight_per_unit,
+		"unit": unit,
+		"is_weight_based": is_weight_based,
+	}
+
+
+def _normalize_preorder_line_uom(raw_uom):
+	"""Map UI labels (WEIGHT / NOS (single) / CAJA) to ERPNext UOM master names."""
+	from erpnext.erpnext_integrations.ecommerce_api.product_manager import _normalize_stock_uom
+
+	return _normalize_stock_uom(cstr(raw_uom or "").strip() or None)
+
+
+def _weight_sell_uom_tokens():
+	return {
+		"weight",
+		"por peso",
+		"porpeso",
+		"kg",
+		"kgs",
+		"g",
+		"gr",
+		"gram",
+		"grams",
+		"l",
+		"lt",
+		"ml",
+		"milliliter",
+	}
+
+
+def _is_weight_sell_uom(uom):
+	return cstr(uom or "").strip().lower() in _weight_sell_uom_tokens()
+
+
+@contextmanager
+def _allow_weight_fractional_stock_qty(so):
+	"""Re-align stock_uom after set_missing resets it to Item Nos (whole-number check)."""
+	from erpnext.utilities import transaction_base as tb
+
+	orig = tb.validate_uom_is_integer
+
+	def _patched(doc, uom_field, qty_fields, child_dt=None):
+		if doc is so:
+			for row in doc.get("items") or []:
+				if _is_weight_sell_uom(row.uom):
+					row.stock_uom = row.uom
+					row.conversion_factor = 1.0
+					row.stock_qty = flt(row.qty)
+		return orig(doc, uom_field, qty_fields, child_dt)
+
+	tb.validate_uom_is_integer = _patched
+	so.flags.ecommerce_weight_sell = True
+	try:
+		yield
+	finally:
+		tb.validate_uom_is_integer = orig
+		so.flags.ecommerce_weight_sell = False
+
+
+def _apply_so_line_uom(row, raw_uom):
+	"""Set Sales Order Item.uom so fractional qty is allowed when selling by WEIGHT.
+
+	ERPNext also validates stock_qty against stock_uom (usually Nos). For Armado /
+	WEIGHT sells we align stock_uom to the sell UOM with conversion_factor=1 so
+	fractional kg does not trip 'Must be Whole Number' on Nos.
+	"""
+	if raw_uom is None and not cstr(getattr(row, "uom", "") or "").strip():
+		return
+	uom = _normalize_preorder_line_uom(raw_uom if raw_uom is not None else row.uom)
+	if not uom:
+		return
+	row.uom = uom
+	if _is_weight_sell_uom(uom):
+		row.stock_uom = uom
+		row.conversion_factor = 1.0
+		row.stock_qty = flt(row.qty)
+		return
+	try:
+		from erpnext.stock.get_item_details import get_conversion_factor
+
+		row.conversion_factor = flt(
+			get_conversion_factor(row.item_code, uom).get("conversion_factor") or 1.0
+		)
+	except Exception:
+		row.conversion_factor = flt(getattr(row, "conversion_factor", None) or 1.0)
+	# Restore item stock UOM when leaving WEIGHT back to Nos/CAJA.
+	item_stock = frappe.db.get_value("Item", row.item_code, "stock_uom") or "Nos"
+	row.stock_uom = item_stock
+	row.stock_qty = flt(row.qty) * flt(row.conversion_factor)
 
 
 def _update_guest_preorder_tag(so, key: str, value: str | None) -> None:
@@ -3732,6 +4216,18 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			o.get("grand_total", 0),
 			o.get("advance_paid", 0),
 		)
+		o["delivery_date_forced"] = _delivery_date_forced_from_tags(o)
+
+	geo = _customer_address_zone_map([o.get("customer") for o in filtered])
+	for o in filtered:
+		info = geo.get(o.get("customer")) or {}
+		o["address"] = info.get("address")
+		o["territory"] = info.get("territory")
+		o["zone"] = info.get("zone")
+		# Fallback: guest_address tag when customer has no street yet.
+		if not o.get("address"):
+			tags = _parse_remarks_tags(_guest_preorder_tag_text(o))
+			o["address"] = tags.get("guest_address") or None
 
 	return {"preorders": filtered, "total_count": total_count}
 
@@ -3757,6 +4253,8 @@ def get_guest_preorder(preorder_name):
 			key, val = part.split(":", 1)
 			tags[key.strip()] = val.strip()
 
+	geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
+
 	return {
 		"name": so.name,
 		"order_type": so.order_type,
@@ -3773,6 +4271,10 @@ def get_guest_preorder(preorder_name):
 		"is_delivery": tags.get("delivery") == "1",
 		"transaction_date": so.transaction_date,
 		"delivery_date": so.delivery_date,
+		"delivery_date_forced": _delivery_date_forced_from_tags(so),
+		"address": geo.get("address") or tags.get("guest_address") or None,
+		"territory": geo.get("territory"),
+		"zone": geo.get("zone"),
 		"docstatus": so.docstatus,
 		"status": so.status,
 		"display_status": _display_status(so),
@@ -3793,6 +4295,10 @@ def get_guest_preorder(preorder_name):
 				"rate": flt(d.rate),
 				"amount": flt(d.amount),
 				"discount_percentage": flt(getattr(d, "discount_percentage", 0)),
+				**_item_line_weight_fields(
+					d.item_code,
+					line_uom=getattr(d, "uom", None),
+				),
 			}
 			for d in (so.items or [])
 		],
@@ -3951,7 +4457,11 @@ def set_guest_preorder_status(preorder_name, target_status):
 	_require_guest_preorder_visible(so)
 
 	if so.docstatus == 2:
-		frappe.throw(_("Cannot change status of a cancelled order"))
+		# Archivado → amend into a new Consulta draft, then optionally advance.
+		new_detail = unarchive_guest_preorder(preorder_name)
+		if target_status == "Consulta":
+			return new_detail
+		return set_guest_preorder_status(new_detail["name"], target_status)
 
 	current = _display_status(so)
 	current_base = "Completado" if str(current).startswith("Completado") else current
@@ -3981,6 +4491,12 @@ def set_guest_preorder_status(preorder_name, target_status):
 	# Submit draft if needed for forward transitions
 	if so.docstatus == 0:
 		try:
+			# Safety: stale Consumidor Final contact must not block Consulta→Orden.
+			if _resync_so_party_links(so):
+				so.flags.ignore_permissions = True
+				so.flags.ignore_mandatory = True
+				so.save(ignore_permissions=True)
+				so.reload()
 			so.flags.ignore_permissions = True
 			so.submit()
 			so.reload()
@@ -4064,6 +4580,40 @@ def mark_prepared_guest_preorder(preorder_name):
 	return result
 
 
+@frappe.whitelist(allow_guest=True)
+def unarchive_guest_preorder(preorder_name=None):
+	"""Restore an Archivado (cancelled) guest preorder as a new Consulta draft.
+
+	ERPNext cannot reopen a cancelled Sales Order in place — we amend it:
+	copy the cancelled doc into a new draft linked via ``amended_from``.
+	"""
+	name = cstr(preorder_name or "").strip()
+	if not name:
+		frappe.throw(_("Sales Order name is required"))
+	if not frappe.db.exists("Sales Order", name):
+		frappe.throw(_("Sales Order {0} not found").format(name))
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+
+	if so.docstatus != 2:
+		frappe.throw(_("Order is not archived"))
+
+	new_so = frappe.copy_doc(so)
+	new_so.amended_from = so.name
+	new_so.docstatus = 0
+	# Clear cancel markers so the draft looks like a fresh Consulta.
+	if hasattr(new_so, "status"):
+		new_so.status = "Draft"
+	new_so.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return get_guest_preorder(new_so.name)
+
+
 @frappe.whitelist()
 def unmark_prepared_guest_preorder(preorder_name):
 	"""Move Preparado / later custom steps back to Orden."""
@@ -4101,6 +4651,9 @@ def update_guest_preorder_details(preorder_name, data=None):
 
 	data: {
 	  delivery_date?,
+	  delivery_date_forced?,  # bool / 0 / 1 — black date when forced; blue when auto
+	  address_line1? / address?,
+	  territory? / zone?,     # CRM territory + Address.custom_zone; auto-recomputes delivery when not forced
 	  customer?,          # Customer link (must exist)
 	  customer_name?,     # Display name on Customer
 	  paid_amount?,       # Absolute advance_paid target
@@ -4125,11 +4678,67 @@ def update_guest_preorder_details(preorder_name, data=None):
 		frappe.throw(_("Cannot edit a cancelled order"))
 
 	current_name = so.name
+	geo_touched = False
+	force_flag = None
+	if "delivery_date_forced" in data:
+		raw_f = data.get("delivery_date_forced")
+		force_flag = str(raw_f).strip().lower() in ("1", "true", "yes") if raw_f is not None and raw_f != "" else False
 
-	if data.get("delivery_date"):
+	addr_val = data.get("address_line1") if "address_line1" in data else data.get("address")
+	zone_val = data.get("zone") if "zone" in data else data.get("territory")
+	if addr_val is not None or zone_val is not None or ("territory" in data):
+		territory_val = data.get("territory") if "territory" in data else zone_val
+		_set_customer_zone_and_address(
+			so.customer,
+			territory=territory_val if territory_val is not None else None,
+			zone=zone_val if zone_val is not None else territory_val,
+			address_line1=addr_val if addr_val is not None else None,
+		)
+		geo_touched = True
+		if force_flag is not True:
+			# Zone change → auto delivery date (unless explicitly forcing).
+			geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
+			auto_due = _auto_delivery_date_for_zone(geo.get("zone") or geo.get("territory"))
+			if auto_due:
+				so.delivery_date = getdate(auto_due)
+				for row in so.items or []:
+					row.delivery_date = so.delivery_date
+			_update_guest_preorder_tag(so, "delivery_forced", None)
+			force_flag = False
+
+	if data.get("delivery_date") is not None and str(data.get("delivery_date") or "").strip() != "":
 		so.delivery_date = getdate(data.get("delivery_date"))
 		for row in so.items or []:
 			row.delivery_date = so.delivery_date
+		if force_flag is None:
+			# Explicit date edit without flag → treat as forced.
+			force_flag = True
+		if force_flag:
+			_update_guest_preorder_tag(so, "delivery_forced", "1")
+			# Assign a delivery zone that visits that weekday.
+			wd = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+			try:
+				label = wd[getdate(so.delivery_date).weekday()]
+			except Exception:
+				label = None
+			if label:
+				geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
+				pick = _zone_matching_weekday(label, prefer=geo.get("zone") or geo.get("territory"))
+				if pick:
+					_set_customer_zone_and_address(so.customer, zone=pick, territory=pick)
+					geo_touched = True
+		else:
+			_update_guest_preorder_tag(so, "delivery_forced", None)
+	elif force_flag is False:
+		_update_guest_preorder_tag(so, "delivery_forced", None)
+		geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
+		auto_due = _auto_delivery_date_for_zone(geo.get("zone") or geo.get("territory"))
+		if auto_due:
+			so.delivery_date = getdate(auto_due)
+			for row in so.items or []:
+				row.delivery_date = so.delivery_date
+	elif force_flag is True:
+		_update_guest_preorder_tag(so, "delivery_forced", "1")
 
 	if data.get("customer"):
 		customer = str(data.get("customer")).strip()
@@ -4137,6 +4746,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 			frappe.throw(_("Customer {0} not found").format(customer))
 		so.customer = customer
 		_update_guest_preorder_tag(so, "customer", customer)
+		_resync_so_party_links(so)
 
 	guest_tag_keys = (
 		("guest_name", "guest_name"),
@@ -4176,6 +4786,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 			):
 				so.customer = matched
 				_update_guest_preorder_tag(so, "customer", matched)
+				_resync_so_party_links(so)
 
 	if data.get("cashier_user") is not None:
 		if not _can_view_all_guest_preorders():
@@ -4183,12 +4794,16 @@ def update_guest_preorder_details(preorder_name, data=None):
 		_update_guest_preorder_tag(so, "cashier", str(data.get("cashier_user") or "").strip())
 
 	if so.docstatus == 0:
+		# Consulta drafts may have no lines yet — Frappe "Data missing in table: Items"
+		# must not block header / tag updates from the Pedidos panel.
+		so.flags.ignore_mandatory = True
 		so.save(ignore_permissions=True)
 	else:
 		# Submitted: persist allowed header fields without full amend
 		updates = {}
-		if data.get("delivery_date"):
-			updates["delivery_date"] = so.delivery_date
+		if data.get("delivery_date") is not None or geo_touched or force_flag is not None:
+			if so.delivery_date:
+				updates["delivery_date"] = so.delivery_date
 		# Persist customer when explicitly set or auto-matched from phone/local.
 		if data.get("customer") or so.customer:
 			updates["customer"] = so.customer
@@ -4198,11 +4813,13 @@ def update_guest_preorder_details(preorder_name, data=None):
 			or data.get("cashier_user") is not None
 			or guest_tags_touched
 			or so.customer
+			or force_flag is not None
+			or geo_touched
 		):
 			updates[tag_fn] = getattr(so, tag_fn, None)
 		if updates:
 			frappe.db.set_value("Sales Order", current_name, updates)
-			if data.get("delivery_date"):
+			if updates.get("delivery_date"):
 				frappe.db.sql(
 					"""
 					UPDATE `tabSales Order Item`
@@ -4280,14 +4897,18 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 		so.flags.ignore_permissions = True
 		so.cancel()
 		_apply_item_changes(amended, items, additional_discount_amount)
-		amended.insert(ignore_permissions=True)
-		amended.submit()
+		amended.flags.ignore_pricing_rule = True
+		with _allow_weight_fractional_stock_qty(amended):
+			amended.insert(ignore_permissions=True)
+			amended.submit()
 		amended.reload()
 		return get_guest_preorder(amended.name)
 
-	# Draft: edit in place
+	# Draft: edit in place. Keep operator rate/qty/uom (WEIGHT) — do not re-price from rules.
 	_apply_item_changes(so, items, additional_discount_amount)
-	so.save(ignore_permissions=True)
+	so.flags.ignore_pricing_rule = True
+	with _allow_weight_fractional_stock_qty(so):
+		so.save(ignore_permissions=True)
 	so.reload()
 	return get_guest_preorder(preorder_name)
 
@@ -4306,18 +4927,27 @@ def _apply_item_changes(so, items, additional_discount_amount):
 		row.rate = flt(override.get("rate", row.rate))
 		row.qty = flt(override.get("qty", row.qty))
 		row.discount_percentage = flt(override.get("discount_percentage", 0))
+		# WEIGHT / CAJA / Nos from Pedidos "Tipo de peso" — must land on row.uom
+		# or Frappe still validates against Nos ("Quantity cannot be a fraction").
+		if override.get("uom") is not None or override.get("stock_uom") is not None:
+			_apply_so_line_uom(row, override.get("uom") or override.get("stock_uom"))
 		row.amount = row.rate * row.qty
 
 	# Add new items
 	for item in items:
 		if item["item_code"] not in existing_codes:
-			so.append("items", {
-				"item_code": item["item_code"],
-				"qty": flt(item.get("qty", 1)),
-				"rate": flt(item.get("rate", 0)),
-				"discount_percentage": flt(item.get("discount_percentage", 0)),
-				"delivery_date": so.delivery_date,
-			})
+			row = so.append(
+				"items",
+				{
+					"item_code": item["item_code"],
+					"qty": flt(item.get("qty", 1)),
+					"rate": flt(item.get("rate", 0)),
+					"discount_percentage": flt(item.get("discount_percentage", 0)),
+					"delivery_date": so.delivery_date,
+				},
+			)
+			if item.get("uom") is not None or item.get("stock_uom") is not None:
+				_apply_so_line_uom(row, item.get("uom") or item.get("stock_uom"))
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
@@ -4351,12 +4981,16 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 			row.rate = flt(override.get("rate", row.rate))
 			row.qty = flt(override.get("qty", row.qty))
 			row.discount_percentage = flt(override.get("discount_percentage", 0))
+			if override.get("uom") is not None or override.get("stock_uom") is not None:
+				_apply_so_line_uom(row, override.get("uom") or override.get("stock_uom"))
 			row.amount = row.rate * row.qty
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
 	so.run_method("calculate_taxes_and_totals")
-	so.save(ignore_permissions=True)
+	so.flags.ignore_pricing_rule = True
+	with _allow_weight_fractional_stock_qty(so):
+		so.save(ignore_permissions=True)
 	so.reload()
 	return get_guest_preorder(preorder_name)
 

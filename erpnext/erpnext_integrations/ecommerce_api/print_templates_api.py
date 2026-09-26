@@ -2,6 +2,7 @@ import json
 
 import frappe
 from frappe import _
+from frappe.utils import flt
 
 # Fields exposed per source doctype, plus the child-table (line items) fieldname
 # used by the 'line-items' element kind in the template designer.
@@ -51,27 +52,164 @@ _STAFF_CRED_FIELDS = [
 
 # Synthetic "Delivery Checklist" (armado de pedido) — bound from Sales Order + warehouse/floor.
 _DELIVERY_CHECKLIST_FIELDS = [
-	{"fieldname": "name", "label": "Order Nº", "fieldtype": "Data"},
+	{"fieldname": "name", "label": "Pedido", "fieldtype": "Data"},
 	{"fieldname": "customer_name", "label": "Cliente", "fieldtype": "Data"},
-	{"fieldname": "tax_id", "label": "Numero de identificador", "fieldtype": "Data"},
+	{"fieldname": "customer_address", "label": "Dirección", "fieldtype": "Small Text"},
+	{"fieldname": "tax_id", "label": "CUIT", "fieldtype": "Data"},
+	{"fieldname": "tax_category", "label": "Cond. IVA", "fieldtype": "Data"},
+	{"fieldname": "vendedor", "label": "Vend", "fieldtype": "Data"},
+	{"fieldname": "zona", "label": "Zona", "fieldtype": "Data"},
+	{"fieldname": "horario", "label": "Horario", "fieldtype": "Data"},
+	{"fieldname": "fletero", "label": "Fletero", "fieldtype": "Data"},
+	{"fieldname": "cargado", "label": "Cargado", "fieldtype": "Data"},
+	{"fieldname": "armado_flag", "label": "Armado", "fieldtype": "Data"},
+	{"fieldname": "facturado_flag", "label": "Facturado", "fieldtype": "Data"},
 	{"fieldname": "delivery_date", "label": "Fecha de Envio", "fieldtype": "Date"},
 	{"fieldname": "transaction_date", "label": "Order Date", "fieldtype": "Date"},
 	{"fieldname": "warehouse_name", "label": "Almacen", "fieldtype": "Data"},
-	{"fieldname": "net_total", "label": "Subtotal", "fieldtype": "Currency"},
-	{"fieldname": "grand_total", "label": "TOTAL", "fieldtype": "Currency"},
+	{"fieldname": "total_weight", "label": "Peso total", "fieldtype": "Float"},
+	{"fieldname": "company", "label": "Company", "fieldtype": "Data"},
 	{"fieldname": "_map", "label": "Warehouse Map", "fieldtype": "JSON"},
 ]
 
 _DELIVERY_CHECKLIST_CHILD_FIELDS = [
 	{"fieldname": "item_code", "label": "Código", "fieldtype": "Data"},
+	{"fieldname": "code_display", "label": "Código + barra", "fieldtype": "Data"},
 	{"fieldname": "item_name", "label": "Descripción", "fieldtype": "Data"},
 	{"fieldname": "qty", "label": "Cantidad", "fieldtype": "Float"},
+	{"fieldname": "uom", "label": "Uni", "fieldtype": "Data"},
+	{"fieldname": "qty_display", "label": "Cantidad (con UOM)", "fieldtype": "Data"},
+	{"fieldname": "weight", "label": "Peso", "fieldtype": "Float"},
+	{"fieldname": "actual_weight", "label": "Peso real", "fieldtype": "Float"},
+	{"fieldname": "total_weight", "label": "Peso total línea", "fieldtype": "Float"},
+	{"fieldname": "weight_uom", "label": "UOM peso", "fieldtype": "Data"},
+	{"fieldname": "confirm_uni", "label": "Armado Uni", "fieldtype": "Data"},
+	{"fieldname": "confirm_qty", "label": "Armado Cantidad", "fieldtype": "Data"},
 	{"fieldname": "warehouse", "label": "Desde", "fieldtype": "Data"},
 	{"fieldname": "location", "label": "Ubicación", "fieldtype": "Data"},
 	{"fieldname": "barcode", "label": "Codigo de Barras", "fieldtype": "Data"},
-	{"fieldname": "amount", "label": "Importe", "fieldtype": "Currency"},
-	{"fieldname": "rate", "label": "Precio", "fieldtype": "Currency"},
+	{"fieldname": "is_weight_based", "label": "Por peso", "fieldtype": "Check"},
 ]
+
+_WEIGHT_UOMS = {
+	"kg",
+	"kgs",
+	"kilogram",
+	"kilograms",
+	"kilogramo",
+	"kilogramos",
+	"g",
+	"gr",
+	"gram",
+	"grams",
+	"gramo",
+	"gramos",
+	"lb",
+	"lbs",
+	"oz",
+	"ounce",
+	"ounces",
+}
+
+
+def _norm_uom(uom) -> str:
+	return str(uom or "").strip().lower()
+
+
+def _is_weight_uom(uom) -> bool:
+	return _norm_uom(uom) in _WEIGHT_UOMS
+
+
+def _item_weight_meta(item_code):
+	"""Return (stock_uom, weight_per_unit, weight_uom) for an Item."""
+	if not item_code:
+		return "", 0.0, ""
+	try:
+		row = frappe.db.get_value(
+			"Item",
+			item_code,
+			["stock_uom", "weight_per_unit", "weight_uom"],
+			as_dict=True,
+		)
+	except Exception:
+		return "", 0.0, ""
+	if not row:
+		return "", 0.0, ""
+	return (
+		row.get("stock_uom") or "",
+		float(row.get("weight_per_unit") or 0),
+		row.get("weight_uom") or "",
+	)
+
+
+def _order_print_client_knows_weight() -> bool:
+	"""Shop UI setting — default False (qty-only orders, reweigh on armado)."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import get_shop_ui_settings
+
+		res = get_shop_ui_settings() or {}
+		pos = (res.get("settings") or {}).get("posDisplay") or {}
+		return bool(pos.get("orderPrintClientKnowsWeight"))
+	except Exception:
+		return False
+
+
+def _is_weight_based_line(row: dict, stock_uom: str = "", weight_uom: str = "") -> bool:
+	"""Sold-by-weight when the transaction/stock UOM is a mass unit."""
+	for u in (
+		row.get("uom"),
+		row.get("stock_uom"),
+		weight_uom,
+		stock_uom,
+		row.get("weight_uom"),
+	):
+		if _is_weight_uom(u):
+			return True
+	return False
+
+
+def _enrich_print_line_item(row) -> dict:
+	"""Add weight fields; blank amount for weight-based lines when client may not know weight."""
+	out = dict(row) if isinstance(row, dict) else {}
+	item_code = out.get("item_code") or ""
+	stock_uom, wpu, wuom = _item_weight_meta(item_code)
+	line_wpu = float(out.get("weight_per_unit") or 0) or wpu
+	line_wuom = out.get("weight_uom") or wuom
+	qty = float(out.get("qty") or 0)
+	weight_based = _is_weight_based_line(out, stock_uom=stock_uom, weight_uom=line_wuom)
+
+	weight_val = line_wpu if line_wpu else (qty if weight_based else None)
+	total_w = None
+	if line_wpu and qty:
+		total_w = line_wpu * qty
+	elif weight_based and qty:
+		total_w = qty
+
+	out["weight"] = weight_val if weight_val not in (None, 0) else ""
+	out["weight_uom"] = line_wuom or (stock_uom if weight_based else "") or ""
+	out["total_weight"] = total_w if total_w not in (None, 0) else ""
+	out["actual_weight"] = out.get("actual_weight") if out.get("actual_weight") not in (None, "") else ""
+	out["is_weight_based"] = 1 if weight_based else 0
+	# Default: client does not know weight → leave amount blank for weight-based lines.
+	if weight_based and not _order_print_client_knows_weight():
+		out["amount"] = ""
+	return out
+
+
+def _sum_line_total_weight(rows) -> float:
+	total = 0.0
+	any_w = False
+	for r in rows or []:
+		raw = r.get("total_weight") if isinstance(r, dict) else None
+		if raw in (None, ""):
+			continue
+		try:
+			total += float(raw)
+			any_w = True
+		except (TypeError, ValueError):
+			continue
+	return total if any_w else 0.0
+
 
 # Extra synthetic fields available only when designing an Item template scoped to
 # paper_kind "Catalog Card" — computed by the catalog exporter per product, not
@@ -549,8 +687,70 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 	sku_to_loc, map_payload = _floor_sku_locations(floor_id=floor_id, company=company)
 
 	tax_id = ""
-	if so.customer:
-		tax_id = frappe.db.get_value("Customer", so.customer, "tax_id") or ""
+	tax_category = ""
+	zona = ""
+	horario = ""
+	customer_address = ""
+	if so.customer and frappe.db.exists("Customer", so.customer):
+		cust = frappe.db.get_value(
+			"Customer",
+			so.customer,
+			[
+				"tax_id",
+				"tax_category",
+				"territory",
+				"primary_address",
+				"custom_preferred_hours",
+			]
+			if frappe.db.has_column("Customer", "custom_preferred_hours")
+			else ["tax_id", "tax_category", "territory", "primary_address"],
+			as_dict=True,
+		) or {}
+		tax_id = cust.get("tax_id") or ""
+		tax_category = cust.get("tax_category") or ""
+		zona = cust.get("territory") or ""
+		horario = cust.get("custom_preferred_hours") or ""
+		customer_address = (cust.get("primary_address") or "").replace("<br>", ", ").replace("\n", ", ")
+
+	# Facturado / Armado flags from linked docs
+	has_si = bool(
+		frappe.db.exists(
+			"Sales Invoice Item",
+			{"sales_order": sales_order_name, "docstatus": ["!=", 2]},
+		)
+	)
+	has_dn = bool(
+		frappe.db.exists(
+			"Delivery Note Item",
+			{"against_sales_order": sales_order_name, "docstatus": ["!=", 2]},
+		)
+	)
+
+	vendedor = getattr(so, "sales_person", None) or so.owner or ""
+	# Delivery trip / driver if linked
+	fletero = ""
+	try:
+		trip = frappe.db.sql(
+			"""
+			SELECT dt.driver_name, dt.name
+			FROM `tabDelivery Trip` dt
+			INNER JOIN `tabDelivery Stop` ds ON ds.parent = dt.name
+			WHERE ds.customer = %s AND dt.docstatus < 2
+			ORDER BY dt.modified DESC LIMIT 1
+			""",
+			(so.customer,),
+		)
+		if trip:
+			fletero = trip[0][0] or trip[0][1] or ""
+	except Exception:
+		fletero = ""
+
+	cargado = ""
+	if so.modified:
+		try:
+			cargado = frappe.utils.format_datetime(so.modified, "dd/MM/yy-HH:mm:ss")
+		except Exception:
+			cargado = str(so.modified)
 
 	rows = []
 	highlight_ids = set()
@@ -560,18 +760,33 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		sid = loc_info.get("section_id")
 		if sid:
 			highlight_ids.add(sid)
-		rows.append(
+		barcode = _item_barcode(it.item_code)
+		code_display = it.item_code or ""
+		if barcode:
+			code_display = f"{code_display} - {barcode}"
+		uom = it.uom or ""
+		qty = it.qty
+		qty_display = f"{flt(qty):.2f} {uom}".strip() if qty is not None else ""
+		row = _enrich_print_line_item(
 			{
 				"item_code": it.item_code,
 				"item_name": it.item_name,
-				"qty": it.qty,
+				"qty": qty,
+				"uom": uom,
+				"qty_display": qty_display,
+				"code_display": code_display,
 				"rate": it.rate,
 				"amount": it.amount,
+				"weight_per_unit": getattr(it, "weight_per_unit", None),
+				"weight_uom": getattr(it, "weight_uom", None),
 				"warehouse": it.warehouse or wh,
 				"location": loc,
-				"barcode": _item_barcode(it.item_code),
+				"barcode": barcode,
+				"confirm_uni": "",
+				"confirm_qty": "",
 			}
 		)
+		rows.append(row)
 
 	map_out = None
 	if map_payload:
@@ -589,16 +804,25 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"name": so.name,
 		"customer": so.customer,
 		"customer_name": so.customer_name or so.customer,
+		"customer_address": customer_address,
 		"tax_id": tax_id,
+		"tax_category": tax_category,
+		"vendedor": vendedor,
+		"zona": zona,
+		"horario": horario,
+		"fletero": fletero,
+		"cargado": cargado,
+		"armado_flag": "SI" if has_dn else "NO",
+		"facturado_flag": "SI" if has_si else "NO",
 		"delivery_date": so.delivery_date,
 		"transaction_date": so.transaction_date,
 		"warehouse_name": wh,
-		"net_total": so.net_total,
-		"grand_total": so.grand_total,
+		"total_weight": _sum_line_total_weight(rows) or getattr(so, "total_weight", None) or "",
 		"company": company,
 		"_map": map_out,
 	}
 	return {"doc": doc, "lineItems": rows, "map": map_out}
+
 
 
 @frappe.whitelist(allow_guest=True)
@@ -621,7 +845,12 @@ def get_print_data(source_doctype, docname, warehouse=None, floor_id=None):
 	rows = []
 	if child_table_fieldname:
 		# doc.as_dict() already recursively converts child table rows to plain dicts.
-		rows = list(data.get(child_table_fieldname) or [])
+		rows = [_enrich_print_line_item(r) for r in (data.get(child_table_fieldname) or [])]
+		data[child_table_fieldname] = rows
+		if not data.get("total_weight"):
+			tw = _sum_line_total_weight(rows)
+			if tw:
+				data["total_weight"] = tw
 
 	return {
 		"doc": data,
@@ -930,14 +1159,15 @@ def _ar_documento_no_valido_a4_elements(*, party_label: str, party_field: str, i
 			"headerBg": "#1e3a5f",
 			"headerColor": "#ffffff",
 			"columns": [
-				{"fieldPath": "item_code", "label": "Código", "width": 22},
-				{"fieldPath": "item_name", "label": "Descripción", "width": 48},
-				{"fieldPath": "uom", "label": "Unidades", "width": 22},
-				{"fieldPath": "qty", "label": "Cantidad", "width": 18},
-				{"fieldPath": "price_list_rate", "label": "Precio Kg.", "width": 22},
-				{"fieldPath": "rate", "label": "Precio U.", "width": 20},
-				{"fieldPath": "discount_percentage", "label": "Descuento", "width": 16},
-				{"fieldPath": "amount", "label": "Importe", "width": 18},
+				{"fieldPath": "item_code", "label": "Código", "width": 20},
+				{"fieldPath": "item_name", "label": "Descripción", "width": 40},
+				{"fieldPath": "uom", "label": "Unidades", "width": 16},
+				{"fieldPath": "qty", "label": "Cantidad", "width": 16},
+				{"fieldPath": "weight", "label": "Peso", "width": 14},
+				{"fieldPath": "price_list_rate", "label": "Precio Kg.", "width": 18},
+				{"fieldPath": "rate", "label": "Precio U.", "width": 18},
+				{"fieldPath": "discount_percentage", "label": "Descuento", "width": 14},
+				{"fieldPath": "amount", "label": "Importe", "width": 16},
 			],
 		},
 		# Totals (right)
@@ -1014,246 +1244,354 @@ def _ar_documento_no_valido_a4_elements(*, party_label: str, party_field: str, i
 	]
 
 
-def _ar_entregas_checklist_a4_elements(*, id_prefix: str, with_location: bool = False, with_map: bool = False):
-	"""A4 picking / armado de pedido layout matching ENTREGAS commercial form."""
+def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
+	"""Compressed header (screenshot-style): meta grid + cliente + pedido — no ENTREGAS title."""
+	fs = font
+	fs_sm = max(8, font - 1)
+	rows = [
+		("Vend:", "vendedor", "Zona:", "zona"),
+		("Horario:", "horario", "Fletero:", "fletero"),
+		("Cargado:", "cargado", "Armado:", "armado_flag"),
+		("Facturado:", "facturado_flag", "CUIT:", "tax_id"),
+	]
+	els = []
+	y0 = 10
+	# Left: cliente box
+	els.extend(
+		[
+			{
+				"id": f"{p}-cli-box",
+				"kind": "shape",
+				"x": 10,
+				"y": y0,
+				"width": 105,
+				"height": 28,
+				"shapeType": "rect",
+				"color": "#94a3b8",
+				"filled": False,
+			},
+			{
+				"id": f"{p}-cli-label",
+				"kind": "text",
+				"x": 12,
+				"y": y0 + 1,
+				"width": 20,
+				"height": 5,
+				"staticText": "CLIENTE:",
+				"fontSize": fs_sm,
+				"bold": True,
+				"align": "left",
+			},
+			{
+				"id": f"{p}-cli",
+				"kind": "field",
+				"x": 32,
+				"y": y0 + 1,
+				"width": 80,
+				"height": 5,
+				"fieldPath": "customer_name",
+				"label": "Cliente",
+				"fontSize": fs,
+				"bold": True,
+				"align": "left",
+			},
+			{
+				"id": f"{p}-addr",
+				"kind": "field",
+				"x": 12,
+				"y": y0 + 8,
+				"width": 100,
+				"height": 8,
+				"fieldPath": "customer_address",
+				"label": "Dirección",
+				"fontSize": fs_sm,
+				"align": "left",
+			},
+			{
+				"id": f"{p}-cond-label",
+				"kind": "text",
+				"x": 12,
+				"y": y0 + 18,
+				"width": 22,
+				"height": 5,
+				"staticText": "Cond. IVA:",
+				"fontSize": fs_sm,
+				"align": "left",
+			},
+			{
+				"id": f"{p}-cond",
+				"kind": "field",
+				"x": 34,
+				"y": y0 + 18,
+				"width": 78,
+				"height": 5,
+				"fieldPath": "tax_category",
+				"label": "Cond. IVA",
+				"fontSize": fs_sm,
+				"align": "left",
+			},
+		]
+	)
+	# Right: pedido badge + meta
+	els.extend(
+		[
+			{
+				"id": f"{p}-ped-box",
+				"kind": "shape",
+				"x": 120,
+				"y": y0,
+				"width": 80,
+				"height": 10,
+				"shapeType": "rect",
+				"color": "#cbd5e1",
+				"filled": True,
+				"bgColor": "#cbd5e1",
+			},
+			{
+				"id": f"{p}-ped-label",
+				"kind": "text",
+				"x": 122,
+				"y": y0 + 2,
+				"width": 22,
+				"height": 6,
+				"staticText": "Pedido:",
+				"fontSize": fs,
+				"bold": True,
+				"align": "left",
+			},
+			{
+				"id": f"{p}-ped",
+				"kind": "field",
+				"x": 144,
+				"y": y0 + 2,
+				"width": 54,
+				"height": 6,
+				"fieldPath": "name",
+				"label": "Pedido",
+				"fontSize": fs,
+				"bold": True,
+				"align": "left",
+			},
+		]
+	)
+	meta_y = y0 + 12
+	for i, (l1, f1, l2, f2) in enumerate(rows):
+		yy = meta_y + i * 6
+		els.extend(
+			[
+				{
+					"id": f"{p}-m{i}a-l",
+					"kind": "text",
+					"x": 120,
+					"y": yy,
+					"width": 18,
+					"height": 5,
+					"staticText": l1,
+					"fontSize": fs_sm,
+					"align": "left",
+				},
+				{
+					"id": f"{p}-m{i}a",
+					"kind": "field",
+					"x": 138,
+					"y": yy,
+					"width": 22,
+					"height": 5,
+					"fieldPath": f1,
+					"label": l1,
+					"fontSize": fs_sm,
+					"align": "left",
+				},
+				{
+					"id": f"{p}-m{i}b-l",
+					"kind": "text",
+					"x": 160,
+					"y": yy,
+					"width": 16,
+					"height": 5,
+					"staticText": l2,
+					"fontSize": fs_sm,
+					"align": "left",
+				},
+				{
+					"id": f"{p}-m{i}b",
+					"kind": "field",
+					"x": 176,
+					"y": yy,
+					"width": 24,
+					"height": 5,
+					"fieldPath": f2,
+					"label": l2,
+					"fontSize": fs_sm,
+					"align": "left",
+				},
+			]
+		)
+	return els
+
+
+def _ar_entregas_checklist_a4_elements(
+	*,
+	id_prefix: str,
+	with_location: bool = False,
+	with_map: bool = False,
+	mode: str = "almacen",
+):
+	"""A4 armado layouts.
+
+	mode=peso_indefinido — Código (sku-barcode), Descripción, Cantidad, Peso, Peso real + ARMADO side table.
+	mode=almacen — warehouse/location focused + ARMADO side confirmation columns.
+	Compressed header; larger type; no ENTREGAS title block.
+	"""
 	p = id_prefix
-	columns = [
-		{"fieldPath": "item_code", "label": "Código", "width": 28},
-		{"fieldPath": "item_name", "label": "Descripción", "width": 62 if with_location else 72},
-		{"fieldPath": "qty", "label": "Cantidad", "width": 20},
-		{"fieldPath": "warehouse", "label": "Desde", "width": 28},
-	]
-	if with_location:
-		columns.append({"fieldPath": "location", "label": "Ubicación", "width": 22})
-	columns.append({"fieldPath": "barcode", "label": "Codigo de Barras", "width": 26 if with_location else 32})
+	font = 12
+	header_h = 44
+	table_y = header_h + 4
 
-	items_height = 90 if with_map else 120
-	elements = [
+	if mode == "peso_indefinido":
+		main_cols = [
+			{"fieldPath": "code_display", "label": "Codigo", "width": 36},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 58},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 28},
+			{"fieldPath": "weight", "label": "Peso", "width": 16},
+			{"fieldPath": "actual_weight", "label": "Peso Real", "width": 18},
+		]
+		main_w = 156
+	else:
+		main_cols = [
+			{"fieldPath": "code_display", "label": "Codigo", "width": 30},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 48},
+			{"fieldPath": "qty", "label": "Cant.", "width": 14},
+			{"fieldPath": "warehouse", "label": "Desde", "width": 22},
+		]
+		if with_location:
+			main_cols.append({"fieldPath": "location", "label": "Ubic.", "width": 18})
+		main_cols.append({"fieldPath": "barcode", "label": "Barras", "width": 20})
+		main_w = 152 if with_location else 154
+
+	confirm_cols = [
+		{"fieldPath": "confirm_uni", "label": "Uni", "width": 14},
+		{"fieldPath": "confirm_qty", "label": "Cantidad", "width": 20},
+	]
+	confirm_w = 34
+	items_h = 95 if with_map else 175
+
+	elements = _armado_meta_header_elements(p, font=font)
+	# PEDIDO section label
+	elements.append(
 		{
-			"id": f"{p}-title",
+			"id": f"{p}-sec-ped",
 			"kind": "text",
-			"x": 15,
-			"y": 12,
-			"width": 180,
-			"height": 14,
-			"staticText": "ENTREGAS",
-			"fontSize": 22,
-			"bold": True,
-			"align": "center",
-		},
-		{
-			"id": f"{p}-nro-label",
-			"kind": "text",
-			"x": 15,
-			"y": 28,
-			"width": 180,
-			"height": 6,
-			"staticText": "Nº",
-			"fontSize": 10,
-			"align": "center",
-		},
-		{
-			"id": f"{p}-nro",
-			"kind": "field",
-			"x": 15,
-			"y": 34,
-			"width": 180,
-			"height": 7,
-			"fieldPath": "name",
-			"label": "Nº",
-			"fontSize": 11,
-			"bold": True,
-			"align": "center",
-		},
-		{
-			"id": f"{p}-cli-label",
-			"kind": "text",
-			"x": 15,
-			"y": 48,
-			"width": 28,
-			"height": 6,
-			"staticText": "Cliente :",
-			"fontSize": 9,
-			"align": "left",
-		},
-		{
-			"id": f"{p}-cli",
-			"kind": "field",
-			"x": 43,
-			"y": 48,
-			"width": 90,
-			"height": 6,
-			"fieldPath": "customer_name",
-			"label": "Cliente",
-			"fontSize": 9,
-			"align": "left",
-		},
-		{
-			"id": f"{p}-wh-label",
-			"kind": "text",
-			"x": 145,
-			"y": 46,
-			"width": 50,
-			"height": 5,
-			"staticText": "Almacen",
-			"fontSize": 8,
-			"align": "right",
-		},
-		{
-			"id": f"{p}-wh",
-			"kind": "field",
-			"x": 130,
-			"y": 52,
-			"width": 65,
-			"height": 10,
-			"fieldPath": "warehouse_name",
-			"label": "Almacen",
-			"fontSize": 14,
-			"bold": True,
-			"align": "right",
-		},
-		{
-			"id": f"{p}-id-label",
-			"kind": "text",
-			"x": 15,
-			"y": 56,
-			"width": 50,
-			"height": 6,
-			"staticText": "Numero de identificador:",
-			"fontSize": 9,
-			"align": "left",
-		},
-		{
-			"id": f"{p}-id",
-			"kind": "field",
-			"x": 65,
-			"y": 56,
-			"width": 60,
-			"height": 6,
-			"fieldPath": "tax_id",
-			"label": "ID",
-			"fontSize": 9,
-			"align": "left",
-		},
-		{
-			"id": f"{p}-ship-label",
-			"kind": "text",
-			"x": 15,
-			"y": 64,
+			"x": 10,
+			"y": table_y - 5,
 			"width": 40,
-			"height": 6,
-			"staticText": "Fecha de Envio:",
+			"height": 5,
+			"staticText": "PEDIDO",
 			"fontSize": 9,
+			"bold": True,
 			"align": "left",
-		},
+		}
+	)
+	elements.append(
 		{
-			"id": f"{p}-ship",
-			"kind": "field",
-			"x": 55,
-			"y": 64,
-			"width": 50,
-			"height": 6,
-			"fieldPath": "delivery_date",
-			"label": "Fecha de Envio",
+			"id": f"{p}-sec-arm",
+			"kind": "text",
+			"x": 10 + main_w + 2,
+			"y": table_y - 5,
+			"width": 34,
+			"height": 5,
+			"staticText": "ARMADO",
 			"fontSize": 9,
-			"align": "left",
-		},
+			"bold": True,
+			"align": "center",
+		}
+	)
+	elements.append(
 		{
-			"id": f"{p}-items",
+			"id": f"{p}-items-v3",
 			"kind": "line-items",
-			"x": 12,
-			"y": 78,
-			"width": 186,
-			"height": items_height,
+			"x": 10,
+			"y": table_y,
+			"width": main_w,
+			"height": items_h,
 			"childTableFieldname": "items",
-			"headerBg": "#1e3a5f",
+			"headerBg": "#64748b",
 			"headerColor": "#ffffff",
-			"columns": columns,
-		},
-	]
+			"columns": main_cols,
+		}
+	)
+	elements.append(
+		{
+			"id": f"{p}-confirm-v3",
+			"kind": "line-items",
+			"x": 10 + main_w + 2,
+			"y": table_y,
+			"width": confirm_w,
+			"height": items_h,
+			"childTableFieldname": "items",
+			"headerBg": "#64748b",
+			"headerColor": "#ffffff",
+			"columns": confirm_cols,
+		}
+	)
 
-	footer_y = 200 if with_map else 210
+	footer_y = table_y + items_h + 6
 	if with_map:
 		elements.append(
 			{
 				"id": f"{p}-map",
 				"kind": "warehouse-map",
-				"x": 12,
-				"y": 172,
-				"width": 186,
-				"height": 55,
+				"x": 10,
+				"y": footer_y,
+				"width": 190,
+				"height": 45,
 				"fieldPath": "_map",
 			}
 		)
-		footer_y = 232
+		footer_y += 50
 
 	elements.extend(
 		[
 			{
-				"id": f"{p}-sub-label",
+				"id": f"{p}-tw-label",
 				"kind": "text",
-				"x": 130,
+				"x": 10,
 				"y": footer_y,
-				"width": 30,
-				"height": 7,
-				"staticText": "Subtotal",
+				"width": 28,
+				"height": 6,
+				"staticText": "Peso tot:",
 				"fontSize": 10,
-				"align": "right",
+				"align": "left",
 			},
 			{
-				"id": f"{p}-sub",
+				"id": f"{p}-tw",
 				"kind": "field",
-				"x": 160,
+				"x": 38,
 				"y": footer_y,
-				"width": 35,
-				"height": 7,
-				"fieldPath": "net_total",
-				"label": "Subtotal",
-				"fontSize": 10,
-				"align": "right",
-			},
-			{
-				"id": f"{p}-total-label",
-				"kind": "text",
-				"x": 130,
-				"y": footer_y + 10,
-				"width": 30,
-				"height": 8,
-				"staticText": "TOTAL",
-				"fontSize": 12,
-				"bold": True,
-				"align": "right",
-			},
-			{
-				"id": f"{p}-total",
-				"kind": "field",
-				"x": 160,
-				"y": footer_y + 10,
-				"width": 35,
-				"height": 8,
-				"fieldPath": "grand_total",
-				"label": "TOTAL",
-				"fontSize": 12,
-				"bold": True,
-				"align": "right",
+				"width": 36,
+				"height": 6,
+				"fieldPath": "total_weight",
+				"label": "Peso total",
+				"fontSize": 11,
+				"align": "left",
 			},
 			{
 				"id": f"{p}-firma-label",
 				"kind": "text",
 				"x": 110,
-				"y": footer_y + 28,
-				"width": 85,
+				"y": footer_y,
+				"width": 90,
 				"height": 6,
 				"staticText": "Recibi Conforme (Firma y Aclaración):",
-				"fontSize": 8,
+				"fontSize": 9,
 				"align": "left",
 			},
 			{
 				"id": f"{p}-firma-line",
 				"kind": "shape",
 				"x": 110,
-				"y": footer_y + 40,
-				"width": 85,
+				"y": footer_y + 12,
+				"width": 90,
 				"height": 1,
 				"shapeType": "line",
 				"color": "#0f172a",
@@ -1261,6 +1599,7 @@ def _ar_entregas_checklist_a4_elements(*, id_prefix: str, with_location: bool = 
 		]
 	)
 	return elements
+
 
 
 _STARTER_TEMPLATES = [
@@ -1284,6 +1623,8 @@ _STARTER_TEMPLATES = [
 		"source_doctype": "Sales Invoice",
 		"paper_kind": "A4",
 		"is_default": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-inv-items-v2",
 		"margin_mm": [15, 15, 15, 15],
 		"elements": [
 			{"id": "starter-inv-title", "kind": "text", "x": 15, "y": 15, "width": 110, "height": 12, "staticText": "INVOICE", "fontSize": 20, "bold": True, "align": "left"},
@@ -1294,7 +1635,7 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-inv-bill-to-label", "kind": "text", "x": 15, "y": 32, "width": 90, "height": 6, "staticText": "Bill To", "fontSize": 8, "bold": True, "align": "left"},
 			{"id": "starter-inv-customer", "kind": "field", "x": 15, "y": 38, "width": 100, "height": 8, "fieldPath": "customer_name", "label": "Customer", "fontSize": 11, "align": "left"},
 			{
-				"id": "starter-inv-items",
+				"id": "starter-inv-items-v2",
 				"kind": "line-items",
 				"x": 15,
 				"y": 60,
@@ -1302,11 +1643,12 @@ _STARTER_TEMPLATES = [
 				"height": 90,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_code", "label": "Item", "width": 30},
-					{"fieldPath": "item_name", "label": "Description", "width": 70},
-					{"fieldPath": "qty", "label": "Qty", "width": 20},
-					{"fieldPath": "rate", "label": "Rate", "width": 25},
-					{"fieldPath": "amount", "label": "Amount", "width": 30},
+					{"fieldPath": "item_code", "label": "Item", "width": 26},
+					{"fieldPath": "item_name", "label": "Description", "width": 52},
+					{"fieldPath": "qty", "label": "Qty", "width": 16},
+					{"fieldPath": "weight", "label": "Weight", "width": 18},
+					{"fieldPath": "rate", "label": "Rate", "width": 22},
+					{"fieldPath": "amount", "label": "Amount", "width": 26},
 				],
 			},
 			{"id": "starter-inv-total-label", "kind": "text", "x": 130, "y": 155, "width": 30, "height": 8, "staticText": "Total", "fontSize": 10, "bold": True, "align": "right"},
@@ -1336,9 +1678,10 @@ _STARTER_TEMPLATES = [
 				"height": 55,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_name", "label": "Item", "width": 36},
-					{"fieldPath": "qty", "label": "Cant", "width": 12},
-					{"fieldPath": "amount", "label": "Monto", "width": 24},
+					{"fieldPath": "item_name", "label": "Item", "width": 28},
+					{"fieldPath": "qty", "label": "Cant", "width": 10},
+					{"fieldPath": "weight", "label": "Peso", "width": 12},
+					{"fieldPath": "amount", "label": "Monto", "width": 22},
 				],
 			},
 			{"id": "starter-pos80-total-label", "kind": "text", "x": 4, "y": 102, "width": 28, "height": 7, "staticText": "TOTAL", "fontSize": 10, "bold": True, "align": "left"},
@@ -1765,24 +2108,54 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-card-price", "kind": "field", "x": 12, "y": 67, "width": 34, "height": 6, "fieldPath": "display_price", "label": "Catalog Price", "fontSize": 11, "bold": True, "align": "center", "textColor": "#ffffff"},
 		],
 	},
-	# ── Delivery Checklist · A4 (armado de pedido / ENTREGAS) ───────────
+	# ── Delivery Checklist · A4 (armado) ────────────────────────────────
 	{
-		"template_name": "Armado de Pedido — ENTREGAS (A4)",
+		"template_name": "Armado con Peso Indefinido (A4)",
 		"source_doctype": "Delivery Checklist",
 		"paper_kind": "A4",
 		"is_default": True,
 		"gift": True,
-		"margin_mm": [12, 12, 12, 12],
-		"elements": _ar_entregas_checklist_a4_elements(id_prefix="starter-ent", with_location=False, with_map=False),
+		"resync": True,
+		"resync_if_missing_id": "starter-peso-items-v3",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_entregas_checklist_a4_elements(
+			id_prefix="starter-peso",
+			with_location=False,
+			with_map=False,
+			mode="peso_indefinido",
+		),
 	},
 	{
-		"template_name": "Armado de Pedido — ENTREGAS + Mapa (A4)",
+		"template_name": "Armado Almacen (A4)",
 		"source_doctype": "Delivery Checklist",
 		"paper_kind": "A4",
 		"is_default": False,
 		"gift": True,
-		"margin_mm": [12, 12, 12, 12],
-		"elements": _ar_entregas_checklist_a4_elements(id_prefix="starter-entmap", with_location=True, with_map=True),
+		"resync": True,
+		"resync_if_missing_id": "starter-alm-items-v3",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_entregas_checklist_a4_elements(
+			id_prefix="starter-alm",
+			with_location=True,
+			with_map=False,
+			mode="almacen",
+		),
+	},
+	{
+		"template_name": "Armado Almacen + Mapa (A4)",
+		"source_doctype": "Delivery Checklist",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-almmap-items-v3",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_entregas_checklist_a4_elements(
+			id_prefix="starter-almmap",
+			with_location=True,
+			with_map=True,
+			mode="almacen",
+		),
 	},
 	# ── TMS delivery tickets (Delivery Note · Thermal 80mm) ─────────────
 	{
@@ -1790,6 +2163,8 @@ _STARTER_TEMPLATES = [
 		"source_doctype": "Delivery Note",
 		"paper_kind": "Thermal 80mm",
 		"is_default": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-dnconf-items-v2",
 		"margin_mm": [4, 4, 4, 4],
 		"elements": [
 			{"id": "starter-dnconf-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "Confirmación de Entrega", "fontSize": 12, "bold": True, "align": "center"},
@@ -1800,7 +2175,7 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-dnconf-date-label", "kind": "text", "x": 4, "y": 40, "width": 30, "height": 5, "staticText": "Fecha", "fontSize": 7, "align": "left"},
 			{"id": "starter-dnconf-date", "kind": "field", "x": 4, "y": 45, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
 			{
-				"id": "starter-dnconf-items",
+				"id": "starter-dnconf-items-v2",
 				"kind": "line-items",
 				"x": 4,
 				"y": 53,
@@ -1808,16 +2183,20 @@ _STARTER_TEMPLATES = [
 				"height": 40,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_name", "label": "Item", "width": 44},
-					{"fieldPath": "qty", "label": "Cant", "width": 14},
+					{"fieldPath": "item_name", "label": "Item", "width": 28},
+					{"fieldPath": "qty", "label": "Cant", "width": 12},
+					{"fieldPath": "weight", "label": "Peso", "width": 12},
+					{"fieldPath": "total_weight", "label": "P.tot", "width": 12},
 					{"fieldPath": "amount", "label": "Monto", "width": 14},
 				],
 			},
-			{"id": "starter-dnconf-total-label", "kind": "text", "x": 4, "y": 96, "width": 30, "height": 6, "staticText": "Total", "fontSize": 9, "bold": True, "align": "left"},
-			{"id": "starter-dnconf-total", "kind": "field", "x": 34, "y": 96, "width": 42, "height": 8, "fieldPath": "grand_total", "label": "Total", "fontSize": 11, "bold": True, "align": "right"},
-			{"id": "starter-dnconf-tracking-label", "kind": "text", "x": 4, "y": 106, "width": 30, "height": 5, "staticText": "Seguimiento", "fontSize": 7, "align": "left"},
-			{"id": "starter-dnconf-tracking", "kind": "field", "x": 4, "y": 111, "width": 72, "height": 6, "fieldPath": "custom_tracking_code", "label": "Tracking Code", "fontSize": 9, "align": "left"},
-			{"id": "starter-dnconf-qr", "kind": "qrcode", "x": 4, "y": 119, "width": 30, "height": 30, "fieldPath": "custom_tracking_code"},
+			{"id": "starter-dnconf-tw-label", "kind": "text", "x": 4, "y": 96, "width": 30, "height": 5, "staticText": "Peso total", "fontSize": 7, "align": "left"},
+			{"id": "starter-dnconf-tw", "kind": "field", "x": 34, "y": 96, "width": 42, "height": 6, "fieldPath": "total_weight", "label": "Peso total", "fontSize": 9, "align": "right"},
+			{"id": "starter-dnconf-total-label", "kind": "text", "x": 4, "y": 104, "width": 30, "height": 6, "staticText": "Total", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-dnconf-total", "kind": "field", "x": 34, "y": 104, "width": 42, "height": 8, "fieldPath": "grand_total", "label": "Total", "fontSize": 11, "bold": True, "align": "right"},
+			{"id": "starter-dnconf-tracking-label", "kind": "text", "x": 4, "y": 114, "width": 30, "height": 5, "staticText": "Seguimiento", "fontSize": 7, "align": "left"},
+			{"id": "starter-dnconf-tracking", "kind": "field", "x": 4, "y": 119, "width": 72, "height": 6, "fieldPath": "custom_tracking_code", "label": "Tracking Code", "fontSize": 9, "align": "left"},
+			{"id": "starter-dnconf-qr", "kind": "qrcode", "x": 4, "y": 127, "width": 30, "height": 30, "fieldPath": "custom_tracking_code"},
 		],
 	},
 	{
@@ -1830,14 +2209,18 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-dnpay-ref", "kind": "field", "x": 4, "y": 15, "width": 72, "height": 6, "fieldPath": "name", "label": "Delivery Note", "fontSize": 9, "bold": True, "align": "left"},
 			{"id": "starter-dnpay-customer", "kind": "field", "x": 4, "y": 23, "width": 72, "height": 6, "fieldPath": "customer_name", "label": "Customer", "fontSize": 9, "align": "left"},
 			{"id": "starter-dnpay-date", "kind": "field", "x": 4, "y": 31, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
-			{"id": "starter-dnpay-total-label", "kind": "text", "x": 4, "y": 41, "width": 30, "height": 6, "staticText": "Total", "fontSize": 9, "bold": True, "align": "left"},
-			{"id": "starter-dnpay-total", "kind": "field", "x": 34, "y": 41, "width": 42, "height": 8, "fieldPath": "grand_total", "label": "Total", "fontSize": 11, "bold": True, "align": "right"},
+			{"id": "starter-dnpay-tw-label", "kind": "text", "x": 4, "y": 41, "width": 30, "height": 5, "staticText": "Peso total", "fontSize": 7, "align": "left"},
+			{"id": "starter-dnpay-tw", "kind": "field", "x": 34, "y": 41, "width": 42, "height": 6, "fieldPath": "total_weight", "label": "Peso total", "fontSize": 9, "align": "right"},
+			{"id": "starter-dnpay-total-label", "kind": "text", "x": 4, "y": 49, "width": 30, "height": 6, "staticText": "Total", "fontSize": 9, "bold": True, "align": "left"},
+			{"id": "starter-dnpay-total", "kind": "field", "x": 34, "y": 49, "width": 42, "height": 8, "fieldPath": "grand_total", "label": "Total", "fontSize": 11, "bold": True, "align": "right"},
 		],
 	},
 	{
 		"template_name": "Recibo de Devolución (80mm)",
 		"source_doctype": "Delivery Note",
 		"paper_kind": "Thermal 80mm",
+		"resync": True,
+		"resync_if_missing_id": "starter-dnret-items-v2",
 		"margin_mm": [4, 4, 4, 4],
 		"elements": [
 			{"id": "starter-dnret-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "Recibo de Devolución", "fontSize": 12, "bold": True, "align": "center"},
@@ -1845,7 +2228,7 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-dnret-customer", "kind": "field", "x": 4, "y": 23, "width": 72, "height": 6, "fieldPath": "customer_name", "label": "Customer", "fontSize": 9, "align": "left"},
 			{"id": "starter-dnret-date", "kind": "field", "x": 4, "y": 31, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
 			{
-				"id": "starter-dnret-items",
+				"id": "starter-dnret-items-v2",
 				"kind": "line-items",
 				"x": 4,
 				"y": 41,
@@ -1853,13 +2236,154 @@ _STARTER_TEMPLATES = [
 				"height": 40,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_name", "label": "Item", "width": 44},
-					{"fieldPath": "qty", "label": "Cant", "width": 28},
+					{"fieldPath": "item_name", "label": "Item", "width": 36},
+					{"fieldPath": "qty", "label": "Cant", "width": 14},
+					{"fieldPath": "weight", "label": "Peso", "width": 14},
+					{"fieldPath": "total_weight", "label": "P.tot", "width": 14},
 				],
 			},
 		],
 	},
 ]
+
+
+def _localize_print_text(text: str, locale: str) -> str:
+	"""Best-effort UI string localization for starter template copies."""
+	if not text or locale not in ("es", "zh"):
+		return text
+	# Shared keys → (es, zh)
+	table = {
+		"INVOICE": ("FACTURA", "发票"),
+		"Invoice #": ("Factura #", "发票号"),
+		"Date": ("Fecha", "日期"),
+		"Bill To": ("Facturar a", "收票方"),
+		"Customer": ("Cliente", "客户"),
+		"Item": ("Ítem", "商品"),
+		"Description": ("Descripción", "描述"),
+		"Qty": ("Cant.", "数量"),
+		"Weight": ("Peso", "重量"),
+		"Rate": ("Precio", "单价"),
+		"Amount": ("Importe", "金额"),
+		"Total": ("Total", "合计"),
+		"TOTAL": ("TOTAL", "合计"),
+		"Subtotal": ("Subtotal", "小计"),
+		"Código": ("Código", "编码"),
+		"Descripción": ("Descripción", "描述"),
+		"Cantidad": ("Cantidad", "数量"),
+		"Peso": ("Peso", "重量"),
+		"Peso real": ("Peso real", "实重"),
+		"Peso total": ("Peso total", "总重量"),
+		"Peso total:": ("Peso total:", "总重量："),
+		"P.tot": ("P.tot", "总重"),
+		"Desde": ("Desde", "库位"),
+		"Ubicación": ("Ubicación", "位置"),
+		"Codigo de Barras": ("Codigo de Barras", "条码"),
+		"Cliente": ("Cliente", "客户"),
+		"Cliente :": ("Cliente :", "客户："),
+		"Almacen": ("Almacen", "仓库"),
+		"ENTREGAS": ("ENTREGAS", "发货单"),
+		"PEDIDO": ("PEDIDO", "订单"),
+		"ARMADO": ("ARMADO", "配货"),
+		"CLIENTE:": ("CLIENTE:", "客户："),
+		"Pedido:": ("Pedido:", "订单："),
+		"Codigo": ("Codigo", "编码"),
+		"Detalle": ("Detalle", "明细"),
+		"Peso Real": ("Peso Real", "实重"),
+		"Peso tot:": ("Peso tot:", "总重："),
+		"Ubic.": ("Ubic.", "库位"),
+		"Barras": ("Barras", "条码"),
+		"Cant.": ("Cant.", "数量"),
+		"Uni": ("Uni", "单位"),
+		"Vend:": ("Vend:", "销售："),
+		"Zona:": ("Zona:", "区域："),
+		"Horario:": ("Horario:", "时段："),
+		"Fletero:": ("Fletero:", "司机："),
+		"Cargado:": ("Cargado:", "装载："),
+		"Armado:": ("Armado:", "配货："),
+		"Facturado:": ("Facturado:", "已开票："),
+		"CUIT:": ("CUIT:", "税号："),
+		"Cond. IVA:": ("Cond. IVA:", "IVA条件："),
+		"Cond. IVA": ("Cond. IVA", "IVA条件"),
+		"Nº": ("Nº", "编号"),
+		"Numero de identificador:": ("Numero de identificador:", "税号："),
+		"Fecha de Envio:": ("Fecha de Envio:", "发货日期："),
+		"Fecha de Envio": ("Fecha de Envio", "发货日期"),
+		"Recibi Conforme (Firma y Aclaración):": (
+			"Recibi Conforme (Firma y Aclaración):",
+			"收货确认（签名）：",
+		),
+		"Confirmación de Entrega": ("Confirmación de Entrega", "配送确认"),
+		"Comprobante": ("Comprobante", "单据"),
+		"Fecha": ("Fecha", "日期"),
+		"Cant": ("Cant", "数量"),
+		"Monto": ("Monto", "金额"),
+		"Seguimiento": ("Seguimiento", "追踪"),
+		"Recibo de Pago": ("Recibo de Pago", "付款收据"),
+		"Recibo de Devolución": ("Recibo de Devolución", "退货收据"),
+		"RECIBO DE VENTA": ("RECIBO DE VENTA", "销售小票"),
+		"RECIBO": ("RECIBO", "小票"),
+		"Price": ("Precio", "价格"),
+		"Product": ("Producto", "产品"),
+		"Code": ("Código", "编码"),
+		"UOM": ("UOM", "单位"),
+		"Standard Rate": ("Precio estándar", "标准价"),
+		"ITEM SPECIFICATION": ("FICHA DE PRODUCTO", "商品规格"),
+		"Name": ("Nombre", "名称"),
+		"Unidades": ("Unidades", "单位"),
+		"Precio Kg.": ("Precio Kg.", "公斤价"),
+		"Precio U.": ("Precio U.", "单价"),
+		"Descuento": ("Descuento", "折扣"),
+		"Importe": ("Importe", "金额"),
+		"Responsable Inscripto :": ("Responsable Inscripto :", "纳税人："),
+		"Condición de Venta :": ("Condición de Venta :", "付款条件："),
+		"Condición": ("Condición", "条件"),
+	}
+	pair = table.get(text)
+	if not pair:
+		return text
+	return pair[0] if locale == "es" else pair[1]
+
+
+def _localize_elements(elements, locale: str):
+	import copy
+
+	cloned = copy.deepcopy(elements)
+	for el in cloned:
+		if not isinstance(el, dict):
+			continue
+		if el.get("staticText"):
+			el["staticText"] = _localize_print_text(el["staticText"], locale)
+		if el.get("label"):
+			el["label"] = _localize_print_text(el["label"], locale)
+		cols = el.get("columns")
+		if isinstance(cols, list):
+			for c in cols:
+				if isinstance(c, dict) and c.get("label"):
+					c["label"] = _localize_print_text(c["label"], locale)
+	return cloned
+
+
+def _expand_locale_starter_templates(base_starters):
+	"""Duplicate every starter as ES - … and CH - … localized copies."""
+	import copy
+
+	out = list(base_starters)
+	for starter in base_starters:
+		name = starter.get("template_name") or ""
+		if name.startswith("ES - ") or name.startswith("CH - "):
+			continue
+		for locale, prefix in (("es", "ES"), ("zh", "CH")):
+			clone = copy.deepcopy(starter)
+			clone["template_name"] = f"{prefix} - {name}"
+			clone["is_default"] = False
+			clone.pop("resync", None)
+			clone.pop("resync_if_missing_id", None)
+			clone["elements"] = _localize_elements(clone.get("elements") or [], locale)
+			out.append(clone)
+	return out
+
+
+_STARTER_TEMPLATES = _expand_locale_starter_templates(_STARTER_TEMPLATES)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1950,7 +2474,39 @@ def ensure_starter_print_templates():
 
 	if created or resynced:
 		frappe.db.commit()
+
+	# Promote renamed armado default when legacy ENTREGAS is still the only default.
+	_promote_armado_default_if_legacy()
 	return {"created": created, "gifted": created, "resynced": resynced}
+
+
+def _promote_armado_default_if_legacy():
+	"""If Delivery Checklist A4 default is still the old ENTREGAS seed, switch to Peso Indefinido."""
+	cur = frappe.db.get_value(
+		"ECommerce Print Template",
+		{"source_doctype": "Delivery Checklist", "paper_kind": "A4", "is_default": 1},
+		["name", "template_name"],
+		as_dict=True,
+	)
+	if not cur:
+		return
+	tname = cur.template_name or ""
+	if "ENTREGAS" not in tname:
+		return
+	new = frappe.db.get_value(
+		"ECommerce Print Template",
+		{
+			"template_name": "Armado con Peso Indefinido (A4)",
+			"source_doctype": "Delivery Checklist",
+			"paper_kind": "A4",
+		},
+		"name",
+	)
+	if not new or new == cur.name:
+		return
+	frappe.db.set_value("ECommerce Print Template", cur.name, "is_default", 0)
+	frappe.db.set_value("ECommerce Print Template", new, "is_default", 1)
+	frappe.db.commit()
 
 
 def gift_core_print_templates():

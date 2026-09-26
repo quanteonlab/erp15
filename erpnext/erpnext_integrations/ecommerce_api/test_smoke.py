@@ -561,6 +561,154 @@ def suite_5_9_master_data():
                     frappe.delete_doc("Customer", cname, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_empty_items_consulta_update():
+        """Draft Consulta with no Items must accept header/notes save (no HTTP 417 Items)."""
+        so_name = None
+        try:
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke empty-items consulta",
+                guest_name="Smoke Empty Items",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name and frappe.db.exists("Sales Order", so_name)
+            assert not frappe.get_all(
+                "Sales Order Item",
+                filters={"parent": so_name},
+                limit=1,
+                ignore_permissions=True,
+            )
+            detail = api.update_guest_preorder_details(
+                so_name,
+                {
+                    "guest_notes": "smoke empty-items updated",
+                    "guest_name": "Smoke Empty Items 2",
+                },
+            )
+            assert isinstance(detail, dict)
+            assert detail.get("name") == so_name
+            assert (detail.get("guest_name") or "") == "Smoke Empty Items 2"
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_weight_uom_fractional_qty():
+        """Selecting WEIGHT on a Nos item must set SO line UOM so fractional qty saves."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "stock_uom": "Nos", "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "stock_uom": "Nos"},
+            "name",
+        )
+        assert item_code, "need a Nos stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 10}],
+                guest_notes="smoke weight uom",
+                guest_name="Smoke Weight",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name
+            detail = api.update_guest_preorder_items(
+                so_name,
+                [{"item_code": item_code, "qty": 2.12, "rate": 69.74, "uom": "WEIGHT"}],
+                0,
+            )
+            assert isinstance(detail, dict)
+            line = (detail.get("items") or [None])[0]
+            assert line, detail
+            assert abs(flt(line.get("qty")) - 2.12) < 0.001, line
+            assert cstr(line.get("uom") or line.get("stock_uom")).upper() == "WEIGHT", line
+            assert line.get("is_weight_based") is True, line
+            row_uom = frappe.db.get_value(
+                "Sales Order Item",
+                {"parent": so_name, "item_code": item_code},
+                "uom",
+            )
+            assert row_uom == "WEIGHT", row_uom
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_relate_clears_stale_contact():
+        """Relacionar must clear Consumidor Final contact when switching customer (no HTTP 417)."""
+        so_name = None
+        target = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code
+        bucket = api._get_or_create_consumidor_final()
+        bucket_contact = frappe.db.get_value(
+            "Dynamic Link",
+            {"link_doctype": "Customer", "link_name": bucket, "parenttype": "Contact"},
+            "parent",
+        )
+        # Ensure bucket has a contact so the SO can carry a stale one.
+        if not bucket_contact and frappe.db.exists("DocType", "Contact"):
+            c = frappe.get_doc(
+                {
+                    "doctype": "Contact",
+                    "first_name": "Smoke Bucket",
+                    "links": [{"link_doctype": "Customer", "link_name": bucket}],
+                }
+            )
+            c.insert(ignore_permissions=True)
+            bucket_contact = c.name
+        assert bucket_contact, "need a Contact on Consumidor Final"
+        try:
+            target = api.create_customer(
+                customer_name=f"Smoke Relate Cust {frappe.generate_hash(length=6)}",
+                phone="5491199887766",
+            )
+            target_name = target.get("name") if isinstance(target, dict) else target
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 10}],
+                guest_notes="smoke relate contact",
+                guest_name="Smoke Relate",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            # Force stale contact from bucket customer onto the draft.
+            frappe.db.set_value("Sales Order", so_name, "customer", bucket)
+            frappe.db.set_value("Sales Order", so_name, "contact_person", bucket_contact)
+            frappe.db.commit()
+            detail = api.update_guest_preorder_details(
+                so_name,
+                {"customer": target_name, "guest_name": "Smoke Relate Linked"},
+            )
+            assert detail.get("customer") == target_name, detail
+            row_contact = frappe.db.get_value("Sales Order", so_name, "contact_person")
+            assert row_contact != bucket_contact, row_contact
+            # Advance to Orden must also succeed (submit validate_party_contact).
+            advanced = api.set_guest_preorder_status(so_name, "Orden")
+            assert advanced.get("docstatus") == 1 or str(advanced.get("display_status") or "").startswith(
+                "Orden"
+            ) or advanced.get("status") in ("To Deliver and Bill", "Orden"), advanced
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                docstatus = frappe.db.get_value("Sales Order", so_name, "docstatus")
+                if cint(docstatus) == 1:
+                    try:
+                        so = frappe.get_doc("Sales Order", so_name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    except Exception:
+                        pass
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            if target:
+                tname = target.get("name") if isinstance(target, dict) else target
+                if tname and frappe.db.exists("Customer", tname):
+                    frappe.delete_doc("Customer", tname, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     _run("5.9.1 get_item_groups", check_item_groups, "S3")
     _run("5.9.2 get_price_lists", check_price_lists, "S3")
     _run("5.9.3 get_warehouses", check_warehouses, "S3")
@@ -573,6 +721,9 @@ def suite_5_9_master_data():
     _run("5.9.10 get_items_for_label_print", check_labels, "S3")
     _run("5.9.11 get_guest_preorders_list", check_guest_preorders_list, "S3")
     _run("5.9.12 consulta phone→customer match", check_consulta_phone_match, "S2")
+    _run("5.9.13 empty-items Consulta header update", check_empty_items_consulta_update, "S2")
+    _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
+    _run("5.9.15 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
 
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────
@@ -1459,12 +1610,36 @@ def suite_5_12_modules_read():
         assert "require_pin_for_order_actions" in settings
         claimable = tms.list_claimable_orders()
         assert isinstance(claimable, dict) and isinstance(claimable.get("orders"), list)
+
+        map_store = tms.list_map_pins_and_plans()
+        assert isinstance(map_store, dict)
+        assert isinstance(map_store.get("pins"), list)
+        assert isinstance(map_store.get("plans"), list)
+        temp = tms.save_map_temp_location(
+            label="Smoke Temp Pin",
+            address="Av. Corrientes 1234, Buenos Aires",
+            lat=-34.6037,
+            lng=-58.3816,
+        )
+        assert isinstance(temp, dict) and temp.get("pin")
+        pin_id = temp["pin"]["id"]
+        plan = tms.save_map_plan(name=f"Smoke Plan {frappe.generate_hash(length=4)}", pin_ids=[pin_id])
+        assert isinstance(plan, dict) and plan.get("plan")
+        tms.delete_map_plan(plan["plan"]["id"])
+        tms.delete_map_pin(pin_id)
+
         # Empty claim must raise a controlled error (not TypeError/500)
         try:
             tms.claim_orders_to_trip(delivery_notes=[], preorder_names=[], pin=None)
             raise AssertionError("expected error for empty claim")
         except Exception as exc:
             assert "ValidationError" in type(exc).__name__ or "select" in str(exc).lower() or "pin" in str(exc).lower() or "Admin" in str(exc) or "Incorrect" in str(exc), exc
+
+        try:
+            tms.update_pending_delivery_due(delivery_note=None, due_date=None)
+            raise AssertionError("expected error for null due update")
+        except Exception as exc:
+            assert "ValidationError" in type(exc).__name__ or "required" in str(exc).lower() or "due" in str(exc).lower(), exc
 
         tmpl = tms.get_rutas_orders_csv_template()
         assert isinstance(tmpl, dict) and tmpl.get("csv_text")
@@ -1499,6 +1674,39 @@ def suite_5_12_modules_read():
         deleted = tms.import_rutas_orders_csv(csv_text=delete_csv, pin=None)
         assert isinstance(deleted, dict), deleted
         assert deleted.get("summary", {}).get("deleted", 0) >= 1 or deleted.get("deleted"), deleted
+
+        # i039 auto groups — dirty preview must not 500; fixture cluster is stable for k
+        dirty = tms.preview_auto_delivery_groups(
+            date=None,
+            strategy=None,
+            driver_names=None,
+            k=None,
+            working_days=None,
+            use_time_slots=None,
+        )
+        assert isinstance(dirty, dict) and "groups" in dirty and "ungeocoded" in dirty, dirty
+
+        try:
+            tms.commit_auto_delivery_groups(preview=None)
+            raise AssertionError("expected error for null preview commit")
+        except Exception as exc:
+            assert (
+                "ValidationError" in type(exc).__name__
+                or "preview" in str(exc).lower()
+                or "required" in str(exc).lower()
+            ), exc
+
+        # Synthetic lat/lng clustering stability (pure helper)
+        pts = [
+            (-34.55, -58.45),
+            (-34.56, -58.44),
+            (-34.63, -58.41),
+            (-34.64, -58.42),
+        ]
+        labels = tms._kmeans_cluster_indices(pts, 2)
+        assert len(labels) == 4 and set(labels) <= {0, 1}
+        # Nearby pairs should share a cluster more often than not
+        assert labels[0] == labels[1] or labels[2] == labels[3]
 
     def check_shop_ui():
         from erpnext.erpnext_integrations.ecommerce_api import shop_ui_settings as sui

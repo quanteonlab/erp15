@@ -69,6 +69,7 @@ after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.silkos_branding.ensure_silkos_branding",
 	"erpnext.erpnext_integrations.ecommerce_api.price_list_rules.ensure_price_list_rule_fields",
 	"erpnext.erpnext_integrations.ecommerce_api.price_list_rules.ensure_transferencia_auto_defaults",
+	"erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields.ensure_preferred_delivery_hours",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"
