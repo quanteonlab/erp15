@@ -7115,7 +7115,8 @@ _CUSTOM_FIELD_ALIASES = {
 	"status": ("estado", "status", "stock status", "availability", "disponibilidad"),
 	"barcode": ("barcode", "ean", "upc", "codigo_barras", "código de barras", "barras"),
 	"stock_uom": ("uom", "stock_uom", "unidad", "unit", "um"),
-	"price": ("transferencia", "price", "precio", "rate", "standard selling", "precio lista"),
+	# Catalog / POS list only — never alias Transferencia here (payment-method list).
+	"price": ("price", "precio", "rate", "standard selling", "precio lista", "selling price"),
 	"cash_price": ("efectivo", "cash", "cash_price", "precio efectivo", "precio_efectivo"),
 	"offer_rate": ("oferta", "offer", "offer_rate", "promo_rate", "promo price", "precio oferta"),
 	"offer_qty": ("cantidad", "offer_qty", "promo_qty", "min_qty", "x", "cantidad oferta"),
