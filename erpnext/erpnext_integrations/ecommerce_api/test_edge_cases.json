@@ -2255,6 +2255,23 @@
         "phone": null
       },
       "expect": "error"
+    },
+    {
+      "id": "create_customer_null_optional_crm_fields",
+      "source": "regression",
+      "bug": "create_customer with null tax_id/tax_category/preferred_hours/address/pin/cred must not TypeError; defaults Cond. IVA to IVA 21%",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_customer",
+      "args": {
+        "customer_name": "",
+        "phone": null,
+        "tax_id": null,
+        "tax_category": null,
+        "preferred_hours": null,
+        "address_line1": null,
+        "client_access_pin": null,
+        "client_phone_e164": null
+      },
+      "expect": "error"
     }
   ]
 }
