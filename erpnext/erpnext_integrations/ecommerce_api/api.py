@@ -2598,25 +2598,50 @@ def create_customer(
 	customer_group="Individual",
 	territory="All Territories",
 	customer_type="Individual",
+	tax_id=None,
+	tax_category=None,
+	preferred_hours=None,
+	custom_preferred_hours=None,
+	address_line1=None,
+	client_access_pin=None,
+	client_phone_e164=None,
+	**kwargs,
 ):
 	"""
-	Create a new customer or return existing customer
+	Create a new customer or return existing customer.
 
-	Args:
-		customer_name (str): Customer name
-		email (str): Email address
-		phone (str): Phone number
-		customer_group (str): Customer group (default: Individual)
-		territory (str): Territory (default: All Territories)
-		customer_type (str): Customer type (default: Individual)
-
-	Returns:
-		dict: Created or existing customer details
+	Optional CRM fields (all nullable / blank-safe): tax_id (CUIT), tax_category
+	(Cond. IVA — defaults to IVA 21%), preferred hours, address, PIN, credential phone.
 	"""
+	from frappe.utils import cstr
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+			ensure_client_access_custom_fields,
+		)
+
+		ensure_client_access_custom_fields()
+	except Exception:
+		pass
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+			ensure_argentina_iva_conditions,
+			ensure_preferred_delivery_hours,
+		)
+
+		ensure_preferred_delivery_hours()
+		ensure_argentina_iva_conditions()
+	except Exception:
+		pass
+
+	label = cstr(customer_name or "").strip()
+	if not label:
+		frappe.throw(_("Customer name is required"))
+
 	# Check if customer already exists - if so, return it
 	existing_name = None
-	if frappe.db.exists("Customer", customer_name):
-		existing_name = customer_name
+	if frappe.db.exists("Customer", label):
+		existing_name = label
 	else:
 		found = frappe.db.sql(
 			"""
@@ -2624,7 +2649,7 @@ def create_customer(
 			WHERE LOWER(TRIM(customer_name)) = %s
 			LIMIT 1
 			""",
-			(str(customer_name).strip().lower(),),
+			(label.lower(),),
 		)
 		if found:
 			existing_name = found[0][0]
@@ -2635,27 +2660,77 @@ def create_customer(
 		frappe.flags.ignore_permissions = False
 		return customer.as_dict()
 
+	# Defaults for optional CRM fields
+	phone_val = cstr(phone or "").strip() or None
+	email_val = cstr(email or "").strip() or None
+	tax_id_val = cstr(tax_id or "").strip() or None
+	# Cond. IVA defaults to standard Argentina rate when omitted / blank
+	raw_cat = tax_category if tax_category is not None else kwargs.get("tax_category")
+	cat_val = cstr(raw_cat or "").strip() or "IVA 21%"
+	if cat_val and not frappe.db.exists("Tax Category", cat_val):
+		# Soft-fallback: seed may not have run; keep blank rather than LinkError
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+				ensure_or_create_tax_category,
+			)
+
+			ensure_or_create_tax_category(cat_val)
+		except Exception:
+			cat_val = None
+
+	hours_val = cstr(
+		preferred_hours
+		if preferred_hours is not None
+		else (custom_preferred_hours if custom_preferred_hours is not None else "")
+	).strip() or None
+	addr_val = cstr(address_line1 or "").strip() or None
+	pin_val = cstr(
+		client_access_pin
+		if client_access_pin is not None
+		else kwargs.get("custom_client_access_pin")
+	).strip() or None
+	cred_val = cstr(
+		client_phone_e164
+		if client_phone_e164 is not None
+		else kwargs.get("custom_client_phone_e164")
+	).strip() or None
+
 	customer = frappe.new_doc("Customer")
-	customer.customer_name = customer_name
-	customer.customer_group = customer_group
-	customer.territory = territory
-	customer.customer_type = customer_type
-	if phone:
-		customer.mobile_no = phone
-	if email:
-		customer.email_id = email
+	customer.customer_name = label
+	customer.customer_group = customer_group or "Individual"
+	customer.territory = territory or "All Territories"
+	customer.customer_type = customer_type or "Individual"
+	if phone_val:
+		customer.mobile_no = phone_val
+	if email_val:
+		customer.email_id = email_val
+	if tax_id_val:
+		customer.tax_id = tax_id_val
+	if cat_val:
+		customer.tax_category = cat_val
+	if hours_val and frappe.db.has_column("Customer", "custom_preferred_hours"):
+		customer.custom_preferred_hours = hours_val
+	if pin_val and frappe.db.has_column("Customer", "custom_client_access_pin"):
+		customer.custom_client_access_pin = pin_val
+	if cred_val and frappe.db.has_column("Customer", "custom_client_phone_e164"):
+		customer.custom_client_phone_e164 = cred_val
 
 	customer.insert(ignore_permissions=True)
+
+	if addr_val:
+		_update_customer_primary_address_line(customer, addr_val)
+		customer.save(ignore_permissions=True)
+
 	frappe.db.commit()
 
 	# Create contact if email or phone provided
-	if email or phone:
+	if email_val or phone_val:
 		contact = frappe.new_doc("Contact")
-		contact.first_name = customer_name
-		if email:
-			contact.append("email_ids", {"email_id": email, "is_primary": 1})
-		if phone:
-			contact.append("phone_nos", {"phone": phone, "is_primary_phone": 1})
+		contact.first_name = label
+		if email_val:
+			contact.append("email_ids", {"email_id": email_val, "is_primary": 1})
+		if phone_val:
+			contact.append("phone_nos", {"phone": phone_val, "is_primary_phone": 1})
 
 		contact.append("links", {
 			"link_doctype": "Customer",
@@ -2802,10 +2877,12 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 		pass
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+			ensure_argentina_iva_conditions,
 			ensure_preferred_delivery_hours,
 		)
 
 		ensure_preferred_delivery_hours()
+		ensure_argentina_iva_conditions()
 	except Exception:
 		pass
 
@@ -2952,8 +3029,14 @@ def search_suppliers(search_term="", page_length=20, ensure_buckets=0):
 def list_crm_customer_options():
 	"""CRM clients table: territories, tax categories, preferred delivery hours (by priority)."""
 	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+		ensure_argentina_iva_conditions,
 		list_preferred_delivery_hours,
 	)
+
+	try:
+		ensure_argentina_iva_conditions()
+	except Exception:
+		pass
 
 	hours = list_preferred_delivery_hours(include_disabled=0)
 	territories = frappe.get_all(
@@ -2966,6 +3049,7 @@ def list_crm_customer_options():
 	if frappe.db.exists("DocType", "Tax Category"):
 		tax_categories = frappe.get_all(
 			"Tax Category",
+			filters={"disabled": 0},
 			fields=["name"],
 			order_by="name asc",
 			ignore_permissions=True,
@@ -2975,6 +3059,16 @@ def list_crm_customer_options():
 		"territories": [r.name for r in territories],
 		"tax_categories": [r.name for r in tax_categories],
 	}
+
+
+@frappe.whitelist(allow_guest=True)
+def ensure_or_create_tax_category(title=None):
+	"""Proxy — CRM Cond. IVA allowCreate."""
+	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+		ensure_or_create_tax_category as _ensure,
+	)
+
+	return _ensure(title=title)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -3027,6 +3121,17 @@ def update_customer(customer_name, **kwargs):
 		# Frontend may send preferred_hours alias
 		if "preferred_hours" in kwargs and "custom_preferred_hours" not in kwargs:
 			kwargs["custom_preferred_hours"] = kwargs.get("preferred_hours")
+	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		allowed_fields.append("custom_client_access_pin")
+		if "client_access_pin" in kwargs and "custom_client_access_pin" not in kwargs:
+			kwargs["custom_client_access_pin"] = kwargs.get("client_access_pin")
+	if frappe.db.has_column("Customer", "custom_client_phone_e164"):
+		allowed_fields.append("custom_client_phone_e164")
+		if "client_phone_e164" in kwargs and "custom_client_phone_e164" not in kwargs:
+			kwargs["custom_client_phone_e164"] = kwargs.get("client_phone_e164")
+	# CRM TEL column aliases
+	if "phone" in kwargs and "mobile_no" not in kwargs:
+		kwargs["mobile_no"] = kwargs.get("phone")
 
 	for field, value in kwargs.items():
 		if field in allowed_fields:

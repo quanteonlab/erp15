@@ -2224,6 +2224,37 @@
         "mode_of_payment": "Cash"
       },
       "expect": "fail"
+    },
+    {
+      "id": "ensure_argentina_iva_conditions_ok",
+      "source": "regression",
+      "bug": "ensure_argentina_iva_conditions must seed IVA 21/10.5/27 Tax Categories without crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields.ensure_argentina_iva_conditions",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "ensure_or_create_tax_category_null_title",
+      "source": "regression",
+      "bug": "ensure_or_create_tax_category with null title must ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.ensure_or_create_tax_category",
+      "args": {
+        "title": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_customer_null_pin_cred",
+      "source": "regression",
+      "bug": "update_customer with null client_access_pin/client_phone_e164/phone must not AttributeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "",
+        "client_access_pin": null,
+        "client_phone_e164": null,
+        "phone": null
+      },
+      "expect": "error"
     }
   ]
 }
