@@ -871,6 +871,28 @@
       "expect": "error"
     },
     {
+      "id": "list_party_interactions_null_party",
+      "source": "regression",
+      "bug": "list_party_interactions null party controlled error not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.list_party_interactions",
+      "args": {
+        "party_type": "Customer",
+        "party": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "list_party_interactions_missing_party_empty",
+      "source": "regression",
+      "bug": "phantom CRM supplier label returns empty interactions not Supplier not found",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.list_party_interactions",
+      "args": {
+        "party_type": "Supplier",
+        "party": "EDGE-PHANTOM-SUP-NOEXIST"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "list_party_payments_empty_party_type",
       "source": "regression",
       "bug": "list_party_payments with empty party_type must controlled error",
@@ -1115,6 +1137,20 @@
         "notes": ""
       },
       "expect": "no_500"
+    },
+    {
+      "id": "buying_create_po_unknown_supplier_autocreate",
+      "source": "regression",
+      "bug": "CRM free-text receiving supplier (e.g. awdsa) must auto-create Supplier, not throw not found",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
+      "args": {
+        "supplier": "EDGE-FREE-SUP-AW",
+        "schedule_date": null,
+        "items": [],
+        "submit": 0,
+        "notes": ""
+      },
+      "expect": "error"
     },
     {
       "id": "buying_create_po_empty_items",
@@ -1854,6 +1890,81 @@
       "expect": "fail"
     },
     {
+      "id": "buying_update_po_force_null_name",
+      "source": "regression",
+      "bug": "update_purchase_order force=1 with null name is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.update_purchase_order",
+      "args": {
+        "name": null,
+        "force": 1,
+        "items": []
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "buying_update_po_supplier_null_name",
+      "source": "regression",
+      "bug": "update_purchase_order with supplier but null name is controlled error (not crash on doc.supplier)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.update_purchase_order",
+      "args": {
+        "name": null,
+        "supplier": "SUP-OFFICE-TOOLS",
+        "items": [],
+        "force": 0
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "buying_update_po_unknown_supplier",
+      "source": "regression",
+      "bug": "update_purchase_order with unknown supplier on missing PO is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.update_purchase_order",
+      "args": {
+        "name": "__no_such_po__",
+        "supplier": "__no_such_supplier__",
+        "items": [],
+        "force": 0
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "buying_update_po_eta_only_null_name",
+      "source": "regression",
+      "bug": "update_purchase_order schedule_date-only (Compras ETA dbl-click) with null name is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.update_purchase_order",
+      "args": {
+        "name": null,
+        "schedule_date": "2026-10-01",
+        "items": null,
+        "force": 1
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "buying_record_po_payment_null_name",
+      "source": "regression",
+      "bug": "record_purchase_order_payment with null name is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.record_purchase_order_payment",
+      "args": {
+        "name": null,
+        "paid_amount": 10,
+        "mode_of_payment": "Cash"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "buying_update_po_payment_null_name",
+      "source": "regression",
+      "bug": "update_purchase_order_payment with null payment_name is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.update_purchase_order_payment",
+      "args": {
+        "payment_name": null,
+        "paid_amount": 10,
+        "mode_of_payment": "Cash"
+      },
+      "expect": "fail"
+    },
+    {
       "id": "buying_set_pipeline_null_name",
       "source": "regression",
       "bug": "set_purchase_order_pipeline with null name must return controlled error, not 500",
@@ -1862,22 +1973,41 @@
         "name": null,
         "target_pipeline": "to_receive"
       },
-      "expect": {
-        "ok": false
-      }
+      "expect": "fail"
     },
     {
       "id": "buying_set_pipeline_auto_only_partial",
       "source": "regression",
-      "bug": "Cannot force Partial from status bar — clear ValidationError",
+      "bug": "Partial without a PO name is a controlled ValidationError (name required)",
       "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.set_purchase_order_pipeline",
       "args": {
         "name": "",
         "target_pipeline": "partial"
       },
-      "expect": {
-        "ok": false
-      }
+      "expect": "fail"
+    },
+    {
+      "id": "buying_set_pipeline_force_null_target",
+      "source": "regression",
+      "bug": "force=1 with null target_pipeline must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.set_purchase_order_pipeline",
+      "args": {
+        "name": "PUR-ORD-MISSING",
+        "target_pipeline": null,
+        "force": 1,
+        "resolve": "override"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "print_get_purchase_print_bundle_null",
+      "source": "regression",
+      "bug": "get_purchase_print_bundle with null purchase_order is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_purchase_print_bundle",
+      "args": {
+        "purchase_order": null
+      },
+      "expect": "fail"
     },
     {
       "id": "preorder_set_status_invalid",
@@ -2069,6 +2199,31 @@
         }
       },
       "expect": "error"
+    },
+    {
+      "id": "update_preorder_payment_null_name",
+      "source": "regression",
+      "bug": "update_preorder_payment with null payment_name is controlled error, not AttributeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_preorder_payment",
+      "args": {
+        "payment_name": null,
+        "paid_amount": 10,
+        "mode_of_payment": "Cash",
+        "posting_date": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "record_preorder_payment_null_name",
+      "source": "regression",
+      "bug": "record_preorder_payment with null preorder_name is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.record_preorder_payment",
+      "args": {
+        "preorder_name": null,
+        "paid_amount": 10,
+        "mode_of_payment": "Cash"
+      },
+      "expect": "fail"
     }
   ]
 }

@@ -1783,6 +1783,24 @@ def suite_5_12_modules_read():
         )
         if item and supplier:
             rate = 12.34
+            # Free-text supplier from CRM receiving sessions must auto-create (not "not found")
+            free_sup = f"SMOKE-FREE-SUP-{frappe.generate_hash(length=5)}"
+            free_po = ba.create_purchase_order(
+                supplier=free_sup,
+                items=[{"item_code": item, "qty": 1, "rate": 1}],
+                submit=0,
+            )
+            assert free_po.get("ok") and free_po.get("name"), free_po
+            assert frappe.db.exists("Supplier", free_sup) or frappe.db.exists(
+                "Supplier", {"supplier_name": free_sup}
+            ), free_sup
+            if free_po.get("name"):
+                frappe.delete_doc("Purchase Order", free_po["name"], ignore_permissions=True, force=1)
+            if frappe.db.exists("Supplier", free_sup):
+                try:
+                    frappe.delete_doc("Supplier", free_sup, ignore_permissions=True, force=1)
+                except Exception:
+                    pass
             buying_pl = frappe.db.get_single_value("Buying Settings", "buying_price_list") or "Standard Buying"
             before = frappe.db.get_value(
                 "Item Price",

@@ -22,6 +22,23 @@ def _as_str(v) -> str:
 	return s
 
 
+def _resolve_supplier(supplier) -> str:
+	"""Return an existing Supplier name, or create one from a free-text label.
+
+	CRM merges receiving-session supplier strings that may never have been
+	inserted as `tabSupplier` — Buying / +compra must not fail with
+	"Supplier X not found" for those rows.
+	"""
+	label = _as_str(supplier)
+	if not label:
+		frappe.throw(_("supplier is required"))
+	if frappe.db.exists("Supplier", label):
+		return label
+	from erpnext.erpnext_integrations.ecommerce_api.api import _get_or_create_named_supplier
+
+	return _get_or_create_named_supplier(label)
+
+
 def _as_int(v, default: int, lo: int = 0, hi: int = 500) -> int:
 	try:
 		n = cint(v)
@@ -62,6 +79,12 @@ def _parse_items(items):
 				"schedule_date": _as_str(raw.get("schedule_date")) or None,
 				"description": _as_str(raw.get("notes") or raw.get("description")) or None,
 				"cost_edited": 1 if cint(raw.get("cost_edited")) else 0,
+				"amount": abs(flt(raw.get("amount"))) if raw.get("amount") not in (None, "") else None,
+				"received_qty": (
+					abs(flt(raw.get("received_qty")))
+					if raw.get("received_qty") not in (None, "")
+					else None
+				),
 			}
 		)
 	return clean
@@ -122,11 +145,7 @@ def create_purchase_order(
 	notes=None,
 ):
 	"""Create a Purchase Order with one shared expected (schedule) date."""
-	supplier = _as_str(supplier)
-	if not supplier:
-		frappe.throw(_("supplier is required"))
-	if not frappe.db.exists("Supplier", supplier):
-		frappe.throw(_("Supplier {0} not found").format(supplier))
+	supplier = _resolve_supplier(supplier)
 
 	sched = _as_str(schedule_date) or nowdate()
 	try:
@@ -226,8 +245,15 @@ def update_purchase_order(
 	items=None,
 	notes=None,
 	submit=0,
+	force=0,
+	supplier=None,
 ):
-	"""Update a draft Purchase Order (lines / ETA). Submitted docs must be amended in desk."""
+	"""Update Purchase Order lines / ETA / supplier.
+
+	Drafts: full replace of items; supplier can change.
+	Submitted: pass force=1 to update qty/rate/amount/received in place (admin inline edit)
+	and optionally change supplier.
+	"""
 	name = _as_str(name)
 	if not name:
 		frappe.throw(_("name is required"))
@@ -237,17 +263,62 @@ def update_purchase_order(
 	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc("Purchase Order", name)
 	frappe.flags.ignore_permissions = False
-	if cint(doc.docstatus) != 0:
+
+	do_force = cint(force)
+	if cint(doc.docstatus) == 2:
+		frappe.throw(_("Cancelled purchase orders cannot be edited"))
+	if cint(doc.docstatus) != 0 and not do_force:
 		frappe.throw(_("Only draft purchase orders can be edited here"))
 
 	sched = _as_str(schedule_date)
 	if sched:
 		try:
-			doc.schedule_date = str(getdate(sched))
+			new_sched = str(getdate(sched))
+			doc.schedule_date = new_sched
+			# Keep line ETAs in sync when parent ETA is changed (table dbl-click / detail).
+			for row in doc.get("items") or []:
+				row.schedule_date = new_sched
 		except Exception:
 			pass
 
+	supplier_changed = False
+	sup = _as_str(supplier)
+	if sup:
+		sup = _resolve_supplier(sup)
+		if doc.supplier != sup:
+			doc.supplier = sup
+			supplier_changed = True
+			doc.title = (
+				frappe.db.get_value("Supplier", sup, "supplier_name") or sup
+			)
+
 	clean = _parse_items(items)
+	force_notes: list[str] = []
+
+	if cint(doc.docstatus) == 1 and do_force:
+		if clean:
+			force_notes = _update_submitted_po_lines(doc, clean)
+		elif sched or supplier_changed:
+			doc.flags.ignore_validate_update_after_submit = True
+			doc.flags.ignore_permissions = True
+			doc.save(ignore_permissions=True)
+		if supplier_changed:
+			force_notes.append(_("Supplier set to {0}").format(doc.supplier))
+		note = _as_str(notes)
+		if note and hasattr(doc, "remarks"):
+			frappe.db.set_value("Purchase Order", name, "remarks", note, update_modified=False)
+		frappe.db.commit()
+		return {
+			"ok": True,
+			"name": doc.name,
+			"docstatus": cint(doc.docstatus),
+			"submitted": 1,
+			"grand_total": flt(frappe.db.get_value("Purchase Order", name, "grand_total")),
+			"cost_updates": [],
+			"notes": force_notes,
+			"forced": 1,
+		}
+
 	if clean:
 		doc.set("items", [])
 		for row in clean:
@@ -261,6 +332,9 @@ def update_purchase_order(
 				line["uom"] = row["uom"]
 			if row.get("description"):
 				line["description"] = row["description"]
+			if row.get("amount") is not None and flt(row["qty"]) > 0:
+				line["rate"] = flt(row["amount"]) / flt(row["qty"])
+				line["amount"] = flt(row["amount"])
 			doc.append("items", line)
 
 	if not doc.items:
@@ -273,9 +347,17 @@ def update_purchase_order(
 	if not doc.status:
 		doc.status = "Draft"
 
+	note = _as_str(notes)
+	if note and hasattr(doc, "remarks"):
+		doc.remarks = note
+
 	doc.save(ignore_permissions=True)
 
-	note = _as_str(notes)
+	for row in clean:
+		if row.get("received_qty") is None:
+			continue
+		_set_po_line_received(doc.name, row["item_code"], flt(row["received_qty"]))
+
 	if note:
 		try:
 			doc.add_comment("Comment", note)
@@ -317,51 +399,450 @@ def update_purchase_order(
 	}
 
 
+def _recalc_po_per_received(po_name: str):
+	"""Keep parent per_received in sync after manual received_qty edits."""
+	rows = frappe.get_all(
+		"Purchase Order Item",
+		filters={"parent": po_name},
+		fields=["qty", "received_qty"],
+		ignore_permissions=True,
+	)
+	ordered = sum(flt(r.qty) for r in rows) or 0.0
+	received = sum(flt(r.received_qty) for r in rows) or 0.0
+	pct = (received / ordered * 100.0) if ordered > 0 else 0.0
+	frappe.db.set_value(
+		"Purchase Order",
+		po_name,
+		"per_received",
+		pct,
+		update_modified=False,
+	)
+
+
+def _set_po_line_received(po_name: str, item_code: str, target_received: float):
+	"""Best-effort set received qty on a PO line (PR when increasing; override when decreasing)."""
+	target = max(0.0, flt(target_received))
+	row = frappe.db.get_value(
+		"Purchase Order Item",
+		{"parent": po_name, "item_code": item_code},
+		["name", "qty", "received_qty"],
+		as_dict=True,
+	)
+	if not row:
+		return None
+	current = flt(row.received_qty)
+	ordered = flt(row.qty)
+	if target > ordered + 1e-6:
+		target = ordered
+	delta = target - current
+	note = None
+	if abs(delta) < 1e-9:
+		return None
+
+	if delta > 0 and cint(frappe.db.get_value("Purchase Order", po_name, "docstatus")) == 1:
+		try:
+			from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+
+			pr = make_purchase_receipt(po_name)
+			kept = []
+			for it in pr.items or []:
+				if it.item_code == item_code:
+					it.qty = min(delta, flt(it.qty) if flt(it.qty) > 0 else delta)
+					it.received_qty = it.qty
+					it.stock_qty = flt(it.qty) * flt(it.conversion_factor or 1)
+					it.amount = flt(it.qty) * flt(it.rate)
+					kept.append(it)
+			pr.items = kept
+			if pr.items:
+				pr.flags.ignore_permissions = True
+				pr.insert(ignore_permissions=True)
+				pr.submit()
+				note = _("Purchase Receipt {0}").format(pr.name)
+		except Exception:
+			frappe.log_error(title="Compras set received via PR failed")
+			note = _("PR create failed — received qty overridden on PO line")
+
+	frappe.db.set_value(
+		"Purchase Order Item",
+		row.name,
+		"received_qty",
+		target,
+		update_modified=False,
+	)
+	_recalc_po_per_received(po_name)
+	return note
+
+
+def _update_submitted_po_lines(doc, clean: list) -> list:
+	"""Force-update qty/rate/amount/received on a submitted PO; append new lines."""
+	notes = []
+	by_code = {row.item_code: row for row in (doc.items or [])}
+	for row in clean:
+		poi = by_code.get(row["item_code"])
+		if not poi:
+			line = {
+				"item_code": row["item_code"],
+				"qty": flt(row["qty"]),
+				"rate": flt(row["rate"]),
+				"schedule_date": doc.schedule_date,
+			}
+			if row.get("uom"):
+				line["uom"] = row["uom"]
+			if row.get("amount") is not None:
+				line["amount"] = flt(row["amount"])
+			doc.append("items", line)
+			notes.append(_("Added item {0}").format(row["item_code"]))
+			continue
+		poi.qty = flt(row["qty"])
+		poi.rate = flt(row["rate"])
+		amt = row.get("amount")
+		poi.amount = flt(amt) if amt is not None else flt(poi.qty) * flt(poi.rate)
+		if row.get("uom"):
+			poi.uom = row["uom"]
+	doc.flags.ignore_validate_update_after_submit = True
+	doc.flags.ignore_permissions = True
+	try:
+		doc.run_method("calculate_taxes_and_totals")
+	except Exception:
+		pass
+	doc.save(ignore_permissions=True)
+
+	for row in clean:
+		if row.get("received_qty") is None:
+			continue
+		n = _set_po_line_received(doc.name, row["item_code"], flt(row["received_qty"]))
+		if n:
+			notes.append(n)
+	return notes
+
+
+
+_PIPELINE_IDS = frozenset(
+	{"draft", "to_receive", "partial", "to_bill", "overdue", "done", "cancelled"}
+)
+_AUTO_PIPELINE = frozenset({"partial", "to_bill", "overdue", "done"})
+
+
+def ensure_po_pipeline_override_field():
+	"""Idempotent Custom Field so Compras can force a badge when docs conflict."""
+	if frappe.db.has_column("Purchase Order", "custom_pipeline_override"):
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+	create_custom_fields(
+		{
+			"Purchase Order": [
+				{
+					"fieldname": "custom_pipeline_override",
+					"label": "Compras Pipeline Override",
+					"fieldtype": "Data",
+					"insert_after": "status",
+					"hidden": 1,
+					"read_only": 1,
+					"no_copy": 1,
+				}
+			]
+		},
+		ignore_validate=True,
+	)
+
+
+def _po_override_value(name: str) -> str:
+	if not name or not frappe.db.has_column("Purchase Order", "custom_pipeline_override"):
+		return ""
+	return _as_str(frappe.db.get_value("Purchase Order", name, "custom_pipeline_override"))
+
+
+def _set_po_override(name: str, value: str | None):
+	ensure_po_pipeline_override_field()
+	frappe.db.set_value(
+		"Purchase Order",
+		name,
+		"custom_pipeline_override",
+		_as_str(value) or None,
+		update_modified=False,
+	)
+
+
+def _natural_pipeline_for_doc(doc) -> str:
+	today = getdate(nowdate())
+	sched = getdate(doc.schedule_date) if getattr(doc, "schedule_date", None) else None
+	days_to_eta = (sched - today).days if sched else None
+	return _pipeline_label(
+		cint(doc.docstatus),
+		doc.status or "",
+		flt(doc.per_received),
+		flt(doc.per_billed),
+		days_to_eta,
+		override=None,
+	)
+
+
+def _linked_pr_names(po_name: str) -> list[str]:
+	return frappe.get_all(
+		"Purchase Receipt Item",
+		filters={"purchase_order": po_name, "docstatus": ["!=", 2]},
+		pluck="parent",
+		ignore_permissions=True,
+	) or []
+
+
+def _linked_pi_names(po_name: str) -> list[str]:
+	return frappe.get_all(
+		"Purchase Invoice Item",
+		filters={"purchase_order": po_name, "docstatus": ["!=", 2]},
+		pluck="parent",
+		ignore_permissions=True,
+	) or []
+
+
+def _pipeline_conflict(doc, current: str, target: str) -> dict | None:
+	"""Describe why a bar move is not a clean document action (admin can still force)."""
+	blockers: list[str] = []
+	reasons: list[str] = []
+	options = [
+		{
+			"id": "override",
+			"label": _("Override status badge only"),
+			"hint": _("Keeps ERP documents as-is; Compras list/detail show the chosen step."),
+		},
+		{
+			"id": "documents",
+			"label": _("Apply document changes"),
+			"hint": _(
+				"Submit / cancel / receive as needed. Falls back to badge override if ERP blocks it."
+			),
+		},
+	]
+
+	if target == "cancelled":
+		return {
+			"current": current,
+			"target": target,
+			"reason": _("Cancelled cannot be selected from the pipeline bar."),
+			"blockers": blockers,
+			"options": [],
+		}
+
+	if target in _AUTO_PIPELINE:
+		auto_msgs = {
+			"partial": _(
+				"Partial normally follows a Purchase Receipt with some qty received."
+			),
+			"to_bill": _("To Pay normally means fully received and not yet invoiced/paid."),
+			"done": _("Done normally means received and billed (or closed)."),
+			"overdue": _("Overdue is normally computed from ETA while qty is still pending."),
+		}
+		reasons.append(auto_msgs.get(target, _("This step is normally document-driven.")))
+
+	prs = list({n for n in _linked_pr_names(doc.name) if n})
+	pis = list({n for n in _linked_pi_names(doc.name) if n})
+	if prs:
+		blockers.append(_("Linked Purchase Receipt(s): {0}").format(", ".join(prs[:8])))
+	if pis:
+		blockers.append(_("Linked Purchase Invoice(s): {0}").format(", ".join(pis[:8])))
+
+	if target == "draft" and cint(doc.docstatus) == 1:
+		reasons.append(_("Moving to Draft cancels the Purchase Order."))
+		if prs or pis:
+			reasons.append(_("Linked receipts/invoices usually block cancel unless reversed first."))
+		else:
+			# Clean cancel — no modal needed
+			return None
+
+	if target == "to_receive" and cint(doc.docstatus) == 1 and current != "to_receive":
+		reasons.append(
+			_(
+				"PO is already submitted; natural pipeline is driven by receiving/billing "
+				"({0}). Forcing To Receive will override the badge (or try to unwind docs)."
+			).format(current)
+		)
+
+	if target == "to_receive" and cint(doc.docstatus) == 0:
+		# Clean submit path — no conflict modal.
+		return None
+
+	if target == "draft" and cint(doc.docstatus) == 0:
+		return None
+
+	if not reasons and not blockers and target in {"draft", "to_receive"}:
+		return None
+
+	if not reasons:
+		reasons.append(_("Confirm this pipeline change."))
+
+	return {
+		"current": current,
+		"target": target,
+		"reason": " ".join(reasons),
+		"blockers": blockers,
+		"options": options,
+	}
+
+
+def _try_receive_remaining(po_name: str) -> str | None:
+	"""Create+submit Purchase Receipt for remaining qty. Returns PR name or None."""
+	from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+
+	try:
+		pr = make_purchase_receipt(po_name)
+		if not pr or not getattr(pr, "items", None):
+			return None
+		# Drop zero-qty lines
+		pr.items = [row for row in pr.items if flt(row.qty) > 0]
+		if not pr.items:
+			return None
+		pr.flags.ignore_permissions = True
+		pr.insert(ignore_permissions=True)
+		pr.submit()
+		return pr.name
+	except Exception:
+		frappe.log_error(title="Compras force receive failed")
+		return None
+
+
+def _apply_pipeline_documents(doc, target: str) -> list[str]:
+	"""Best-effort ERP mutations for a forced pipeline target. Returns notes."""
+	notes: list[str] = []
+	name = doc.name
+
+	if target == "to_receive":
+		if cint(doc.docstatus) == 0:
+			doc.flags.ignore_permissions = True
+			doc.submit()
+			notes.append(_("Submitted Purchase Order"))
+			_set_po_override(name, None)
+			return notes
+		# Already submitted — clear override so natural label can show to_receive if applicable
+		_set_po_override(name, None)
+		natural = _natural_pipeline_for_doc(frappe.get_doc("Purchase Order", name))
+		if natural != "to_receive":
+			_set_po_override(name, "to_receive")
+			notes.append(_("Override set to To Receive (receiving progress remains)"))
+		else:
+			notes.append(_("Pipeline already To Receive"))
+		return notes
+
+	if target == "draft":
+		if cint(doc.docstatus) == 0:
+			_set_po_override(name, None)
+			return notes
+		if cint(doc.docstatus) == 2:
+			notes.append(_("Already cancelled"))
+			return notes
+		# Cancel linked drafts first, then PO
+		for pr_name in _linked_pr_names(name):
+			try:
+				pr = frappe.get_doc("Purchase Receipt", pr_name)
+				pr.flags.ignore_permissions = True
+				if cint(pr.docstatus) == 1:
+					pr.cancel()
+					notes.append(_("Cancelled {0}").format(pr_name))
+				elif cint(pr.docstatus) == 0:
+					frappe.delete_doc("Purchase Receipt", pr_name, ignore_permissions=True)
+					notes.append(_("Deleted draft {0}").format(pr_name))
+			except Exception as e:
+				notes.append(_("Could not clear {0}: {1}").format(pr_name, frappe.utils.cstr(e)))
+		doc = frappe.get_doc("Purchase Order", name)
+		doc.flags.ignore_permissions = True
+		try:
+			doc.cancel()
+			_set_po_override(name, None)
+			notes.append(_("Cancelled Purchase Order"))
+		except Exception as e:
+			_set_po_override(name, "draft")
+			notes.append(
+				_("Cancel blocked ({0}) — badge overridden to Draft").format(frappe.utils.cstr(e))
+			)
+		return notes
+
+	if target in {"partial", "to_bill", "done"}:
+		if cint(doc.docstatus) == 0:
+			doc.flags.ignore_permissions = True
+			doc.submit()
+			notes.append(_("Submitted Purchase Order"))
+			doc = frappe.get_doc("Purchase Order", name)
+		if flt(doc.per_received) < 99.5 and target in {"to_bill", "done", "partial"}:
+			pr_name = _try_receive_remaining(name)
+			if pr_name:
+				notes.append(_("Created Purchase Receipt {0}").format(pr_name))
+			elif target == "partial" and flt(doc.per_received) <= 0.5:
+				# Partial with nothing received yet — override
+				_set_po_override(name, "partial")
+				notes.append(_("Could not create receipt — badge overridden to Partial"))
+				return notes
+		doc = frappe.get_doc("Purchase Order", name)
+		natural = _natural_pipeline_for_doc(doc)
+		if natural != target:
+			_set_po_override(name, target)
+			notes.append(
+				_("Natural pipeline is {0}; badge overridden to {1}").format(natural, target)
+			)
+		else:
+			_set_po_override(name, None)
+			notes.append(_("Documents already match {0}").format(target))
+		return notes
+
+	if target == "overdue":
+		# Push ETA into the past so natural overdue applies when still open
+		if cint(doc.docstatus) == 0:
+			doc.flags.ignore_permissions = True
+			doc.submit()
+			notes.append(_("Submitted Purchase Order"))
+			doc = frappe.get_doc("Purchase Order", name)
+		from frappe.utils import add_days
+
+		past = add_days(nowdate(), -1)
+		frappe.db.set_value("Purchase Order", name, "schedule_date", past, update_modified=False)
+		for row in doc.items or []:
+			frappe.db.set_value(
+				"Purchase Order Item", row.name, "schedule_date", past, update_modified=False
+			)
+		notes.append(_("ETA set to {0}").format(past))
+		doc = frappe.get_doc("Purchase Order", name)
+		natural = _natural_pipeline_for_doc(doc)
+		if natural != "overdue":
+			_set_po_override(name, "overdue")
+			notes.append(_("Badge overridden to Overdue"))
+		else:
+			_set_po_override(name, None)
+		return notes
+
+	_set_po_override(name, target)
+	notes.append(_("Badge overridden to {0}").format(target))
+	return notes
+
+
 @frappe.whitelist(allow_guest=True)
-def set_purchase_order_pipeline(name=None, target_pipeline=None):
+def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolve=None):
 	"""
 	Attempt a pipeline move for Tables → Compras status bar.
 
-	Selectable targets today:
+	Clean paths (no force):
 	  - draft → to_receive (submit)
-	  - to_receive / partial / to_bill / done / overdue → draft (cancel; may fail if linked)
+	  - submitted → draft (cancel) when nothing blocks
 
-	partial / to_bill / done / overdue cannot be forced manually — return a clear reason.
+	When the move conflicts with document state, returns
+	``{ok: False, conflict: {...}}`` so the UI can open a resolver modal.
+	Pass ``force=1`` with ``resolve=override|documents`` to complete the move.
 	"""
 	name = _as_str(name)
 	target = _as_str(target_pipeline).lower()
+	resolve = _as_str(resolve).lower() or "override"
+	do_force = cint(force)
+
 	if not name:
 		frappe.throw(_("name is required"))
 	if not target:
 		frappe.throw(_("target_pipeline is required"))
+	if target not in _PIPELINE_IDS:
+		frappe.throw(_("Unknown pipeline step: {0}").format(target))
+	if target == "cancelled" and not do_force:
+		frappe.throw(_("Cancelled documents cannot be selected from the pipeline bar."))
 	if not frappe.db.exists("Purchase Order", name):
 		frappe.throw(_("Purchase Order {0} not found").format(name))
 
-	allowed_manual = {"draft", "to_receive"}
-	auto_only = {
-		"partial": _(
-			"Partial is set automatically when a Purchase Receipt receives some qty. "
-			"Create / submit a Purchase Receipt instead."
-		),
-		"to_bill": _(
-			"To Bill means the PO is fully received but not invoiced. "
-			"Create a Purchase Invoice against this order."
-		),
-		"done": _(
-			"Done means received and billed (or closed). "
-			"Complete receiving and billing documents in ERP — cannot jump here from the status bar."
-		),
-		"overdue": _(
-			"Overdue is computed from the expected delivery date while qty is still pending. "
-			"Change the ETA or receive goods — it is not a manual status."
-		),
-		"cancelled": _("Cancelled documents cannot be selected from the pipeline bar."),
-	}
-
-	if target in auto_only:
-		frappe.throw(auto_only[target])
-	if target not in allowed_manual:
-		frappe.throw(_("Unknown pipeline step: {0}").format(target))
+	ensure_po_pipeline_override_field()
 
 	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc("Purchase Order", name)
@@ -373,51 +854,111 @@ def set_purchase_order_pipeline(name=None, target_pipeline=None):
 		flt(doc.per_received),
 		flt(doc.per_billed),
 		None,
+		override=_po_override_value(name),
 	)
 
-	if target == current:
+	if target == current and not do_force:
 		return get_purchase_order_detail(name)
 
-	if target == "to_receive":
-		if cint(doc.docstatus) == 0:
-			try:
-				doc.flags.ignore_permissions = True
-				doc.submit()
-			except Exception as e:
-				frappe.throw(
-					_("Cannot move from Draft to To Receive: submit failed — {0}").format(
-						frappe.utils.cstr(e)
-					)
-				)
-			frappe.db.commit()
-			return get_purchase_order_detail(name)
-		if cint(doc.docstatus) == 1:
-			# Already submitted — pipeline may read as partial/to_bill/done/overdue
+	conflict = _pipeline_conflict(doc, current, target)
+
+	# Clean submit draft → to_receive
+	if not do_force and target == "to_receive" and cint(doc.docstatus) == 0 and not conflict:
+		try:
+			doc.flags.ignore_permissions = True
+			doc.submit()
+		except Exception as e:
 			frappe.throw(
-				_(
-					"Cannot force To Receive from {0}. "
-					"This PO is already submitted; receiving/billing progress drives the pipeline."
-				).format(current)
+				_("Cannot move from Draft to To Receive: submit failed — {0}").format(
+					frappe.utils.cstr(e)
+				)
 			)
-		frappe.throw(_("Cannot submit a cancelled Purchase Order"))
-
-	# target == draft
-	if cint(doc.docstatus) == 0:
+		_set_po_override(name, None)
+		frappe.db.commit()
 		return get_purchase_order_detail(name)
-	if cint(doc.docstatus) == 2:
-		frappe.throw(_("Purchase Order is already cancelled"))
-	try:
-		doc.flags.ignore_permissions = True
-		doc.cancel()
-	except Exception as e:
-		frappe.throw(
-			_(
-				"Cannot go back to Draft from {0}: cancel failed — {1}. "
-				"Linked receipts or invoices usually block this; amend or reverse them in ERP first."
-			).format(current, frappe.utils.cstr(e))
-		)
+
+	# Clean cancel → draft when no conflict signal
+	if not do_force and target == "draft" and cint(doc.docstatus) == 1 and not conflict:
+		try:
+			doc.flags.ignore_permissions = True
+			doc.cancel()
+		except Exception as e:
+			# Surface as conflict payload instead of hard fail when linked docs block
+			return {
+				"ok": False,
+				"conflict": {
+					"current": current,
+					"target": target,
+					"reason": _(
+						"Cancel failed: {0}. Choose how to resolve."
+					).format(frappe.utils.cstr(e)),
+					"blockers": [
+						b
+						for b in [
+							_("Linked Purchase Receipt(s): {0}").format(
+								", ".join(_linked_pr_names(name)[:8])
+							)
+							if _linked_pr_names(name)
+							else "",
+							_("Linked Purchase Invoice(s): {0}").format(
+								", ".join(_linked_pi_names(name)[:8])
+							)
+							if _linked_pi_names(name)
+							else "",
+						]
+						if b
+					],
+					"options": [
+						{
+							"id": "override",
+							"label": _("Override status badge only"),
+							"hint": _("Keeps ERP documents as-is."),
+						},
+						{
+							"id": "documents",
+							"label": _("Cancel linked docs then PO"),
+							"hint": _("Best-effort cancel of receipts, then the PO."),
+						},
+					],
+				},
+				"order": get_purchase_order_detail(name)["order"],
+			}
+		_set_po_override(name, None)
+		frappe.db.commit()
+		return get_purchase_order_detail(name)
+
+	if conflict and not do_force:
+		return {
+			"ok": False,
+			"conflict": conflict,
+			"order": get_purchase_order_detail(name)["order"],
+		}
+
+	# Forced path
+	notes: list[str] = []
+	if resolve == "documents":
+		notes = _apply_pipeline_documents(frappe.get_doc("Purchase Order", name), target)
+	else:
+		# override (default)
+		if target == "to_receive" and cint(doc.docstatus) == 0:
+			doc.flags.ignore_permissions = True
+			doc.submit()
+			_set_po_override(name, None)
+			notes.append(_("Submitted Purchase Order"))
+		elif target == "draft" and cint(doc.docstatus) == 1 and resolve == "override":
+			_set_po_override(name, "draft")
+			notes.append(_("Badge overridden to Draft (document still submitted)"))
+		else:
+			_set_po_override(name, None if target == _natural_pipeline_for_doc(doc) else target)
+			notes.append(_("Badge set to {0}").format(target))
+
 	frappe.db.commit()
-	return get_purchase_order_detail(name)
+	detail = get_purchase_order_detail(name)
+	detail["ok"] = True
+	detail["notes"] = notes
+	detail["forced"] = 1
+	detail["resolve"] = resolve
+	return detail
 
 
 @frappe.whitelist(allow_guest=True)
@@ -526,8 +1067,18 @@ def list_item_buying_cost_trail(item_code=None, limit=40):
 	}
 
 
-def _pipeline_label(docstatus: int, status: str, per_received: float, per_billed: float, days_to_eta) -> str:
-	"""Coarse buying pipeline for filters / badges."""
+def _pipeline_label(
+	docstatus: int,
+	status: str,
+	per_received: float,
+	per_billed: float,
+	days_to_eta,
+	override=None,
+) -> str:
+	"""Coarse buying pipeline for filters / badges. Optional override wins for Compras UI."""
+	ov = _as_str(override).lower()
+	if ov in _PIPELINE_IDS and ov != "cancelled":
+		return ov
 	st = (status or "").lower()
 	if cint(docstatus) == 0 or "draft" in st:
 		return "draft"
@@ -564,6 +1115,7 @@ def _enrich_po_rows(rows: list) -> list:
 			"received_qty",
 			"amount",
 			"rate",
+			"billed_amt",
 		],
 		ignore_permissions=True,
 	)
@@ -585,6 +1137,18 @@ def _enrich_po_rows(rows: list) -> list:
 			if row.brand:
 				brand_map[row.name] = row.brand
 
+	overrides: dict[str, str] = {}
+	if names and frappe.db.has_column("Purchase Order", "custom_pipeline_override"):
+		for row in frappe.get_all(
+			"Purchase Order",
+			filters={"name": ["in", names]},
+			fields=["name", "custom_pipeline_override"],
+			ignore_permissions=True,
+		):
+			ov = _as_str(row.custom_pipeline_override)
+			if ov:
+				overrides[row.name] = ov
+
 	out = []
 	for r in rows:
 		lines = by_po.get(r.name, [])
@@ -592,6 +1156,15 @@ def _enrich_po_rows(rows: list) -> list:
 		qty_received = sum(flt(x.received_qty) for x in lines)
 		line_count = len(lines)
 		sku_count = len({x.item_code for x in lines if x.item_code})
+		amount_billed = sum(flt(getattr(x, "billed_amt", 0) or 0) for x in lines)
+		qty_billed = 0.0
+		for x in lines:
+			rate = flt(x.rate)
+			billed = flt(getattr(x, "billed_amt", 0) or 0)
+			if rate > 0 and billed > 0:
+				qty_billed += min(flt(x.qty), billed / rate)
+			elif flt(x.qty) > 0 and flt(x.amount) > 0 and billed >= flt(x.amount) - 0.01:
+				qty_billed += flt(x.qty)
 		preview = []
 		for x in lines[:3]:
 			label = _as_str(x.item_name) or _as_str(x.item_code)
@@ -613,7 +1186,13 @@ def _enrich_po_rows(rows: list) -> list:
 		grand = flt(r.grand_total)
 		open_receive_value = max(0.0, grand * (100.0 - min(per_recv, 100.0)) / 100.0)
 		open_bill_value = max(0.0, grand * (100.0 - min(per_bill, 100.0)) / 100.0)
-		pipeline = _pipeline_label(cint(r.docstatus), r.status or "", per_recv, per_bill, days_to_eta)
+		ov = overrides.get(r.name)
+		pipeline_natural = _pipeline_label(
+			cint(r.docstatus), r.status or "", per_recv, per_bill, days_to_eta, override=None
+		)
+		pipeline = _pipeline_label(
+			cint(r.docstatus), r.status or "", per_recv, per_bill, days_to_eta, override=ov
+		)
 
 		out.append(
 			{
@@ -628,6 +1207,7 @@ def _enrich_po_rows(rows: list) -> list:
 				"grand_total": grand,
 				"net_total": flt(getattr(r, "net_total", 0) or 0),
 				"total_taxes_and_charges": flt(getattr(r, "total_taxes_and_charges", 0) or 0),
+				"advance_paid": flt(getattr(r, "advance_paid", 0) or 0),
 				"status": r.status,
 				"docstatus": cint(r.docstatus),
 				"currency": r.currency,
@@ -638,6 +1218,8 @@ def _enrich_po_rows(rows: list) -> list:
 				"qty_ordered": qty_ordered,
 				"qty_received": qty_received,
 				"qty_pending": max(0.0, qty_ordered - qty_received),
+				"qty_billed": qty_billed,
+				"amount_billed": amount_billed,
 				"items_preview": preview,
 				"brands": brands,
 				"brands_label": ", ".join(brands[:3]) + ("…" if len(brands) > 3 else ""),
@@ -646,6 +1228,8 @@ def _enrich_po_rows(rows: list) -> list:
 				"open_receive_value": open_receive_value,
 				"open_bill_value": open_bill_value,
 				"pipeline": pipeline,
+				"pipeline_natural": pipeline_natural,
+				"pipeline_override": ov or None,
 				"remarks": None,
 			}
 		)
@@ -703,6 +1287,7 @@ def list_purchase_orders(
 			"grand_total",
 			"net_total",
 			"total_taxes_and_charges",
+			"advance_paid",
 			"status",
 			"docstatus",
 			"currency",
@@ -785,17 +1370,19 @@ def get_purchase_order_detail(name=None):
 					"grand_total": doc.grand_total,
 					"net_total": doc.net_total,
 					"total_taxes_and_charges": doc.total_taxes_and_charges,
+					"advance_paid": getattr(doc, "advance_paid", 0) or 0,
 					"status": doc.status,
 					"docstatus": doc.docstatus,
 					"currency": doc.currency,
 					"per_received": doc.per_received,
 					"per_billed": doc.per_billed,
-					"remarks": None,
+					"remarks": _as_str(getattr(doc, "remarks", None)) or None,
 				}
 			)
 		]
 	)[0]
 	base["lines"] = lines
+	base["payments"] = _payments_for_purchase_order(doc.name, flt(doc.grand_total))
 	return {"ok": True, "order": base}
 
 
@@ -927,3 +1514,283 @@ def force_retag_po_currency(currency=None, company=None):
 		"already": already,
 		"total_active": updated + already,
 	}
+
+
+# ── Compras payments (Payment Entry Pay → Purchase Order) ─────────────────────
+
+
+def _payments_for_purchase_order(po_name: str, grand_total=None) -> list:
+	"""Payment Entry rows allocated to this Purchase Order (oldest first)."""
+	if not po_name:
+		return []
+	rows = frappe.db.sql(
+		"""
+		SELECT
+			pe.name AS name,
+			pe.posting_date AS posting_date,
+			pe.mode_of_payment AS mode_of_payment,
+			pe.paid_amount AS paid_amount,
+			pe.received_amount AS received_amount,
+			pe.docstatus AS docstatus,
+			pe.creation AS creation,
+			per.allocated_amount AS allocated_amount
+		FROM `tabPayment Entry Reference` per
+		INNER JOIN `tabPayment Entry` pe ON pe.name = per.parent
+		WHERE per.reference_doctype = 'Purchase Order'
+			AND per.reference_name = %s
+			AND pe.docstatus < 2
+		ORDER BY pe.posting_date ASC, pe.creation ASC
+		""",
+		(po_name,),
+		as_dict=True,
+	)
+	total = flt(grand_total)
+	if total <= 0 and po_name and frappe.db.exists("Purchase Order", po_name):
+		total = flt(frappe.db.get_value("Purchase Order", po_name, "grand_total") or 0)
+
+	out = []
+	seen = set()
+	running = 0.0
+	for r in rows or []:
+		name = r.get("name")
+		if not name or name in seen:
+			continue
+		seen.add(name)
+		amount = flt(r.get("allocated_amount"))
+		if amount <= 0:
+			amount = flt(r.get("paid_amount") or r.get("received_amount"))
+		running += amount
+		out.append(
+			{
+				"name": name,
+				"posting_date": str(r.posting_date) if r.get("posting_date") else None,
+				"mode_of_payment": r.get("mode_of_payment") or None,
+				"amount": amount,
+				"docstatus": cint(r.get("docstatus")),
+				"outstanding_after": max(0.0, total - running),
+			}
+		)
+	return out
+
+
+def _resolve_payable_account(company: str, supplier: str | None = None) -> str | None:
+	"""Supplier payable account for Payment Entry Pay."""
+	if supplier:
+		acc = frappe.db.get_value(
+			"Party Account",
+			{"parent": supplier, "parenttype": "Supplier", "company": company},
+			"account",
+		)
+		if acc:
+			return acc
+
+	acc = frappe.db.get_value("Company", company, "default_payable_account")
+	if acc and frappe.db.exists("Account", acc):
+		return acc
+
+	for like in (
+		"%Acreedores locales%",
+		"%Creditors%",
+		"%Acreedores%",
+		"%Proveedores%",
+		"%Payable%",
+	):
+		acc = frappe.db.get_value(
+			"Account",
+			{
+				"company": company,
+				"account_type": "Payable",
+				"is_group": 0,
+				"disabled": 0,
+				"name": ("like", like),
+			},
+			"name",
+		)
+		if acc:
+			return acc
+
+	return frappe.db.get_value(
+		"Account",
+		{"company": company, "account_type": "Payable", "is_group": 0, "disabled": 0},
+		"name",
+	)
+
+
+def _resolve_purchase_payment_accounts(company: str, mode_of_payment=None, supplier=None):
+	"""Return (cash_account, payable_account, mop_name) for supplier Pay entries."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_ensure_preorder_mop_account,
+		_resolve_preorder_cash_account,
+		_resolve_preorder_mop_name,
+	)
+
+	mop = _resolve_preorder_mop_name(mode_of_payment)
+	cash_account = _resolve_preorder_cash_account(company, mop)
+	payable_account = _resolve_payable_account(company, supplier)
+
+	if cash_account and mop:
+		_ensure_preorder_mop_account(company, mop, cash_account)
+
+	if not payable_account or not cash_account:
+		missing = []
+		if not payable_account:
+			missing.append(_("payable (Company → Default Payable Account)"))
+		if not cash_account:
+			missing.append(_("cash/bank (Mode of Payment Account or Company cash account)"))
+		frappe.throw(
+			_("Could not find debit/credit accounts for payment ({0}). Check company defaults.").format(
+				", ".join(str(m) for m in missing)
+			)
+		)
+	return cash_account, payable_account, mop
+
+
+@frappe.whitelist(allow_guest=True)
+def list_purchase_payment_modes():
+	"""Enabled Mode of Payment names for Compras payment UI."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import list_preorder_payment_modes
+
+	return list_preorder_payment_modes()
+
+
+@frappe.whitelist(allow_guest=True)
+def record_purchase_order_payment(
+	name=None,
+	paid_amount=None,
+	mode_of_payment="Cash",
+	posting_date=None,
+):
+	"""Create a Payment Entry (Pay) allocated to a submitted Purchase Order."""
+	name = _as_str(name)
+	if not name:
+		frappe.throw(_("name is required"))
+	if not frappe.db.exists("Purchase Order", name):
+		frappe.throw(_("Purchase Order {0} not found").format(name))
+
+	frappe.flags.ignore_permissions = True
+	po = frappe.get_doc("Purchase Order", name)
+	frappe.flags.ignore_permissions = False
+
+	if cint(po.docstatus) != 1:
+		frappe.throw(_("Payment can only be recorded on submitted purchase orders"))
+	if not po.supplier:
+		frappe.throw(_("Purchase Order has no supplier"))
+
+	paid_amount = flt(paid_amount)
+	if paid_amount <= 0:
+		frappe.throw(_("Paid amount must be greater than zero"))
+
+	company = po.company
+	cash_account, payable_account, mop = _resolve_purchase_payment_accounts(
+		company, mode_of_payment, po.supplier
+	)
+
+	outstanding = flt(po.grand_total) - flt(getattr(po, "advance_paid", 0) or 0)
+	allocated = min(paid_amount, outstanding) if outstanding > 0 else paid_amount
+
+	pe = frappe.new_doc("Payment Entry")
+	pe.payment_type = "Pay"
+	pe.company = company
+	pe.party_type = "Supplier"
+	pe.party = po.supplier
+	pe.mode_of_payment = mop
+	pe.paid_from = cash_account
+	pe.paid_to = payable_account
+	pe.paid_from_account_currency = po.currency
+	pe.paid_to_account_currency = po.currency
+	pe.paid_amount = paid_amount
+	pe.received_amount = paid_amount
+	pe.reference_date = nowdate()
+	pe.reference_no = name
+	raw_pd = _as_str(posting_date)
+	if raw_pd:
+		try:
+			pe.posting_date = str(getdate(raw_pd))
+		except Exception:
+			pass
+	if allocated > 0:
+		pe.append(
+			"references",
+			{
+				"reference_doctype": "Purchase Order",
+				"reference_name": name,
+				"total_amount": flt(po.grand_total),
+				"outstanding_amount": outstanding,
+				"allocated_amount": allocated,
+			},
+		)
+	pe.insert(ignore_permissions=True)
+	pe.submit()
+	frappe.db.commit()
+	return get_purchase_order_detail(name)
+
+
+@frappe.whitelist(allow_guest=True)
+def update_purchase_order_payment(
+	payment_name=None,
+	posting_date=None,
+	mode_of_payment=None,
+	paid_amount=None,
+):
+	"""Amend a Compras payment: cancel PE + recreate."""
+	payment_name = _as_str(payment_name)
+	if not payment_name:
+		frappe.throw(_("payment_name is required"))
+	if not frappe.db.exists("Payment Entry", payment_name):
+		frappe.throw(_("Payment Entry {0} not found").format(payment_name))
+
+	frappe.flags.ignore_permissions = True
+	pe = frappe.get_doc("Payment Entry", payment_name)
+	frappe.flags.ignore_permissions = False
+
+	po_name = None
+	for ref in pe.references or []:
+		if ref.reference_doctype == "Purchase Order" and ref.reference_name:
+			po_name = ref.reference_name
+			break
+	if not po_name:
+		po_name = _as_str(getattr(pe, "reference_no", None)) or None
+	if not po_name or not frappe.db.exists("Purchase Order", po_name):
+		frappe.throw(_("Payment is not linked to a Purchase Order"))
+
+	old_amount = flt(pe.paid_amount or pe.received_amount)
+	old_mode = pe.mode_of_payment or ""
+	old_date = str(pe.posting_date) if pe.posting_date else ""
+
+	new_amount = flt(paid_amount) if paid_amount not in (None, "") else old_amount
+	if new_amount <= 0:
+		frappe.throw(_("Paid amount must be greater than zero"))
+	new_mode = _as_str(mode_of_payment) or old_mode or "Cash"
+	new_date = _as_str(posting_date) or old_date or nowdate()
+
+	if cint(pe.docstatus) == 1:
+		pe.cancel()
+	elif cint(pe.docstatus) == 0:
+		pe.delete()
+
+	detail = record_purchase_order_payment(
+		name=po_name,
+		paid_amount=new_amount,
+		mode_of_payment=new_mode,
+		posting_date=new_date,
+	)
+
+	try:
+		frappe.flags.ignore_permissions = True
+		po = frappe.get_doc("Purchase Order", po_name)
+		frappe.flags.ignore_permissions = False
+		po.add_comment(
+			"Comment",
+			_("Payment amended: {0} → new entry (was {1} {2} on {3})").format(
+				payment_name,
+				old_amount,
+				old_mode,
+				old_date,
+			),
+		)
+		frappe.db.commit()
+	except Exception:
+		pass
+
+	return detail
+

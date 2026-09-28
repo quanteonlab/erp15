@@ -2738,6 +2738,14 @@ def _default_supplier_group():
 	)
 
 
+def _default_supplier_type() -> str:
+	"""Supplier.supplier_type is often mandatory (Company / Individual / Partnership)."""
+	existing = frappe.db.get_value("Supplier", {"supplier_type": ["is", "set"]}, "supplier_type")
+	if existing:
+		return existing
+	return "Company"
+
+
 def _get_or_create_named_supplier(display_name: str) -> str:
 	label = (display_name or "").strip()
 	if not label:
@@ -2758,6 +2766,7 @@ def _get_or_create_named_supplier(display_name: str) -> str:
 			"doctype": "Supplier",
 			"supplier_name": label,
 			"supplier_group": _default_supplier_group(),
+			"supplier_type": _default_supplier_type(),
 		}
 	)
 	doc.insert(ignore_permissions=True)
@@ -2889,6 +2898,7 @@ def create_supplier(supplier_name, supplier_group=None):
 			"doctype": "Supplier",
 			"supplier_name": label,
 			"supplier_group": supplier_group or _default_supplier_group(),
+			"supplier_type": _default_supplier_type(),
 		}
 	)
 	doc.insert(ignore_permissions=True)
@@ -4323,6 +4333,7 @@ def get_guest_preorder(preorder_name):
 		"advance_paid": flt(getattr(so, "advance_paid", 0)),
 		"amended_from": so.amended_from or None,
 		"delivery_note": _delivery_note_for_sales_order(preorder_name),
+		"payments": _payments_for_sales_order(preorder_name, flt(so.grand_total)),
 		"items": [
 			{
 				"item_code": d.item_code,
@@ -4426,6 +4437,60 @@ def _so_is_fully_paid(so) -> bool:
 	total = flt(getattr(so, "grand_total", 0) or 0)
 	paid = flt(getattr(so, "advance_paid", 0) or 0)
 	return total > 0 and paid + 0.005 >= total
+
+
+def _payments_for_sales_order(so_name: str, grand_total=None) -> list:
+	"""Payment Entry rows allocated to this Sales Order (oldest first) with running balance."""
+	if not so_name:
+		return []
+	rows = frappe.db.sql(
+		"""
+		SELECT
+			pe.name AS name,
+			pe.posting_date AS posting_date,
+			pe.mode_of_payment AS mode_of_payment,
+			pe.paid_amount AS paid_amount,
+			pe.received_amount AS received_amount,
+			pe.docstatus AS docstatus,
+			pe.creation AS creation,
+			per.allocated_amount AS allocated_amount
+		FROM `tabPayment Entry Reference` per
+		INNER JOIN `tabPayment Entry` pe ON pe.name = per.parent
+		WHERE per.reference_doctype = 'Sales Order'
+			AND per.reference_name = %s
+			AND pe.docstatus < 2
+		ORDER BY pe.posting_date ASC, pe.creation ASC
+		""",
+		(so_name,),
+		as_dict=True,
+	)
+	total = flt(grand_total)
+	if total <= 0 and so_name and frappe.db.exists("Sales Order", so_name):
+		total = flt(frappe.db.get_value("Sales Order", so_name, "grand_total") or 0)
+
+	out = []
+	seen = set()
+	running = 0.0
+	for r in rows or []:
+		name = r.get("name")
+		if not name or name in seen:
+			continue
+		seen.add(name)
+		amount = flt(r.get("allocated_amount"))
+		if amount <= 0:
+			amount = flt(r.get("received_amount") or r.get("paid_amount"))
+		running += amount
+		out.append(
+			{
+				"name": name,
+				"posting_date": str(r.posting_date) if r.get("posting_date") else None,
+				"mode_of_payment": r.get("mode_of_payment") or None,
+				"amount": amount,
+				"docstatus": cint(r.get("docstatus")),
+				"outstanding_after": max(0.0, total - running),
+			}
+		)
+	return out
 
 
 def _display_status(so):
@@ -5044,7 +5109,33 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 
 
 @frappe.whitelist()
-def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectivo"):
+def list_preorder_payment_modes():
+	"""Enabled Mode of Payment names for Pedidos payment UI (Cash/Efectivo preferred)."""
+	rows = frappe.get_all(
+		"Mode of Payment",
+		filters={"enabled": 1},
+		fields=["name"],
+		order_by="name asc",
+		ignore_permissions=True,
+	)
+	names = [r.name for r in rows if r.name]
+	preferred = ["Cash", "Efectivo", "Transferencia", "Bank Draft", "Card", "Cheque"]
+	ordered = []
+	seen = set()
+	for p in preferred:
+		if p in names and p not in seen:
+			ordered.append(p)
+			seen.add(p)
+	for n in names:
+		if n not in seen:
+			ordered.append(n)
+			seen.add(n)
+	default = "Cash" if "Cash" in seen else ("Efectivo" if "Efectivo" in seen else (ordered[0] if ordered else "Cash"))
+	return {"modes": ordered, "default": default}
+
+
+@frappe.whitelist()
+def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectivo", posting_date=None):
 	"""Create a Payment Entry for a confirmed preorder."""
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
@@ -5083,6 +5174,12 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 	pe.received_amount = paid_amount
 	pe.reference_date = nowdate()
 	pe.reference_no = preorder_name
+	raw_pd = str(posting_date or "").strip()
+	if raw_pd:
+		try:
+			pe.posting_date = str(getdate(raw_pd))
+		except Exception:
+			pass
 	if allocated > 0:
 		pe.append("references", {
 			"reference_doctype": "Sales Order",
@@ -5094,6 +5191,79 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 	pe.insert(ignore_permissions=True)
 	pe.submit()
 	return get_guest_preorder(preorder_name)
+
+
+@frappe.whitelist()
+def update_preorder_payment(
+	payment_name=None,
+	posting_date=None,
+	mode_of_payment=None,
+	paid_amount=None,
+):
+	"""Amend a Pedidos payment: cancel PE + recreate (keeps SO historial via comment)."""
+	payment_name = str(payment_name or "").strip()
+	if not payment_name:
+		frappe.throw(_("payment_name is required"))
+	if not frappe.db.exists("Payment Entry", payment_name):
+		frappe.throw(_("Payment Entry {0} not found").format(payment_name))
+
+	frappe.flags.ignore_permissions = True
+	pe = frappe.get_doc("Payment Entry", payment_name)
+	frappe.flags.ignore_permissions = False
+
+	so_name = None
+	for ref in pe.references or []:
+		if ref.reference_doctype == "Sales Order" and ref.reference_name:
+			so_name = ref.reference_name
+			break
+	if not so_name:
+		so_name = str(getattr(pe, "reference_no", "") or "").strip() or None
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		frappe.throw(_("Payment is not linked to a Sales Order"))
+
+	so = frappe.get_doc("Sales Order", so_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+
+	old_amount = flt(pe.received_amount or pe.paid_amount)
+	old_mode = pe.mode_of_payment or ""
+	old_date = str(pe.posting_date) if pe.posting_date else ""
+
+	new_amount = flt(paid_amount) if paid_amount is not None and paid_amount != "" else old_amount
+	if new_amount <= 0:
+		frappe.throw(_("Paid amount must be greater than zero"))
+	new_mode = str(mode_of_payment or "").strip() or old_mode or "Cash"
+	new_date = str(posting_date or "").strip() or old_date or nowdate()
+
+	if cint(pe.docstatus) == 1:
+		pe.cancel()
+	elif cint(pe.docstatus) == 0:
+		pe.delete()
+
+	# After cancel, SO advance_paid drops — recreate with new values.
+	detail = record_preorder_payment(
+		so_name,
+		new_amount,
+		mode_of_payment=new_mode,
+		posting_date=new_date,
+	)
+
+	try:
+		so.add_comment(
+			"Comment",
+			_("Payment amended: {0} → new entry (was {1} {2} on {3})").format(
+				payment_name,
+				old_amount,
+				old_mode,
+				old_date,
+			),
+		)
+		frappe.db.commit()
+	except Exception:
+		pass
+
+	return detail
 
 
 def _resolve_preorder_mop_name(preferred: str | None = None) -> str | None:
@@ -7156,12 +7326,9 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			}).insert(ignore_permissions=True)
 
 	def _upsert_item_default_supplier(item_code: str, supplier_name: str) -> None:
-		if not frappe.db.exists("Supplier", supplier_name):
-			frappe.get_doc({
-				"doctype": "Supplier",
-				"supplier_name": supplier_name,
-				"supplier_group": "All Supplier Groups",
-			}).insert(ignore_permissions=True)
+		from erpnext.erpnext_integrations.ecommerce_api.api import _get_or_create_named_supplier
+
+		resolved = _get_or_create_named_supplier(cstr(supplier_name or "").strip() or "Uncategorized")
 		company = frappe.db.get_single_value("Global Defaults", "default_company")
 		defaults = frappe.get_all(
 			"Item Default",
@@ -7170,10 +7337,10 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			limit=1,
 		)
 		if defaults:
-			frappe.db.set_value("Item Default", defaults[0].name, "default_supplier", supplier_name)
+			frappe.db.set_value("Item Default", defaults[0].name, "default_supplier", resolved)
 		else:
 			item_doc = frappe.get_doc("Item", item_code)
-			row = {"default_supplier": supplier_name}
+			row = {"default_supplier": resolved}
 			if company:
 				row["company"] = company
 			item_doc.append("item_defaults", row)

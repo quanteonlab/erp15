@@ -431,15 +431,12 @@ PROTECTED_ROLES = {"All", "Guest", "Administrator"}
 
 # Default groups: created automatically if missing. Existing non-empty permission
 # lists are never overwritten.
+# Starter floor roles intentionally omit log.* and tables.* — ops (+ tools) only.
+# Frontend flattens Operaciones into top-level header pills when those zones are hidden.
 _STARTER_REPOSITOR = [
 	"ops.receiving",
 	"ops.catalog",
-	"tables.products",
-	"tables.review",
-	"tables.variants",
 	"ops.buying",
-	"tables.compras",
-	"log.sections",
 	"tools.labels",
 	"tools.catalog_pdf",
 	"tools.sync",
@@ -447,19 +444,12 @@ _STARTER_REPOSITOR = [
 _STARTER_CAJA = [
 	"ops.pos",
 	"ops.catalog",
-	"tables.orders.own",
-	"tables.orders.tag:caja",
-	"tables.cajas",
-	"log.accounting",
 	"tools.labels",
 ]
 _STARTER_VENTAS = [
 	"ops.preventa",
 	"ops.catalog",
-	"tables.orders",
-	"tables.orders.all",
-	"tables.crm",
-	"tools.catalog_pdf",
+	"tools.sync",
 ]
 # Field driver / conductor app — assigned trips + PoD, not full route planning.
 _STARTER_DRIVER = [
@@ -467,6 +457,77 @@ _STARTER_DRIVER = [
 ]
 # Alias of ventas for EN-labeled sites / Vista previa “Sales”.
 _STARTER_SALES = list(_STARTER_VENTAS)
+
+# Prior starter lists (pre ops-only defaults). Matching groups are upgraded in place
+# so unmodified floor roles lose log.*/tables.* without touching customised groups.
+_FLOOR_STARTER_TITLES = frozenset({"repositor", "caja", "ventas", "Sales", "Driver"})
+_LEGACY_STARTER_BY_TITLE = {
+	"repositor": [
+		[
+			"ops.receiving",
+			"ops.catalog",
+			"tables.products",
+			"tables.review",
+			"tables.variants",
+			"ops.buying",
+			"tables.compras",
+			"log.sections",
+			"tools.labels",
+			"tools.catalog_pdf",
+			"tools.sync",
+		],
+	],
+	"caja": [
+		[
+			"ops.pos",
+			"ops.catalog",
+			"tables.orders.own",
+			"tables.orders.tag:caja",
+			"tables.cajas",
+			"log.accounting",
+			"tools.labels",
+		],
+	],
+	"ventas": [
+		[
+			"ops.preventa",
+			"ops.catalog",
+			"tables.orders",
+			"tables.orders.all",
+			"tables.crm",
+			"tools.catalog_pdf",
+		],
+	],
+	"Sales": [
+		[
+			"ops.preventa",
+			"ops.catalog",
+			"tables.orders",
+			"tables.orders.all",
+			"tables.crm",
+			"tools.catalog_pdf",
+		],
+	],
+}
+
+
+def _perm_set(ids) -> frozenset:
+	return frozenset(_normalize_permission_ids(ids))
+
+
+def _is_legacy_starter_perms(title: str, current: list[str]) -> bool:
+	cur = _perm_set(current)
+	for legacy in _LEGACY_STARTER_BY_TITLE.get(title) or []:
+		if cur == _perm_set(legacy):
+			return True
+	return False
+
+
+def _floor_starter_needs_ops_only_upgrade(title: str, current: list[str]) -> bool:
+	"""True when a named floor starter still carries tables.* / log.* access."""
+	if title not in _FLOOR_STARTER_TITLES:
+		return False
+	return any(p.startswith("tables.") or p.startswith("log.") for p in current)
 
 
 STARTER_STAFF_GROUPS = [
@@ -1416,14 +1477,19 @@ def _apply_caja_orders_split(store: dict) -> bool:
 
 
 def _ensure_starter_staff_groups() -> dict:
-	"""Create repositor / caja / admin if missing. Do not overwrite non-empty permission lists."""
+	"""Create repositor / caja / admin if missing. Do not overwrite customised lists.
+
+	Empty lists get the current starter perms. Groups still on a known legacy starter
+	fingerprint (pre ops-only) are upgraded in place.
+	"""
 	if getattr(frappe.local, "_staff_starter_ensured", False):
-		return {"created": [], "attached": [], "skipped": []}
+		return {"created": [], "attached": [], "upgraded": [], "skipped": []}
 	frappe.local._staff_starter_ensured = True
 	frappe.flags.ignore_permissions = True
 	store = _load_perm_store()
 	created = []
 	attached = []
+	upgraded = []
 	skipped = []
 	dirty = _apply_caja_orders_split(store)
 	for spec in STARTER_STAFF_GROUPS:
@@ -1435,6 +1501,13 @@ def _ensure_starter_staff_groups() -> dict:
 			if not current:
 				store[existing] = perms
 				attached.append({"name": existing, "employee_group_name": title, "permissions": perms})
+				dirty = True
+			elif (
+				_is_legacy_starter_perms(title, current)
+				or _floor_starter_needs_ops_only_upgrade(title, current)
+			) and _perm_set(current) != _perm_set(perms):
+				store[existing] = perms
+				upgraded.append({"name": existing, "employee_group_name": title, "permissions": perms})
 				dirty = True
 			else:
 				skipped.append({"name": existing, "employee_group_name": title, "permissions": current})
@@ -1448,7 +1521,7 @@ def _ensure_starter_staff_groups() -> dict:
 	if dirty:
 		_save_perm_store(store)
 		frappe.db.commit()
-	return {"created": created, "attached": attached, "skipped": skipped}
+	return {"created": created, "attached": attached, "upgraded": upgraded, "skipped": skipped}
 
 
 @frappe.whitelist()

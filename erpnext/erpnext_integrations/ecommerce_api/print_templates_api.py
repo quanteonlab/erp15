@@ -2,7 +2,7 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import flt
+from frappe.utils import flt, nowdate
 
 # Fields exposed per source doctype, plus the child-table (line items) fieldname
 # used by the 'line-items' element kind in the template designer.
@@ -69,6 +69,7 @@ _DELIVERY_CHECKLIST_FIELDS = [
 	{"fieldname": "warehouse_name", "label": "Almacen", "fieldtype": "Data"},
 	{"fieldname": "total_weight", "label": "Peso total", "fieldtype": "Float"},
 	{"fieldname": "company", "label": "Company", "fieldtype": "Data"},
+	{"fieldname": "order_ean13", "label": "Armado EAN-13", "fieldtype": "Data"},
 	{"fieldname": "_map", "label": "Warehouse Map", "fieldtype": "JSON"},
 ]
 
@@ -577,6 +578,13 @@ def get_doctype_fields(source_doctype, paper_kind=None):
 	}
 
 
+def _armado_order_ean13(so_name: str) -> str:
+	"""EAN-13 for armado sheets (prefix 290…) — never collides with product barcodes."""
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import armado_ean13_for_order
+
+	return armado_ean13_for_order(so_name)
+
+
 def _item_barcode(item_code: str) -> str:
 	if not item_code:
 		return ""
@@ -823,6 +831,7 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"warehouse_name": wh,
 		"total_weight": _sum_line_total_weight(rows) or getattr(so, "total_weight", None) or "",
 		"company": company,
+		"order_ean13": _armado_order_ean13(so.name),
 		"_map": map_out,
 	}
 	return {"doc": doc, "lineItems": rows, "map": map_out}
@@ -1032,6 +1041,108 @@ def get_order_print_bundle(sales_order, warehouse=None, floor_id=None):
 		},
 		"checklist": checklist,
 		"item_codes": [it.item_code for it in (so.items or []) if it.item_code],
+	}
+
+
+def _purchase_order_as_receipt_preview(po_name: str, warehouse=None) -> dict:
+	"""Shape Purchase Order lines like Purchase Receipt print data when no PR exists yet."""
+	frappe.flags.ignore_permissions = True
+	po = frappe.get_doc("Purchase Order", po_name)
+	frappe.flags.ignore_permissions = False
+
+	wh = warehouse or _default_warehouse_name(po.company)
+	rows = []
+	for it in po.items or []:
+		row = {
+			"item_code": it.item_code,
+			"item_name": it.item_name,
+			"description": it.description,
+			"qty": flt(it.qty) - flt(it.received_qty) if flt(it.received_qty) else flt(it.qty),
+			"uom": it.uom,
+			"stock_uom": it.stock_uom,
+			"rate": flt(it.rate),
+			"amount": flt(it.amount),
+			"warehouse": wh,
+			"purchase_order": po.name,
+			"barcode": "",
+		}
+		# Prefer ordered qty for receiving sheet (check-off style)
+		row["qty"] = flt(it.qty)
+		row["ordered_qty"] = flt(it.qty)
+		row["received_qty"] = flt(it.received_qty)
+		rows.append(_enrich_print_line_item(row))
+
+	data = {
+		"name": po.name,
+		"supplier": po.supplier,
+		"supplier_name": po.supplier_name or po.supplier,
+		"posting_date": str(po.transaction_date or nowdate())[:10],
+		"set_warehouse": wh,
+		"company": po.company,
+		"currency": po.currency,
+		"grand_total": flt(po.grand_total),
+		"total_qty": sum(flt(r.get("qty") or 0) for r in rows),
+		"pedido_ref": po.name,
+		"items": rows,
+		"owner": po.owner,
+	}
+	_enrich_commercial_print_doc("Purchase Receipt", data, rows)
+	return {"doc": data, "lineItems": rows}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_purchase_print_bundle(purchase_order=None, warehouse=None):
+	"""Resolve linked Purchase Receipts + PO-as-receipt preview for Compras print modal."""
+	po_name = (purchase_order or "").strip()
+	if not po_name:
+		frappe.throw(_("purchase_order is required"))
+	if not frappe.db.exists("Purchase Order", po_name):
+		frappe.throw(_("Purchase Order {0} not found").format(po_name), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	po = frappe.get_doc("Purchase Order", po_name)
+	frappe.flags.ignore_permissions = False
+
+	pr_names = frappe.get_all(
+		"Purchase Receipt Item",
+		filters={"purchase_order": po_name, "docstatus": ["!=", 2]},
+		pluck="parent",
+		ignore_permissions=True,
+	) or []
+	# Unique, newest first
+	seen = set()
+	prs = []
+	for n in pr_names:
+		if n and n not in seen:
+			seen.add(n)
+			prs.append(n)
+	primary_pr = prs[0] if prs else None
+
+	wh = warehouse or _default_warehouse_name(po.company)
+	warehouses = frappe.get_all(
+		"Warehouse",
+		filters={"is_group": 0, "company": po.company} if po.company else {"is_group": 0},
+		fields=["name"],
+		order_by="name asc",
+		limit_page_length=200,
+		ignore_permissions=True,
+	)
+
+	preview = _purchase_order_as_receipt_preview(po_name, warehouse=wh)
+
+	return {
+		"purchase_order": po.name,
+		"supplier_name": po.supplier_name or po.supplier,
+		"grand_total": flt(po.grand_total),
+		"currency": po.currency,
+		"default_warehouse": wh,
+		"warehouses": [w.name for w in warehouses],
+		"links": {
+			"purchase_receipt": primary_pr,
+			"purchase_receipts": prs,
+		},
+		"receipt_preview": preview,
+		"item_codes": [it.item_code for it in (po.items or []) if it.item_code],
 	}
 
 
@@ -1904,6 +2015,20 @@ def _ar_entregas_checklist_a4_elements(
 	items_h = 95 if with_map else 175
 
 	elements = _armado_meta_header_elements(p, font=font)
+	# Scannable armado EAN-13 (prefix 290…) — filters /armado when scanned
+	elements.append(
+		{
+			"id": f"{p}-order-ean13",
+			"kind": "barcode",
+			"x": 148,
+			"y": 4,
+			"width": 52,
+			"height": 18,
+			"fieldPath": "order_ean13",
+			"barcodeFormat": "EAN13",
+			"displayValue": True,
+		}
+	)
 	# PEDIDO / ARMADO section labels over the shared table column groups
 	elements.append(
 		{

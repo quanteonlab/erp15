@@ -390,6 +390,10 @@ def save_shop_ui_settings(settings=None):
 				}
 			}
 		),
+		"opsKiosk": {
+			**(current.get("opsKiosk") or {}),
+			**(incoming.get("opsKiosk") or {}),
+		},
 	}
 	_save_raw(merged)
 	return {"ok": True, "settings": merged, "source": "server"}

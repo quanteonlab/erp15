@@ -342,24 +342,36 @@ def update_party_doc_remarks(doctype=None, name=None, remarks=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def get_party_invoice_detail(invoice_name=None):
-	"""Sales Invoice header + items for credit-note picker (ignore_permissions)."""
+def get_party_invoice_detail(invoice_name=None, for_credit=0):
+	"""Sales/Purchase Invoice header + items for CRM tabs / credit-note picker.
+
+	`for_credit=1` keeps the stricter credit-note rules (submitted SI, not a return).
+	"""
 	name = _as_str(invoice_name)
 	if not name:
 		frappe.throw(_("invoice_name is required"))
-	if not frappe.db.exists("Sales Invoice", name):
-		frappe.throw(_("Sales Invoice {0} not found").format(name))
+
+	doctype = None
+	if frappe.db.exists("Sales Invoice", name):
+		doctype = "Sales Invoice"
+	elif frappe.db.exists("Purchase Invoice", name):
+		doctype = "Purchase Invoice"
+	else:
+		frappe.throw(_("Invoice {0} not found").format(name))
 
 	frappe.flags.ignore_permissions = True
 	try:
-		doc = frappe.get_doc("Sales Invoice", name)
+		doc = frappe.get_doc(doctype, name)
 	finally:
 		frappe.flags.ignore_permissions = False
 
-	if cint(doc.is_return):
-		frappe.throw(_("Cannot credit against another credit note"))
-	if cint(doc.docstatus) != 1:
-		frappe.throw(_("Invoice must be submitted"))
+	if cint(for_credit):
+		if doctype != "Sales Invoice":
+			frappe.throw(_("Credit notes require a Sales Invoice"))
+		if cint(doc.is_return):
+			frappe.throw(_("Cannot credit against another credit note"))
+		if cint(doc.docstatus) != 1:
+			frappe.throw(_("Invoice must be submitted"))
 
 	items = []
 	for row in doc.items or []:
@@ -374,22 +386,33 @@ def get_party_invoice_detail(invoice_name=None):
 				"rate": flt(row.rate),
 				"amount": flt(row.amount),
 				"uom": row.uom,
-				"warehouse": row.warehouse,
+				"warehouse": getattr(row, "warehouse", None),
 			}
 		)
 
+	party = getattr(doc, "customer", None) or getattr(doc, "supplier", None)
+	party_name = getattr(doc, "customer_name", None) or getattr(doc, "supplier_name", None)
+
 	return {
 		"ok": True,
+		"doctype": doctype,
 		"invoice": {
 			"name": doc.name,
 			"posting_date": str(doc.posting_date) if doc.posting_date else None,
 			"grand_total": flt(doc.grand_total),
 			"outstanding_amount": flt(doc.outstanding_amount),
-			"customer": doc.customer,
-			"customer_name": doc.customer_name,
+			"customer": getattr(doc, "customer", None),
+			"customer_name": getattr(doc, "customer_name", None),
+			"supplier": getattr(doc, "supplier", None),
+			"supplier_name": getattr(doc, "supplier_name", None),
+			"party": party,
+			"party_name": party_name,
 			"status": doc.status,
 			"currency": doc.currency,
 			"company": doc.company,
+			"is_return": cint(getattr(doc, "is_return", 0)),
+			"docstatus": cint(doc.docstatus),
+			"remarks": (doc.remarks or "") if getattr(doc, "remarks", None) else "",
 		},
 		"items": items,
 	}
@@ -618,4 +641,236 @@ def create_party_credit_note(
 		"grand_total": flt(doc.grand_total),
 		"customer": doc.customer,
 		"reason_code": reason_key,
+	}
+
+
+def _interaction_row(
+	*,
+	doctype: str,
+	name: str,
+	date,
+	doc_kind: str,
+	amount: float,
+	paid: float,
+	status: str = "",
+	currency: str | None = None,
+) -> dict:
+	amt = flt(amount)
+	pd = flt(paid)
+	return {
+		"id": f"{doctype}:{name}",
+		"doctype": doctype,
+		"name": name,
+		"date": str(date) if date else None,
+		"doc_kind": doc_kind,
+		"amount": amt,
+		"paid": pd,
+		"outstanding": max(0.0, amt - pd) if doctype != "Payment Entry" else 0.0,
+		"status": status or "",
+		"currency": currency,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_party_interactions(party_type=None, party=None, start=0, page_length=100):
+	"""Unified ledger of orders / invoices / payments for a CRM party.
+
+	Customer → Sales Order + Sales Invoice (+ Payment Entry Receive).
+	Supplier → Purchase Order + Purchase Invoice (+ Payment Entry Pay).
+
+	Missing party (phantom CRM receiving label) returns an empty list — not 404 —
+	so the detail panel can still render.
+	"""
+	ptype = _norm_party_type(party_type)
+	party = _as_str(party)
+	if not party:
+		frappe.throw(_("party is required"))
+	start = _as_int(start, 0, lo=0, hi=100000)
+	page_length = _as_int(page_length, 100, lo=1, hi=300)
+
+	if not frappe.db.exists(ptype, party):
+		return {
+			"ok": True,
+			"party_type": ptype,
+			"party": party,
+			"total": 0,
+			"rows": [],
+			"totals": {"amount": 0.0, "paid": 0.0, "outstanding": 0.0},
+		}
+
+	rows: list[dict] = []
+
+	if ptype == "Customer":
+		for r in frappe.get_all(
+			"Sales Order",
+			filters={"customer": party, "docstatus": ["<", 2]},
+			fields=[
+				"name",
+				"transaction_date",
+				"grand_total",
+				"advance_paid",
+				"status",
+				"currency",
+			],
+			order_by="transaction_date desc",
+			limit_page_length=300,
+			ignore_permissions=True,
+		):
+			rows.append(
+				_interaction_row(
+					doctype="Sales Order",
+					name=r.name,
+					date=r.transaction_date,
+					doc_kind="sale",
+					amount=flt(r.grand_total),
+					paid=flt(r.advance_paid),
+					status=r.status,
+					currency=r.currency,
+				)
+			)
+		for r in frappe.get_all(
+			"Sales Invoice",
+			filters={"customer": party, "docstatus": ["<", 2]},
+			fields=[
+				"name",
+				"posting_date",
+				"grand_total",
+				"outstanding_amount",
+				"status",
+				"currency",
+				"is_return",
+			],
+			order_by="posting_date desc",
+			limit_page_length=300,
+			ignore_permissions=True,
+		):
+			gt = flt(r.grand_total)
+			out = flt(r.outstanding_amount)
+			# Returns are negative totals — paid = gt - out still works in abs terms
+			rows.append(
+				_interaction_row(
+					doctype="Sales Invoice",
+					name=r.name,
+					date=r.posting_date,
+					doc_kind="credit_note" if cint(r.is_return) else "sales_invoice",
+					amount=gt,
+					paid=gt - out,
+					status=r.status,
+					currency=r.currency,
+				)
+			)
+	else:
+		for r in frappe.get_all(
+			"Purchase Order",
+			filters={"supplier": party, "docstatus": ["<", 2]},
+			fields=[
+				"name",
+				"transaction_date",
+				"schedule_date",
+				"grand_total",
+				"advance_paid",
+				"status",
+				"currency",
+			],
+			order_by="transaction_date desc",
+			limit_page_length=300,
+			ignore_permissions=True,
+		):
+			rows.append(
+				_interaction_row(
+					doctype="Purchase Order",
+					name=r.name,
+					date=r.transaction_date or r.schedule_date,
+					doc_kind="purchase",
+					amount=flt(r.grand_total),
+					paid=flt(r.advance_paid),
+					status=r.status,
+					currency=r.currency,
+				)
+			)
+		for r in frappe.get_all(
+			"Purchase Invoice",
+			filters={"supplier": party, "docstatus": ["<", 2]},
+			fields=[
+				"name",
+				"posting_date",
+				"grand_total",
+				"outstanding_amount",
+				"status",
+				"currency",
+				"is_return",
+			],
+			order_by="posting_date desc",
+			limit_page_length=300,
+			ignore_permissions=True,
+		):
+			gt = flt(r.grand_total)
+			out = flt(r.outstanding_amount)
+			rows.append(
+				_interaction_row(
+					doctype="Purchase Invoice",
+					name=r.name,
+					date=r.posting_date,
+					doc_kind="debit_note" if cint(r.is_return) else "purchase_invoice",
+					amount=gt,
+					paid=gt - out,
+					status=r.status,
+					currency=r.currency,
+				)
+			)
+
+	pe_filters = {"party_type": ptype, "party": party, "docstatus": ["<", 2]}
+	for r in frappe.get_all(
+		"Payment Entry",
+		filters=pe_filters,
+		fields=[
+			"name",
+			"posting_date",
+			"paid_amount",
+			"received_amount",
+			"payment_type",
+			"status",
+			"paid_to_account_currency",
+			"paid_from_account_currency",
+		],
+		order_by="posting_date desc",
+		limit_page_length=300,
+		ignore_permissions=True,
+	):
+		amt = flt(r.received_amount) if ptype == "Customer" else flt(r.paid_amount)
+		if amt <= 0:
+			amt = flt(r.paid_amount) or flt(r.received_amount)
+		rows.append(
+			_interaction_row(
+				doctype="Payment Entry",
+				name=r.name,
+				date=r.posting_date,
+				doc_kind="payment",
+				amount=0.0,
+				paid=amt,
+				status=r.status or r.payment_type,
+				currency=r.paid_to_account_currency or r.paid_from_account_currency,
+			)
+		)
+
+	rows.sort(key=lambda x: (x.get("date") or "", x.get("name") or ""), reverse=True)
+	total = len(rows)
+	page = rows[start : start + page_length]
+	sum_amount = sum(flt(r["amount"]) for r in rows if r["doctype"] != "Payment Entry")
+	sum_paid = sum(flt(r["paid"]) for r in rows)
+	# Outstanding across invoices/orders (payments reduce paid side)
+	sum_out = sum(flt(r.get("outstanding") or 0) for r in rows)
+
+	return {
+		"ok": True,
+		"party_type": ptype,
+		"party": party,
+		"total": total,
+		"rows": page,
+		"totals": {
+			"amount": sum_amount,
+			"paid": sum_paid,
+			"outstanding": sum_out,
+			"balance": sum_amount - sum_paid,
+		},
 	}
