@@ -142,6 +142,10 @@ def get_products(
 		):
 			if frappe.db.has_column("Item", custom):
 				fields.append(custom)
+		# Standard Item fields used by catalog mayorista weight estimates (units × kg).
+		for std in ("weight_per_unit", "weight_uom"):
+			if std not in fields and frappe.db.has_column("Item", std):
+				fields.append(std)
 
 	if isinstance(filters, str):
 		import json
@@ -1039,6 +1043,15 @@ def save_pricing_rule(data):
 	elif apply_on == "Item Group" and _is_all_targets(groups):
 		apply_on = "Transaction"
 		doc.apply_on = "Transaction"
+
+	# Empty Item Code targets used to hit ERPNext's cryptic
+	# "Item Code is not added in the table".
+	if apply_on == "Item Code" and not items:
+		frappe.throw(_("Add at least one Item Code in Targets, or * for all products"))
+	elif apply_on == "Item Group" and not groups:
+		frappe.throw(_("Add at least one Item Group in Targets, or * for all products"))
+	elif apply_on == "Brand" and not brands:
+		frappe.throw(_("Add at least one Brand in Targets"))
 
 	if apply_on == "Item Code":
 		for code in items:
@@ -3215,7 +3228,9 @@ def create_order(
 	if payment_terms:
 		so.payment_terms_template = payment_terms
 
-	# Add items
+	# Add items — client/catalog rates win; skip Pricing Rule re-apply on insert.
+	so.ignore_pricing_rule = 1
+	so.flags.ignore_pricing_rule = True
 	for item in items:
 		item_code = item.get("item_code")
 		qty = flt(item.get("qty", 1))
@@ -3232,6 +3247,7 @@ def create_order(
 				"conversion_rate": so.conversion_rate,
 				"transaction_date": so.transaction_date,
 				"doctype": "Sales Order",
+				"ignore_pricing_rule": 1,
 			})
 			rate = item_details.get("price_list_rate", 0)
 
@@ -3586,7 +3602,13 @@ def _set_customer_zone_and_address(customer, *, territory=None, zone=None, addre
 	return _customer_address_zone_map([cust_name]).get(cust_name) or {}
 
 
-def _item_line_weight_fields(item_code, line_uom=None):
+def _item_line_weight_fields(
+	item_code,
+	line_uom=None,
+	line_weight_per_unit=None,
+	line_total_weight=None,
+	line_qty=None,
+):
 	stock_uom, weight_per_unit, weight_uom = "", 0.0, ""
 	unit = ""
 	try:
@@ -3624,6 +3646,14 @@ def _item_line_weight_fields(item_code, line_uom=None):
 		"milliliter",
 	}
 	is_weight_based = bool(uoms & weight_tokens)
+	# Prefer line-level pack weight / measured total (remeasure) over Item master.
+	line_wpu = flt(line_weight_per_unit) if line_weight_per_unit not in (None, "") else 0.0
+	if line_wpu > 0:
+		weight_per_unit = line_wpu
+	qty = flt(line_qty)
+	total_weight = flt(line_total_weight) if line_total_weight not in (None, "") else 0.0
+	if total_weight <= 0 and weight_per_unit > 0 and qty > 0:
+		total_weight = weight_per_unit * qty
 	return {
 		# Prefer the Sales Order line UOM so Pedidos "Tipo de peso" persists after save.
 		"stock_uom": sell_uom or stock_uom,
@@ -3631,6 +3661,7 @@ def _item_line_weight_fields(item_code, line_uom=None):
 		"item_stock_uom": stock_uom,
 		"weight_uom": weight_uom,
 		"weight_per_unit": weight_per_unit,
+		"total_weight": total_weight or None,
 		"unit": unit,
 		"is_weight_based": is_weight_based,
 	}
@@ -3910,6 +3941,10 @@ def create_guest_preorder(
 	so.conversion_rate = 1
 	so.price_list_currency = price_list_currency
 	so.plc_conversion_rate = 1
+	# Catalog/consulta already resolved Price-promo conflicts and sent line rates —
+	# do not re-apply Pricing Rules on insert (would 417 on equal-priority overlaps).
+	so.ignore_pricing_rule = 1
+	so.flags.ignore_pricing_rule = True
 
 	remarks_parts = [GUEST_PREORDER_REMARKS_TAG, f"customer:{customer}"]
 	if guest_phone:
@@ -3976,6 +4011,7 @@ def create_guest_preorder(
 				"price_list_currency": price_list_currency,
 				"plc_conversion_rate": 1,
 				"doctype": "Sales Order",
+				"ignore_pricing_rule": 1,
 			})
 			rate = item_details.get("price_list_rate", 0)
 
@@ -4298,6 +4334,9 @@ def get_guest_preorder(preorder_name):
 				**_item_line_weight_fields(
 					d.item_code,
 					line_uom=getattr(d, "uom", None),
+					line_weight_per_unit=getattr(d, "weight_per_unit", None),
+					line_total_weight=getattr(d, "total_weight", None),
+					line_qty=flt(d.qty),
 				),
 			}
 			for d in (so.items or [])
@@ -4931,6 +4970,15 @@ def _apply_item_changes(so, items, additional_discount_amount):
 		# or Frappe still validates against Nos ("Quantity cannot be a fraction").
 		if override.get("uom") is not None or override.get("stock_uom") is not None:
 			_apply_so_line_uom(row, override.get("uom") or override.get("stock_uom"))
+		# Measured pack weight (gondolas → kg after scale). Keep qty as units.
+		if "total_weight" in override and override.get("total_weight") is not None:
+			tw = flt(override.get("total_weight"))
+			row.total_weight = tw
+			if flt(row.qty) > 0:
+				row.weight_per_unit = tw / flt(row.qty)
+		elif "weight_per_unit" in override and override.get("weight_per_unit") is not None:
+			row.weight_per_unit = flt(override.get("weight_per_unit"))
+			row.total_weight = flt(row.qty) * flt(row.weight_per_unit)
 		row.amount = row.rate * row.qty
 
 	# Add new items
@@ -5462,6 +5510,9 @@ def create_delivery_note_for_preorder(preorder_name):
 	lists submitted Delivery Notes) - and advances the preorder's display
 	status to "En Delivery". Idempotent: reuses an existing linked DN
 	instead of creating a duplicate.
+
+	Insufficient warehouse qty does **not** block submit — stock may go
+	negative (Pedidos remitos are operational; shortfalls are warned only).
 	"""
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
@@ -5473,6 +5524,7 @@ def create_delivery_note_for_preorder(preorder_name):
 	if so.docstatus != 1:
 		frappe.throw(_("Confirm the order before creating a delivery note."))
 
+	stock_warnings = []
 	dn_name = _delivery_note_for_sales_order(preorder_name)
 	if not dn_name:
 		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
@@ -5491,15 +5543,60 @@ def create_delivery_note_for_preorder(preorder_name):
 				row.warehouse = default_warehouse
 			dn.set_warehouse = default_warehouse
 
+		stock_warnings = _delivery_note_stock_shortages(dn)
 		dn.insert(ignore_permissions=True)
 		dn.flags.ignore_permissions = True
-		dn.submit()
+		_submit_delivery_note_allowing_negative(dn)
 		dn_name = dn.name
 		frappe.db.commit()
 
 	updated = set_guest_preorder_status(preorder_name, "En Delivery")
 	updated["delivery_note"] = dn_name
+	if stock_warnings:
+		updated["stock_warnings"] = stock_warnings
 	return updated
+
+
+def _delivery_note_stock_shortages(dn):
+	"""Soft report of lines where required qty exceeds warehouse balance."""
+	from erpnext.stock.utils import get_stock_balance
+
+	out = []
+	for row in dn.get("items") or []:
+		wh = cstr(getattr(row, "warehouse", None) or "").strip()
+		code = cstr(getattr(row, "item_code", None) or "").strip()
+		need = flt(getattr(row, "stock_qty", None) or getattr(row, "qty", None) or 0)
+		if not wh or not code or need <= 0:
+			continue
+		try:
+			bal = flt(get_stock_balance(code, wh, dn.posting_date, dn.posting_time))
+		except TypeError:
+			bal = flt(get_stock_balance(code, wh))
+		except Exception:
+			continue
+		if bal + 1e-9 < need:
+			out.append(
+				{
+					"item_code": code,
+					"item_name": getattr(row, "item_name", None) or code,
+					"warehouse": wh,
+					"required": need,
+					"available": bal,
+				}
+			)
+	return out
+
+
+def _submit_delivery_note_allowing_negative(dn):
+	"""Submit DN even when warehouse qty is short (allow negative stock)."""
+	with _temporarily_allow_negative_stock():
+		orig = dn.update_stock_ledger
+
+		def _update_stock_ledger(allow_negative_stock=False):
+			return orig(allow_negative_stock=True)
+
+		dn.update_stock_ledger = _update_stock_ledger
+		dn.submit()
 
 
 @frappe.whitelist(allow_guest=True)

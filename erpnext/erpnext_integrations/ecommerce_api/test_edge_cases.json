@@ -1347,6 +1347,19 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_dual_price_rules",
+      "source": "regression",
+      "bug": "EDGE-PSTYLE with qty meeting both AT-EDGE-PSTYLE (x3@$80) and EDGE-PACK-10 (x6@$41) must not MultiplePricingRuleConflict 417 — soft-resolve / ignore_pricing_rule",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [{"item_code": "EDGE-PSTYLE", "qty": 7, "rate": 41}],
+        "guest_notes": "edge dual price rules conflict",
+        "guest_name": "Edge Dual Promo",
+        "price_list": "Standard Selling"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "match_customers_for_consulta_null_empty",
       "source": "regression",
       "bug": "match_customers_for_consulta with null/empty phone and local must not match empty Customer phones; controlled empty list",
@@ -1911,6 +1924,36 @@
       "expect": "no_500"
     },
     {
+      "id": "update_guest_preorder_items_null_total_weight",
+      "source": "regression",
+      "bug": "update_guest_preorder_items with null total_weight must not TypeError (peso remasure path)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_items",
+      "args": {
+        "preorder_name": "",
+        "items": [
+          {
+            "item_code": null,
+            "qty": null,
+            "rate": null,
+            "total_weight": null,
+            "weight_per_unit": null
+          }
+        ],
+        "additional_discount_amount": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "create_delivery_note_for_preorder_empty_name",
+      "source": "regression",
+      "bug": "create_delivery_note_for_preorder with empty name is controlled error (not NegativeStockError/500)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_delivery_note_for_preorder",
+      "args": {
+        "preorder_name": ""
+      },
+      "expect": "fail"
+    },
+    {
       "id": "preorder_unarchive_null_name",
       "source": "regression",
       "bug": "unarchive_guest_preorder with null name returns controlled error, not TypeError/500",
@@ -2005,6 +2048,25 @@
       "args": {
         "delivery_note": "",
         "zone": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "save_pricing_rule_item_code_empty_targets",
+      "source": "regression",
+      "bug": "save_pricing_rule apply_on Item Code with empty applicable_items must controlled error, not ERPNext 417 Item Code is not added in the table",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.save_pricing_rule",
+      "args": {
+        "data": {
+          "title": "Edge empty targets",
+          "apply_on": "Item Code",
+          "price_or_product_discount": "Price",
+          "rate_or_discount": "Discount Percentage",
+          "discount_percentage": 10,
+          "applicable_items": [],
+          "applicable_groups": [],
+          "applicable_brands": []
+        }
       },
       "expect": "error"
     }

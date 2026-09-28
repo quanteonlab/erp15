@@ -10,7 +10,7 @@ import math
 
 import frappe
 from frappe import _, bold
-from frappe.utils import cint, flt, fmt_money, get_link_to_form, getdate, today
+from frappe.utils import cint, cstr, flt, fmt_money, get_link_to_form, getdate, today
 
 from erpnext.setup.doctype.item_group.item_group import get_child_item_groups
 from erpnext.stock.doctype.warehouse.warehouse import get_child_warehouses
@@ -338,15 +338,54 @@ def filter_pricing_rules(args, pricing_rules, doc=None):
 				list(filter(lambda x: x.for_price_list == args.price_list, pricing_rules)) or pricing_rules
 			)
 
-	if len(pricing_rules) > 1 and not args.for_shopping_cart:
-		frappe.throw(
-			_(
-				"Multiple Price Rules exists with same criteria, please resolve conflict by assigning priority. Price Rules: {0}"
-			).format("\n".join(d.name for d in pricing_rules)),
-			MultiplePricingRuleConflict,
-		)
+	if len(pricing_rules) > 1:
+		# Soft-resolve equal-priority conflicts (catalog/consulta default: best unit $).
+		# Desk historically threw MultiplePricingRuleConflict to force priority assignment;
+		# that blocked guest preorders and POS when two Rate rules (e.g. unit + threshold)
+		# both qualify. Prefer the rule that yields the lowest effective unit rate.
+		return _pick_best_conflicting_pricing_rule(pricing_rules, args)
 	elif pricing_rules:
 		return pricing_rules[0]
+
+
+def _pricing_rule_effective_unit_rate(rule, list_rate: float) -> float:
+	"""Unit rate a Price rule would charge against ``list_rate`` (lower = better for buyer)."""
+	list_rate = flt(list_rate)
+	rod = cstr(rule.get("rate_or_discount") or "").strip().lower()
+	rate = flt(rule.get("rate"))
+	pct = flt(rule.get("discount_percentage"))
+	amt = flt(rule.get("discount_amount"))
+
+	if rod == "rate" or (rate > 0 and not pct and not amt):
+		return rate if rate > 0 else list_rate
+	if "percentage" in rod and pct:
+		return list_rate * (1 - pct / 100.0) if list_rate else 0
+	if "amount" in rod and amt:
+		return max(0.0, list_rate - amt) if list_rate else 0
+	if pct:
+		return list_rate * (1 - pct / 100.0) if list_rate else 0
+	if amt:
+		return max(0.0, list_rate - amt) if list_rate else 0
+	if rate > 0:
+		return rate
+	return list_rate
+
+
+def _pick_best_conflicting_pricing_rule(pricing_rules, args):
+	"""Pick one Pricing Rule when several share criteria/priority (best unit $ wins)."""
+	list_rate = flt(args.get("price_list_rate") or args.get("rate") or 0)
+
+	def sort_key(rule):
+		unit = _pricing_rule_effective_unit_rate(rule, list_rate)
+		# Lower unit rate first; then higher priority / min_qty; stable name.
+		return (
+			unit,
+			-cint(rule.get("priority")),
+			-flt(rule.get("min_qty")),
+			cstr(rule.get("name") or ""),
+		)
+
+	return sorted(pricing_rules, key=sort_key)[0]
 
 
 def validate_quantity_and_amount_for_suggestion(args, qty, amount, item_code, transaction_type):

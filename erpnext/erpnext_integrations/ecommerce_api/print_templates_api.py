@@ -109,6 +109,10 @@ _WEIGHT_UOMS = {
 	"oz",
 	"ounce",
 	"ounces",
+	# Catalog / PM sell-by-weight token (mayorista units → remesaure at armado).
+	"weight",
+	"por peso",
+	"porpeso",
 }
 
 
@@ -825,6 +829,103 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 
 
 
+def _party_print_meta(party_type: str, party_name: str | None) -> dict:
+	"""Shared customer/supplier fields for compact remito headers."""
+	out = {
+		"tax_id": "",
+		"tax_category": "",
+		"zona": "",
+		"horario": "",
+		"customer_address": "",
+		"address_display": "",
+	}
+	if not party_name or not frappe.db.exists(party_type, party_name):
+		return out
+	fields = ["tax_id", "tax_category"]
+	if party_type == "Customer":
+		fields += ["territory", "primary_address"]
+		if frappe.db.has_column("Customer", "custom_preferred_hours"):
+			fields.append("custom_preferred_hours")
+	elif party_type == "Supplier":
+		if frappe.db.has_column("Supplier", "territory"):
+			fields.append("territory")
+		if frappe.db.has_column("Supplier", "supplier_primary_address"):
+			fields.append("supplier_primary_address")
+	row = frappe.db.get_value(party_type, party_name, fields, as_dict=True) or {}
+	out["tax_id"] = row.get("tax_id") or ""
+	out["tax_category"] = row.get("tax_category") or ""
+	out["zona"] = row.get("territory") or ""
+	out["horario"] = row.get("custom_preferred_hours") or ""
+	addr = row.get("primary_address") or row.get("supplier_primary_address") or ""
+	addr = str(addr).replace("<br>", ", ").replace("\n", ", ")
+	out["customer_address"] = addr
+	out["address_display"] = addr
+	return out
+
+
+def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) -> None:
+	"""Fill Armado-style header fields + line display helpers for DN / SI / PR."""
+	# Line display helpers (Codigo - barcode, qty + uom)
+	for r in rows:
+		if not isinstance(r, dict):
+			continue
+		code = r.get("item_code") or ""
+		barcode = r.get("barcode") or (_item_barcode(code) if code else "")
+		if barcode and code:
+			r["code_display"] = f"{code} - {barcode}"
+		else:
+			r["code_display"] = code or barcode or r.get("code_display") or ""
+		uom = r.get("uom") or r.get("stock_uom") or ""
+		qty = r.get("qty")
+		if qty is not None and not r.get("qty_display"):
+			r["qty_display"] = f"{flt(qty):.2f} {uom}".strip()
+		if uom and not r.get("uom"):
+			r["uom"] = uom
+
+	# Party meta
+	if source_doctype in ("Delivery Note", "Sales Invoice", "Sales Order"):
+		party = data.get("customer")
+		meta = _party_print_meta("Customer", party)
+		for k, v in meta.items():
+			if not data.get(k):
+				data[k] = v
+		if not data.get("vendedor"):
+			data["vendedor"] = data.get("sales_person") or data.get("owner") or ""
+	elif source_doctype == "Purchase Receipt":
+		meta = _party_print_meta("Supplier", data.get("supplier"))
+		for k, v in meta.items():
+			if not data.get(k):
+				data[k] = v
+		if not data.get("vendedor"):
+			data["vendedor"] = data.get("owner") or ""
+
+	# Linked Sales Order ref (first item)
+	if not data.get("pedido_ref"):
+		ref = ""
+		for r in rows:
+			if not isinstance(r, dict):
+				continue
+			ref = (
+				r.get("against_sales_order")
+				or r.get("sales_order")
+				or r.get("purchase_order")
+				or ""
+			)
+			if ref:
+				break
+		data["pedido_ref"] = ref or data.get("against_sales_order") or ""
+
+	if not data.get("fletero"):
+		data["fletero"] = ""
+	if not data.get("set_warehouse") and rows:
+		wh = next(
+			(r.get("warehouse") for r in rows if isinstance(r, dict) and r.get("warehouse")),
+			"",
+		)
+		if wh:
+			data["set_warehouse"] = wh
+
+
 @frappe.whitelist(allow_guest=True)
 def get_print_data(source_doctype, docname, warehouse=None, floor_id=None):
 	if source_doctype == "Staff Cred.":
@@ -851,6 +952,9 @@ def get_print_data(source_doctype, docname, warehouse=None, floor_id=None):
 			tw = _sum_line_total_weight(rows)
 			if tw:
 				data["total_weight"] = tw
+
+	if source_doctype in ("Delivery Note", "Sales Invoice", "Purchase Receipt"):
+		_enrich_commercial_print_doc(source_doctype, data, rows)
 
 	return {
 		"doc": data,
@@ -1244,11 +1348,26 @@ def _ar_documento_no_valido_a4_elements(*, party_label: str, party_field: str, i
 	]
 
 
-def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
-	"""Compressed header (screenshot-style): meta grid + cliente + pedido — no ENTREGAS title."""
+def _compact_party_doc_header_elements(
+	p: str,
+	*,
+	party_label: str = "CLIENTE:",
+	party_field: str = "customer_name",
+	address_field: str = "customer_address",
+	cond_label: str = "Cond. IVA:",
+	cond_field: str = "tax_category",
+	doc_badge_label: str = "Pedido:",
+	doc_badge_field: str = "name",
+	meta_rows: list | None = None,
+	font: int = 10,
+) -> list:
+	"""Compressed two-column header (Armado style): party box + doc badge + meta grid.
+
+	Keeps vertical space ~44mm so line-items start early on A4.
+	"""
 	fs = font
 	fs_sm = max(8, font - 1)
-	rows = [
+	rows = meta_rows or [
 		("Vend:", "vendedor", "Zona:", "zona"),
 		("Horario:", "horario", "Fletero:", "fletero"),
 		("Cargado:", "cargado", "Armado:", "armado_flag"),
@@ -1256,7 +1375,7 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 	]
 	els = []
 	y0 = 10
-	# Left: cliente box
+	# Left: party box
 	els.extend(
 		[
 			{
@@ -1275,25 +1394,27 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 				"kind": "text",
 				"x": 12,
 				"y": y0 + 1,
-				"width": 20,
+				"width": 28,
 				"height": 5,
-				"staticText": "CLIENTE:",
+				"staticText": party_label,
 				"fontSize": fs_sm,
 				"bold": True,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-cli",
 				"kind": "field",
-				"x": 32,
+				"x": 40,
 				"y": y0 + 1,
-				"width": 80,
+				"width": 72,
 				"height": 5,
-				"fieldPath": "customer_name",
-				"label": "Cliente",
+				"fieldPath": party_field,
+				"label": party_label,
 				"fontSize": fs,
 				"bold": True,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-addr",
@@ -1302,10 +1423,11 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 				"y": y0 + 8,
 				"width": 100,
 				"height": 8,
-				"fieldPath": "customer_address",
+				"fieldPath": address_field,
 				"label": "Dirección",
 				"fontSize": fs_sm,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-cond-label",
@@ -1314,9 +1436,10 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 				"y": y0 + 18,
 				"width": 22,
 				"height": 5,
-				"staticText": "Cond. IVA:",
+				"staticText": cond_label,
 				"fontSize": fs_sm,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-cond",
@@ -1325,14 +1448,15 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 				"y": y0 + 18,
 				"width": 78,
 				"height": 5,
-				"fieldPath": "tax_category",
-				"label": "Cond. IVA",
+				"fieldPath": cond_field,
+				"label": cond_label,
 				"fontSize": fs_sm,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 		]
 	)
-	# Right: pedido badge + meta
+	# Right: document number badge + meta grid
 	els.extend(
 		[
 			{
@@ -1354,10 +1478,11 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 				"y": y0 + 2,
 				"width": 22,
 				"height": 6,
-				"staticText": "Pedido:",
+				"staticText": doc_badge_label,
 				"fontSize": fs,
 				"bold": True,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-ped",
@@ -1366,16 +1491,17 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 				"y": y0 + 2,
 				"width": 54,
 				"height": 6,
-				"fieldPath": "name",
-				"label": "Pedido",
+				"fieldPath": doc_badge_field,
+				"label": doc_badge_label,
 				"fontSize": fs,
 				"bold": True,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 		]
 	)
 	meta_y = y0 + 12
-	for i, (l1, f1, l2, f2) in enumerate(rows):
+	for i, (l1, f1, l2, f2) in enumerate(rows[:4]):
 		yy = meta_y + i * 6
 		els.extend(
 			[
@@ -1389,6 +1515,7 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 					"staticText": l1,
 					"fontSize": fs_sm,
 					"align": "left",
+					"textColor": "#0f172a",
 				},
 				{
 					"id": f"{p}-m{i}a",
@@ -1401,6 +1528,7 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 					"label": l1,
 					"fontSize": fs_sm,
 					"align": "left",
+					"textColor": "#0f172a",
 				},
 				{
 					"id": f"{p}-m{i}b-l",
@@ -1412,6 +1540,7 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 					"staticText": l2,
 					"fontSize": fs_sm,
 					"align": "left",
+					"textColor": "#0f172a",
 				},
 				{
 					"id": f"{p}-m{i}b",
@@ -1424,10 +1553,296 @@ def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
 					"label": l2,
 					"fontSize": fs_sm,
 					"align": "left",
+					"textColor": "#0f172a",
 				},
 			]
 		)
 	return els
+
+
+def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
+	"""Compressed header (screenshot-style): meta grid + cliente + pedido — no ENTREGAS title."""
+	return _compact_party_doc_header_elements(p, font=font)
+
+
+def _compact_commercial_a4_elements(
+	*,
+	id_prefix: str,
+	party_label: str,
+	party_field: str,
+	doc_badge_label: str,
+	meta_rows: list,
+	columns: list,
+	footer_kind: str = "remito",
+	disclaimer: str | None = None,
+	address_field: str = "customer_address",
+):
+	"""Armado-style A4: compact header + multi-column line items + signature footer."""
+	p = id_prefix
+	font = 11
+	header_h = 44
+	table_y = header_h + (8 if disclaimer else 4)
+	table_w = 190
+	items_h = 165 if not disclaimer else 160
+
+	elements = _compact_party_doc_header_elements(
+		p,
+		party_label=party_label,
+		party_field=party_field,
+		address_field=address_field,
+		doc_badge_label=doc_badge_label,
+		doc_badge_field="name",
+		meta_rows=meta_rows,
+		font=font,
+	)
+	if disclaimer:
+		elements.append(
+			{
+				"id": f"{p}-disclaimer",
+				"kind": "text",
+				"x": 10,
+				"y": header_h - 1,
+				"width": 190,
+				"height": 5,
+				"staticText": disclaimer,
+				"fontSize": 7,
+				"bold": True,
+				"align": "center",
+				"textColor": "#334155",
+			}
+		)
+	elements.append(
+		{
+			"id": f"{p}-items-v1",
+			"kind": "line-items",
+			"x": 10,
+			"y": table_y,
+			"width": table_w,
+			"height": items_h,
+			"childTableFieldname": "items",
+			"headerBg": "#64748b",
+			"headerColor": "#ffffff",
+			"columns": columns,
+		}
+	)
+	footer_y = table_y + items_h + 6
+	if footer_kind == "remito":
+		elements.extend(
+			[
+				{
+					"id": f"{p}-tw-label",
+					"kind": "text",
+					"x": 10,
+					"y": footer_y,
+					"width": 28,
+					"height": 6,
+					"staticText": "Peso tot:",
+					"fontSize": 10,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-tw",
+					"kind": "field",
+					"x": 38,
+					"y": footer_y,
+					"width": 36,
+					"height": 6,
+					"fieldPath": "total_weight",
+					"label": "Peso total",
+					"fontSize": 11,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-firma-label",
+					"kind": "text",
+					"x": 110,
+					"y": footer_y,
+					"width": 90,
+					"height": 6,
+					"staticText": "Recibi Conforme (Firma y Aclaración):",
+					"fontSize": 9,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-firma-line",
+					"kind": "shape",
+					"x": 110,
+					"y": footer_y + 12,
+					"width": 90,
+					"height": 1,
+					"shapeType": "line",
+					"color": "#0f172a",
+				},
+			]
+		)
+	elif footer_kind == "invoice":
+		elements.extend(
+			[
+				{
+					"id": f"{p}-total-label",
+					"kind": "text",
+					"x": 120,
+					"y": footer_y,
+					"width": 36,
+					"height": 6,
+					"staticText": "TOTAL",
+					"fontSize": 11,
+					"bold": True,
+					"align": "right",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-total",
+					"kind": "field",
+					"x": 158,
+					"y": footer_y,
+					"width": 42,
+					"height": 8,
+					"fieldPath": "grand_total",
+					"label": "Total",
+					"fontSize": 13,
+					"bold": True,
+					"align": "right",
+					"textColor": "#0f172a",
+				},
+			]
+		)
+	else:
+		elements.extend(
+			[
+				{
+					"id": f"{p}-tq-label",
+					"kind": "text",
+					"x": 120,
+					"y": footer_y,
+					"width": 36,
+					"height": 6,
+					"staticText": "Total Qty",
+					"fontSize": 10,
+					"bold": True,
+					"align": "right",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-tq",
+					"kind": "field",
+					"x": 158,
+					"y": footer_y,
+					"width": 42,
+					"height": 8,
+					"fieldPath": "total_qty",
+					"label": "Total Qty",
+					"fontSize": 12,
+					"bold": True,
+					"align": "right",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-firma-label",
+					"kind": "text",
+					"x": 10,
+					"y": footer_y,
+					"width": 90,
+					"height": 6,
+					"staticText": "Recibido por / Firma:",
+					"fontSize": 9,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-firma-line",
+					"kind": "shape",
+					"x": 10,
+					"y": footer_y + 12,
+					"width": 90,
+					"height": 1,
+					"shapeType": "line",
+					"color": "#0f172a",
+				},
+			]
+		)
+	return elements
+
+
+def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem"):
+	"""Delivery Note remito — compact Armado header + shipped qty columns."""
+	return _compact_commercial_a4_elements(
+		id_prefix=id_prefix,
+		party_label="CLIENTE:",
+		party_field="customer_name",
+		doc_badge_label="Remito:",
+		meta_rows=[
+			("Fecha:", "posting_date", "Pedido:", "pedido_ref"),
+			("Vend:", "vendedor", "Zona:", "zona"),
+			("Almacen:", "set_warehouse", "Fletero:", "fletero"),
+			("CUIT:", "tax_id", "Horario:", "horario"),
+		],
+		columns=[
+			{"fieldPath": "code_display", "label": "Codigo", "width": 36},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 58},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 28},
+			{"fieldPath": "uom", "label": "Uni", "width": 14},
+			{"fieldPath": "weight", "label": "Peso", "width": 18},
+			{"fieldPath": "warehouse", "label": "Desde", "width": 36},
+		],
+		footer_kind="remito",
+	)
+
+
+def _pr_remito_a4_elements(id_prefix: str = "starter-prrem", *, disclaimer: str | None = None):
+	"""Purchase Receipt — compact header (supplier) + received qty columns."""
+	return _compact_commercial_a4_elements(
+		id_prefix=id_prefix,
+		party_label="PROVEEDOR:",
+		party_field="supplier_name",
+		address_field="address_display",
+		doc_badge_label="Remito:",
+		meta_rows=[
+			("Fecha:", "posting_date", "PO:", "pedido_ref"),
+			("Almacen:", "set_warehouse", "CUIT:", "tax_id"),
+			("Cond. IVA:", "tax_category", "Vend:", "vendedor"),
+			("Zona:", "zona", "Horario:", "horario"),
+		],
+		columns=[
+			{"fieldPath": "code_display", "label": "Codigo", "width": 36},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 62},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 28},
+			{"fieldPath": "uom", "label": "Uni", "width": 14},
+			{"fieldPath": "warehouse", "label": "Destino", "width": 30},
+			{"fieldPath": "amount", "label": "Importe", "width": 20},
+		],
+		footer_kind="receipt",
+		disclaimer=disclaimer,
+	)
+
+
+def _si_compact_a4_elements(id_prefix: str = "starter-sicomp", *, disclaimer: str | None = None):
+	"""Sales Invoice / non-fiscal compact — Armado header + money columns."""
+	return _compact_commercial_a4_elements(
+		id_prefix=id_prefix,
+		party_label="CLIENTE:",
+		party_field="customer_name",
+		doc_badge_label="Doc:",
+		meta_rows=[
+			("Fecha:", "posting_date", "Pedido:", "pedido_ref"),
+			("Vend:", "vendedor", "Zona:", "zona"),
+			("CUIT:", "tax_id", "Cond. IVA:", "tax_category"),
+			("Pago:", "mode_of_payment", "Horario:", "horario"),
+		],
+		columns=[
+			{"fieldPath": "code_display", "label": "Codigo", "width": 32},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 52},
+			{"fieldPath": "qty_display", "label": "Cant.", "width": 22},
+			{"fieldPath": "rate", "label": "Precio", "width": 22},
+			{"fieldPath": "discount_percentage", "label": "Desc%", "width": 16},
+			{"fieldPath": "amount", "label": "Importe", "width": 26},
+		],
+		footer_kind="invoice",
+		disclaimer=disclaimer,
+	)
 
 
 def _ar_entregas_checklist_a4_elements(
@@ -1439,8 +1854,9 @@ def _ar_entregas_checklist_a4_elements(
 ):
 	"""A4 armado layouts.
 
-	mode=peso_indefinido — Código (sku-barcode), Descripción, Cantidad, Peso, Peso real + ARMADO side table.
-	mode=almacen — warehouse/location focused + ARMADO side confirmation columns.
+	mode=peso_indefinido — Código, Descripción, Cantidad, Peso, Peso real + ARMADO Uni/Cantidad.
+	mode=almacen — warehouse/location focused + ARMADO confirmation columns.
+	PEDIDO + ARMADO share one line-items table so row heights stay aligned.
 	Compressed header; larger type; no ENTREGAS title block.
 	"""
 	p = id_prefix
@@ -1449,89 +1865,88 @@ def _ar_entregas_checklist_a4_elements(
 	table_y = header_h + 4
 
 	if mode == "peso_indefinido":
-		main_cols = [
-			{"fieldPath": "code_display", "label": "Codigo", "width": 36},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 58},
-			{"fieldPath": "qty_display", "label": "Cantidad", "width": 28},
-			{"fieldPath": "weight", "label": "Peso", "width": 16},
-			{"fieldPath": "actual_weight", "label": "Peso Real", "width": 18},
+		# Single table: pedido cols + armado confirm cols (shared row height).
+		cols = [
+			{"fieldPath": "code_display", "label": "Codigo", "width": 34},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 52},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 26},
+			{"fieldPath": "weight", "label": "Peso", "width": 16, "fillIn": True},
+			{"fieldPath": "actual_weight", "label": "Peso Real", "width": 18, "fillIn": True},
+			{"fieldPath": "confirm_uni", "label": "Uni", "width": 14, "fillIn": True},
+			{"fieldPath": "confirm_qty", "label": "Cantidad", "width": 20, "fillIn": True},
 		]
-		main_w = 156
+		table_w = 180
+		# PEDIDO: Codigo+Detalle+Cantidad; ARMADO: Peso… write-in cols
+		pedido_label_w = 112
+		armado_label_x = 10 + 112
+		armado_label_w = 68
 	else:
-		main_cols = [
-			{"fieldPath": "code_display", "label": "Codigo", "width": 30},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 48},
+		cols = [
+			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 44},
 			{"fieldPath": "qty", "label": "Cant.", "width": 14},
 			{"fieldPath": "warehouse", "label": "Desde", "width": 22},
 		]
 		if with_location:
-			main_cols.append({"fieldPath": "location", "label": "Ubic.", "width": 18})
-		main_cols.append({"fieldPath": "barcode", "label": "Barras", "width": 20})
-		main_w = 152 if with_location else 154
+			cols.append({"fieldPath": "location", "label": "Ubic.", "width": 16})
+		cols.append({"fieldPath": "barcode", "label": "Barras", "width": 18})
+		cols.extend(
+			[
+				{"fieldPath": "confirm_uni", "label": "Uni", "width": 14, "fillIn": True},
+				{"fieldPath": "confirm_qty", "label": "Cantidad", "width": 20, "fillIn": True},
+			]
+		)
+		table_w = 176 if with_location else 160
+		pedido_label_w = table_w - 34
+		armado_label_x = 10 + pedido_label_w
+		armado_label_w = 34
 
-	confirm_cols = [
-		{"fieldPath": "confirm_uni", "label": "Uni", "width": 14},
-		{"fieldPath": "confirm_qty", "label": "Cantidad", "width": 20},
-	]
-	confirm_w = 34
 	items_h = 95 if with_map else 175
 
 	elements = _armado_meta_header_elements(p, font=font)
-	# PEDIDO section label
+	# PEDIDO / ARMADO section labels over the shared table column groups
 	elements.append(
 		{
 			"id": f"{p}-sec-ped",
 			"kind": "text",
 			"x": 10,
 			"y": table_y - 5,
-			"width": 40,
+			"width": pedido_label_w,
 			"height": 5,
 			"staticText": "PEDIDO",
 			"fontSize": 9,
 			"bold": True,
 			"align": "left",
+			"textColor": "#0f172a",
 		}
 	)
 	elements.append(
 		{
 			"id": f"{p}-sec-arm",
 			"kind": "text",
-			"x": 10 + main_w + 2,
+			"x": armado_label_x,
 			"y": table_y - 5,
-			"width": 34,
+			"width": armado_label_w,
 			"height": 5,
 			"staticText": "ARMADO",
 			"fontSize": 9,
 			"bold": True,
 			"align": "center",
+			"textColor": "#0f172a",
 		}
 	)
 	elements.append(
 		{
-			"id": f"{p}-items-v3",
+			"id": f"{p}-items-v5",
 			"kind": "line-items",
 			"x": 10,
 			"y": table_y,
-			"width": main_w,
+			"width": table_w,
 			"height": items_h,
 			"childTableFieldname": "items",
 			"headerBg": "#64748b",
 			"headerColor": "#ffffff",
-			"columns": main_cols,
-		}
-	)
-	elements.append(
-		{
-			"id": f"{p}-confirm-v3",
-			"kind": "line-items",
-			"x": 10 + main_w + 2,
-			"y": table_y,
-			"width": confirm_w,
-			"height": items_h,
-			"childTableFieldname": "items",
-			"headerBg": "#64748b",
-			"headerColor": "#ffffff",
-			"columns": confirm_cols,
+			"columns": cols,
 		}
 	)
 
@@ -1562,6 +1977,7 @@ def _ar_entregas_checklist_a4_elements(
 				"staticText": "Peso tot:",
 				"fontSize": 10,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-tw",
@@ -1574,6 +1990,7 @@ def _ar_entregas_checklist_a4_elements(
 				"label": "Peso total",
 				"fontSize": 11,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-firma-label",
@@ -1585,6 +2002,7 @@ def _ar_entregas_checklist_a4_elements(
 				"staticText": "Recibi Conforme (Firma y Aclaración):",
 				"fontSize": 9,
 				"align": "left",
+				"textColor": "#0f172a",
 			},
 			{
 				"id": f"{p}-firma-line",
@@ -1603,18 +2021,19 @@ def _ar_entregas_checklist_a4_elements(
 
 
 _STARTER_TEMPLATES = [
-	# ── Sales Invoice · AR commercial A4 (gifted core) ─────────────────
+	# ── Sales Invoice · AR commercial A4 (gifted core, compact Armado header) ─
 	{
 		"template_name": "Documento no válido como factura (A4)",
 		"source_doctype": "Sales Invoice",
 		"paper_kind": "A4",
 		"is_default": False,
 		"gift": True,
-		"margin_mm": [12, 12, 12, 12],
-		"elements": _ar_documento_no_valido_a4_elements(
-			party_label="Cliente",
-			party_field="customer_name",
+		"resync": True,
+		"resync_if_missing_id": "starter-siad-items-v1",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _si_compact_a4_elements(
 			id_prefix="starter-siad",
+			disclaimer="DOCUMENTO NO VALIDO COMO FACTURA",
 		),
 	},
 	# ── Sales Invoice ──────────────────────────────────────────────────
@@ -1808,87 +2227,42 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-i80b-qr", "kind": "qrcode", "x": 58, "y": 56, "width": 18, "height": 18, "fieldPath": "item_code"},
 		],
 	},
-	# ── Purchase Receipt · A4 (2) ──────────────────────────────────────
+	# ── Purchase Receipt · A4 (compact Armado-style; retire tall checklist) ─
 	{
 		"template_name": "Documento no válido como factura — Remito (A4)",
 		"source_doctype": "Purchase Receipt",
 		"paper_kind": "A4",
 		"is_default": False,
 		"gift": True,
-		"margin_mm": [12, 12, 12, 12],
-		"elements": _ar_documento_no_valido_a4_elements(
-			party_label="Proveedor",
-			party_field="supplier_name",
+		"resync": True,
+		"resync_if_missing_id": "starter-prad-items-v1",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _pr_remito_a4_elements(
 			id_prefix="starter-prad",
+			disclaimer="DOCUMENTO NO VALIDO COMO FACTURA",
 		),
 	},
+	{
+		"template_name": "Remito de compra (A4)",
+		"source_doctype": "Purchase Receipt",
+		"paper_kind": "A4",
+		"is_default": True,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-prrem-items-v1",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _pr_remito_a4_elements(id_prefix="starter-prrem"),
+	},
+	# Legacy name kept for sites that already defaulted to Goods Receipt — same compact layout.
 	{
 		"template_name": "Goods Receipt (A4)",
 		"source_doctype": "Purchase Receipt",
 		"paper_kind": "A4",
-		"is_default": True,
-		"margin_mm": [15, 15, 15, 15],
-		"elements": [
-			{"id": "starter-pra4a-title", "kind": "text", "x": 15, "y": 15, "width": 120, "height": 12, "staticText": "PURCHASE RECEIPT", "fontSize": 18, "bold": True, "align": "left"},
-			{"id": "starter-pra4a-num-label", "kind": "text", "x": 140, "y": 15, "width": 55, "height": 6, "staticText": "Receipt #", "fontSize": 8, "align": "right"},
-			{"id": "starter-pra4a-num", "kind": "field", "x": 140, "y": 21, "width": 55, "height": 8, "fieldPath": "name", "label": "Receipt #", "fontSize": 11, "bold": True, "align": "right"},
-			{"id": "starter-pra4a-date-label", "kind": "text", "x": 140, "y": 31, "width": 55, "height": 6, "staticText": "Date", "fontSize": 8, "align": "right"},
-			{"id": "starter-pra4a-date", "kind": "field", "x": 140, "y": 37, "width": 55, "height": 8, "fieldPath": "posting_date", "label": "Date", "fontSize": 10, "align": "right"},
-			{"id": "starter-pra4a-sup-label", "kind": "text", "x": 15, "y": 32, "width": 90, "height": 6, "staticText": "Supplier", "fontSize": 8, "bold": True, "align": "left"},
-			{"id": "starter-pra4a-sup", "kind": "field", "x": 15, "y": 38, "width": 110, "height": 8, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 11, "align": "left"},
-			{"id": "starter-pra4a-wh-label", "kind": "text", "x": 15, "y": 48, "width": 40, "height": 6, "staticText": "Warehouse", "fontSize": 8, "bold": True, "align": "left"},
-			{"id": "starter-pra4a-wh", "kind": "field", "x": 55, "y": 48, "width": 80, "height": 6, "fieldPath": "set_warehouse", "label": "Warehouse", "fontSize": 10, "align": "left"},
-			{
-				"id": "starter-pra4a-items",
-				"kind": "line-items",
-				"x": 15,
-				"y": 60,
-				"width": 180,
-				"height": 100,
-				"childTableFieldname": "items",
-				"columns": [
-					{"fieldPath": "item_code", "label": "Item", "width": 35},
-					{"fieldPath": "item_name", "label": "Description", "width": 75},
-					{"fieldPath": "qty", "label": "Qty", "width": 20},
-					{"fieldPath": "uom", "label": "UOM", "width": 20},
-					{"fieldPath": "amount", "label": "Amount", "width": 30},
-				],
-			},
-			{"id": "starter-pra4a-total-label", "kind": "text", "x": 130, "y": 170, "width": 30, "height": 8, "staticText": "Total Qty", "fontSize": 10, "bold": True, "align": "right"},
-			{"id": "starter-pra4a-total", "kind": "field", "x": 160, "y": 170, "width": 35, "height": 10, "fieldPath": "total_qty", "label": "Total Qty", "fontSize": 13, "bold": True, "align": "right"},
-		],
-	},
-	{
-		"template_name": "Receiving Checklist (A4)",
-		"source_doctype": "Purchase Receipt",
-		"paper_kind": "A4",
-		"margin_mm": [12, 12, 12, 12],
-		"elements": [
-			{"id": "starter-pra4b-title", "kind": "text", "x": 12, "y": 12, "width": 140, "height": 10, "staticText": "RECEIVING CHECKLIST", "fontSize": 16, "bold": True, "align": "left"},
-			{"id": "starter-pra4b-num", "kind": "field", "x": 155, "y": 12, "width": 43, "height": 8, "fieldPath": "name", "label": "Receipt #", "fontSize": 10, "bold": True, "align": "right"},
-			{"id": "starter-pra4b-date", "kind": "field", "x": 155, "y": 22, "width": 43, "height": 7, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "right"},
-			{"id": "starter-pra4b-sup-label", "kind": "text", "x": 12, "y": 28, "width": 50, "height": 6, "staticText": "From", "fontSize": 8, "bold": True, "align": "left"},
-			{"id": "starter-pra4b-sup", "kind": "field", "x": 12, "y": 34, "width": 120, "height": 8, "fieldPath": "supplier_name", "label": "Supplier", "fontSize": 11, "align": "left"},
-			{"id": "starter-pra4b-line", "kind": "shape", "x": 12, "y": 46, "width": 186, "height": 1, "shapeType": "line", "color": "#0f172a"},
-			{
-				"id": "starter-pra4b-items",
-				"kind": "line-items",
-				"x": 12,
-				"y": 52,
-				"width": 186,
-				"height": 140,
-				"childTableFieldname": "items",
-				"columns": [
-					{"fieldPath": "item_code", "label": "Code", "width": 40},
-					{"fieldPath": "item_name", "label": "Item", "width": 90},
-					{"fieldPath": "qty", "label": "Expected", "width": 28},
-					{"fieldPath": "uom", "label": "UOM", "width": 28},
-				],
-			},
-			{"id": "starter-pra4b-sign-label", "kind": "text", "x": 12, "y": 210, "width": 80, "height": 6, "staticText": "Received by / Signature", "fontSize": 8, "align": "left"},
-			{"id": "starter-pra4b-sign-box", "kind": "shape", "x": 12, "y": 218, "width": 90, "height": 28, "shapeType": "rect", "color": "#94a3b8"},
-			{"id": "starter-pra4b-qr", "kind": "qrcode", "x": 160, "y": 210, "width": 38, "height": 38, "fieldPath": "name"},
-		],
+		"is_default": False,
+		"resync": True,
+		"resync_if_missing_id": "starter-pra4a-items-v1",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _pr_remito_a4_elements(id_prefix="starter-pra4a"),
 	},
 	# ── Purchase Receipt · Thermal 58mm (2) ────────────────────────────
 	{
@@ -2116,7 +2490,7 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-peso-items-v3",
+		"resync_if_missing_id": "starter-peso-items-v5",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-peso",
@@ -2132,7 +2506,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-alm-items-v3",
+		"resync_if_missing_id": "starter-alm-items-v5",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-alm",
@@ -2148,7 +2522,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-almmap-items-v3",
+		"resync_if_missing_id": "starter-almmap-items-v5",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-almmap",
@@ -2156,6 +2530,18 @@ _STARTER_TEMPLATES = [
 			with_map=True,
 			mode="almacen",
 		),
+	},
+	# ── Delivery Note · A4 remito (compact Armado header) ───────────────
+	{
+		"template_name": "Remito (A4)",
+		"source_doctype": "Delivery Note",
+		"paper_kind": "A4",
+		"is_default": True,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-dnrem-items-v1",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem"),
 	},
 	# ── TMS delivery tickets (Delivery Note · Thermal 80mm) ─────────────
 	{
@@ -2283,6 +2669,22 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Almacen": ("Almacen", "仓库"),
 		"ENTREGAS": ("ENTREGAS", "发货单"),
 		"PEDIDO": ("PEDIDO", "订单"),
+		"Remito:": ("Remito:", "出库单："),
+		"Doc:": ("Doc:", "单据："),
+		"PROVEEDOR:": ("PROVEEDOR:", "供应商："),
+		"Almacen:": ("Almacen:", "仓库："),
+		"PO:": ("PO:", "采购单："),
+		"Pago:": ("Pago:", "付款："),
+		"Destino": ("Destino", "目的仓"),
+		"Importe": ("Importe", "金额"),
+		"Precio": ("Precio", "单价"),
+		"Desc%": ("Desc%", "折扣%"),
+		"Cant.": ("Cant.", "数量"),
+		"DOCUMENTO NO VALIDO COMO FACTURA": (
+			"DOCUMENTO NO VALIDO COMO FACTURA",
+			"非正式发票单据",
+		),
+		"Recibido por / Firma:": ("Recibido por / Firma:", "收货人／签名："),
 		"ARMADO": ("ARMADO", "配货"),
 		"CLIENTE:": ("CLIENTE:", "客户："),
 		"Pedido:": ("Pedido:", "订单："),
@@ -2292,7 +2694,6 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Peso tot:": ("Peso tot:", "总重："),
 		"Ubic.": ("Ubic.", "库位"),
 		"Barras": ("Barras", "条码"),
-		"Cant.": ("Cant.", "数量"),
 		"Uni": ("Uni", "单位"),
 		"Vend:": ("Vend:", "销售："),
 		"Zona:": ("Zona:", "区域："),
@@ -2304,6 +2705,7 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"CUIT:": ("CUIT:", "税号："),
 		"Cond. IVA:": ("Cond. IVA:", "IVA条件："),
 		"Cond. IVA": ("Cond. IVA", "IVA条件"),
+		"Fecha:": ("Fecha:", "日期："),
 		"Nº": ("Nº", "编号"),
 		"Numero de identificador:": ("Numero de identificador:", "税号："),
 		"Fecha de Envio:": ("Fecha de Envio:", "发货日期："),
@@ -2376,8 +2778,8 @@ def _expand_locale_starter_templates(base_starters):
 			clone = copy.deepcopy(starter)
 			clone["template_name"] = f"{prefix} - {name}"
 			clone["is_default"] = False
-			clone.pop("resync", None)
-			clone.pop("resync_if_missing_id", None)
+			# Keep resync markers so localized copies pick up layout fixes
+			# (element ids are not locale-specific).
 			clone["elements"] = _localize_elements(clone.get("elements") or [], locale)
 			out.append(clone)
 	return out
@@ -2477,7 +2879,44 @@ def ensure_starter_print_templates():
 
 	# Promote renamed armado default when legacy ENTREGAS is still the only default.
 	_promote_armado_default_if_legacy()
-	return {"created": created, "gifted": created, "resynced": resynced}
+	retired = _retire_redundant_print_templates()
+	return {
+		"created": created,
+		"gifted": created,
+		"resynced": resynced,
+		"retired": retired,
+	}
+
+
+# Tall / duplicate A4 seeds superseded by Armado-style Remito compact layouts.
+_RETIRED_PRINT_TEMPLATE_NAMES = (
+	"Receiving Checklist (A4)",
+	"ES - Receiving Checklist (A4)",
+	"CH - Receiving Checklist (A4)",
+)
+
+
+def _retire_redundant_print_templates() -> list:
+	"""Hide obsolete starter clones from the print modal (status → Draft)."""
+	retired = []
+	for tname in _RETIRED_PRINT_TEMPLATE_NAMES:
+		rows = frappe.get_all(
+			"ECommerce Print Template",
+			filters={"template_name": tname, "status": ["!=", "Draft"]},
+			pluck="name",
+			ignore_permissions=True,
+		)
+		for name in rows:
+			frappe.db.set_value(
+				"ECommerce Print Template",
+				name,
+				{"status": "Draft", "is_default": 0},
+				update_modified=False,
+			)
+			retired.append(name)
+	if retired:
+		frappe.db.commit()
+	return retired
 
 
 def _promote_armado_default_if_legacy():
