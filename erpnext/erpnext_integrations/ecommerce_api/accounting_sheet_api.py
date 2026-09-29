@@ -24,11 +24,17 @@ Naming convention for constants ("genealogy") — read before adding a new one:
 - Time-scoped financial metric: `{scope}_{metric}`
   scope  in {today, yesterday, this_week, this_month, this_year}
   metric in {revenue, net_total, tax_total, orders_count, avg_ticket,
-             cash_total, card_total, purchase_total, payout_total}
-  e.g. today_revenue, this_month_tax_total, this_year_purchase_total
+             cash_total, card_total, mp_total, transfer_total,
+             purchase_total, payout_total, sales_gross, returns_total,
+             sales_net, black_total, white_total, po_ordered,
+             po_received_value, po_billed_value, caja_opening_total,
+             si_white_count, si_black_count}
+  e.g. today_revenue, this_month_tax_total, this_year_purchase_total,
+       this_month_sales_net, this_month_po_ordered
 
 - Point-in-time state: `{domain}_{noun}_count` / `{domain}_{noun}_total` / `{domain}_outstanding`
-  e.g. employees_count, employees_salary_total, receivables_outstanding
+  e.g. employees_count, employees_salary_total, receivables_outstanding,
+       so_unbilled_total, ar_aging_0_30, caja_sessions_open_count
 
 - Configured rate (from ERP masters, not a date window): `{domain}_{noun}_rate`
   e.g. sales_tax_rate (percent from the default Sales Taxes template)
@@ -107,7 +113,13 @@ def _purchase_totals(start_date, end_date) -> dict:
 
 
 def _payment_totals(start_date, end_date, payment_type: str = "Receive") -> dict:
-	empty = {"cash_total": 0.0, "card_total": 0.0, "payout_total": 0.0}
+	empty = {
+		"cash_total": 0.0,
+		"card_total": 0.0,
+		"mp_total": 0.0,
+		"transfer_total": 0.0,
+		"payout_total": 0.0,
+	}
 	if not frappe.db.exists("DocType", "Payment Entry"):
 		return empty
 	try:
@@ -126,16 +138,216 @@ def _payment_totals(start_date, end_date, payment_type: str = "Receive") -> dict
 		return empty
 	cash = 0.0
 	card = 0.0
+	mp = 0.0
+	transfer = 0.0
 	total = 0.0
 	for r in rows:
 		amt = flt(r.amount)
 		total += amt
 		mop = (r.mode_of_payment or "").lower()
-		if "cash" in mop:
+		if "cash" in mop or "efectivo" in mop:
 			cash += amt
 		elif "card" in mop or "tarjeta" in mop:
 			card += amt
-	return {"cash_total": cash, "card_total": card, "payout_total": total}
+		elif "mobile" in mop or "mercado" in mop or mop in ("mp", "qr"):
+			mp += amt
+		elif "transfer" in mop or "transferencia" in mop or "bank" in mop or "cheque" in mop:
+			transfer += amt
+	return {
+		"cash_total": cash,
+		"card_total": card,
+		"mp_total": mp,
+		"transfer_total": transfer,
+		"payout_total": total,
+	}
+
+
+def _sales_mode_totals(start_date, end_date) -> dict:
+	"""Gross / returns / WHITE vs BLACK (sale_mode tagged in SI.remarks)."""
+	out = {
+		"sales_gross": 0.0,
+		"returns_total": 0.0,
+		"sales_net": 0.0,
+		"black_total": 0.0,
+		"white_total": 0.0,
+		"si_white_count": 0,
+		"si_black_count": 0,
+	}
+	if not frappe.db.exists("DocType", "Sales Invoice"):
+		return out
+	try:
+		rows = frappe.db.sql(
+			"""
+			SELECT
+				IFNULL(is_return, 0) AS is_return,
+				CASE
+					WHEN IFNULL(remarks, '') LIKE '%%sale_mode:BLACK%%' THEN 'BLACK'
+					ELSE 'WHITE'
+				END AS sale_mode,
+				COALESCE(SUM(grand_total), 0) AS revenue,
+				COUNT(*) AS orders_count
+			FROM `tabSales Invoice`
+			WHERE docstatus = 1 AND posting_date BETWEEN %s AND %s
+			GROUP BY IFNULL(is_return, 0),
+				CASE
+					WHEN IFNULL(remarks, '') LIKE '%%sale_mode:BLACK%%' THEN 'BLACK'
+					ELSE 'WHITE'
+				END
+			""",
+			(start_date, end_date),
+			as_dict=True,
+		)
+	except Exception:
+		return out
+	gross = 0.0
+	returns = 0.0
+	black = 0.0
+	white = 0.0
+	white_count = 0
+	black_count = 0
+	for r in rows:
+		amt = flt(r.revenue)
+		cnt = int(r.orders_count or 0)
+		is_ret = int(r.is_return or 0)
+		is_black = str(r.sale_mode or "") == "BLACK"
+		if is_ret:
+			returns += abs(amt)
+			continue
+		gross += amt
+		if is_black:
+			black += amt
+			black_count += cnt
+		else:
+			white += amt
+			white_count += cnt
+	out.update(
+		{
+			"sales_gross": gross,
+			"returns_total": returns,
+			"sales_net": gross - returns,
+			"black_total": black,
+			"white_total": white,
+			"si_white_count": white_count,
+			"si_black_count": black_count,
+		}
+	)
+	return out
+
+
+def _po_totals(start_date, end_date) -> dict:
+	empty = {"ordered": 0.0, "received_value": 0.0, "billed_value": 0.0}
+	if not frappe.db.exists("DocType", "Purchase Order"):
+		return empty
+	try:
+		row = frappe.db.sql(
+			"""
+			SELECT
+				COALESCE(SUM(grand_total), 0) AS ordered,
+				COALESCE(SUM(grand_total * IFNULL(per_received, 0) / 100), 0) AS received_value,
+				COALESCE(SUM(grand_total * IFNULL(per_billed, 0) / 100), 0) AS billed_value
+			FROM `tabPurchase Order`
+			WHERE docstatus = 1 AND transaction_date BETWEEN %s AND %s
+			""",
+			(start_date, end_date),
+			as_dict=True,
+		)[0]
+	except Exception:
+		return empty
+	return {
+		"ordered": flt(row.ordered),
+		"received_value": flt(row.received_value),
+		"billed_value": flt(row.billed_value),
+	}
+
+
+def _so_unbilled_total() -> float:
+	if not frappe.db.exists("DocType", "Sales Order"):
+		return 0.0
+	try:
+		row = frappe.db.sql(
+			"""
+			SELECT COALESCE(SUM(grand_total * (100 - IFNULL(per_billed, 0)) / 100), 0) AS gap
+			FROM `tabSales Order`
+			WHERE docstatus = 1
+			  AND IFNULL(status, '') NOT IN ('Completed', 'Closed', 'Cancelled')
+			""",
+			as_dict=True,
+		)[0]
+		return flt(row.gap)
+	except Exception:
+		return 0.0
+
+
+def _ar_aging(as_of) -> dict:
+	empty = {
+		"ar_aging_0_30": 0.0,
+		"ar_aging_31_60": 0.0,
+		"ar_aging_61_90": 0.0,
+		"ar_aging_90_plus": 0.0,
+	}
+	if not frappe.db.exists("DocType", "Sales Invoice"):
+		return empty
+	try:
+		row = frappe.db.sql(
+			"""
+			SELECT
+				COALESCE(SUM(CASE WHEN DATEDIFF(%s, posting_date) <= 30
+					THEN outstanding_amount ELSE 0 END), 0) AS b0,
+				COALESCE(SUM(CASE WHEN DATEDIFF(%s, posting_date) BETWEEN 31 AND 60
+					THEN outstanding_amount ELSE 0 END), 0) AS b1,
+				COALESCE(SUM(CASE WHEN DATEDIFF(%s, posting_date) BETWEEN 61 AND 90
+					THEN outstanding_amount ELSE 0 END), 0) AS b2,
+				COALESCE(SUM(CASE WHEN DATEDIFF(%s, posting_date) > 90
+					THEN outstanding_amount ELSE 0 END), 0) AS b3
+			FROM `tabSales Invoice`
+			WHERE docstatus = 1
+			  AND IFNULL(is_return, 0) = 0
+			  AND outstanding_amount > 0.0001
+			""",
+			(as_of, as_of, as_of, as_of),
+			as_dict=True,
+		)[0]
+	except Exception:
+		return empty
+	return {
+		"ar_aging_0_30": flt(row.b0),
+		"ar_aging_31_60": flt(row.b1),
+		"ar_aging_61_90": flt(row.b2),
+		"ar_aging_90_plus": flt(row.b3),
+	}
+
+
+def _caja_session_stats(month_start, as_of) -> dict:
+	empty = {
+		"caja_sessions_open_count": 0,
+		"caja_sessions_closed_count": 0,
+		"this_month_caja_opening_total": 0.0,
+	}
+	if not frappe.db.exists("DocType", "POS Cash Session"):
+		return empty
+	try:
+		open_n = int(
+			frappe.db.count("POS Cash Session", {"status": "Open"}) or 0
+		)
+		closed_n = int(
+			frappe.db.count("POS Cash Session", {"status": "Closed"}) or 0
+		)
+		row = frappe.db.sql(
+			"""
+			SELECT COALESCE(SUM(opening_cash), 0) AS opening_total
+			FROM `tabPOS Cash Session`
+			WHERE DATE(started_at) BETWEEN %s AND %s
+			""",
+			(month_start, as_of),
+			as_dict=True,
+		)[0]
+		return {
+			"caja_sessions_open_count": open_n,
+			"caja_sessions_closed_count": closed_n,
+			"this_month_caja_opening_total": flt(row.opening_total),
+		}
+	except Exception:
+		return empty
 
 
 def _sales_tax_rate() -> float:
@@ -218,6 +430,10 @@ def get_accounting_constants(as_of_date=None):
 	month_payout = _payment_totals(month_start, today, "Pay")
 	month_purchases = _purchase_totals(month_start, today)
 	year_purchases = _purchase_totals(year_start, today)
+	month_mode = _sales_mode_totals(month_start, today)
+	month_po = _po_totals(month_start, today)
+	aging = _ar_aging(today)
+	caja = _caja_session_stats(month_start, today)
 
 	return {
 		"today_revenue": today_sales["revenue"],
@@ -253,6 +469,189 @@ def get_accounting_constants(as_of_date=None):
 		"suppliers_count": _safe_count("Supplier", {"disabled": 0}),
 		"active_items_count": _safe_count("Item", {"disabled": 0}),
 		"inventory_value": _inventory_value(),
+		# Starter-pack constants (Dashboard / POS / Ventas / Compras / Sueldos).
+		"this_month_sales_gross": month_mode["sales_gross"],
+		"this_month_returns_total": month_mode["returns_total"],
+		"this_month_sales_net": month_mode["sales_net"],
+		"this_month_black_total": month_mode["black_total"],
+		"this_month_white_total": month_mode["white_total"],
+		"this_month_mp_total": month_pay["mp_total"],
+		"this_month_transfer_total": month_pay["transfer_total"],
+		"this_month_po_ordered": month_po["ordered"],
+		"this_month_po_received_value": month_po["received_value"],
+		"this_month_po_billed_value": month_po["billed_value"],
+		"so_unbilled_total": _so_unbilled_total(),
+		"ar_aging_0_30": aging["ar_aging_0_30"],
+		"ar_aging_31_60": aging["ar_aging_31_60"],
+		"ar_aging_61_90": aging["ar_aging_61_90"],
+		"ar_aging_90_plus": aging["ar_aging_90_plus"],
+		"caja_sessions_open_count": caja["caja_sessions_open_count"],
+		"caja_sessions_closed_count": caja["caja_sessions_closed_count"],
+		"this_month_caja_opening_total": caja["this_month_caja_opening_total"],
+		"this_month_si_white_count": month_mode["si_white_count"],
+		"this_month_si_black_count": month_mode["si_black_count"],
+	}
+
+
+DETAIL_ROW_LIMIT = 45
+
+
+def _po_pipeline_label(per_received, per_billed) -> str:
+	pr = flt(per_received)
+	pb = flt(per_billed)
+	if pr >= 99.5 and pb >= 99.5:
+		return "done"
+	if pr >= 99.5:
+		return "to_bill"
+	if pr > 0.5:
+		return "partial"
+	return "to_receive"
+
+
+def _compras_oc_dump(month_start, as_of, limit: int) -> dict:
+	headers = [
+		"fecha_oc",
+		"oc",
+		"proveedor",
+		"pipeline",
+		"total_oc",
+		"recibido_pct",
+		"pagado",
+		"saldo",
+	]
+	empty = {
+		"headers": headers,
+		"rows": [],
+		"total": 0,
+		"truncated": False,
+		"month_start": str(month_start),
+		"as_of": str(as_of),
+	}
+	if not frappe.db.exists("DocType", "Purchase Order"):
+		return empty
+	try:
+		total = int(
+			frappe.db.sql(
+				"""
+				SELECT COUNT(*)
+				FROM `tabPurchase Order`
+				WHERE docstatus = 1 AND transaction_date BETWEEN %s AND %s
+				""",
+				(month_start, as_of),
+			)[0][0]
+			or 0
+		)
+		rows = frappe.db.sql(
+			"""
+			SELECT
+				name,
+				transaction_date,
+				IFNULL(supplier_name, supplier) AS proveedor,
+				IFNULL(grand_total, 0) AS total_oc,
+				IFNULL(per_received, 0) AS per_received,
+				IFNULL(per_billed, 0) AS per_billed,
+				IFNULL(advance_paid, 0) AS pagado
+			FROM `tabPurchase Order`
+			WHERE docstatus = 1 AND transaction_date BETWEEN %s AND %s
+			ORDER BY transaction_date DESC, name DESC
+			LIMIT %s
+			""",
+			(month_start, as_of, int(limit)),
+			as_dict=True,
+		)
+	except Exception:
+		return empty
+	out_rows = []
+	for r in rows:
+		total_oc = flt(r.total_oc)
+		pagado = flt(r.pagado)
+		out_rows.append(
+			[
+				str(r.transaction_date or ""),
+				str(r.name or ""),
+				str(r.proveedor or ""),
+				_po_pipeline_label(r.per_received, r.per_billed),
+				total_oc,
+				round(flt(r.per_received), 2),
+				pagado,
+			]
+		)
+	return {
+		"headers": headers,
+		"rows": out_rows,
+		"total": total,
+		"truncated": total > len(out_rows),
+		"month_start": str(month_start),
+		"as_of": str(as_of),
+	}
+
+
+def _sueldos_ctc_dump(limit: int) -> dict:
+	headers = ["empleado", "sucursal", "ctc_mensual", "estado", "dias", "costo_mes", "notas"]
+	empty = {"headers": headers, "rows": [], "total": 0, "truncated": False}
+	if not frappe.db.exists("DocType", "Employee"):
+		return empty
+	try:
+		total = int(frappe.db.count("Employee", {"status": "Active"}) or 0)
+		rows = frappe.db.sql(
+			"""
+			SELECT
+				IFNULL(employee_name, name) AS empleado,
+				IFNULL(branch, '') AS sucursal,
+				IFNULL(ctc, 0) AS ctc,
+				IFNULL(status, 'Active') AS estado
+			FROM `tabEmployee`
+			WHERE status = 'Active'
+			ORDER BY employee_name ASC, name ASC
+			LIMIT %s
+			""",
+			(int(limit),),
+			as_dict=True,
+		)
+	except Exception:
+		return empty
+	out_rows = []
+	for r in rows:
+		ctc = flt(r.ctc)
+		out_rows.append(
+			[
+				str(r.empleado or ""),
+				str(r.sucursal or ""),
+				ctc,
+				str(r.estado or "Active"),
+				30,
+				"",  # notas; costo_mes is FX filled client-side
+			]
+		)
+	return {
+		"headers": headers,
+		"rows": out_rows,
+		"total": total,
+		"truncated": total > len(out_rows),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_accounting_detail_tables(as_of_date=None, limit=None):
+	"""ERP row dumps for starter tables (month-scoped where it matters).
+
+	Compras OC: Purchase Orders with transaction_date in [month_start, as_of].
+	Sueldos CTC: active employees (point-in-time headcount cost proxy).
+	Both are capped by `limit` (default 45) so the sheet stays readable.
+	"""
+	today = str(getdate(as_of_date)) if as_of_date else nowdate()
+	month_start = str(get_first_day(today))
+	try:
+		lim = int(limit) if limit not in (None, "") else DETAIL_ROW_LIMIT
+	except (TypeError, ValueError):
+		lim = DETAIL_ROW_LIMIT
+	lim = max(1, min(80, lim))
+	return {
+		"as_of": today,
+		"month_start": month_start,
+		"limit": lim,
+		"compras_oc": _compras_oc_dump(month_start, today, lim),
+		"sueldos_ctc": _sueldos_ctc_dump(lim),
 	}
 
 
@@ -558,20 +957,461 @@ def _normalize_cache(raw) -> dict:
 	return out
 
 
+def _starter_variables() -> list:
+	return [
+		{
+			"id": "_a01",
+			"name": "contribucion_comercial",
+			"expr": "this_month_sales_net-this_month_po_received_value",
+			"notes": "Proxy: ventas netas − valor OC recibido (no es COGS contable)",
+		},
+		{
+			"id": "_a02",
+			"name": "return_rate",
+			"expr": "IF(this_month_sales_gross,this_month_returns_total/this_month_sales_gross,0)",
+			"notes": "Tasa de devoluciones (0 si no hay ventas brutas)",
+		},
+		{
+			"id": "_a03",
+			"name": "caja_esperado_mes",
+			"expr": "this_month_caja_opening_total+this_month_cash_total",
+			"notes": "Aperturas del mes + efectivo cobrado (proxy de caja esperada)",
+		},
+	]
+
+
+def _starter_sheets() -> list:
+	"""Five-tab close pack from accounting_spreadsheet_workbook.md §7."""
+	dash_id = "sheet-dash"
+	pos_id = "sheet-pos"
+	ventas_id = "sheet-ventas"
+	compras_id = "sheet-compras"
+	sueldos_id = "sheet-sueldos"
+
+	dash_cells = {
+		"A1": "Dashboard (mes)",
+		"B1": "SYS",
+		"C1": "Valor",
+		"D1": "Nota",
+		"A2": "Ventas brutas",
+		"B2": "SYS",
+		"C2": "=this_month_sales_gross",
+		"D2": "SI excl. returns",
+		"A3": "Notas de crédito",
+		"B3": "SYS",
+		"C3": "=this_month_returns_total",
+		"D3": "SI is_return",
+		"A4": "Ventas netas",
+		"B4": "FX",
+		"C4": "=C2-C3",
+		"D4": "Brutas − returns",
+		"A5": "Cobrado cash",
+		"B5": "SYS",
+		"C5": "=this_month_cash_total",
+		"A6": "Cobrado tarjeta",
+		"B6": "SYS",
+		"C6": "=this_month_card_total",
+		"A7": "Cobrado MP",
+		"B7": "SYS",
+		"C7": "=this_month_mp_total",
+		"A8": "Cobrado transferencia",
+		"B8": "SYS",
+		"C8": "=this_month_transfer_total",
+		"A9": "Compras OC (pedido)",
+		"B9": "SYS",
+		"C9": "=this_month_po_ordered",
+		"A10": "Compras recibidas $",
+		"B10": "SYS",
+		"C10": "=this_month_po_received_value",
+		"A11": "Pagado a proveedores",
+		"B11": "SYS",
+		"C11": "=this_month_payout_total",
+		"A12": "CxC outstanding",
+		"B12": "SYS",
+		"C12": "=receivables_outstanding",
+		"A13": "CxP outstanding",
+		"B13": "SYS",
+		"C13": "=payables_outstanding",
+		"A14": "Inventario estimado",
+		"B14": "SYS",
+		"C14": "=inventory_value",
+		"A15": "Masa salarial CTC",
+		"B15": "SYS",
+		"C15": "=employees_salary_total",
+		"A16": "Contribución comercial",
+		"B16": "FX",
+		"C16": "=contribucion_comercial",
+		"D16": "Proxy, no COGS",
+		"A17": "Pedidos sin facturar",
+		"B17": "SYS",
+		"C17": "=so_unbilled_total",
+		"A19": "Cierre del mes (checklist)",
+		"A20": "1. Cajas Closed; Diff≈0",
+		"B20": "IN",
+		"A21": "2. WHITE = SI; BLACK aparte",
+		"B21": "IN",
+		"A22": "3. MP matched a PE/SI",
+		"B22": "IN",
+		"A23": "4. OC recibidas vs pagadas",
+		"B23": "IN",
+		"A24": "5. CxC/CxP aging revisado",
+		"B24": "IN",
+		"A25": "6. Snapshot inventario",
+		"B25": "IN",
+		"A26": "7. CTC joiners/leavers",
+		"B26": "IN",
+		"A27": "8. AFIP vs WHITE documentado",
+		"B27": "IN",
+		"A28": "9. Pedidos unbilled aceptados",
+		"B28": "IN",
+		"A29": "10. Dashboard locked archive",
+		"B29": "IN",
+	}
+	dash_styles = {
+		"A1": "#dbeafe",
+		"B1": "#dbeafe",
+		"C1": "#dbeafe",
+		"D1": "#dbeafe",
+		"B2": "#dbeafe",
+		"B3": "#dbeafe",
+		"B4": "#dcfce7",
+		"B5": "#dbeafe",
+		"B6": "#dbeafe",
+		"B7": "#dbeafe",
+		"B8": "#dbeafe",
+		"B9": "#dbeafe",
+		"B10": "#dbeafe",
+		"B11": "#dbeafe",
+		"B12": "#dbeafe",
+		"B13": "#dbeafe",
+		"B14": "#dbeafe",
+		"B15": "#dbeafe",
+		"B16": "#dcfce7",
+		"B17": "#dbeafe",
+		"A19": "#fef08a",
+		"B20": "#fef08a",
+		"B21": "#fef08a",
+		"B22": "#fef08a",
+		"B23": "#fef08a",
+		"B24": "#fef08a",
+		"B25": "#fef08a",
+		"B26": "#fef08a",
+		"B27": "#fef08a",
+		"B28": "#fef08a",
+		"B29": "#fef08a",
+	}
+
+	pos_cells = {
+		"A1": "POS Diario / Cajas",
+		"B1": "SYS = auto · IN = tipiado · Diff = contado − esperado",
+		"A3": "Resumen mes",
+		"A4": "Sesiones abiertas",
+		"B4": "SYS",
+		"C4": "=caja_sessions_open_count",
+		"A5": "Sesiones cerradas",
+		"B5": "SYS",
+		"C5": "=caja_sessions_closed_count",
+		"A6": "Aperturas $ (mes)",
+		"B6": "SYS",
+		"C6": "=this_month_caja_opening_total",
+		"A7": "Efectivo cobrado",
+		"B7": "SYS",
+		"C7": "=this_month_cash_total",
+		"A8": "Caja esperada (proxy)",
+		"B8": "FX",
+		"C8": "=caja_esperado_mes",
+		"A9": "Contado manual (IN)",
+		"B9": "IN",
+		"C9": "0",
+		"A10": "Diferencia",
+		"B10": "FX",
+		"C10": "=C9-C8",
+		"A12": "fecha",
+		"B12": "sesion",
+		"C12": "caja",
+		"D12": "cajero",
+		"E12": "apertura",
+		"F12": "ventas_cash",
+		"G12": "contado",
+		"H12": "diff",
+		"I12": "estado",
+		"A13": "",
+		"B13": "",
+		"C13": "",
+		"D13": "",
+		"E13": "",
+		"F13": "",
+		"G13": "",
+		"H13": "=G13-E13-F13",
+		"I13": "Open",
+		"A14": "",
+		"H14": "=G14-E14-F14",
+		"A15": "",
+		"H15": "=G15-E15-F15",
+		"A17": "Cierre: Diff≈0 o nota; abiertas no entran al mes.",
+	}
+	pos_styles = {
+		"A1": "#dbeafe",
+		"B4": "#dbeafe",
+		"B5": "#dbeafe",
+		"B6": "#dbeafe",
+		"B7": "#dbeafe",
+		"B8": "#dcfce7",
+		"B9": "#fef08a",
+		"C9": "#fef08a",
+		"B10": "#dcfce7",
+		"A12": "#e5e7eb",
+		"B12": "#e5e7eb",
+		"C12": "#e5e7eb",
+		"D12": "#e5e7eb",
+		"E12": "#e5e7eb",
+		"F12": "#e5e7eb",
+		"G12": "#e5e7eb",
+		"H12": "#e5e7eb",
+		"I12": "#e5e7eb",
+		"G13": "#fef08a",
+		"G14": "#fef08a",
+		"G15": "#fef08a",
+	}
+
+	ventas_cells = {
+		"A1": "Ventas (libro ops)",
+		"B1": "WHITE/BLACK split + pivote diario",
+		"A3": "Métrica",
+		"B3": "Tipo",
+		"C3": "Valor",
+		"A4": "WHITE $",
+		"B4": "SYS",
+		"C4": "=this_month_white_total",
+		"A5": "BLACK $",
+		"B5": "SYS",
+		"C5": "=this_month_black_total",
+		"A6": "Tickets WHITE",
+		"B6": "SYS",
+		"C6": "=this_month_si_white_count",
+		"A7": "Tickets BLACK",
+		"B7": "SYS",
+		"C7": "=this_month_si_black_count",
+		"A8": "IVA (ops)",
+		"B8": "SYS",
+		"C8": "=this_month_tax_total",
+		"A9": "Neto pre-IVA",
+		"B9": "SYS",
+		"C9": "=this_month_net_total",
+		"A10": "Tasa devolución",
+		"B10": "FX",
+		"C10": "=return_rate",
+		"A12": "month",
+		"B12": "revenue",
+		"C12": "orders",
+		"A13": "Jan",
+		"B13": "1200",
+		"C13": "18",
+		"A14": "Feb",
+		"B14": "1540",
+		"C14": "21",
+		"A15": "Mar",
+		"B15": "980",
+		"C15": "14",
+		"A16": "Apr",
+		"B16": "1710",
+		"C16": "25",
+		"A17": "May",
+		"B17": "1890",
+		"C17": "27",
+		"A18": "Jun",
+		"B18": "2100",
+		"C18": "31",
+		"A20": "Reemplazar filas A13:C18 con totales diarios del mes (IN).",
+		"A22": "fecha",
+		"B22": "comprobante",
+		"C22": "cliente",
+		"D22": "canal",
+		"E22": "modo",
+		"F22": "total",
+		"G22": "cobrado",
+		"H22": "mop",
+		"A23": "",
+		"E23": "WHITE",
+		"A24": "",
+		"E24": "BLACK",
+	}
+	ventas_styles = {
+		"A1": "#dbeafe",
+		"A3": "#e5e7eb",
+		"B3": "#e5e7eb",
+		"C3": "#e5e7eb",
+		"B4": "#dbeafe",
+		"B5": "#dbeafe",
+		"B6": "#dbeafe",
+		"B7": "#dbeafe",
+		"B8": "#dbeafe",
+		"B9": "#dbeafe",
+		"B10": "#dcfce7",
+		"A12": "#e5e7eb",
+		"B12": "#e5e7eb",
+		"C12": "#e5e7eb",
+		"A22": "#e5e7eb",
+		"B22": "#e5e7eb",
+		"C22": "#e5e7eb",
+		"D22": "#e5e7eb",
+		"E22": "#e5e7eb",
+		"F22": "#e5e7eb",
+		"G22": "#e5e7eb",
+		"H22": "#e5e7eb",
+		"E23": "#fef08a",
+		"E24": "#fef08a",
+	}
+
+	compras_cells = {
+		"A1": "Compras operativas (OC)",
+		"B1": "No es libro IVA compras hasta que PI sea first-class",
+		"A3": "Métrica",
+		"B3": "Tipo",
+		"C3": "Valor",
+		"A4": "OC pedidas $",
+		"B4": "SYS",
+		"C4": "=this_month_po_ordered",
+		"A5": "Recibido $",
+		"B5": "SYS",
+		"C5": "=this_month_po_received_value",
+		"A6": "Facturado $ (PI)",
+		"B6": "SYS",
+		"C6": "=this_month_po_billed_value",
+		"A7": "Pagado (PE Pay)",
+		"B7": "SYS",
+		"C7": "=this_month_payout_total",
+		"A8": "Saldo ops",
+		"B8": "FX",
+		"C8": "=C4-C7",
+		"A9": "Recibido no facturado",
+		"B9": "FX",
+		"C9": "=C5-C6",
+		"D9": "Riesgo accrual AP",
+		"A10": "PI del mes (legacy)",
+		"B10": "SYS",
+		"C10": "=this_month_purchase_total",
+		"A12": "fecha_oc",
+		"B12": "oc",
+		"C12": "proveedor",
+		"D12": "pipeline",
+		"E12": "total_oc",
+		"F12": "recibido_pct",
+		"G12": "pagado",
+		"H12": "saldo",
+		"A13": "(Refrescá la fecha → volcado de OCs del mes, tope 45)",
+	}
+	compras_styles = {
+		"A1": "#dbeafe",
+		"B1": "#fecaca",
+		"A3": "#e5e7eb",
+		"B3": "#e5e7eb",
+		"C3": "#e5e7eb",
+		"B4": "#dbeafe",
+		"B5": "#dbeafe",
+		"B6": "#dbeafe",
+		"B7": "#dbeafe",
+		"B8": "#dcfce7",
+		"B9": "#dcfce7",
+		"B10": "#dbeafe",
+		"A12": "#e5e7eb",
+		"B12": "#e5e7eb",
+		"C12": "#e5e7eb",
+		"D12": "#e5e7eb",
+		"E12": "#e5e7eb",
+		"F12": "#e5e7eb",
+		"G12": "#e5e7eb",
+		"H12": "#e5e7eb",
+		"A13": "#fef9c3",
+	}
+
+	sueldos_cells = {
+		"A1": "Sueldos (CTC)",
+		"B1": "CTC ≠ liquidación — sin Salary Slip / cargas / bancos",
+		"A3": "Empleados activos",
+		"B3": "SYS",
+		"C3": "=employees_count",
+		"A4": "Masa salarial CTC",
+		"B4": "SYS",
+		"C4": "=employees_salary_total",
+		"A5": "Prorrateo manual %",
+		"B5": "IN",
+		"C5": "1",
+		"A6": "Costo del mes",
+		"B6": "FX",
+		"C6": "=C4*C5",
+		"A8": "empleado",
+		"B8": "sucursal",
+		"C8": "ctc_mensual",
+		"D8": "estado",
+		"E8": "dias",
+		"F8": "costo_mes",
+		"G8": "notas",
+		"A9": "(Refrescá → volcado de empleados Active, tope 45)",
+		"A11": "Burn rate / headcount → Dashboard C15. No inventar recibos aquí.",
+	}
+	sueldos_styles = {
+		"A1": "#dbeafe",
+		"B1": "#fecaca",
+		"B3": "#dbeafe",
+		"B4": "#dbeafe",
+		"B5": "#fef08a",
+		"C5": "#fef08a",
+		"B6": "#dcfce7",
+		"A8": "#e5e7eb",
+		"B8": "#e5e7eb",
+		"C8": "#e5e7eb",
+		"D8": "#e5e7eb",
+		"E8": "#e5e7eb",
+		"F8": "#e5e7eb",
+		"G8": "#e5e7eb",
+		"A9": "#fef9c3",
+	}
+
+	return [
+		{"id": dash_id, "name": "Dashboard", "cells": dash_cells, "styles": dash_styles},
+		{"id": pos_id, "name": "POS Diario", "cells": pos_cells, "styles": pos_styles},
+		{"id": ventas_id, "name": "Ventas", "cells": ventas_cells, "styles": ventas_styles},
+		{"id": compras_id, "name": "Compras", "cells": compras_cells, "styles": compras_styles},
+		{"id": sueldos_id, "name": "Sueldos CTC", "cells": sueldos_cells, "styles": sueldos_styles},
+	]
+
+
+def _starter_tables() -> list:
+	return [
+		{"id": "t01", "name": "dashboard_kpis", "sheet_id": "sheet-dash", "range": "A2:C17"},
+		{"id": "t02", "name": "monthly_sales", "sheet_id": "sheet-ventas", "range": "A12:C18"},
+		{"id": "t03", "name": "pos_sessions", "sheet_id": "sheet-pos", "range": "A12:I15"},
+		{"id": "t04", "name": "compras_oc", "sheet_id": "sheet-compras", "range": "A12:H12"},
+		{"id": "t05", "name": "sueldos_ctc", "sheet_id": "sheet-sueldos", "range": "A8:G8"},
+	]
+
+
+def _workbook_is_blank(workbook: dict) -> bool:
+	sheets = workbook.get("sheets") or []
+	if not sheets:
+		return True
+	return all(not (s.get("cells") or {}) for s in sheets if isinstance(s, dict))
+
+
 def _default_workbook() -> dict:
 	notebooks, _ = _normalize_notebooks([], "")
+	sheets = _starter_sheets()
 	return {
-		"sheets": [{"id": DEFAULT_SHEET_ID, "name": DEFAULT_SHEET_NAME, "cells": {}, "styles": {}}],
-		"active_sheet_id": DEFAULT_SHEET_ID,
-		"variables": [],
-		"notes": "",
+		"sheets": sheets,
+		"active_sheet_id": sheets[0]["id"],
+		"variables": _starter_variables(),
+		"notes": (
+			"Pack inicial contable (Dashboard / POS / Ventas / Compras / Sueldos). "
+			"SYS=auto refresh · IN=manual · FX=fórmula. CTC ≠ liquidación."
+		),
 		"code": "",
 		"script": "",
 		"conditional_formats": [],
 		"notebooks": notebooks,
 		"active_notebook_id": notebooks[0]["id"],
 		"reports": {"rows": []},
-		"tables": [],
+		"tables": _starter_tables(),
 		"snippet_cache": {},
 		"snippet_run": {"status": "idle", "started_at": "", "finished_at": "", "error": ""},
 	}
@@ -680,7 +1520,24 @@ def get_accounting_sheet(scope=None):
 	except Exception:
 		raw = {}
 	workbook = _normalize_workbook(raw)
+	# Upgrade blank workbooks (legacy empty Sheet1) to the starter close pack.
+	if _workbook_is_blank(workbook):
+		workbook = _default_workbook()
+		doc.cells_json = json.dumps(workbook, ensure_ascii=False)
+		doc.save(ignore_permissions=True)
+		frappe.db.commit()
 	return {"scope": doc.scope, **workbook, "modified": str(doc.modified)}
+
+
+@frappe.whitelist(allow_guest=True)
+def reset_accounting_starter_workbook(scope=None):
+	"""Replace workbook with the five-tab accounting starter pack (destructive)."""
+	doc = _get_sheet(scope)
+	workbook = _default_workbook()
+	doc.cells_json = json.dumps(workbook, ensure_ascii=False)
+	doc.save(ignore_permissions=True)
+	frappe.db.commit()
+	return {"ok": True, "scope": doc.scope, "modified": str(doc.modified), **workbook}
 
 
 @frappe.whitelist(allow_guest=True)

@@ -3796,9 +3796,27 @@ def get_accounting_constants(as_of_date=None):
 
 
 @frappe.whitelist(allow_guest=True)
+def get_accounting_detail_tables(as_of_date=None, limit=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        get_accounting_detail_tables as _impl,
+    )
+
+    return _impl(as_of_date=as_of_date, limit=limit)
+
+
+@frappe.whitelist(allow_guest=True)
 def get_accounting_sheet(scope=None):
     from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
         get_accounting_sheet as _impl,
+    )
+
+    return _impl(scope=scope)
+
+
+@frappe.whitelist(allow_guest=True)
+def reset_accounting_starter_workbook(scope=None):
+    from erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api import (
+        reset_accounting_starter_workbook as _impl,
     )
 
     return _impl(scope=scope)

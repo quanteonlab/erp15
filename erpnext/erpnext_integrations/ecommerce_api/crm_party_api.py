@@ -644,6 +644,128 @@ def create_party_credit_note(
 	}
 
 
+@frappe.whitelist(allow_guest=True)
+def create_party_debit_note(
+	customer=None,
+	items=None,
+	reason=None,
+	reason_code=None,
+	company=None,
+	against_invoice=None,
+):
+	"""Create a customer debit note as a Sales Invoice (additional charge).
+
+	In ERPNext/AR, customer debit notes increase what the customer owes (not is_return).
+	Supplier debit notes remain Purchase Invoice is_return via list_party_invoices.
+	``items``: [{item_code, qty, rate?, item_name?}] with positive qty.
+	"""
+	import json
+
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_ensure_pos_caja_item,
+		_ensure_pos_sale_item_groups,
+		_ensure_pos_sale_items_enabled,
+		_normalize_pos_caja_item_code,
+		_temporarily_allow_negative_stock,
+	)
+
+	if isinstance(items, str):
+		try:
+			items = json.loads(items) if items.strip() else []
+		except Exception:
+			items = []
+	if items is None:
+		items = []
+	if not isinstance(items, list):
+		frappe.throw(_("items must be a list"))
+
+	cust = _as_str(customer)
+	if not cust:
+		frappe.throw(_("customer is required"))
+	if not frappe.db.exists("Customer", cust):
+		frappe.throw(_("Customer {0} not found").format(cust))
+
+	against = _as_str(against_invoice)
+	reason_text = _as_str(reason)
+	reason_key = _as_str(reason_code) or "debit"
+
+	clean = []
+	for raw in items:
+		if not isinstance(raw, dict):
+			continue
+		code_item = _as_str(raw.get("item_code"))
+		qty = abs(flt(raw.get("qty")))
+		rate = abs(flt(raw.get("rate")))
+		if not code_item or qty <= 0:
+			continue
+		if not frappe.db.exists("Item", code_item):
+			frappe.throw(_("Item {0} not found").format(code_item))
+		clean.append(
+			{
+				"item_code": code_item,
+				"item_name": _as_str(raw.get("item_name")) or code_item,
+				"qty": qty,
+				"rate": rate,
+			}
+		)
+	if not clean:
+		frappe.throw(_("Select at least one item to debit"))
+
+	company = resolve_company(company)
+	_ensure_pos_caja_item()
+	for r in clean:
+		r["item_code"] = _normalize_pos_caja_item_code(r["item_code"])
+	codes = [r["item_code"] for r in clean]
+	_ensure_pos_sale_items_enabled(codes)
+	_ensure_pos_sale_item_groups(codes)
+
+	invoice_items = [
+		{
+			"item_code": r["item_code"],
+			"item_name": r["item_name"],
+			"qty": r["qty"],
+			"rate": r["rate"],
+		}
+		for r in clean
+	]
+	doc = frappe.get_doc(
+		{
+			"doctype": "Sales Invoice",
+			"customer": cust,
+			"company": company,
+			"is_pos": 0,
+			"is_return": 0,
+			"posting_date": frappe.utils.nowdate(),
+			"due_date": frappe.utils.nowdate(),
+			"items": invoice_items,
+		}
+	)
+	tag_parts = [f"debit_reason:{reason_key}", "doc_kind:debit_note"]
+	if against:
+		tag_parts.append(f"against:{against}")
+	if reason_text:
+		tag_parts.append(f"note:{reason_text[:200]}")
+	doc.remarks = " | ".join(tag_parts)
+
+	doc.set_missing_values()
+	doc.calculate_taxes_and_totals()
+	doc.insert(ignore_permissions=True)
+	with _temporarily_allow_negative_stock():
+		doc.submit()
+	frappe.db.commit()
+
+	return {
+		"ok": True,
+		"invoice_id": doc.name,
+		"against_invoice": against or None,
+		"grand_total": flt(doc.grand_total),
+		"customer": doc.customer,
+		"reason_code": reason_key,
+		"doc_kind": "debit_note",
+	}
+
+
 def _interaction_row(
 	*,
 	doctype: str,

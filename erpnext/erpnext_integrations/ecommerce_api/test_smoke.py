@@ -784,6 +784,41 @@ def suite_5_10_product_manager():
         assert stock_uom == "Nos", f"expected Nos, got {stock_uom!r}"
         frappe.delete_doc("Item", sku, ignore_permissions=True, force=True)
 
+    def check_accounting_constants_starter():
+        consts = pm.get_accounting_constants(as_of_date=None)
+        assert isinstance(consts, dict), f"expected dict, got {type(consts)}"
+        for key in (
+            "this_month_sales_gross",
+            "this_month_sales_net",
+            "this_month_black_total",
+            "this_month_po_ordered",
+            "this_month_po_received_value",
+            "so_unbilled_total",
+            "ar_aging_0_30",
+            "employees_salary_total",
+            "caja_sessions_open_count",
+        ):
+            assert key in consts, f"missing starter constant {key}; keys={list(consts.keys())[-12:]}"
+            assert isinstance(consts[key], (int, float)), f"{key} not numeric: {consts[key]!r}"
+
+    def check_accounting_starter_sheet():
+        wb = pm.get_accounting_sheet(scope="logistica.accounting.smoke")
+        assert isinstance(wb, dict) and isinstance(wb.get("sheets"), list), f"bad sheet: {wb}"
+        names = [s.get("name") for s in wb["sheets"]]
+        for need in ("Dashboard", "POS Diario", "Ventas", "Compras", "Sueldos CTC"):
+            assert need in names, f"missing tab {need}; have {names}"
+        assert wb.get("tables"), "starter tables missing"
+        assert wb.get("variables"), "starter variables missing"
+
+    def check_accounting_detail_tables():
+        dumps = pm.get_accounting_detail_tables(as_of_date=None, limit=10)
+        assert isinstance(dumps, dict), f"expected dict, got {type(dumps)}"
+        for key in ("compras_oc", "sueldos_ctc"):
+            block = dumps.get(key)
+            assert isinstance(block, dict), f"missing {key}: {dumps}"
+            assert "headers" in block and "rows" in block, f"bad {key}: {block}"
+            assert isinstance(block["rows"], list)
+
     _run("5.10.1 get_pm_context", check_pm_context, "S2")
     _run("5.10.2 get_product_rows page", check_product_rows, "S2")
     _run("5.10.3 list_uoms", check_uoms, "S3")
@@ -793,6 +828,9 @@ def suite_5_10_product_manager():
     _run("5.10.7 generate_item_code", check_generate_item_code, "S3")
     _run("5.10.8 create_product_row NOS (single)→Nos", check_create_with_nos_single_uom, "S3")
     _run("5.10.9 remove_white_bg_item_images dry_run", check_remove_white_bg_dry, "S3")
+    _run("5.10.10 get_accounting_constants starter keys", check_accounting_constants_starter, "S2")
+    _run("5.10.11 get_accounting_sheet starter tabs", check_accounting_starter_sheet, "S2")
+    _run("5.10.12 get_accounting_detail_tables dumps", check_accounting_detail_tables, "S2")
 
 
 # ── Suite 5.11 — POS session / cash / admin settings ──────────────────────────

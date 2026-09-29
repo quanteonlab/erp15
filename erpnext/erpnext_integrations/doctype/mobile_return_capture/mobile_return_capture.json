@@ -14,6 +14,11 @@
   "captured_at",
   "captured_lat",
   "captured_lng",
+  "delivery_note",
+  "credit_note",
+  "debit_note",
+  "delivery_note_return",
+  "process_error",
   "section_break_2",
   "lines",
   "notes",
@@ -50,7 +55,7 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Status",
-   "options": "Captured\nProcessed",
+   "options": "Captured\nProcessed\nError",
    "reqd": 1
   },
   {
@@ -81,6 +86,41 @@
    "read_only": 1
   },
   {
+   "fieldname": "delivery_note",
+   "fieldtype": "Link",
+   "label": "Delivery Note",
+   "options": "Delivery Note",
+   "read_only": 1
+  },
+  {
+   "fieldname": "credit_note",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Credit Note",
+   "options": "Sales Invoice",
+   "read_only": 1
+  },
+  {
+   "fieldname": "debit_note",
+   "fieldtype": "Link",
+   "label": "Debit Note",
+   "options": "Sales Invoice",
+   "read_only": 1
+  },
+  {
+   "fieldname": "delivery_note_return",
+   "fieldtype": "Link",
+   "label": "Delivery Note Return",
+   "options": "Delivery Note",
+   "read_only": 1
+  },
+  {
+   "fieldname": "process_error",
+   "fieldtype": "Small Text",
+   "label": "Process Error",
+   "read_only": 1
+  },
+  {
    "fieldname": "section_break_2",
    "fieldtype": "Section Break"
   },
@@ -108,7 +148,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-09-01 00:00:00.000000",
+ "modified": "2026-09-29 13:30:00.000000",
  "modified_by": "Administrator",
  "module": "ERPNext Integrations",
  "name": "Mobile Return Capture",

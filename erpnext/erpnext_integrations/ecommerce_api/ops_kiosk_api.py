@@ -323,19 +323,29 @@ def get_sku_locations(item_codes=None):
 def get_delivery_check_items(delivery_note=None):
 	"""Items for Entregas verification checklist, grouped as one 'caja' per DN (per cliente)."""
 	delivery_note = str(delivery_note or "").strip()
-	if not delivery_note or not frappe.db.exists("Delivery Note", delivery_note):
+	if (
+		not delivery_note
+		or delivery_note.lower() in ("null", "undefined", "none")
+		or not frappe.db.exists("Delivery Note", delivery_note)
+	):
 		frappe.throw(_("Delivery Note not found"))
 
 	frappe.flags.ignore_permissions = True
 	dn = frappe.get_doc("Delivery Note", delivery_note)
+	frappe.flags.ignore_permissions = False
 	items = []
 	for d in dn.items or []:
+		qty = flt(d.qty)
+		rate = flt(getattr(d, "rate", None) or 0)
+		amount = flt(getattr(d, "amount", None) or (rate * qty))
 		items.append(
 			{
 				"item_code": d.item_code,
 				"item_name": d.item_name,
-				"qty": flt(d.qty),
+				"qty": qty,
 				"uom": d.uom,
+				"rate": rate,
+				"amount": amount,
 				"against_sales_order": getattr(d, "against_sales_order", None),
 			}
 		)

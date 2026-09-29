@@ -1388,7 +1388,13 @@
       "bug": "EDGE-PSTYLE with qty meeting both AT-EDGE-PSTYLE (x3@$80) and EDGE-PACK-10 (x6@$41) must not MultiplePricingRuleConflict 417 — soft-resolve / ignore_pricing_rule",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
       "args": {
-        "items": [{"item_code": "EDGE-PSTYLE", "qty": 7, "rate": 41}],
+        "items": [
+          {
+            "item_code": "EDGE-PSTYLE",
+            "qty": 7,
+            "rate": 41
+          }
+        ],
         "guest_notes": "edge dual price rules conflict",
         "guest_name": "Edge Dual Promo",
         "price_list": "Standard Selling"
@@ -1846,6 +1852,27 @@
       "expect": "fail"
     },
     {
+      "id": "tms_geocode_query_null",
+      "source": "regression",
+      "bug": "geocode_query with null/empty query must controlled ValidationError not TypeError/REQUEST_DENIED leak",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.geocode_query",
+      "args": {
+        "query": null,
+        "region": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_driver_get_trip_delivery_summary_null",
+      "source": "regression",
+      "bug": "driver_get_trip_delivery_summary with null/empty trip_name must controlled ValidationError not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_get_trip_delivery_summary",
+      "args": {
+        "trip_name": null
+      },
+      "expect": "fail"
+    },
+    {
       "id": "tms_get_driver_detail_null",
       "source": "regression",
       "bug": "get_driver_detail with null name is controlled ValidationError, not TypeError/500",
@@ -2272,6 +2299,103 @@
         "client_phone_e164": null
       },
       "expect": "error"
+    },
+    {
+      "id": "get_accounting_constants_null_date",
+      "source": "regression",
+      "bug": "get_accounting_constants(as_of_date=null) must return starter-pack keys (sales_net, po_ordered, ar_aging) without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api.get_accounting_constants",
+      "args": {
+        "as_of_date": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_accounting_sheet_null_scope",
+      "source": "regression",
+      "bug": "get_accounting_sheet(scope=null) must default to logistica.accounting and return sheets list without crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api.get_accounting_sheet",
+      "args": {
+        "scope": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_accounting_detail_tables_null_date",
+      "source": "regression",
+      "bug": "get_accounting_detail_tables(as_of_date=null) must return compras_oc/sueldos_ctc dumps without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.accounting_sheet_api.get_accounting_detail_tables",
+      "args": {
+        "as_of_date": null,
+        "limit": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "driver_record_return_capture_invalid_reason",
+      "source": "regression",
+      "bug": "Return lines must use predefined reason categories; free-text/null reason fails controlled (never TypeError), decimal qty allowed",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_record_return_capture",
+      "args": {
+        "trip_name": null,
+        "stop_idx": 1,
+        "lines": [
+          {
+            "item_code": "__no_such_item__",
+            "qty": 1.25,
+            "reason": "broken free text"
+          }
+        ],
+        "signature_base64": "data:image/png;base64,AAA",
+        "notes": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "driver_record_return_capture_null_lines",
+      "source": "regression",
+      "bug": "driver_record_return_capture(lines=null) must controlled-fail, not AttributeError on iteration",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_record_return_capture",
+      "args": {
+        "trip_name": "",
+        "stop_idx": null,
+        "lines": null,
+        "signature_base64": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "ops_get_delivery_check_items_null",
+      "source": "regression",
+      "bug": "get_delivery_check_items with null delivery_note must controlled ValidationError not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_delivery_check_items",
+      "args": {
+        "delivery_note": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_driver_get_stop_returns_null",
+      "source": "regression",
+      "bug": "driver_get_stop_returns with null trip/stop must controlled ValidationError not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_get_stop_returns",
+      "args": {
+        "trip_name": null,
+        "stop_idx": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "crm_create_party_debit_note_empty_items",
+      "source": "regression",
+      "bug": "create_party_debit_note with null/empty items is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.create_party_debit_note",
+      "args": {
+        "customer": null,
+        "items": null,
+        "reason": null
+      },
+      "expect": "fail"
     }
   ]
 }

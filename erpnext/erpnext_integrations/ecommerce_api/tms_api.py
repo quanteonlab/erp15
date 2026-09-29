@@ -319,18 +319,66 @@ def _stops_payload(trip, geo_by_address=None):
 	for name, addr in address_meta.items():
 		if name not in geo_by_address and (addr.get("custom_latitude") or addr.get("custom_longitude")):
 			geo_by_address[name] = addr
-	return [_stop_out(s, geo_by_address, customer_meta, address_meta) for s in ordered]
+
+	tracking_by_dn = {}
+	dn_names = [s.delivery_note for s in ordered if s.delivery_note]
+	if dn_names and frappe.db.has_column("Delivery Note", "custom_tracking_code"):
+		for row in frappe.get_all(
+			"Delivery Note",
+			filters={"name": ["in", dn_names]},
+			fields=["name", "custom_tracking_code"],
+			ignore_permissions=True,
+		):
+			code = cstr(row.custom_tracking_code or "").strip()
+			if not code:
+				code = cstr(_ensure_tracking_code(row.name) or "").strip()
+			if code:
+				tracking_by_dn[row.name] = code
+
+	return [
+		_stop_out(s, geo_by_address, customer_meta, address_meta, tracking_by_dn)
+		for s in ordered
+	]
 
 
-def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None):
+def _valid_map_coord(value):
+	"""Return a usable lat/lng, or None. Treat 0 / empty as missing (common on unoptimized stops)."""
+	if value in (None, "", "null", "undefined"):
+		return None
+	try:
+		n = float(value)
+	except (TypeError, ValueError):
+		return None
+	if not n or abs(n) < 1e-6:
+		return None
+	return n
+
+
+def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tracking_by_dn=None):
 	address_geo = address_geo or {}
 	customer_meta = customer_meta or {}
 	address_meta = address_meta or {}
+	tracking_by_dn = tracking_by_dn or {}
 	geo = address_geo.get(stop.address) or {}
 	outcome = stop.get("custom_outcome") if hasattr(stop, "get") else getattr(stop, "custom_outcome", None)
 	cust = customer_meta.get(stop.customer) or {}
 	addr = address_meta.get(stop.address) or {}
 	addr_line = addr.get("address_line1") or None
+	# Prefer optimized route coords; fall back to address geocode (never keep 0,0 placeholders).
+	lat = (
+		_valid_map_coord(getattr(stop, "lat", None))
+		or _valid_map_coord(geo.get("custom_latitude"))
+		or _valid_map_coord(addr.get("custom_latitude"))
+	)
+	lng = (
+		_valid_map_coord(getattr(stop, "lng", None))
+		or _valid_map_coord(geo.get("custom_longitude"))
+		or _valid_map_coord(addr.get("custom_longitude"))
+	)
+	dn = cstr(stop.delivery_note or "").strip()
+	tracking_code = tracking_by_dn.get(dn) if dn else None
+	if dn and not tracking_code and frappe.db.has_column("Delivery Note", "custom_tracking_code"):
+		tracking_code = _ensure_tracking_code(dn)
 	return {
 		"idx": stop.idx,
 		"customer": stop.customer,
@@ -341,16 +389,15 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None):
 		"preferred_hours": cust.get("custom_preferred_hours") or None,
 		"comments": cust.get("customer_details") or None,
 		"delivery_note": stop.delivery_note,
+		"tracking_code": tracking_code or None,
 		"grand_total": stop.grand_total,
 		"contact": stop.contact,
 		"visited": bool(stop.visited),
 		"outcome": outcome or None,
 		"distance": stop.distance,
 		"estimated_arrival": stop.estimated_arrival,
-		# Prefer the optimized lat/lng from process_route(); fall back to the
-		# geocode cache so the map has pins before a route has been optimized.
-		"lat": stop.lat or geo.get("custom_latitude"),
-		"lng": stop.lng or geo.get("custom_longitude"),
+		"lat": lat,
+		"lng": lng,
 		"pod": {
 			"recipient_name": stop.custom_pod_recipient_name,
 			"recipient_id_number": stop.custom_pod_recipient_id_number,
@@ -991,6 +1038,134 @@ def geocode_address(address_name):
 	frappe.db.commit()
 
 	return {"lat": location["lat"], "lng": location["lng"], "cached": False}
+
+
+def _geocode_via_nominatim(address_str, country_code="ar"):
+	"""Free fallback geocoder (OpenStreetMap Nominatim) when Google Maps key is unset."""
+	import urllib.error
+	import urllib.parse
+	import urllib.request
+
+	params = urllib.parse.urlencode(
+		{
+			"q": address_str,
+			"format": "json",
+			"limit": "1",
+			"countrycodes": cstr(country_code or "ar").lower(),
+			"addressdetails": "0",
+		}
+	)
+	req = urllib.request.Request(
+		f"https://nominatim.openstreetmap.org/search?{params}",
+		headers={
+			"User-Agent": "NextERP-TMS-DriverGeocode/1.0 (local; contact ops)",
+			"Accept": "application/json",
+			"Accept-Language": "es,en",
+		},
+		method="GET",
+	)
+	try:
+		with urllib.request.urlopen(req, timeout=12) as resp:
+			payload = resp.read().decode("utf-8")
+	except urllib.error.HTTPError as e:
+		frappe.throw(_("Geocoder HTTP error: {0}").format(e.code))
+	except Exception as e:
+		frappe.throw(_("Geocoder unavailable: {0}").format(cstr(e)))
+
+	import json
+
+	try:
+		rows = json.loads(payload)
+	except Exception:
+		frappe.throw(_("Geocoder returned invalid JSON."))
+
+	if not isinstance(rows, list) or not rows:
+		return None
+
+	top = rows[0] or {}
+	try:
+		lat = float(top.get("lat"))
+		lng = float(top.get("lon"))
+	except (TypeError, ValueError):
+		return None
+	formatted = cstr(top.get("display_name") or address_str).strip()
+	return {"lat": lat, "lng": lng, "address": formatted, "provider": "nominatim"}
+
+
+def _resolve_maps_geocode_api_key():
+	"""Google Settings first, then site_config google_maps_api_key."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.google_api import get_google_maps_api_key
+
+		key = get_google_maps_api_key()
+		if key:
+			return key
+	except Exception:
+		pass
+	return cstr(frappe.conf.get("google_maps_api_key") or "").strip()
+
+
+@frappe.whitelist(allow_guest=True)
+def geocode_query(query=None, region=None):
+	"""Geocode free-text address for driver Completar Entrega map search.
+
+	Prefers Google Settings / site_config Maps key (Geocoding API). Falls back to
+	OpenStreetMap Nominatim when no key is configured — so search still works on
+	sites that only set NEXT_PUBLIC_GOOGLE_MAPS_API_KEY for the browser map.
+	"""
+	q = cstr(query or "").strip()
+	if not q or q.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Address text is required."))
+
+	region = cstr(region or "ar").strip().lower() or "ar"
+	address_str = sanitize_address(q) or q
+	api_key = _resolve_maps_geocode_api_key()
+
+	if api_key:
+		import googlemaps
+
+		maps_client = googlemaps.Client(key=api_key)
+		results = None
+		try:
+			results = maps_client.geocode(
+				address_str,
+				region=region,
+				components={"country": "AR"},
+			)
+		except Exception as e:
+			# Key present but Geocoding API disabled / billing — try Nominatim.
+			frappe.log_error(title="geocode_query Google failed", message=cstr(e))
+
+		if results:
+			top = results[0]
+			location = top["geometry"]["location"]
+			formatted = cstr(top.get("formatted_address") or address_str).strip()
+			return {
+				"lat": location["lat"],
+				"lng": location["lng"],
+				"address": formatted,
+				"cached": False,
+				"provider": "google",
+			}
+
+	hit = _geocode_via_nominatim(address_str, country_code=region)
+	if not hit:
+		if not api_key:
+			frappe.throw(
+				_(
+					"Could not geocode that address. Set a Maps API key in Settings → Integraciones "
+					"(Google Settings) for better results, or try a fuller street address."
+				)
+			)
+		frappe.throw(_("Could not geocode that address."))
+
+	return {
+		"lat": hit["lat"],
+		"lng": hit["lng"],
+		"address": hit["address"],
+		"cached": False,
+		"provider": hit.get("provider") or "nominatim",
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1848,6 +2023,9 @@ TMS_SETTINGS_DEFAULTS = {
 	"print_template_delivery": None,
 	"print_template_payment": None,
 	"tracking_code_length": 8,
+	# Auto-create Sales Invoice credit notes (+ DN returns) from driver returns / partials.
+	"auto_credit_note_on_return": True,
+	"auto_credit_note_on_partial": True,
 	# i039 auto groups — días de venta + whether visit tags include Man/Med/Tar/Noc
 	"auto_group_working_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
 	"auto_group_use_time_slots": False,
@@ -1883,6 +2061,8 @@ def save_tms_settings(
 	print_template_delivery=None,
 	print_template_payment=None,
 	tracking_code_length=None,
+	auto_credit_note_on_return=None,
+	auto_credit_note_on_partial=None,
 	auto_group_working_days=None,
 	auto_group_use_time_slots=None,
 	auto_group_excluded_slots=None,
@@ -1898,6 +2078,8 @@ def save_tms_settings(
 			"print_template_delivery": print_template_delivery,
 			"print_template_payment": print_template_payment,
 			"tracking_code_length": tracking_code_length,
+			"auto_credit_note_on_return": auto_credit_note_on_return,
+			"auto_credit_note_on_partial": auto_credit_note_on_partial,
 			"auto_group_working_days": auto_group_working_days,
 			"auto_group_use_time_slots": auto_group_use_time_slots,
 			"auto_group_excluded_slots": auto_group_excluded_slots,
@@ -1916,6 +2098,8 @@ def _persist_tms_settings(raw, commit=True):
 		"allow_driver_delivery_request",
 		"require_pin_for_order_actions",
 		"auto_group_use_time_slots",
+		"auto_credit_note_on_return",
+		"auto_credit_note_on_partial",
 	}
 	list_keys = {"auto_group_working_days", "auto_group_excluded_slots"}
 	for key, value in raw.items():
@@ -3866,6 +4050,156 @@ def driver_get_trip_stops(trip_name):
 
 
 @frappe.whitelist()
+def driver_get_trip_delivery_summary(trip_name=None):
+	"""End-of-delivery / trip summary: planned, delivered, and returned items (all stops)."""
+	trip_name = cstr(trip_name or "").strip()
+	if not trip_name or trip_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required."))
+
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+
+	address_names = list({s.address for s in trip.delivery_stops if s.address})
+	geo_by_address = {}
+	if address_names:
+		for row in frappe.get_all(
+			"Address",
+			filters={"name": ["in", address_names]},
+			fields=["name", "custom_latitude", "custom_longitude"],
+			ignore_permissions=True,
+		):
+			geo_by_address[row.name] = row
+
+	stops = _stops_payload(trip, geo_by_address)
+
+	dn_names = [cstr(s.get("delivery_note") or "").strip() for s in stops if s.get("delivery_note")]
+	dn_names = [n for n in dn_names if n]
+	dn_items_by_name = {}
+	if dn_names:
+		for dn_name in dn_names:
+			try:
+				frappe.flags.ignore_permissions = True
+				dn = frappe.get_doc("Delivery Note", dn_name)
+				frappe.flags.ignore_permissions = False
+			except Exception:
+				frappe.flags.ignore_permissions = False
+				continue
+			items = []
+			for row in dn.items or []:
+				qty = flt(row.qty)
+				if qty <= 0:
+					continue
+				items.append(
+					{
+						"item_code": cstr(row.item_code),
+						"item_name": cstr(row.item_name or row.item_code),
+						"qty": qty,
+						"uom": cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or ""),
+					}
+				)
+			dn_items_by_name[dn_name] = items
+
+	# All return captures for this trip (includes earlier stops).
+	returns_by_stop = {}
+	if frappe.db.exists("DocType", "Mobile Return Capture"):
+		captures = frappe.get_all(
+			"Mobile Return Capture",
+			filters={"delivery_trip": trip_name},
+			fields=["name", "stop_idx", "customer", "captured_at", "notes", "status"],
+			order_by="stop_idx asc, creation asc",
+			ignore_permissions=True,
+		)
+		for cap in captures:
+			frappe.flags.ignore_permissions = True
+			try:
+				doc = frappe.get_doc("Mobile Return Capture", cap.name)
+			except Exception:
+				continue
+			finally:
+				frappe.flags.ignore_permissions = False
+			lines = []
+			for row in doc.lines or []:
+				qty = flt(row.qty)
+				if qty <= 0:
+					continue
+				lines.append(
+					{
+						"item_code": cstr(row.item_code or ""),
+						"item_name": cstr(row.description or row.item_code or ""),
+						"qty": qty,
+						"reason": cstr(row.reason or ""),
+					}
+				)
+			if not lines:
+				continue
+			idx = cint(cap.stop_idx)
+			returns_by_stop.setdefault(idx, []).append(
+				{
+					"name": cap.name,
+					"captured_at": cap.captured_at,
+					"notes": cap.notes,
+					"lines": lines,
+				}
+			)
+
+	summary_stops = []
+	total_planned = 0.0
+	total_delivered = 0.0
+	total_returned = 0.0
+	for s in stops:
+		dn = cstr(s.get("delivery_note") or "").strip()
+		planned = list(dn_items_by_name.get(dn) or [])
+		outcome = cstr(s.get("outcome") or "")
+		visited = bool(s.get("visited"))
+		delivered = []
+		if visited and outcome in ("Delivered", "Partial"):
+			# Full DN as delivered when Delivered; Partial still lists planned lines
+			# (structured partial qtys are not stored server-side yet).
+			delivered = [dict(it) for it in planned]
+		returned_groups = returns_by_stop.get(cint(s.get("idx")), [])
+		returned_flat = []
+		for g in returned_groups:
+			returned_flat.extend(g.get("lines") or [])
+
+		planned_qty = sum(flt(i.get("qty")) for i in planned)
+		delivered_qty = sum(flt(i.get("qty")) for i in delivered)
+		returned_qty = sum(flt(i.get("qty")) for i in returned_flat)
+		total_planned += planned_qty
+		total_delivered += delivered_qty
+		total_returned += returned_qty
+
+		summary_stops.append(
+			{
+				**s,
+				"planned_items": planned,
+				"delivered_items": delivered,
+				"returned_items": returned_flat,
+				"return_captures": returned_groups,
+				"planned_qty": planned_qty,
+				"delivered_qty": delivered_qty,
+				"returned_qty": returned_qty,
+			}
+		)
+
+	return {
+		"trip": {
+			"name": trip.name,
+			"status": trip.status,
+			"departure_time": trip.departure_time,
+			"driver": trip.driver,
+		},
+		"stops": summary_stops,
+		"totals": {
+			"planned_qty": total_planned,
+			"delivered_qty": total_delivered,
+			"returned_qty": total_returned,
+			"stops_total": len(summary_stops),
+			"stops_visited": sum(1 for s in summary_stops if s.get("visited")),
+		},
+	}
+
+
+@frappe.whitelist()
 def driver_update_stop_details(
 	trip_name=None,
 	stop_idx=None,
@@ -4057,17 +4391,17 @@ def driver_record_stop_outcome(
 	lng=None,
 	amount_collected=None,
 	payment_method=None,
+	credit_items=None,
 ):
 	"""Replaces/extends `driver_complete_stop` with an outcome enum.
 
-	- Delivered: recipient name/ID + signature required (same rule the old
-	  driver_complete_stop enforced). Marks the stop visited.
+	- Delivered / Partial: recipient name/ID + signature required (same POD
+	  fields). Clarification notes are optional; Partial may still carry an
+	  auto-generated qty summary in notes.
 	- Not Home: a note is required. Deliberately does NOT mark the stop
 	  visited - the linked Delivery Note stays open for replanning (see
 	  `_assigned_delivery_note_names`).
-	- Partial / Refused: a note + signature are required. Marks visited -
-	  the attempt is resolved, even though nothing (or only some items)
-	  changed hands.
+	- Refused: a note + signature are required. Marks visited.
 	"""
 	driver = _get_current_driver()
 	trip = _require_owned_trip(trip_name, driver)
@@ -4084,18 +4418,27 @@ def driver_record_stop_outcome(
 	if not stop:
 		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
 
+	settings = _load_tms_settings()
+	signature_required = cstr(settings.get("require_signature") or "always") != "never"
+
 	if outcome == "Delivered":
 		if not recipient_name or not recipient_id_number:
 			frappe.throw(_("Recipient name and ID/DNI are required to complete a delivery."))
-		if not signature_base64:
+		if signature_required and not signature_base64:
 			frappe.throw(_("A signature is required to complete a delivery."))
+	elif outcome == "Partial":
+		# Same POD fields as Delivered (name / DNI / signature); clarification note is optional.
+		if not recipient_name or not recipient_id_number:
+			frappe.throw(_("Recipient name and ID/DNI are required for a partial delivery."))
+		if signature_required and not signature_base64:
+			frappe.throw(_("A signature is required for a partial delivery."))
 	elif outcome == "Not Home":
 		if not attempt_note:
 			frappe.throw(_("A note is required to record a failed delivery attempt."))
-	else:  # Partial / Refused
+	else:  # Refused
 		if not notes:
 			frappe.throw(_("A note is required for a {0} outcome.").format(outcome))
-		if not signature_base64:
+		if signature_required and not signature_base64:
 			frappe.throw(_("A signature is required for a {0} outcome.").format(outcome))
 
 	if signature_base64:
@@ -4123,7 +4466,6 @@ def driver_record_stop_outcome(
 	# "separate_collector" mode means someone else collects later, so the
 	# driver isn't asked for these fields at all - ignore anything sent.
 	if outcome in ("Delivered", "Partial"):
-		settings = _load_tms_settings()
 		amount_due = flt(stop.grand_total)
 		stop.custom_amount_due = amount_due
 		if settings.get("delivery_payment_mode") != "separate_collector" and amount_collected is not None:
@@ -4135,6 +4477,19 @@ def driver_record_stop_outcome(
 
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)
+
+	tracking_code = None
+	if stop.delivery_note and frappe.db.has_column("Delivery Note", "custom_tracking_code"):
+		tracking_code = _ensure_tracking_code(stop.delivery_note)
+
+	credit_note = None
+	if outcome == "Partial":
+		raw_items = frappe.parse_json(credit_items) if isinstance(credit_items, str) else (credit_items or [])
+		if isinstance(raw_items, list) and raw_items:
+			credit_note = _process_partial_credit_note(
+				stop, verify_shortfall_items=raw_items, notes=notes, settings=settings
+			)
+
 	frappe.db.commit()
 
 	try:
@@ -4154,12 +4509,17 @@ def driver_record_stop_outcome(
 				"outcome": outcome,
 				"customer": stop.customer,
 				"delivery_note": stop.delivery_note,
+				"tracking_code": tracking_code,
+				"credit_note": credit_note,
 			},
 		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "webhook stop outcome")
 
-	return get_trip_map_data(trip_name)
+	payload = get_trip_map_data(trip_name)
+	payload["tracking_code"] = tracking_code
+	payload["credit_note"] = credit_note
+	return payload
 
 
 @frappe.whitelist()
@@ -4293,6 +4653,321 @@ def get_delivery_print_data(trip_name, stop_idx):
 # In-premise returns
 # ---------------------------------------------------------------------------
 
+# Stable English codes — keep in sync with erpnext-ecommerce/lib/return-reasons.ts
+# and Mobile Return Capture Item.reason Select options.
+RETURN_REASON_OPTIONS = (
+	"Damaged",
+	"Expired",
+	"Wrong item",
+	"Quality issue",
+	"Customer refusal",
+	"Excess",
+	"Other",
+)
+
+
+def _delivery_note_line_map(dn_name):
+	"""item_code → {rate, qty, against_sales_invoice, warehouse, uom, item_name}."""
+	out = {}
+	if not dn_name or not frappe.db.exists("Delivery Note", dn_name):
+		return out
+	frappe.flags.ignore_permissions = True
+	try:
+		dn = frappe.get_doc("Delivery Note", dn_name)
+	finally:
+		frappe.flags.ignore_permissions = False
+	for row in dn.items or []:
+		code = cstr(row.item_code)
+		if not code:
+			continue
+		prev = out.get(code)
+		qty = flt(row.qty)
+		rate = flt(row.rate)
+		if prev:
+			prev["qty"] = flt(prev.get("qty")) + qty
+			continue
+		out[code] = {
+			"rate": rate,
+			"qty": qty,
+			"against_sales_invoice": cstr(getattr(row, "against_sales_invoice", None) or "") or None,
+			"warehouse": getattr(row, "warehouse", None),
+			"uom": getattr(row, "uom", None),
+			"item_name": cstr(row.item_name or code),
+		}
+	return out
+
+
+def _find_sales_invoice_for_dn(dn_name, customer=None):
+	"""Best Sales Invoice to return-against for a Delivery Note."""
+	line_map = _delivery_note_line_map(dn_name)
+	for meta in line_map.values():
+		si = meta.get("against_sales_invoice")
+		if si and frappe.db.exists("Sales Invoice", si):
+			return si
+	# SI that references this DN on item rows.
+	rows = frappe.get_all(
+		"Sales Invoice Item",
+		filters={"delivery_note": dn_name, "docstatus": 1, "parenttype": "Sales Invoice"},
+		fields=["parent"],
+		limit=5,
+		ignore_permissions=True,
+	)
+	for row in rows:
+		si = row.parent
+		if not si:
+			continue
+		is_return = cint(frappe.db.get_value("Sales Invoice", si, "is_return") or 0)
+		if is_return:
+			continue
+		return si
+	if customer:
+		# Last resort: latest submitted non-return SI for customer (no DN link).
+		si = frappe.db.get_value(
+			"Sales Invoice",
+			{"customer": customer, "docstatus": 1, "is_return": 0},
+			"name",
+			order_by="posting_date desc, creation desc",
+		)
+		return si
+	return None
+
+
+def _create_credit_note_for_items(customer, items, return_against=None, reason=None, reason_code="return"):
+	"""Wrapper around CRM credit-note API (Sales Invoice is_return=1)."""
+	from erpnext.erpnext_integrations.ecommerce_api.crm_party_api import create_party_credit_note
+
+	return create_party_credit_note(
+		customer=customer,
+		return_against=return_against,
+		items=items,
+		reason=reason,
+		reason_code=reason_code,
+	)
+
+
+def _create_dn_return_for_items(dn_name, items):
+	"""Create + submit a Delivery Note return for the selected returned qtys."""
+	if not dn_name or not items:
+		return None
+	from erpnext.controllers.sales_and_purchase_return import make_return_doc
+	from erpnext.erpnext_integrations.ecommerce_api.api import _temporarily_allow_negative_stock
+
+	wanted = {cstr(i.get("item_code")): abs(flt(i.get("qty"))) for i in items if i.get("item_code")}
+	if not wanted:
+		return None
+	doc = make_return_doc("Delivery Note", dn_name)
+	kept = []
+	for row in list(doc.items or []):
+		code = cstr(row.item_code)
+		if code not in wanted:
+			continue
+		max_q = abs(flt(row.qty))
+		q = min(wanted[code], max_q) if max_q else wanted[code]
+		if q <= 0:
+			continue
+		row.qty = -q
+		kept.append(row)
+		wanted[code] = max(0.0, wanted[code] - q)
+	if not kept:
+		return None
+	doc.set("items", [])
+	for row in kept:
+		doc.append(
+			"items",
+			{
+				"item_code": row.item_code,
+				"item_name": row.item_name,
+				"qty": row.qty,
+				"rate": row.rate,
+				"uom": row.uom,
+				"stock_uom": row.stock_uom,
+				"conversion_factor": row.conversion_factor,
+				"warehouse": row.warehouse,
+				"against_sales_order": getattr(row, "against_sales_order", None),
+				"so_detail": getattr(row, "so_detail", None),
+				"against_sales_invoice": getattr(row, "against_sales_invoice", None),
+				"si_detail": getattr(row, "si_detail", None),
+			},
+		)
+	doc.insert(ignore_permissions=True)
+	with _temporarily_allow_negative_stock():
+		doc.submit()
+	return doc.name
+
+
+def _capture_set(capture_name, **kwargs):
+	"""Set optional Mobile Return Capture fields when columns exist."""
+	for field, value in kwargs.items():
+		if value is None:
+			continue
+		if frappe.db.has_column("Mobile Return Capture", field):
+			frappe.db.set_value("Mobile Return Capture", capture_name, field, value, update_modified=False)
+
+
+def _process_return_accounting(capture, stop, settings=None):
+	"""Create credit note (+ DN return) from a Mobile Return Capture. Best-effort."""
+	settings = settings or _load_tms_settings()
+	result = {
+		"credit_note": None,
+		"debit_note": None,
+		"delivery_note_return": None,
+		"process_error": None,
+	}
+	if not settings.get("auto_credit_note_on_return", True):
+		return result
+
+	dn_name = cstr(getattr(stop, "delivery_note", None) or "").strip() or None
+	customer = cstr(capture.customer or getattr(stop, "customer", None) or "").strip()
+	lines = []
+	line_map = _delivery_note_line_map(dn_name) if dn_name else {}
+	reason_codes = []
+	for row in capture.lines or []:
+		code = cstr(row.item_code or "").strip()
+		qty = flt(row.qty)
+		if not code or qty <= 0:
+			continue
+		meta = line_map.get(code) or {}
+		rate = flt(meta.get("rate") or 0)
+		lines.append(
+			{
+				"item_code": code,
+				"item_name": cstr(row.description or meta.get("item_name") or code),
+				"qty": qty,
+				"rate": rate,
+			}
+		)
+		if getattr(row, "reason", None):
+			reason_codes.append(cstr(row.reason))
+	if not lines:
+		return result
+
+	_capture_set(capture.name, delivery_note=dn_name)
+
+	try:
+		if dn_name:
+			dn_ret = _create_dn_return_for_items(dn_name, lines)
+			if dn_ret:
+				result["delivery_note_return"] = dn_ret
+				_capture_set(capture.name, delivery_note_return=dn_ret)
+
+		return_against = _find_sales_invoice_for_dn(dn_name, customer) if dn_name else None
+		# Credit note needs rates when not linked to an invoice mapper.
+		if not return_against:
+			for line in lines:
+				if flt(line.get("rate")) <= 0:
+					# Fall back to Item price / valuation 0 is invalid for standalone CN.
+					line["rate"] = flt(
+						frappe.db.get_value("Item Price", {"item_code": line["item_code"]}, "price_list_rate")
+						or 0
+					)
+		reason_text = cstr(capture.notes or "").strip() or None
+		reason_code = reason_codes[0] if reason_codes else "return"
+		cn = _create_credit_note_for_items(
+			customer=customer,
+			items=lines,
+			return_against=return_against,
+			reason=reason_text,
+			reason_code=reason_code,
+		)
+		cn_name = (cn or {}).get("invoice_id")
+		if cn_name:
+			result["credit_note"] = cn_name
+			_capture_set(capture.name, credit_note=cn_name, status="Processed", process_error="")
+		else:
+			_capture_set(capture.name, status="Processed")
+	except Exception as exc:
+		msg = cstr(exc)[:500]
+		result["process_error"] = msg
+		_capture_set(capture.name, status="Error", process_error=msg)
+		frappe.log_error(frappe.get_traceback(), "TMS return credit note")
+
+	return result
+
+
+def _process_partial_credit_note(stop, verify_shortfall_items=None, notes=None, settings=None):
+	"""Credit undelivered qty on Partial when items were already invoiced."""
+	settings = settings or _load_tms_settings()
+	if not settings.get("auto_credit_note_on_partial", True):
+		return None
+	dn_name = cstr(getattr(stop, "delivery_note", None) or "").strip()
+	customer = cstr(getattr(stop, "customer", None) or "").strip()
+	if not dn_name or not customer:
+		return None
+	items = verify_shortfall_items or []
+	if not items:
+		return None
+	line_map = _delivery_note_line_map(dn_name)
+	clean = []
+	for raw in items:
+		code = cstr(raw.get("item_code") or "").strip()
+		qty = abs(flt(raw.get("qty")))
+		if not code or qty <= 0:
+			continue
+		meta = line_map.get(code) or {}
+		clean.append(
+			{
+				"item_code": code,
+				"item_name": cstr(raw.get("item_name") or meta.get("item_name") or code),
+				"qty": qty,
+				"rate": flt(raw.get("rate") or meta.get("rate") or 0),
+			}
+		)
+	if not clean:
+		return None
+	return_against = _find_sales_invoice_for_dn(dn_name, customer)
+	try:
+		cn = _create_credit_note_for_items(
+			customer=customer,
+			items=clean,
+			return_against=return_against,
+			reason=cstr(notes or "")[:200] or "Partial delivery shortfall",
+			reason_code="partial",
+		)
+		return (cn or {}).get("invoice_id")
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "TMS partial credit note")
+		return None
+
+
+def _normalize_return_lines(lines):
+	"""Validate/coerce return lines. Qty may be fractional (WEIGHT kg/L)."""
+	raw = frappe.parse_json(lines) if isinstance(lines, str) else (lines or [])
+	if not isinstance(raw, (list, tuple)):
+		frappe.throw(_("Returned items must be a list."))
+	normalized = []
+	for line in raw:
+		if not isinstance(line, dict):
+			continue
+		item_code = cstr(line.get("item_code") or "").strip()
+		if not item_code:
+			continue
+		if not frappe.db.exists("Item", item_code):
+			frappe.throw(_("Item {0} does not exist.").format(item_code), frappe.DoesNotExistError)
+		qty = flt(line.get("qty"))
+		if qty <= 0:
+			frappe.throw(_("Quantity for {0} must be greater than zero.").format(item_code))
+		reason = cstr(line.get("reason") or "").strip()
+		if reason not in RETURN_REASON_OPTIONS:
+			frappe.throw(
+				_("Invalid return reason for {0}. Choose one of: {1}.").format(
+					item_code, ", ".join(RETURN_REASON_OPTIONS)
+				)
+			)
+		description = cstr(line.get("description") or "").strip()
+		if not description:
+			description = cstr(frappe.db.get_value("Item", item_code, "item_name") or item_code)
+		normalized.append(
+			{
+				"item_code": item_code,
+				"description": description,
+				"qty": qty,
+				"reason": reason,
+			}
+		)
+	if not normalized:
+		frappe.throw(_("Add at least one returned item."))
+	return normalized
+
 
 @frappe.whitelist()
 def driver_record_return_capture(trip_name, stop_idx, lines, signature_base64, notes=None, photo_base64_list=None):
@@ -4304,9 +4979,7 @@ def driver_record_return_capture(trip_name, stop_idx, lines, signature_base64, n
 	if not stop:
 		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
 
-	lines = frappe.parse_json(lines) if isinstance(lines, str) else (lines or [])
-	if not lines:
-		frappe.throw(_("Add at least one returned item."))
+	normalized_lines = _normalize_return_lines(lines)
 	if not signature_base64:
 		frappe.throw(_("A signature is required to capture a return."))
 
@@ -4319,15 +4992,12 @@ def driver_record_return_capture(trip_name, stop_idx, lines, signature_base64, n
 			"status": "Captured",
 			"captured_at": now_datetime(),
 			"notes": notes,
-			"lines": [
-				{
-					"item_code": line.get("item_code"),
-					"description": line.get("description"),
-					"qty": flt(line.get("qty")),
-					"reason": line.get("reason"),
-				}
-				for line in lines
-			],
+			"lines": normalized_lines,
+			**(
+				{"delivery_note": stop.delivery_note}
+				if stop.delivery_note and frappe.db.has_column("Mobile Return Capture", "delivery_note")
+				else {}
+			),
 		}
 	)
 	capture.insert(ignore_permissions=True)
@@ -4357,8 +5027,91 @@ def driver_record_return_capture(trip_name, stop_idx, lines, signature_base64, n
 	if photo_urls:
 		capture.db_set("photo_urls", frappe.as_json(photo_urls), update_modified=False)
 
+	accounting = _process_return_accounting(capture, stop)
 	frappe.db.commit()
-	return {"name": capture.name, "status": capture.status}
+	return {
+		"name": capture.name,
+		"status": frappe.db.get_value("Mobile Return Capture", capture.name, "status") or capture.status,
+		"credit_note": accounting.get("credit_note"),
+		"debit_note": accounting.get("debit_note"),
+		"delivery_note_return": accounting.get("delivery_note_return"),
+		"process_error": accounting.get("process_error"),
+	}
+
+
+@frappe.whitelist()
+def driver_get_stop_returns(trip_name=None, stop_idx=None):
+	"""Return captures for one trip stop (for delivery receipt / Completar Entrega)."""
+	trip_name = cstr(trip_name or "").strip()
+	if not trip_name or trip_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required."))
+	if stop_idx is None or cstr(stop_idx).strip().lower() in ("", "null", "undefined", "none"):
+		frappe.throw(_("Stop is required."))
+
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+	stop_idx = cint(stop_idx)
+	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)
+	if not stop:
+		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
+
+	tracking_code = None
+	dn = cstr(stop.delivery_note or "").strip()
+	if dn and frappe.db.has_column("Delivery Note", "custom_tracking_code"):
+		tracking_code = _ensure_tracking_code(dn)
+
+	returns = []
+	if frappe.db.exists("DocType", "Mobile Return Capture"):
+		captures = frappe.get_all(
+			"Mobile Return Capture",
+			filters={"delivery_trip": trip_name, "stop_idx": stop_idx},
+			fields=["name", "captured_at", "notes", "status"],
+			order_by="creation asc",
+			ignore_permissions=True,
+		)
+		for cap in captures:
+			frappe.flags.ignore_permissions = True
+			try:
+				doc = frappe.get_doc("Mobile Return Capture", cap.name)
+			except Exception:
+				continue
+			finally:
+				frappe.flags.ignore_permissions = False
+			lines = []
+			for row in doc.lines or []:
+				qty = flt(row.qty)
+				if qty <= 0:
+					continue
+				lines.append(
+					{
+						"item_code": cstr(row.item_code or ""),
+						"item_name": cstr(row.description or row.item_code or ""),
+						"qty": qty,
+						"reason": cstr(row.reason or ""),
+					}
+				)
+			if not lines:
+				continue
+			returns.append(
+				{
+					"name": cap.name,
+					"captured_at": cap.captured_at,
+					"notes": cap.notes,
+					"status": cap.status,
+					"credit_note": getattr(doc, "credit_note", None),
+					"debit_note": getattr(doc, "debit_note", None),
+					"delivery_note_return": getattr(doc, "delivery_note_return", None),
+					"lines": lines,
+				}
+			)
+
+	return {
+		"trip_name": trip.name,
+		"stop_idx": stop_idx,
+		"delivery_note": dn or None,
+		"tracking_code": tracking_code,
+		"returns": returns,
+	}
 
 
 @frappe.whitelist()

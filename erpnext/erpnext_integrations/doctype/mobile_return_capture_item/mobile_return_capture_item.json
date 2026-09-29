@@ -32,15 +32,17 @@
   },
   {
    "fieldname": "reason",
-   "fieldtype": "Small Text",
+   "fieldtype": "Select",
    "in_list_view": 1,
-   "label": "Reason"
+   "in_standard_filter": 1,
+   "label": "Reason",
+   "options": "\nDamaged\nExpired\nWrong item\nQuality issue\nCustomer refusal\nExcess\nOther"
   }
  ],
  "index_web_pages_for_search": 0,
  "istable": 1,
  "links": [],
- "modified": "2026-09-01 00:00:00.000000",
+ "modified": "2026-09-28 21:40:00.000000",
  "modified_by": "Administrator",
  "module": "ERPNext Integrations",
  "name": "Mobile Return Capture Item",
