@@ -402,9 +402,18 @@ def save_pos_profile(name=None, data=None):
 			frappe.throw(_("Warehouse is required"))
 
 		defaults = _company_defaults(company)
-		currency = data.get("currency") or defaults.get("default_currency")
-		write_off_account = defaults.get("write_off_account") or frappe.db.get_value(
-			"Account", {"company": company, "account_type": "Write Off"}, "name"
+		currency = (
+			data.get("currency")
+			or defaults.get("default_currency")
+			or frappe.db.get_single_value("Global Defaults", "default_currency")
+		)
+		write_off_account = (
+			defaults.get("write_off_account")
+			or frappe.db.get_value("Account", {"company": company, "account_type": "Write Off"}, "name")
+			# Any leaf expense account is an acceptable write-off target for POS rounding.
+			or frappe.db.get_value(
+				"Account", {"company": company, "root_type": "Expense", "is_group": 0}, "name"
+			)
 		)
 		cost_center = defaults.get("cost_center") or frappe.db.get_value(
 			"Cost Center", {"company": company, "is_group": 0}, "name"

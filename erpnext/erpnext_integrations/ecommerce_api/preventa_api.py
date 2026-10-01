@@ -25,6 +25,7 @@ from frappe.utils import cint, get_datetime, now_datetime
 from erpnext.erpnext_integrations.ecommerce_api.company_context import acting_user as _acting_user
 from erpnext.erpnext_integrations.ecommerce_api.employee_api import _can_app, _require_app_permission
 from erpnext.erpnext_integrations.ecommerce_api.tags_api import set_tags_for_doc, tags_map_for_docs
+from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
 
 # ---------------------------------------------------------------------------
 # Custom fields (Lead) — wired into hooks.py after_migrate
@@ -601,6 +602,7 @@ def save_board_columns(columns, owner_user=None):
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def upsert_lead(lead=None, values=None):
 	ensure_preventa_custom_fields()
 	if isinstance(values, str):
@@ -759,6 +761,7 @@ def move_lead(lead, to_stage, lost_reason=None, values=None, force=0):
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def duplicate_lead(lead=None):
 	"""Clone a Lead onto the same board (new name, same stage + mapped fields)."""
 	lead = (lead or "").strip()
@@ -1220,6 +1223,7 @@ def _do_convert_lead(
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def convert_lead_to_customer(
 	lead, customer_group=None, customer_type=None, tax_id=None, create_contact=1, create_address=1
 ):

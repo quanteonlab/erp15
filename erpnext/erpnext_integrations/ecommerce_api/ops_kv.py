@@ -65,3 +65,71 @@ def kv_get_many(scope: str, row_keys: list[str]) -> dict[str, dict]:
 		if isinstance(data, dict):
 			out[rk] = data
 	return out
+
+
+# ── Offline outbox idempotency ────────────────────────────────────────────────
+
+OPS_REQUEST_SCOPE = "ops_request"
+
+
+def _clean_request_id(v) -> str:
+	if v is None or isinstance(v, (list, dict, tuple)):
+		return ""
+	s = str(v).strip()
+	if s.lower() in ("null", "undefined", "none"):
+		return ""
+	return s[:140]
+
+
+def idempotent_request(fn):
+	"""Make a create/record endpoint safe to replay from the offline ops outbox.
+
+	The client sends ``client_request_id`` (a uuid / ``tmp:<kind>:<uuid>``). The
+	first call runs ``fn`` and stores its JSON-able result; a repeat with the same
+	id returns that stored result (plus ``already_exists: 1`` for dicts) instead of
+	creating a duplicate. Without the id the endpoint behaves exactly as before.
+
+	Put it *under* ``@frappe.whitelist`` — the wrapper takes ``**kwargs`` so
+	Frappe passes ``client_request_id`` through.
+	"""
+	import functools
+	import inspect
+
+	params = inspect.signature(fn).parameters
+	accepts_any = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+	@functools.wraps(fn)
+	def wrapper(*args, **kwargs):
+		request_id = _clean_request_id(kwargs.pop("client_request_id", None))
+		if not accepts_any:
+			# Same filtering Frappe would have applied to the original function.
+			kwargs = {k: v for k, v in kwargs.items() if k in params}
+		if not request_id:
+			return fn(*args, **kwargs)
+		key = f"{fn.__module__.rsplit('.', 1)[-1]}.{fn.__name__}:{request_id}"[:140]
+		_row, prior = kv_get(OPS_REQUEST_SCOPE, key)
+		if prior.get("done"):
+			result = prior.get("result")
+			if isinstance(result, dict):
+				return {**result, "already_exists": 1}
+			return result
+		result = fn(*args, **kwargs)
+		try:
+			kv_set(
+				OPS_REQUEST_SCOPE,
+				key,
+				{"done": 1, "result": json.loads(json.dumps(result, default=str))},
+			)
+			frappe.db.commit()
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "ops_kv.idempotent_request store")
+		return result
+
+	# Frappe filters kwargs by the *wrapper's* argspec (getfullargspec ignores
+	# __wrapped__), so **kwargs keeps client_request_id; drop __wrapped__ so
+	# signature-based arg validation doesn't strip it either.
+	try:
+		del wrapper.__wrapped__
+	except AttributeError:
+		pass
+	return wrapper

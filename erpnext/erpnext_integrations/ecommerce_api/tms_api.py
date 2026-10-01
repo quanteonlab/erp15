@@ -7,6 +7,7 @@ for distance fill only. Adds proof-of-delivery capture on top.
 """
 
 import math
+import re
 import secrets
 import string
 
@@ -17,6 +18,7 @@ from frappe.utils import cint, cstr, flt, get_datetime, getdate, now_datetime, n
 from frappe.utils.file_manager import save_file
 
 from erpnext.stock.doctype.delivery_trip.delivery_trip import sanitize_address
+from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
 
 
 # ---------------------------------------------------------------------------
@@ -2012,7 +2014,52 @@ def _ensure_trip_published_for_driving(trip):
 	return trip
 
 
+def _live_sales_order(so_name):
+	"""Follow ``amended_from`` forward from a cancelled SO to its live amendment."""
+	seen = set()
+	cur = so_name
+	while cur and cur not in seen:
+		seen.add(cur)
+		if cint(frappe.db.get_value("Sales Order", cur, "docstatus")) != 2:
+			return cur
+		cur = frappe.db.get_value("Sales Order", {"amended_from": cur}, "name", order_by="creation desc")
+	return None
+
+
+def _repair_dn_cancelled_so_links(dn_names):
+	"""Point DN item ``against_sales_order`` at the live amendment (or clear it).
+
+	Pedidos unarchive / rename amend the Sales Order, leaving existing Delivery
+	Notes linked to the cancelled original — any later DN save (trip publish,
+	POD) then fails with CancelledLinkError.
+	"""
+	for dn in set(dn_names or []):
+		rows = frappe.get_all(
+			"Delivery Note Item",
+			filters={"parent": dn, "against_sales_order": ["is", "set"]},
+			fields=["name", "item_code", "against_sales_order", "so_detail"],
+			ignore_permissions=True,
+		)
+		for row in rows:
+			so = row.against_sales_order
+			if cint(frappe.db.get_value("Sales Order", so, "docstatus")) != 2:
+				continue
+			live = _live_sales_order(so)
+			so_detail = None
+			if live:
+				so_detail = frappe.db.get_value(
+					"Sales Order Item", {"parent": live, "item_code": row.item_code}, "name"
+				)
+			frappe.db.set_value(
+				"Delivery Note Item",
+				row.name,
+				{"against_sales_order": live or None, "so_detail": so_detail},
+				update_modified=False,
+			)
+
+
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, company=None, pickup_warehouse=None):
 	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
 	if not delivery_note_names:
@@ -2226,6 +2273,9 @@ def publish_trip(trip_name):
 	frappe.flags.ignore_permissions = True
 	trip = frappe.get_doc("Delivery Trip", trip_name)
 	frappe.flags.ignore_permissions = False
+	# Delivery Trip.on_submit re-saves every DN; repair DN lines still pointing at
+	# a cancelled (amended) Sales Order so submit can't fail on CancelledLinkError.
+	_repair_dn_cancelled_so_links([st.delivery_note for st in trip.delivery_stops if st.delivery_note])
 
 	# submit() takes no ignore_permissions kwarg - it only reads whatever is
 	# already set on the document instance's own flags.
@@ -2897,12 +2947,18 @@ def _apply_trip_stop_order(trip, delivery_note_names):
 	"""
 	names = _parse_delivery_note_order(delivery_note_names)
 	by_dn = {s.delivery_note: s for s in trip.delivery_stops if s.delivery_note}
-	missing = [dn for dn in names if dn not in by_dn]
-	if missing:
-		frappe.throw(_("Stop not on this trip: {0}").format(missing[0]))
-	extra = [dn for dn in by_dn if dn not in set(names)]
-	if extra:
-		frappe.throw(_("Stop order must include every delivery note on the trip."))
+	# Offline-replay tolerant: the order may have been captured before a stop was
+	# added/removed elsewhere. Unknown DNs are dropped; stops not in the list keep
+	# their current relative order after the listed ones.
+	names = [dn for dn in names if dn in by_dn]
+	if not names:
+		frappe.throw(_("Stop not on this trip: {0}").format(_parse_delivery_note_order(delivery_note_names)[0]))
+	listed = set(names)
+	names = names + [
+		s.delivery_note
+		for s in sorted(trip.delivery_stops, key=lambda r: r.idx or 0)
+		if s.delivery_note and s.delivery_note not in listed
+	]
 
 	ordered = [by_dn[dn] for dn in names]
 	orphans = [s for s in trip.delivery_stops if not s.delivery_note]
@@ -3093,6 +3149,7 @@ def get_delivery_note_route_lock(delivery_note=None):
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_driver_quick(full_name, cell_number=None, company=None):
 	"""Quick-create a Driver (with a minimal Employee) from the dispatcher UI,
 	so typing a name that doesn't exist yet doesn't require a trip to desk."""
@@ -3443,6 +3500,7 @@ def reset_driver_user_password(driver=None):
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_vehicle_quick(license_plate, make=None, model=None):
 	"""Quick-create a Vehicle from the dispatcher UI. `make`/`model` are
 	required by core Vehicle, so a placeholder fills in if left blank -
@@ -3803,6 +3861,9 @@ def _normalize_zone(raw, existing=None):
 		frappe.throw(_("Invalid zone payload"))
 	code = str(raw.get("code") or existing.get("code") or "").strip().upper()
 	name = str(raw.get("name") or existing.get("name") or "").strip()
+	if not code and name:
+		# Auto code from the name (offline-created zones only carry a label).
+		code = re.sub(r"[^A-Z0-9]+", "-", frappe.scrub(name).upper()).strip("-")[:24]
 	if not code:
 		frappe.throw(_("Zone code is required."))
 	if not name:
@@ -7240,6 +7301,7 @@ def _ensure_geo_address(title, line1, lat, lng, link_doctype=None, link_name=Non
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_warehouse_at_location(
 	warehouse_name=None,
 	address=None,
@@ -7403,6 +7465,7 @@ def update_warehouse_depot(pin_id=None, vehicles=None, coverage=None):
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_customer_at_location(
 	customer_name=None,
 	address=None,
@@ -7517,6 +7580,7 @@ def import_rutas_orders_csv(csv_text=None, pin=None, company=None):
 
 
 @frappe.whitelist()
+@idempotent_request
 def driver_request_delivery(customer, delivery_note=None, note=None, photo_base64=None):
 	if not _load_tms_settings().get("allow_driver_delivery_request"):
 		frappe.throw(_("Driver-initiated delivery requests are disabled."))
@@ -9656,6 +9720,7 @@ def list_cliente_debe_stops(date=None):
 
 
 @frappe.whitelist()
+@idempotent_request
 def driver_settle_payment(
 	trip_name,
 	stop_idx,

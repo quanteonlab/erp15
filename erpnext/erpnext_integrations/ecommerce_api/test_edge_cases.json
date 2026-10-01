@@ -3169,6 +3169,28 @@
       "expect": "ok"
     },
     {
+      "id": "guest_preorder_factura_a_null_name",
+      "source": "regression",
+      "bug": "set_guest_preorder_factura_a with null name returns controlled error, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_factura_a",
+      "args": {
+        "preorder_name": null,
+        "requires_factura_a": 1
+      },
+      "expect": "error"
+    },
+    {
+      "id": "guest_preorder_factura_a_dirty_status",
+      "source": "regression",
+      "bug": "set_guest_preorder_factura_a with empty/dirty status coerces or errors controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_factura_a",
+      "args": {
+        "preorder_name": "",
+        "factura_a_status": "undefined"
+      },
+      "expect": "error"
+    },
+    {
       "id": "tms_list_cliente_debe_null_date",
       "source": "regression",
       "bug": "list_cliente_debe_stops with null date returns stops list; penalty fields optional if unmigrated",

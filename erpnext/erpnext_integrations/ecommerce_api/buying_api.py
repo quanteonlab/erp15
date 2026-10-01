@@ -10,6 +10,7 @@ from frappe.utils import cint, flt, getdate, nowdate
 
 from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
 from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
+from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
 
 # Offline outbox replay guard: client_request_id → created PO (Table Extra Data).
 PO_CLIENT_REQUEST_SCOPE = "buying_client_request"
@@ -51,6 +52,21 @@ def _as_int(v, default: int, lo: int = 0, hi: int = 500) -> int:
 	if n < lo:
 		n = default
 	return min(max(n, lo), hi)
+
+
+def _clamp_eta(value, floor) -> str:
+	"""ETA (Reqd By) as YYYY-MM-DD, never before ``floor`` (the PO transaction date).
+
+	ERPNext rejects ``schedule_date < transaction_date``; a PO queued offline
+	yesterday with ETA "today" replays with today's transaction date, so clamp
+	instead of failing the outbox row.
+	"""
+	try:
+		d = getdate(_as_str(value) or floor)
+	except Exception:
+		d = getdate(floor)
+	f = getdate(floor)
+	return str(d if d >= f else f)
 
 
 def _parse_items(items):
@@ -175,11 +191,7 @@ def create_purchase_order(
 
 	supplier = _resolve_supplier(supplier)
 
-	sched = _as_str(schedule_date) or nowdate()
-	try:
-		sched = str(getdate(sched))
-	except Exception:
-		sched = nowdate()
+	sched = _clamp_eta(schedule_date, nowdate())
 
 	clean = _parse_items(items)
 	if not clean:
@@ -197,7 +209,7 @@ def create_purchase_order(
 			"item_code": row["item_code"],
 			"qty": row["qty"],
 			"rate": row["rate"],
-			"schedule_date": row["schedule_date"] or sched,
+			"schedule_date": _clamp_eta(row["schedule_date"] or sched, nowdate()),
 		}
 		if row.get("uom"):
 			line["uom"] = row["uom"]
@@ -303,7 +315,7 @@ def update_purchase_order(
 	sched = _as_str(schedule_date)
 	if sched:
 		try:
-			new_sched = str(getdate(sched))
+			new_sched = _clamp_eta(sched, doc.transaction_date or nowdate())
 			doc.schedule_date = new_sched
 			# Keep line ETAs in sync when parent ETA is changed (table dbl-click / detail).
 			for row in doc.get("items") or []:
@@ -356,7 +368,9 @@ def update_purchase_order(
 				"item_code": row["item_code"],
 				"qty": row["qty"],
 				"rate": row["rate"],
-				"schedule_date": row["schedule_date"] or doc.schedule_date,
+				"schedule_date": _clamp_eta(
+					row["schedule_date"] or doc.schedule_date, doc.transaction_date or nowdate()
+				),
 			}
 			if row.get("uom"):
 				line["uom"] = row["uom"]
@@ -1684,6 +1698,7 @@ def list_purchase_payment_modes():
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def record_purchase_order_payment(
 	name=None,
 	paid_amount=None,

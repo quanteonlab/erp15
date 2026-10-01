@@ -11,6 +11,7 @@ import frappe
 from frappe import _
 from frappe.utils.background_jobs import enqueue
 from frappe.utils import cint, cstr, flt, get_datetime, nowtime, today
+from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
 
 
 # ---------------------------------------------------------------------------
@@ -3587,6 +3588,7 @@ def get_employee(name):
 
 
 @frappe.whitelist()
+@idempotent_request
 def save_employee(name=None, data=None):
     from erpnext.erpnext_integrations.ecommerce_api.employee_api import save_employee as _impl
 
@@ -3621,6 +3623,7 @@ def list_employee_groups():
 
 
 @frappe.whitelist()
+@idempotent_request
 def save_employee_group(name=None, employee_group_name=None, members=None, permissions=None):
     from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
         save_employee_group as _impl,
@@ -3757,6 +3760,7 @@ def list_pos_profile_meta():
 
 
 @frappe.whitelist()
+@idempotent_request
 def save_pos_profile(name=None, data=None):
     from erpnext.erpnext_integrations.ecommerce_api.cash_register_api import (
         save_pos_profile as _impl,
@@ -4029,6 +4033,7 @@ def get_accounting_snippet_outputs(scope=None):
 
 
 @frappe.whitelist()
+@idempotent_request
 def add_extra_column(scope, label, fieldtype="string"):
     from erpnext.erpnext_integrations.ecommerce_api.extra_fields import add_extra_column as _impl
 

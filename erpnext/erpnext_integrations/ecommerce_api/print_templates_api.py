@@ -3079,3 +3079,76 @@ def _promote_armado_default_if_legacy():
 def gift_core_print_templates():
 	"""after_migrate / hypervisor hook: ensure every site receives new core templates."""
 	return ensure_starter_print_templates()
+
+
+def dump_en_starter_fixture(out_path=None):
+	"""Write English (non-locale) print templates to JSON for Playwright fixtures.
+
+	Used by ``erpnext-ecommerce/scripts/dump-print-templates.sh``. Skips ``CH -`` /
+	``ES -`` locale copies and ``__edge*`` test rows.
+	"""
+	import json
+	from pathlib import Path
+
+	rows = frappe.get_all(
+		"ECommerce Print Template",
+		fields=[
+			"name",
+			"template_name",
+			"source_doctype",
+			"paper_kind",
+			"canvas_width_mm",
+			"canvas_height_mm",
+			"canvas_background_color",
+			"margin_mm",
+			"elements_data",
+		],
+		ignore_permissions=True,
+	)
+	out = []
+	for r in rows:
+		tn = r.template_name or ""
+		if tn.startswith(("CH - ", "ES - ")) or tn.startswith("__edge"):
+			continue
+		els = r.elements_data
+		if isinstance(els, str):
+			try:
+				els = json.loads(els)
+			except Exception:
+				els = []
+		kinds = sorted(
+			{e.get("kind") for e in (els or []) if isinstance(e, dict) and e.get("kind")}
+		)
+		out.append(
+			{
+				"id": r.name,
+				"templateName": tn,
+				"sourceDoctype": r.source_doctype,
+				"paperKind": r.paper_kind,
+				"canvasWidthMm": float(r.canvas_width_mm or 210),
+				"canvasHeightMm": float(r.canvas_height_mm or 297),
+				"canvasBackgroundColor": (
+					r.canvas_background_color
+					if r.canvas_background_color is not None
+					else "#ffffff"
+				),
+				"marginMm": r.margin_mm,
+				"elementKinds": kinds,
+				"elements": els or [],
+			}
+		)
+	seen = set()
+	uniq = []
+	for t in sorted(out, key=lambda x: (x["sourceDoctype"], x["paperKind"], x["templateName"])):
+		if t["templateName"] in seen:
+			continue
+		seen.add(t["templateName"])
+		uniq.append(t)
+
+	payload = {"version": 1, "templates": uniq}
+	if out_path:
+		path = Path(out_path)
+		path.parent.mkdir(parents=True, exist_ok=True)
+		path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+		return {"count": len(uniq), "path": str(path)}
+	return payload

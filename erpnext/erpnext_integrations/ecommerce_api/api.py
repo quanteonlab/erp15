@@ -28,6 +28,7 @@ from frappe.utils import (
 )
 from erpnext.stock.get_item_details import get_item_details as get_item_details_base
 from erpnext.accounts.doctype.pricing_rule.pricing_rule import apply_pricing_rule
+from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
 
 
 @frappe.whitelist(allow_guest=True)
@@ -979,6 +980,7 @@ def get_pricing_rule(name):
 
 
 @frappe.whitelist()
+@idempotent_request
 def save_pricing_rule(data):
 	"""
 	Create or update a selling Pricing Rule.
@@ -1293,6 +1295,7 @@ def get_product_bundle(name, price_list=None):
 
 
 @frappe.whitelist()
+@idempotent_request
 def save_product_bundle(data):
 	"""
 	Create or update a Product Bundle.
@@ -2624,6 +2627,7 @@ def _get_or_create_consumidor_final():
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_customer(
 	customer_name,
 	email=None,
@@ -2791,6 +2795,35 @@ def create_customer(
 	out = customer.as_dict()
 	out["zone"] = _customer_delivery_zone_map([customer.name]).get(customer.name)
 	return out
+
+
+def _ensure_territory(name) -> str:
+	"""Auto-create a missing Territory (leaf under the root) and return its name.
+
+	TMS zone codes (``T1-TUE``…) are written to Customer.territory / SO.territory
+	by the CRM / Pedidos zone editors; without a Territory master the save fails
+	with LinkValidationError — fatal for offline-replayed edits. Empty → "".
+	"""
+	label = cstr(name or "").strip()
+	if not label or frappe.db.exists("Territory", label):
+		return label
+	parent = (
+		frappe.db.get_value("Territory", {"is_group": 1, "parent_territory": ["in", ["", None]]}, "name")
+		or (frappe.db.exists("Territory", "All Territories") and "All Territories")
+		or frappe.db.get_value("Territory", {"is_group": 1}, "name")
+	)
+	try:
+		frappe.get_doc(
+			{
+				"doctype": "Territory",
+				"territory_name": label,
+				"parent_territory": parent or "",
+				"is_group": 0,
+			}
+		).insert(ignore_permissions=True)
+	except frappe.DuplicateEntryError:
+		pass
+	return label
 
 
 def _default_customer_group_and_territory():
@@ -2993,6 +3026,7 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_supplier(supplier_name, supplier_group=None):
 	"""Create a Supplier or return the existing one (by name / supplier_name)."""
 	label = (supplier_name or "").strip()
@@ -3212,6 +3246,8 @@ def update_customer(customer_name, **kwargs):
 	if addr_line is not None:
 		_update_customer_primary_address_line(customer, cstr(addr_line).strip())
 
+	if customer.territory:
+		_ensure_territory(customer.territory)
 	customer.save(ignore_permissions=True)
 
 	# RM Zona → Address.custom_zone (committed TMS zone codes like T1-THU)
@@ -3256,6 +3292,7 @@ def _update_customer_primary_address_line(customer, address_line1: str):
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def create_address(
 	customer_name,
 	address_line1,
@@ -3847,6 +3884,8 @@ def _set_customer_zone_and_address(customer, *, territory=None, zone=None, addre
 	frappe.flags.ignore_permissions = False
 	if territory is not None:
 		doc.territory = cstr(territory or "").strip() or doc.territory
+	if doc.territory:
+		_ensure_territory(doc.territory)
 	zone_explicit = zone is not None
 	zone_val = cstr(zone if zone is not None else territory or "").strip()
 	if address_line1 is not None:
@@ -5364,6 +5403,10 @@ def update_guest_preorder_details(preorder_name, data=None):
 
 	if data.get("delivery_date") is not None and str(data.get("delivery_date") or "").strip() != "":
 		so.delivery_date = getdate(data.get("delivery_date"))
+		# ERPNext requires delivery ≥ order date; a stale date (e.g. replayed from
+		# the offline outbox) is clamped instead of failing the save.
+		if so.transaction_date and so.delivery_date < getdate(so.transaction_date):
+			so.delivery_date = getdate(so.transaction_date)
 		for row in so.items or []:
 			row.delivery_date = so.delivery_date
 		if force_flag is None:
@@ -5698,6 +5741,7 @@ def list_preorder_payment_modes():
 
 
 @frappe.whitelist()
+@idempotent_request
 def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectivo", posting_date=None):
 	"""Create a Payment Entry for a confirmed preorder."""
 	if not frappe.db.exists("Sales Order", preorder_name):
@@ -6671,6 +6715,7 @@ def update_guest_preorder_logistics(
 
 
 @frappe.whitelist()
+@idempotent_request
 def create_delivery_note_for_preorder(preorder_name):
 	"""Create + submit a real Delivery Note from a confirmed guest preorder,
 	so it becomes visible in the TMS dispatcher (get_pending_deliveries only

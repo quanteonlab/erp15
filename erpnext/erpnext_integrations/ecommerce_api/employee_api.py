@@ -1078,7 +1078,22 @@ def save_employee(name=None, data=None):
 				doc.last_name = last or None
 		if data.get("company_email") or data.get("prefered_email"):
 			doc.prefered_contact_email = "Company Email"
-		doc.save(ignore_permissions=True)
+		try:
+			doc.save(ignore_permissions=True)
+		except (frappe.ValidationError, frappe.DuplicateEntryError):
+			# Inline table edits (status / branch / salary / name) must not be
+			# blocked by unrelated pre-existing data (e.g. two employees sharing a
+			# login user) — common for offline-replayed edits. Write just the
+			# changed scalar fields; anything else re-raises.
+			simple = {"employee_name", "first_name", "last_name", "status", "branch", "ctc", "bio", "cell_number"}
+			patch = {k: doc.get(k) for k, _o, _n in changes}
+			for k in ("first_name", "last_name", "employee_name"):
+				if k in data:
+					patch[k] = doc.get(k)
+			if not set(patch).issubset(simple):
+				raise
+			if patch:
+				frappe.db.set_value("Employee", doc.name, patch, update_modified=True)
 		if changes:
 			log_field_changes("Employee", doc.name, changes)
 
