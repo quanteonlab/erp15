@@ -767,6 +767,72 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_orden_planner_remito_and_address_gate():
+        """Orden with address → remito for planner; Orden without → not_deliverable warning."""
+        so_ok = so_bad = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1},
+            "name",
+        )
+        assert item_code, "need a stock item"
+        try:
+            with_addr = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 15}],
+                guest_name="Smoke Planner Addr",
+                guest_address="Quintino Bocayuca 141",
+                initial_status="Orden",
+            )
+            so_ok = with_addr.get("preorder_name") or with_addr.get("name")
+            assert so_ok, with_addr
+            # Soft remito: sites without inventory accounts still promote to Orden.
+            assert str(with_addr.get("display_status") or "") == "Orden" or with_addr.get(
+                "status"
+            ) in ("To Deliver and Bill", "Orden"), with_addr
+            if with_addr.get("planner_ready"):
+                assert with_addr.get("delivery_note"), with_addr
+                assert not with_addr.get("not_deliverable"), with_addr
+                assert frappe.db.exists("Delivery Note", with_addr["delivery_note"])
+            else:
+                assert with_addr.get("delivery_warning") or with_addr.get("warnings"), with_addr
+                assert not with_addr.get("not_deliverable"), with_addr
+
+            no_addr = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 15}],
+                guest_name="Smoke Planner NoAddr",
+                initial_status="Orden",
+            )
+            so_bad = no_addr.get("preorder_name") or no_addr.get("name")
+            assert so_bad, no_addr
+            assert no_addr.get("not_deliverable") is True, no_addr
+            assert no_addr.get("delivery_warning"), no_addr
+            assert not no_addr.get("delivery_note"), no_addr
+            assert not api._delivery_note_for_sales_order(so_bad)
+        finally:
+            for name in (so_ok, so_bad):
+                if not name or not frappe.db.exists("Sales Order", name):
+                    continue
+                dn = api._delivery_note_for_sales_order(name)
+                if dn and frappe.db.exists("Delivery Note", dn):
+                    try:
+                        dn_doc = frappe.get_doc("Delivery Note", dn)
+                        if cint(dn_doc.docstatus) == 1:
+                            dn_doc.flags.ignore_permissions = True
+                            dn_doc.cancel()
+                        frappe.delete_doc("Delivery Note", dn, ignore_permissions=True, force=True)
+                    except Exception:
+                        pass
+                docstatus = frappe.db.get_value("Sales Order", name, "docstatus")
+                if cint(docstatus) == 1:
+                    try:
+                        so = frappe.get_doc("Sales Order", name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    except Exception:
+                        pass
+                frappe.delete_doc("Sales Order", name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_crm_rm_zone_options():
         """RM Zona options = committed TMS zones; search_customers exposes zone (not Territory)."""
         opts = api.list_crm_customer_options()
@@ -795,6 +861,7 @@ def suite_5_9_master_data():
     _run("5.9.15 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
     _run("5.9.16 external pipeline status audit", check_external_pipeline_status_audit, "S2")
     _run("5.9.17 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
+    _run("5.9.18 Orden→planner remito + no-address warn", check_orden_planner_remito_and_address_gate, "S2")
 
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────

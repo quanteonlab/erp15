@@ -3616,6 +3616,54 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "g013: PO ETA before today (replayed next day) is clamped to the transaction date"
+    },
+    {
+      "id": "create_guest_preorder_orden_no_address_warn",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge orden no address",
+        "guest_name": "edge no addr",
+        "initial_status": "Orden"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Orden without address must warn not_deliverable / stay off planner, never TypeError"
+    },
+    {
+      "id": "set_guest_preorder_status_orden_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": null,
+        "target_status": "Orden"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "set_guest_preorder_status Orden with null name is controlled (no AttributeError on planner gate)"
+    },
+    {
+      "id": "sync_orden_planner_remitos_null_company",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.sync_orden_planner_remitos",
+      "args": {
+        "company": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "sync_orden_planner_remitos with null company must not crash week bundle"
+    },
+    {
+      "id": "get_guest_preorders_list_null_paging",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "status": null,
+        "start": null,
+        "page_length": null,
+        "cashier_id": null,
+        "scope": "pos"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "get_guest_preorders_list: null paging + missing Delivery Stop custom_payments_json must not TypeError/1054"
     }
   ]
 }

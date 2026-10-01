@@ -4488,6 +4488,7 @@ def create_guest_preorder(
 
 	# Operaciones → Orden (and similar staff entry points): skip Inquiry / Consulta.
 	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
+	promoted = None
 	if want_orden and resolved_rows:
 		promoted = set_guest_preorder_status(so.name, "Orden")
 		so_name = cstr((promoted or {}).get("name") or so.name)
@@ -4504,6 +4505,18 @@ def create_guest_preorder(
 	}
 	if want_orden and resolved_rows:
 		payload["display_status"] = "Orden"
+		if isinstance(promoted, dict):
+			for key in (
+				"planner_ready",
+				"not_deliverable",
+				"delivery_warning",
+				"delivery_note",
+				"geocoded",
+				"warnings",
+				"address",
+			):
+				if key in promoted and promoted.get(key) is not None:
+					payload[key] = promoted.get(key)
 	if client_access and client_access.get("ok"):
 		payload["client_access"] = {
 			"pin": client_access.get("pin"),
@@ -4532,6 +4545,17 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		_order_visibility_scope,
 		guest_preorder_matches_scope,
 	)
+
+	try:
+		start = max(0, cint(start))
+	except Exception:
+		start = 0
+	try:
+		page_length = cint(page_length)
+	except Exception:
+		page_length = 20
+	if page_length <= 0:
+		page_length = 20
 
 	scope = _order_visibility_scope()
 	if scope is not None and not scope.get("own") and not scope.get("tags"):
@@ -4566,7 +4590,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			tag_fn,
 		],
 		start=start,
-		limit_page_length=int(page_length) + (200 if scope else 50),  # fetch extra to account for filtering
+		limit_page_length=page_length + (200 if scope else 50),  # fetch extra to account for filtering
 		order_by="transaction_date desc, creation desc",
 		ignore_permissions=True,
 	)
@@ -4607,7 +4631,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		o.pop(tag_fn, None)
 		filtered.append(o)
 	total_count = len(filtered)
-	filtered = filtered[:int(page_length)]
+	filtered = filtered[:page_length]
 
 	order_names = [o["name"] for o in filtered]
 	items_count_map = {}
@@ -6404,9 +6428,32 @@ def _tms_logistics_map_for_orders(order_names):
 	dn_names = list({v for v in dn_by_so.values() if v})
 	trip_by_dn = {}
 	if dn_names:
+		# Payment-split / Factura A / surcharge columns are added by a later patch;
+		# sites that have not migrated yet must still list preorders without 1054.
+		def _ds_sel(fieldname, alias):
+			if frappe.db.has_column("Delivery Stop", fieldname):
+				return f"ds.`{fieldname}` AS `{alias}`"
+			return f"NULL AS `{alias}`"
+
+		optional_ds_cols = ",\n\t\t\t\t".join(
+			[
+				_ds_sel("custom_payments_json", "payments_json"),
+				_ds_sel("custom_payment_summary", "payment_summary"),
+				_ds_sel("custom_requires_factura_a", "stop_requires_factura_a"),
+				_ds_sel("custom_factura_a_status", "stop_factura_a_status"),
+				_ds_sel("custom_surcharge_pct", "surcharge_pct"),
+				_ds_sel("custom_surcharge_amount", "surcharge_amount"),
+				_ds_sel("custom_surcharge_rule", "surcharge_rule"),
+			]
+		)
+		pickup_wh_sel = (
+			"dt.`custom_pickup_warehouse` AS pickup_warehouse"
+			if frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse")
+			else "NULL AS pickup_warehouse"
+		)
 		# Prefer non-cancelled trips; Not Home attempts stay as audit but DN may be free.
 		stop_rows = frappe.db.sql(
-			"""
+			f"""
 			SELECT
 				ds.delivery_note AS dn,
 				ds.parent AS trip_name,
@@ -6423,19 +6470,13 @@ def _tms_logistics_map_for_orders(order_names):
 				ds.custom_amount_due AS amount_due,
 				ds.custom_amount_collected AS amount_collected,
 				ds.custom_payment_method AS payment_method,
-				ds.custom_payments_json AS payments_json,
-				ds.custom_payment_summary AS payment_summary,
-				ds.custom_requires_factura_a AS stop_requires_factura_a,
-				ds.custom_factura_a_status AS stop_factura_a_status,
-				ds.custom_surcharge_pct AS surcharge_pct,
-				ds.custom_surcharge_amount AS surcharge_amount,
-				ds.custom_surcharge_rule AS surcharge_rule,
+				{optional_ds_cols},
 				dt.status AS trip_status,
 				dt.docstatus AS trip_docstatus,
 				dt.vehicle AS vehicle,
 				dt.driver AS driver,
 				dt.driver_name AS driver_name,
-				dt.custom_pickup_warehouse AS pickup_warehouse,
+				{pickup_wh_sel},
 				dt.departure_time AS departure_time
 			FROM `tabDelivery Stop` ds
 			INNER JOIN `tabDelivery Trip` dt ON dt.name = ds.parent
@@ -6773,8 +6814,12 @@ def update_guest_preorder_logistics(
 	return get_guest_preorder(name)
 
 
-def _preorder_address_line(so) -> str:
-	"""Best-effort street text for a guest preorder (Address doc or guest tag)."""
+def _preorder_address_line(so, *, allow_customer_primary=True) -> str:
+	"""Best-effort street text for a guest preorder (Address doc or guest tag).
+
+	``allow_customer_primary=False`` is used by the planner deliverability gate so an
+	empty guest form does not silently inherit Consumidor Final's last primary.
+	"""
 	addr_name = cstr(
 		getattr(so, "shipping_address_name", None) or getattr(so, "customer_address", None) or ""
 	).strip()
@@ -6799,6 +6844,9 @@ def _preorder_address_line(so) -> str:
 	if guest and guest not in ("-", "null", "undefined"):
 		return guest
 
+	if not allow_customer_primary:
+		return ""
+
 	cust = cstr(getattr(so, "customer", None) or "").strip()
 	if cust:
 		geo = _customer_address_zone_map([cust]).get(cust) or {}
@@ -6808,24 +6856,49 @@ def _preorder_address_line(so) -> str:
 	return ""
 
 
-def _materialize_preorder_shipping_address(so):
+def _orden_has_explicit_direction(so):
+	"""True when this Orden should be treated as deliverable / planner-eligible.
+
+	- ``guest_address`` tag always counts (consulta form / ops location field).
+	- Named customers (not Consumidor Final) may use their primary Address.
+	- Anonymous Consumidor Final with no guest_address is **not** deliverable even
+	  if CF inherited a primary street from a previous guest order.
+	"""
+	tags = _parse_remarks_tags(_guest_preorder_tag_text(so))
+	guest = cstr(tags.get("guest_address") or "").strip()
+	if guest and guest not in ("-", "null", "undefined"):
+		return True
+	cust = cstr(getattr(so, "customer", None) or "").strip()
+	if cust and cust != "Consumidor Final":
+		return bool(_preorder_address_line(so, allow_customer_primary=True))
+	return False
+
+
+def _materialize_preorder_shipping_address(so, *, require_explicit=False):
 	"""Ensure SO has a linked shipping Address from guest_address / customer primary.
 
 	Guest consultas often only store ``guest_address`` in remarks/terms — the
 	planner / remito path needs a real Address on ``shipping_address_name``.
+
+	When ``require_explicit=True`` (Orden gate), anonymous guests without
+	``guest_address`` are rejected — see ``_orden_has_explicit_direction``.
 	"""
+	if require_explicit and not _orden_has_explicit_direction(so):
+		return {"address_name": None, "address_line": "", "created": False}
+
 	existing = cstr(
 		getattr(so, "shipping_address_name", None) or getattr(so, "customer_address", None) or ""
 	).strip()
 	if existing and frappe.db.exists("Address", existing):
-		line = _preorder_address_line(so)
-		return {
-			"address_name": existing,
-			"address_line": line,
-			"created": False,
-		}
+		line = _preorder_address_line(so, allow_customer_primary=True)
+		if line:
+			return {
+				"address_name": existing,
+				"address_line": line,
+				"created": False,
+			}
 
-	line = _preorder_address_line(so)
+	line = _preorder_address_line(so, allow_customer_primary=True)
 	if not line:
 		return {"address_name": None, "address_line": "", "created": False}
 
@@ -6981,7 +7054,7 @@ def _ensure_planner_delivery_note(so):
 			"warnings": warnings,
 		}
 
-	addr = _materialize_preorder_shipping_address(so)
+	addr = _materialize_preorder_shipping_address(so, require_explicit=True)
 	addr_name = addr.get("address_name")
 	addr_line = cstr(addr.get("address_line") or "").strip()
 	if not addr_name or not addr_line:
@@ -6999,40 +7072,85 @@ def _ensure_planner_delivery_note(so):
 			"warnings": warnings,
 		}
 
-	geo = _try_geocode_address_soft(addr_name)
-	if geo.get("warning"):
-		warnings.append(geo["warning"])
-
 	dn_name = _delivery_note_for_sales_order(so.name)
 	stock_warnings = []
 	created = False
 	if not dn_name:
 		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
 
-		dn = make_delivery_note(so.name)
-		# Ensure remito carries the shipping address we just materialized.
-		if addr_name:
-			dn.shipping_address_name = addr_name
-			dn.customer_address = addr_name
-		preferred_wh = (
-			_warehouse_from_guest_tags(so)
-			or frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
-			or _default_company_warehouse(dn.company)
-		)
-		if preferred_wh:
+		try:
+			dn = make_delivery_note(so.name)
+			# Ensure remito carries the shipping address we just materialized.
+			if addr_name:
+				dn.shipping_address_name = addr_name
+				dn.customer_address = addr_name
+			preferred_wh = (
+				_warehouse_from_guest_tags(so)
+				or frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
+				or _default_company_warehouse(dn.company)
+			)
+			if preferred_wh:
+				for row in dn.items:
+					row.warehouse = preferred_wh
+				dn.set_warehouse = preferred_wh
 			for row in dn.items:
-				row.warehouse = preferred_wh
-			dn.set_warehouse = preferred_wh
-		for row in dn.items:
-			if hasattr(row, "allow_zero_valuation_rate"):
-				row.allow_zero_valuation_rate = 1
-		stock_warnings = _delivery_note_stock_shortages(dn)
-		dn.insert(ignore_permissions=True)
-		dn.flags.ignore_permissions = True
-		_submit_delivery_note_allowing_negative(dn)
-		dn_name = dn.name
-		created = True
-		frappe.db.commit()
+				if hasattr(row, "allow_zero_valuation_rate"):
+					row.allow_zero_valuation_rate = 1
+			stock_warnings = _delivery_note_stock_shortages(dn)
+			dn.insert(ignore_permissions=True)
+			dn.flags.ignore_permissions = True
+			_submit_delivery_note_allowing_negative(dn)
+			dn_name = dn.name
+			created = True
+			frappe.db.commit()
+		except Exception as e:
+			# Discard draft remito without rolling back the Orden status change.
+			try:
+				draft = getattr(dn, "name", None) if "dn" in locals() else None
+				if draft and frappe.db.exists("Delivery Note", draft):
+					frappe.delete_doc(
+						"Delivery Note", draft, ignore_permissions=True, force=True
+					)
+					frappe.db.commit()
+			except Exception:
+				pass
+			# frappe.throw leaves 417 / message_log even when caught — clear so the
+			# Orden response stays HTTP 200 with delivery_warning instead of 417.
+			try:
+				frappe.clear_messages()
+			except Exception:
+				pass
+			if hasattr(frappe.local, "response") and isinstance(frappe.local.response, dict):
+				frappe.local.response.pop("http_status_code", None)
+			err = cstr(e)
+			warn = _(
+				"Pedido en Orden, pero no se pudo crear el remito para el planificador: {0}"
+			).format(err)
+			warnings.append(warn)
+			frappe.log_error(frappe.get_traceback(), f"planner remito failed for {so.name}")
+			return {
+				"ok": False,
+				"planner_ready": False,
+				"not_deliverable": False,
+				"delivery_note": None,
+				"delivery_note_created": False,
+				"delivery_warning": warn,
+				"address_name": addr_name,
+				"address_line": addr_line,
+				"geocoded": False,
+				"stock_warnings": stock_warnings,
+				"warnings": warnings,
+			}
+
+	# Geocode only when we just created address/remito (avoid Nominatim spam on week sync).
+	geocoded = False
+	if created or addr.get("created"):
+		geo = _try_geocode_address_soft(addr_name)
+		geocoded = bool(geo.get("geocoded"))
+		if geo.get("warning"):
+			warnings.append(geo["warning"])
+	elif frappe.db.has_column("Address", "custom_latitude"):
+		geocoded = bool(flt(frappe.db.get_value("Address", addr_name, "custom_latitude") or 0))
 
 	return {
 		"ok": True,
@@ -7043,7 +7161,7 @@ def _ensure_planner_delivery_note(so):
 		"delivery_warning": warnings[0] if warnings else None,
 		"address_name": addr_name,
 		"address_line": addr_line,
-		"geocoded": bool(geo.get("geocoded")),
+		"geocoded": geocoded,
 		"stock_warnings": stock_warnings,
 		"warnings": warnings,
 	}
@@ -7118,6 +7236,11 @@ def create_delivery_note_for_preorder(preorder_name):
 	gate = _ensure_planner_delivery_note(so)
 	if gate.get("not_deliverable"):
 		frappe.throw(gate.get("delivery_warning") or _no_address_delivery_warning())
+	if not gate.get("delivery_note"):
+		frappe.throw(
+			gate.get("delivery_warning")
+			or _("Could not create Delivery Note for {0}").format(preorder_name)
+		)
 
 	updated = set_guest_preorder_status(preorder_name, "En Delivery", source="remito")
 	return _attach_planner_gate_fields(updated, gate)

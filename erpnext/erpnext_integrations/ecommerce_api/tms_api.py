@@ -925,6 +925,14 @@ def get_rutas_week_bundle(
 		except Exception:
 			pass
 
+	# Orden/Preparado without remito never show in get_pending_deliveries — sync first.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import sync_orden_planner_remitos
+
+		sync_orden_planner_remitos(company=company)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "sync_orden_planner_remitos")
+
 	pending = get_pending_deliveries(
 		from_date=str(from_d), to_date=str(to_d), company=company
 	)
@@ -1442,6 +1450,22 @@ def _list_claimable_preorders(company=None):
 		if display in ("En Delivery", "Completado", "Closed", "Completed"):
 			continue
 		address_name = o.shipping_address_name or o.customer_address
+		# Fallback: guest_address tag (consultas often lack shipping_address_name).
+		if not address_name:
+			from erpnext.erpnext_integrations.ecommerce_api.api import (
+				_guest_preorder_tag_text,
+				_parse_remarks_tags,
+			)
+
+			tags = _parse_remarks_tags(_guest_preorder_tag_text(o))
+			guest_line = cstr(tags.get("guest_address") or "").strip()
+			if guest_line and guest_line not in ("-", "null", "undefined"):
+				address_name = None  # street only; claim UI uses address field
+				street_fallback = guest_line
+			else:
+				street_fallback = None
+		else:
+			street_fallback = None
 		stats = item_stats.get(o.name) or {}
 		due = o.delivery_date or o.transaction_date
 		out.append(
@@ -1451,7 +1475,7 @@ def _list_claimable_preorders(company=None):
 				"delivery_note": None,
 				"customer": o.customer,
 				"customer_name": o.customer_name,
-				"address": address_name,
+				"address": street_fallback or address_name,
 				"address_name": address_name,
 				"grand_total": o.grand_total,
 				"posting_date": o.transaction_date or o.delivery_date,

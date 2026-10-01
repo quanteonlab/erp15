@@ -110,8 +110,8 @@ def resolve_armado_ean13(code=None):
 	rows = frappe.get_all(
 		"Sales Order",
 		filters={
-			"docstatus": ["<", 2],
-			"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled"]],
+			"docstatus": 1,
+			"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled", "Consulta"]],
 			"transaction_date": [">=", frappe.utils.add_days(today(), -14)],
 		},
 		fields=["name", "docstatus", "status", "grand_total", "advance_paid"],
@@ -153,8 +153,8 @@ def list_armado_orders(delivery_date=None, limit=80):
 
 	frappe.flags.ignore_permissions = True
 	filters = {
-		"docstatus": ["<", 2],
-		"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled"]],
+		"docstatus": 1,
+		"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled", "Consulta"]],
 	}
 	if due is not None:
 		filters["delivery_date"] = due
@@ -188,8 +188,8 @@ def list_armado_orders(delivery_date=None, limit=80):
 	date_rows = frappe.get_all(
 		"Sales Order",
 		filters={
-			"docstatus": ["<", 2],
-			"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled"]],
+			"docstatus": 1,
+			"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled", "Consulta"]],
 			"delivery_date": ["is", "set"],
 		},
 		fields=["delivery_date", "docstatus", "status", "grand_total", "advance_paid"],
