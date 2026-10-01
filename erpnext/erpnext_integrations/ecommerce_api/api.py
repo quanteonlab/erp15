@@ -3624,7 +3624,10 @@ def _tms_zone_visit_days(zone_label):
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _load_tms_zones
 
-		zones = _load_tms_zones() or []
+		payload = _load_tms_zones() or {}
+		zones = payload.get("zones") if isinstance(payload, dict) else payload
+		if not isinstance(zones, list):
+			zones = []
 	except Exception:
 		return []
 	lu = label.upper()
@@ -3645,13 +3648,42 @@ def _tms_zone_visit_days(zone_label):
 
 
 def _auto_delivery_date_for_zone(zone_label, as_of=None):
+	"""Next promised due from zone visit days, or greedy pack when strategy says so (i043/i045)."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+			_load_tms_settings,
+			_packing_strategy,
+			propose_due_for_order,
+		)
+
+		settings = _load_tms_settings()
+		if _packing_strategy(settings) == "fast_deliver_greedy":
+			out = propose_due_for_order(zone=zone_label)
+			due = (out or {}).get("proposed_due_date")
+			if due:
+				return str(due)
+	except Exception:
+		pass
+
+	return _zone_visit_due_date(zone_label, as_of=as_of)
+
+
+def _zone_visit_due_date(zone_label, as_of=None):
+	"""Pure zone visit-day next due (no packing_strategy branch — safe for greedy fallback)."""
 	days = _tms_zone_visit_days(zone_label)
 	if not days:
 		return None
 	try:
-		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _next_due_on_weekdays
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+			_load_tms_settings,
+			_next_due_on_weekdays,
+		)
 
-		due = _next_due_on_weekdays(getdate(as_of) if as_of else getdate(), days)
+		settings = _load_tms_settings()
+		lead = cint(settings.get("delivery_lead_days") or 1)
+		base = getdate(as_of) if as_of else getdate()
+		earliest = add_days(base, max(0, lead))
+		due = _next_due_on_weekdays(earliest, days, strictly_after=False)
 		return str(due) if due else None
 	except Exception:
 		return None
@@ -3665,7 +3697,10 @@ def _zone_matching_weekday(weekday_label, prefer=None):
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _load_tms_zones
 
-		zones = _load_tms_zones() or []
+		payload = _load_tms_zones() or {}
+		zones = payload.get("zones") if isinstance(payload, dict) else payload
+		if not isinstance(zones, list):
+			zones = []
 	except Exception:
 		return None
 	prefer_u = cstr(prefer or "").strip().upper()
@@ -4604,8 +4639,10 @@ def _display_status(so):
 		return "Consulta"
 	if so.docstatus == 2:
 		return "Archivado"
-	# docstatus == 1
+	# docstatus == 1 — soft Consulta (no cancel/amend) uses status marker
 	s = so.status
+	if s == "Consulta":
+		return "Consulta"
 	if s in ("Preparado", "En Delivery"):
 		return s
 	if s == "Completed":
@@ -4620,6 +4657,8 @@ def _display_status_from_row(docstatus, status, grand_total=0, advance_paid=0):
 		return "Consulta"
 	if docstatus == 2:
 		return "Archivado"
+	if status == "Consulta":
+		return "Consulta"
 	if status in ("Preparado", "En Delivery"):
 		return status
 	if status == "Completed":
@@ -4629,6 +4668,36 @@ def _display_status_from_row(docstatus, status, grand_total=0, advance_paid=0):
 			return "Completado"
 		return COMPLETED_UNPAID_LABEL
 	return "Orden"
+
+
+def _allocate_amend_name(doctype, amended_from):
+	"""Next free ``{prefix}-{n}`` amend name (Frappe's stock helper does not skip collisions)."""
+	amended_from = cstr(amended_from or "").strip()
+	if not amended_from:
+		frappe.throw(_("amended_from is required"))
+	am_id = 1
+	am_prefix = amended_from
+	if frappe.db.get_value(doctype, amended_from, "amended_from"):
+		tail = amended_from.rsplit("-", 1)[-1]
+		if str(tail).isdigit():
+			am_id = cint(tail) + 1
+			am_prefix = amended_from.rsplit("-", 1)[0]
+	while frappe.db.exists(doctype, f"{am_prefix}-{am_id}"):
+		am_id += 1
+	return f"{am_prefix}-{am_id}"
+
+
+def _latest_amend_successor(order_name):
+	"""Most recent Sales Order that amends ``order_name``, if any."""
+	rows = frappe.get_all(
+		"Sales Order",
+		filters={"amended_from": order_name},
+		fields=["name", "docstatus", "creation"],
+		order_by="creation desc",
+		limit_page_length=1,
+		ignore_permissions=True,
+	)
+	return rows[0] if rows else None
 
 
 def _erp_status_for_display(display_status):
@@ -4648,7 +4717,8 @@ def set_guest_preorder_status(preorder_name, target_status):
 	Unified status transition for the custom workflow.
 
 	Accepts target_status as one of: Consulta, Orden, Preparado, En Delivery, Completado.
-	Consulta reverts a submitted order back to Draft (cancel + amend).
+	Consulta on a submitted order is a soft marker (db_set status) — it does **not**
+	cancel/archive. Explicit archive uses ``cancel_guest_preorder``.
 	Backward moves among submitted custom statuses use db_set so SilkOS
 	update_status does not block with an opaque error.
 	"""
@@ -4675,26 +4745,11 @@ def set_guest_preorder_status(preorder_name, target_status):
 	current = _display_status(so)
 	current_base = "Completado" if str(current).startswith("Completado") else current
 
-	# Revert to Consulta (Draft)
+	# Soft Consulta — never cancel/archive just to go back.
 	if target_status == "Consulta":
-		if so.docstatus == 1:
-			try:
-				so.flags.ignore_permissions = True
-				so.cancel()
-			except Exception as e:
-				frappe.throw(
-					_("Cannot go back to Consulta from {0}: {1}").format(
-						current_base, frappe.utils.cstr(e)
-					)
-				)
-			# Create a new draft copy
-			new_so = frappe.copy_doc(so)
-			new_so.amended_from = so.name
-			new_so.docstatus = 0
-			new_so.insert(ignore_permissions=True)
-			frappe.db.commit()
-			return get_guest_preorder(new_so.name)
-		# Already draft
+		if so.docstatus == 1 and cstr(so.status) != "Consulta":
+			so.db_set("status", "Consulta", update_modified=True)
+			so.reload()
 		return get_guest_preorder(preorder_name)
 
 	# Submit draft if needed for forward transitions
@@ -4795,6 +4850,10 @@ def unarchive_guest_preorder(preorder_name=None):
 
 	ERPNext cannot reopen a cancelled Sales Order in place — we amend it:
 	copy the cancelled doc into a new draft linked via ``amended_from``.
+
+	If an amendment already exists, reuse it (or walk forward when that
+	successor is also cancelled). Amend names skip collisions (Frappe's
+	default ``prefix-n`` naming does not).
 	"""
 	name = cstr(preorder_name or "").strip()
 	if not name:
@@ -4812,13 +4871,21 @@ def unarchive_guest_preorder(preorder_name=None):
 	if so.docstatus != 2:
 		frappe.throw(_("Order is not archived"))
 
+	# Idempotent: existing amendment of this cancelled SO.
+	succ = _latest_amend_successor(name)
+	if succ:
+		if cint(succ.docstatus) == 2:
+			return unarchive_guest_preorder(succ.name)
+		return get_guest_preorder(succ.name)
+
 	new_so = frappe.copy_doc(so)
 	new_so.amended_from = so.name
 	new_so.docstatus = 0
 	# Clear cancel markers so the draft looks like a fresh Consulta.
 	if hasattr(new_so, "status"):
 		new_so.status = "Draft"
-	new_so.insert(ignore_permissions=True)
+	desired = _allocate_amend_name("Sales Order", so.name)
+	new_so.insert(ignore_permissions=True, set_name=desired)
 	frappe.db.commit()
 	return get_guest_preorder(new_so.name)
 
@@ -5098,6 +5165,16 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	if not items:
 		frappe.throw(_("Items list cannot be empty"))
 
+	if so.docstatus == 1 and cstr(so.status) == "Consulta":
+		# Soft Consulta: edit in place — do not cancel/archive.
+		_apply_item_changes(so, items, additional_discount_amount)
+		so.flags.ignore_pricing_rule = True
+		so.flags.ignore_validate_update_after_submit = True
+		with _allow_weight_fractional_stock_qty(so):
+			so.save(ignore_permissions=True)
+		so.reload()
+		return get_guest_preorder(preorder_name)
+
 	if so.docstatus == 1:
 		# Amend: cancel original, create amended copy with changes, submit
 		amended = frappe.copy_doc(so)
@@ -5107,8 +5184,9 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 		so.cancel()
 		_apply_item_changes(amended, items, additional_discount_amount)
 		amended.flags.ignore_pricing_rule = True
+		desired = _allocate_amend_name("Sales Order", so.name)
 		with _allow_weight_fractional_stock_qty(amended):
-			amended.insert(ignore_permissions=True)
+			amended.insert(ignore_permissions=True, set_name=desired)
 			amended.submit()
 		amended.reload()
 		return get_guest_preorder(amended.name)

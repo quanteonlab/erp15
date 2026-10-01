@@ -9,6 +9,10 @@ from frappe import _
 from frappe.utils import cint, flt, getdate, nowdate
 
 from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
+
+# Offline outbox replay guard: client_request_id → created PO (Table Extra Data).
+PO_CLIENT_REQUEST_SCOPE = "buying_client_request"
 
 
 def _as_str(v) -> str:
@@ -143,8 +147,32 @@ def create_purchase_order(
 	company=None,
 	submit=0,
 	notes=None,
+	client_request_id=None,
 ):
-	"""Create a Purchase Order with one shared expected (schedule) date."""
+	"""Create a Purchase Order with one shared expected (schedule) date.
+
+	``client_request_id`` (optional, client UUID) makes the call idempotent so the
+	offline ops outbox can replay it: a repeat returns the first PO with
+	``already_exists: 1`` instead of creating a duplicate.
+	"""
+	request_id = _as_str(client_request_id)[:140]
+	if request_id:
+		_row, prior = kv_get(PO_CLIENT_REQUEST_SCOPE, request_id)
+		prior_name = _as_str(prior.get("name"))
+		if prior_name and frappe.db.exists("Purchase Order", prior_name):
+			docstatus, grand_total = frappe.db.get_value(
+				"Purchase Order", prior_name, ["docstatus", "grand_total"]
+			)
+			return {
+				"ok": True,
+				"already_exists": 1,
+				"name": prior_name,
+				"docstatus": cint(docstatus),
+				"submitted": 1 if cint(docstatus) == 1 else 0,
+				"grand_total": flt(grand_total),
+				"cost_updates": [],
+			}
+
 	supplier = _resolve_supplier(supplier)
 
 	sched = _as_str(schedule_date) or nowdate()
@@ -196,6 +224,8 @@ def create_purchase_order(
 	)
 	doc.flags.ignore_validate = False
 	doc.insert(ignore_permissions=True)
+	if request_id:
+		kv_set(PO_CLIENT_REQUEST_SCOPE, request_id, {"name": doc.name})
 	if note:
 		try:
 			doc.add_comment("Comment", note)

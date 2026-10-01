@@ -394,6 +394,12 @@ def _upsert_rutas_customer(row: dict) -> tuple[str | None, str | None, list[str]
 		if created:
 			warnings.append(_("Customer created without address (no Calle / Lat-Lng)"))
 
+	if addr_name and not zone and lat is not None and lng is not None:
+		# i044 flow B: CSV row without Zona → nearest under-cap delivery zone.
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _auto_assign_zone_if_missing
+
+		_auto_assign_zone_if_missing(addr_name)
+
 	return customer_name, addr_name, warnings
 
 

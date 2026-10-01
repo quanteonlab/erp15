@@ -1,13 +1,12 @@
 """TMS (route planning + delivery) API.
 
 Thin layer over core ERPNext `Driver` / `Vehicle` / `Delivery Trip` /
-`Delivery Stop`. Route optimization is not reimplemented here - it already
-exists in `DeliveryTrip.process_route()`, which calls the Google Maps
-Directions API with `optimize_waypoints=True`. This module only exposes that
-engine to the dispatcher (planner) and driver (mobile/web) frontends, and adds
-proof-of-delivery capture (signature + recipient name/ID) on top of it.
+`Delivery Stop`. Stop autosort uses a local TSP (warehouse → stops → warehouse)
+with nearest-neighbor seed + 2-opt; Google Maps `process_route` is optional
+for distance fill only. Adds proof-of-delivery capture on top.
 """
 
+import math
 import secrets
 import string
 
@@ -173,6 +172,72 @@ def _require_owned_trip(trip_name, driver):
 	return trip
 
 
+def _ensure_trip_locked_field():
+	"""Idempotent — create Delivery Trip.custom_locked if patch has not run."""
+	if frappe.db.has_column("Delivery Trip", "custom_locked"):
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+	create_custom_fields(
+		{
+			"Delivery Trip": [
+				{
+					"fieldname": "custom_locked",
+					"fieldtype": "Check",
+					"label": "Route Locked",
+					"default": "0",
+					"insert_after": "custom_pickup_warehouse",
+				},
+			]
+		},
+		update=True,
+	)
+	frappe.clear_cache(doctype="Delivery Trip")
+
+
+def _trip_is_locked(trip):
+	"""True when the dispatcher locked the route (no stop add/remove/reorder)."""
+	if not trip:
+		return False
+	if isinstance(trip, str):
+		if not frappe.db.has_column("Delivery Trip", "custom_locked"):
+			return False
+		return bool(cint(frappe.db.get_value("Delivery Trip", trip, "custom_locked")))
+	if not frappe.db.has_column("Delivery Trip", "custom_locked"):
+		return False
+	return bool(cint(getattr(trip, "custom_locked", 0) or 0))
+
+
+def _assert_trip_unlocked(trip, action=None):
+	if _trip_is_locked(trip):
+		name = trip if isinstance(trip, str) else getattr(trip, "name", "")
+		msg = _("Route {0} is locked — unlock it before changing stops.").format(name)
+		if action:
+			msg = _("Route {0} is locked — unlock it before {1}.").format(name, action)
+		frappe.throw(msg)
+
+
+def _locked_trip_for_delivery_note(delivery_note):
+	"""Return locked trip name for a DN, or None."""
+	dn = cstr(delivery_note or "").strip()
+	if not dn or not frappe.db.has_column("Delivery Trip", "custom_locked"):
+		return None
+	rows = frappe.db.sql(
+		"""
+		SELECT dt.name
+		FROM `tabDelivery Stop` ds
+		INNER JOIN `tabDelivery Trip` dt ON dt.name = ds.parent
+		WHERE ds.delivery_note = %s
+		  AND IFNULL(dt.docstatus, 0) < 2
+		  AND IFNULL(dt.custom_locked, 0) = 1
+		ORDER BY dt.modified DESC
+		LIMIT 1
+		""",
+		(dn,),
+	)
+	return rows[0][0] if rows else None
+
+
 def _active_trip_names(exclude_trip=None):
 	filters = {"docstatus": ["!=", 2]}
 	if exclude_trip:
@@ -192,18 +257,19 @@ def _assigned_delivery_note_names(trip_names=None):
 	"""
 	if trip_names is None:
 		trip_names = _active_trip_names()
-	return set(
-		frappe.get_all(
-			"Delivery Stop",
-			filters={
-				"parent": ["in", trip_names or [""]],
-				"delivery_note": ["is", "set"],
-				"custom_outcome": ["!=", "Not Home"],
-			},
-			pluck="delivery_note",
-			ignore_permissions=True,
-		)
+	# ifnull: SQL `NULL != 'Not Home'` is unknown, so unset outcomes must stay locked
+	# to their trip (otherwise draft trips can be duplicated with the same DNs).
+	rows = frappe.db.sql(
+		"""
+		select distinct delivery_note
+		from `tabDelivery Stop`
+		where parent in %(parents)s
+		  and ifnull(delivery_note, '') != ''
+		  and ifnull(custom_outcome, '') != 'Not Home'
+		""",
+		{"parents": trip_names or [""]},
 	)
+	return {r[0] for r in rows if r and r[0]}
 
 
 def _load_delivery_notes_for_stops(delivery_note_names):
@@ -291,6 +357,12 @@ def _stop_detail_meta(stops):
 	address_meta = {}
 	if customer_names:
 		fields = ["name", "customer_name", "customer_details"]
+		if frappe.db.has_column("Customer", "mobile_no"):
+			fields.append("mobile_no")
+		if frappe.db.has_column("Customer", "phone"):
+			fields.append("phone")
+		if frappe.db.has_column("Customer", "custom_client_phone_e164"):
+			fields.append("custom_client_phone_e164")
 		if frappe.db.has_column("Customer", "custom_preferred_hours"):
 			fields.append("custom_preferred_hours")
 		for row in frappe.get_all(
@@ -301,10 +373,13 @@ def _stop_detail_meta(stops):
 		):
 			customer_meta[row.name] = row
 	if address_names:
+		addr_fields = ["name", "address_line1", "address_line2", "city", "custom_latitude", "custom_longitude"]
+		if frappe.db.has_column("Address", "phone"):
+			addr_fields.append("phone")
 		for row in frappe.get_all(
 			"Address",
 			filters={"name": ["in", address_names]},
-			fields=["name", "address_line1", "address_line2", "city", "custom_latitude", "custom_longitude"],
+			fields=addr_fields,
 			ignore_permissions=True,
 		):
 			address_meta[row.name] = row
@@ -379,6 +454,17 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 	tracking_code = tracking_by_dn.get(dn) if dn else None
 	if dn and not tracking_code and frappe.db.has_column("Delivery Note", "custom_tracking_code"):
 		tracking_code = _ensure_tracking_code(dn)
+	phone = None
+	for raw in (
+		cust.get("custom_client_phone_e164"),
+		cust.get("mobile_no"),
+		cust.get("phone"),
+		addr.get("phone"),
+	):
+		s = cstr(raw or "").strip()
+		if s:
+			phone = s
+			break
 	return {
 		"idx": stop.idx,
 		"customer": stop.customer,
@@ -390,6 +476,7 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 		"comments": cust.get("customer_details") or None,
 		"delivery_note": stop.delivery_note,
 		"tracking_code": tracking_code or None,
+		"phone": phone,
 		"grand_total": stop.grand_total,
 		"contact": stop.contact,
 		"visited": bool(stop.visited),
@@ -479,35 +566,84 @@ def get_planner_context(company=None):
 		"vehicles": vehicles,
 		"warehouses": warehouses,
 		"default_warehouse": default_warehouse,
+		"depot": _default_depot_latlng(company),
 		"google_maps_configured": bool(frappe.db.get_single_value("Google Settings", "api_key")),
 		"today": str(getdate()),
 	}
 
 
-@frappe.whitelist(allow_guest=True)
-def get_pending_deliveries(date=None, company=None):
-	"""Unassigned remitos ready for routing (reduced-bureaucracy queue).
-
-	``date`` is an *as-of* ceiling — not an exclusive day bucket. Include every
-	submitted DN that is not on an active trip whose **target ship date**
-	(Sales Order ``delivery_date``, else DN ``posting_date``) is on or before
-	``as_of``. Yesterday's unshipped work still shows when planning "today";
-	future-dated work stays out until its target day.
-	"""
-	assigned_notes = _assigned_delivery_note_names()
-	raw_date = date
-	if isinstance(raw_date, str):
-		raw_date = raw_date.strip()
-		if raw_date.lower() in ("", "null", "undefined", "none"):
-			raw_date = None
+def _coerce_opt_date(raw, fallback=None):
+	if isinstance(raw, str):
+		raw = raw.strip()
+		if raw.lower() in ("", "null", "undefined", "none"):
+			raw = None
+	if raw in (None, ""):
+		return fallback
 	try:
-		as_of = getdate(raw_date) if raw_date else getdate()
+		return getdate(raw)
 	except Exception:
-		as_of = getdate()
-	# Lookback only on posting_date (fetch window). Due ≤ as_of is applied below.
-	from frappe.utils import add_days
+		return fallback
 
-	since = add_days(as_of, -120)
+
+@frappe.whitelist(allow_guest=True)
+def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None, horizon_days=None):
+	"""Unassigned remitos ready for routing.
+
+	Two modes:
+
+	1. **Ceiling** (default, greedy / legacy): ``date`` = as-of ceiling — include
+	   every submitted DN not on an active trip whose target ship date
+	   (SO ``delivery_date``, else DN ``custom_requested_delivery_date``, else
+	   posting_date) is on or before ``as_of``.
+
+	2. **Window** (Rutas day/week UI): pass ``from_date``+``to_date`` or
+	   ``horizon_days`` (1–7) with ``date`` as window start. Only remitos whose
+	   due falls inside the inclusive range are returned — no overdue spill from
+	   earlier weekdays. Spans wider than 7 days are clamped.
+	"""
+	from frappe.utils import add_days, date_diff
+
+	assigned_notes = _assigned_delivery_note_names()
+	today_d = getdate()
+
+	win_from = _coerce_opt_date(from_date)
+	win_to = _coerce_opt_date(to_date)
+	hz = None
+	if horizon_days not in (None, "", "null", "undefined"):
+		try:
+			hz = cint(horizon_days)
+		except Exception:
+			hz = None
+	if hz is not None and hz < 1:
+		hz = 1
+
+	window_mode = bool(win_from or win_to or hz)
+	if window_mode:
+		if win_from and win_to:
+			if win_to < win_from:
+				win_from, win_to = win_to, win_from
+		elif hz:
+			start = _coerce_opt_date(date, today_d) or today_d
+			win_from = start
+			win_to = add_days(start, max(0, hz - 1))
+		elif win_from:
+			win_to = add_days(win_from, 6)
+		else:
+			win_from = add_days(win_to, -6)
+		# Hard cap: Rutas local index is a 7-day window.
+		if date_diff(win_to, win_from) > 6:
+			win_to = add_days(win_from, 6)
+		as_of = win_to
+		due_lo, due_hi = win_from, win_to
+	else:
+		as_of = _coerce_opt_date(date, today_d) or today_d
+		due_lo, due_hi = None, as_of
+
+	# Lookback only on posting_date (fetch window). Due filter applied below.
+	# Ceiling mode may pass as_of = today+365 (greedy all-open); posting lookback
+	# must stay near today/min(as_of, today), or recent remitos vanish.
+	posting_anchor = as_of if as_of <= today_d else today_d
+	since = add_days(posting_anchor, -120)
 
 	filters = {
 		"docstatus": 1,
@@ -519,19 +655,24 @@ def get_pending_deliveries(date=None, company=None):
 	if company and str(company).strip() and str(company).strip().lower() not in ("null", "undefined", "none"):
 		filters["company"] = str(company).strip()
 
+	dn_fields = [
+		"name",
+		"customer",
+		"customer_name",
+		"shipping_address_name",
+		"customer_address",
+		"grand_total",
+		"posting_date",
+		"status",
+	]
+	has_requested_due = frappe.db.has_column("Delivery Note", "custom_requested_delivery_date")
+	if has_requested_due:
+		dn_fields.append("custom_requested_delivery_date")
+
 	notes = frappe.get_all(
 		"Delivery Note",
 		filters=filters,
-		fields=[
-			"name",
-			"customer",
-			"customer_name",
-			"shipping_address_name",
-			"customer_address",
-			"grand_total",
-			"posting_date",
-			"status",
-		],
+		fields=dn_fields,
 		order_by="posting_date asc, creation asc",
 		limit_page_length=500,
 		ignore_permissions=True,
@@ -614,13 +755,21 @@ def get_pending_deliveries(date=None, company=None):
 		due = None
 		if so and so.get("delivery_date"):
 			due = so.get("delivery_date")
+		elif has_requested_due and n.get("custom_requested_delivery_date"):
+			due = n.get("custom_requested_delivery_date")
 		else:
 			due = n.posting_date
 		due_d = getdate(due) if due else as_of
-		# Not ready yet — target ship day is after the planning as-of.
-		if due_d > as_of:
-			continue
-		overdue = due_d < as_of
+		if window_mode:
+			# Exact window — no overdue spill from earlier weekdays.
+			if due_d < due_lo or due_d > due_hi:
+				continue
+			overdue = due_d < today_d
+		else:
+			# Not ready yet — target ship day is after the planning as-of.
+			if due_d > as_of:
+				continue
+			overdue = due_d < as_of
 
 		display = _rutas_order_display_status(
 			dn_status=n.status,
@@ -665,7 +814,159 @@ def get_pending_deliveries(date=None, company=None):
 
 	# Overdue / oldest target dates first so the dispatcher clears the backlog.
 	out.sort(key=lambda r: (r.get("due_date") or "", r.get("delivery_note") or ""))
-	return {"deliveries": out, "as_of": str(as_of)}
+	payload = {"deliveries": out, "as_of": str(as_of), "mode": "window" if window_mode else "ceiling"}
+	if window_mode:
+		payload["from_date"] = str(due_lo)
+		payload["to_date"] = str(due_hi)
+		payload["horizon_days"] = date_diff(due_hi, due_lo) + 1
+	return payload
+
+
+def _monday_of(d):
+	"""Monday of the ISO-style week containing ``d`` (Mon=0)."""
+	from frappe.utils import add_days
+
+	d = getdate(d)
+	return add_days(d, -d.weekday())
+
+
+@frappe.whitelist(allow_guest=True)
+def get_rutas_week_bundle(
+	date=None,
+	company=None,
+	auto_assign_zones=1,
+	include_master=1,
+):
+	"""One Rutas payload for the Mon–Sun week containing ``date``.
+
+	Frontend keeps this locally and filters Fleet / Orders / map by day scope —
+	no per-day ``list_trips`` / ``list_fleet`` / ``get_pending`` fan-out.
+
+	``include_master`` (default on): also return context, settings, zones, clients,
+	map pins/plans, and delivery requests. Pass 0 on soft refreshes when master
+	data is already cached client-side.
+	"""
+	from frappe.utils import add_days, date_diff
+
+	today_d = getdate()
+	as_of = _coerce_opt_date(date, today_d) or today_d
+	if abs(date_diff(as_of, today_d)) > 7:
+		return {
+			"ok": False,
+			"too_distant": True,
+			"as_of": str(as_of),
+			"today": str(today_d),
+			"from_date": None,
+			"to_date": None,
+			"deliveries": [],
+			"trips": [],
+			"fleet_drivers": [],
+		}
+
+	from_d = _monday_of(as_of)
+	to_d = add_days(from_d, 6)
+
+	# Optional zone fill — once per week load, not a separate round-trip.
+	do_assign = True
+	if isinstance(auto_assign_zones, str):
+		do_assign = auto_assign_zones.strip().lower() not in (
+			"0",
+			"false",
+			"no",
+			"null",
+			"undefined",
+			"none",
+			"",
+		)
+	else:
+		do_assign = cint(auto_assign_zones) != 0
+	if do_assign:
+		try:
+			auto_assign_tms_zones(1)
+		except Exception:
+			pass
+
+	pending = get_pending_deliveries(
+		from_date=str(from_d), to_date=str(to_d), company=company
+	)
+	# Week window ending Sunday → Mon..Sun; no open-backlog spill across days.
+	trips_payload = list_trips_for_date(
+		date=str(to_d),
+		company=company,
+		horizon_days=7,
+		include_open_backlog=0,
+	)
+	fleet_payload = list_fleet_day_routes(
+		date=str(to_d),
+		horizon_days=7,
+		company=company,
+		include_open_backlog=0,
+	)
+
+	if include_master is None:
+		want_master = True
+	elif isinstance(include_master, str):
+		want_master = include_master.strip().lower() not in (
+			"0",
+			"false",
+			"no",
+			"null",
+			"undefined",
+			"none",
+			"",
+		)
+	else:
+		want_master = cint(include_master) != 0
+
+	out = {
+		"ok": True,
+		"too_distant": False,
+		"as_of": str(as_of),
+		"today": str(today_d),
+		"from_date": str(from_d),
+		"to_date": str(to_d),
+		"deliveries": pending.get("deliveries") or [],
+		"trips": trips_payload.get("trips") or [],
+		"fleet_drivers": fleet_payload.get("drivers") or [],
+	}
+
+	if want_master:
+		try:
+			out["context"] = get_planner_context(company=company)
+		except Exception:
+			out["context"] = None
+		try:
+			out["tms_settings"] = _load_tms_settings()
+		except Exception:
+			out["tms_settings"] = None
+		try:
+			out["zones"] = (_load_tms_zones() or {}).get("zones") or []
+		except Exception:
+			out["zones"] = []
+		try:
+			clients = list_delivery_clients(limit=2000, only_geocoded=1)
+			out["clients"] = clients.get("clients") or []
+		except Exception:
+			out["clients"] = []
+		try:
+			store = _load_tms_map_store()
+			out["map_pins"] = store.get("pins") or []
+			out["map_plans"] = store.get("plans") or []
+		except Exception:
+			out["map_pins"] = []
+			out["map_plans"] = []
+		try:
+			reqs = list_delivery_requests(status="Requested")
+			out["delivery_requests"] = reqs.get("requests") or []
+		except Exception:
+			out["delivery_requests"] = []
+		# Claim backlog (guest preorders without DN) — same payload Reclamar needs offline.
+		try:
+			out["claimable_preorders"] = _list_claimable_preorders(company=company)
+		except Exception:
+			out["claimable_preorders"] = []
+
+	return out
 
 
 def _rutas_order_display_status(dn_status=None, so_status=None, previous_attempt=False, overdue=False):
@@ -710,9 +1011,212 @@ def update_pending_delivery_zone(delivery_note=None, zone=None):
 	return {"delivery_note": dn, "zone": zone_label or None, "address": addr_name}
 
 
+def _sales_orders_for_dn(dn):
+	"""Unique against_sales_order values on a Delivery Note's items."""
+	so_names = frappe.get_all(
+		"Delivery Note Item",
+		filters={"parent": dn, "against_sales_order": ["is", "set"]},
+		pluck="against_sales_order",
+		ignore_permissions=True,
+	)
+	return list({s for s in so_names if s})
+
+
+def _weekday_tag_from_date(d):
+	tags = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+	try:
+		return tags[getdate(d).weekday()]
+	except Exception:
+		return None
+
+
+def _zone_visit_bases(visit_days):
+	tags = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+	out = set()
+	for raw in visit_days or []:
+		head = cstr(raw or "").split("(", 1)[0].strip()
+		if not head:
+			continue
+		for t in tags:
+			if head.lower() == t.lower() or head[:3].lower() == t[:3].lower():
+				out.add(t)
+				break
+	return out
+
+
+def _snap_dn_zone_to_due_weekday(dn, due_d):
+	"""Align Address.custom_zone to the due weekday within the same territory/driver.
+
+	Territory×day zones (T1-WED → T1-THU) keep geography + owning driver while the
+	visit day matches the promised due. No-op when the zone already visits that day
+	or no sibling day-zone exists.
+	"""
+	if not frappe.db.has_column("Address", "custom_zone"):
+		return None
+	addr = frappe.db.get_value("Delivery Note", dn, "shipping_address_name") or frappe.db.get_value(
+		"Delivery Note", dn, "customer_address"
+	)
+	if not addr or not frappe.db.exists("Address", addr):
+		return None
+	cur = cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip()
+	if not cur:
+		return None
+	tag = _weekday_tag_from_date(due_d)
+	if not tag:
+		return None
+	zones_blob = _load_tms_zones() or {}
+	zones = zones_blob.get("zones") if isinstance(zones_blob, dict) else zones_blob
+	zones = zones if isinstance(zones, list) else []
+	cur_up = cur.upper()
+	cur_z = None
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		if cstr(z.get("code") or "").strip().upper() == cur_up or cstr(z.get("name") or "").strip().upper() == cur_up:
+			cur_z = z
+			break
+	if not cur_z:
+		return None
+	if tag in _zone_visit_bases(cur_z.get("visit_days")):
+		return cstr(cur_z.get("code") or cur)
+	drv = cstr(cur_z.get("driver") or "").strip()
+	code = cstr(cur_z.get("code") or "").strip()
+	prefix = code.rsplit("-", 1)[0] if "-" in code else None
+	want = f"{prefix}-{tag}".upper() if prefix else None
+	candidates = []
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		if tag not in _zone_visit_bases(z.get("visit_days")):
+			continue
+		zcode = cstr(z.get("code") or "").strip()
+		zdrv = cstr(z.get("driver") or "").strip()
+		same_drv = bool(drv and zdrv == drv)
+		same_terr = bool(prefix and zcode.upper().startswith(prefix.upper() + "-"))
+		if same_drv or same_terr:
+			candidates.append(z)
+	if not candidates:
+		return None
+	chosen = None
+	if want:
+		for z in candidates:
+			if cstr(z.get("code") or "").strip().upper() == want:
+				chosen = z
+				break
+	if not chosen:
+		chosen = candidates[0]
+	new_code = cstr(chosen.get("code") or "").strip()
+	if not new_code or new_code.upper() == cur_up:
+		return cstr(cur_z.get("code") or cur)
+	frappe.db.set_value("Address", addr, "custom_zone", new_code, update_modified=True)
+	return new_code
+
+
+def _zone_code_for_driver_day(driver, due_d):
+	"""TMS zone code owned by ``driver`` that visits ``due_d``'s weekday, if any."""
+	drv = cstr(driver or "").strip()
+	if not drv:
+		return None
+	tag = _weekday_tag_from_date(due_d)
+	if not tag:
+		return None
+	zones_blob = _load_tms_zones() or {}
+	zones = zones_blob.get("zones") if isinstance(zones_blob, dict) else zones_blob
+	zones = zones if isinstance(zones, list) else []
+	cands = []
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		if cstr(z.get("driver") or "").strip() != drv:
+			continue
+		if tag not in _zone_visit_bases(z.get("visit_days")):
+			continue
+		cands.append(z)
+	if not cands:
+		return None
+	want_suffix = f"-{tag}".upper()
+	for z in cands:
+		code = cstr(z.get("code") or "").strip()
+		if code.upper().endswith(want_suffix):
+			return code
+	return cstr(cands[0].get("code") or "").strip() or None
+
+
+def _assign_dn_zone(dn, zone_code):
+	"""Set Address.custom_zone for a Delivery Note's shipping address."""
+	code = cstr(zone_code or "").strip()
+	if not code or not frappe.db.has_column("Address", "custom_zone"):
+		return None
+	addr = frappe.db.get_value("Delivery Note", dn, "shipping_address_name") or frappe.db.get_value(
+		"Delivery Note", dn, "customer_address"
+	)
+	if not addr or not frappe.db.exists("Address", addr):
+		return None
+	cur = cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip()
+	if cur.upper() == code.upper():
+		return code
+	frappe.db.set_value("Address", addr, "custom_zone", code, update_modified=True)
+	return code
+
+
+def _apply_pending_delivery_due(dn, due_d, driver=None):
+	"""Write planning due date for a remito.
+
+	Prefer linked Sales Order ``delivery_date`` when present. POS / claim remitos
+	often have no SO — then use ``Delivery Note.custom_requested_delivery_date``
+	so unschedule / greedy / auto-groups still work.
+
+	When ``driver`` is set (greedy pack), assign Address.custom_zone to that
+	driver's day-zone for ``due_d``. Otherwise snap to the same-territory
+	weekday zone (T1-WED + due Thu → T1-THU).
+	"""
+	so_names = _sales_orders_for_dn(dn)
+	via = None
+	if so_names:
+		for so in so_names:
+			frappe.db.set_value("Sales Order", so, "delivery_date", due_d, update_modified=True)
+		via = "sales_order"
+	elif frappe.db.has_column("Delivery Note", "custom_requested_delivery_date"):
+		frappe.db.set_value(
+			"Delivery Note",
+			dn,
+			"custom_requested_delivery_date",
+			due_d,
+			update_modified=True,
+		)
+		via = "custom_requested_delivery_date"
+	else:
+		frappe.throw(_("No Sales Order linked to this Delivery Note; cannot update due date."))
+
+	snapped = None
+	try:
+		drv = cstr(driver or "").strip() or None
+		if drv:
+			code = _zone_code_for_driver_day(drv, due_d)
+			if code:
+				snapped = _assign_dn_zone(dn, code)
+		if not snapped:
+			snapped = _snap_dn_zone_to_due_weekday(dn, due_d)
+	except Exception:
+		snapped = None
+	return {
+		"sales_orders": so_names if via == "sales_order" else [],
+		"via": via,
+		"zone": snapped,
+		"driver": cstr(driver or "").strip() or None,
+	}
+
+
 @frappe.whitelist(allow_guest=True)
-def update_pending_delivery_due(delivery_note=None, due_date=None):
-	"""Update the planning due date for a pending remito (Sales Order.delivery_date)."""
+def update_pending_delivery_due(delivery_note=None, due_date=None, driver=None):
+	"""Update the planning due date for a pending remito.
+
+	Writes Sales Order.delivery_date when linked; otherwise
+	Delivery Note.custom_requested_delivery_date (POS remitos without SO).
+
+	Optional ``driver`` force-assigns Address.custom_zone to that driver's
+	day-zone for the due weekday (overrides territory snap).
+	"""
 	dn = cstr(delivery_note or "").strip()
 	due = cstr(due_date or "").strip()
 	if not dn:
@@ -726,19 +1230,73 @@ def update_pending_delivery_due(delivery_note=None, due_date=None):
 	if not frappe.db.exists("Delivery Note", dn):
 		frappe.throw(_("Delivery Note not found."))
 
-	so_names = frappe.get_all(
-		"Delivery Note Item",
-		filters={"parent": dn, "against_sales_order": ["is", "set"]},
-		pluck="against_sales_order",
-		ignore_permissions=True,
-	)
-	so_names = list({s for s in so_names if s})
-	if not so_names:
-		frappe.throw(_("No Sales Order linked to this Delivery Note; cannot update due date."))
-	for so in so_names:
-		frappe.db.set_value("Sales Order", so, "delivery_date", due_d, update_modified=True)
+	meta = _apply_pending_delivery_due(dn, due_d, driver=driver)
 	frappe.db.commit()
-	return {"delivery_note": dn, "due_date": str(due_d), "sales_orders": so_names}
+	return {
+		"delivery_note": dn,
+		"due_date": str(due_d),
+		"sales_orders": meta.get("sales_orders") or [],
+		"via": meta.get("via"),
+		"zone": meta.get("zone"),
+		"driver": meta.get("driver"),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def update_pending_delivery_driver(delivery_note=None, driver=None, due_date=None):
+	"""Force-assign a remito to a driver's territory for its due day.
+
+	Keeps the current due (or ``due_date`` if provided) and snaps
+	Address.custom_zone to that driver's visiting zone — so plan-day
+	grouping follows the chosen conductor despite prior zone labels.
+	"""
+	dn = cstr(delivery_note or "").strip()
+	drv = cstr(driver or "").strip()
+	if not dn:
+		frappe.throw(_("Delivery Note is required."))
+	if not drv:
+		frappe.throw(_("Driver is required."))
+	if not frappe.db.exists("Delivery Note", dn):
+		frappe.throw(_("Delivery Note not found."))
+	if not frappe.db.exists("Driver", drv):
+		frappe.throw(_("Driver {0} not found").format(drv), frappe.DoesNotExistError)
+
+	due_raw = cstr(due_date or "").strip()
+	if due_raw and due_raw.lower() not in ("null", "undefined", "none"):
+		try:
+			due_d = getdate(due_raw)
+		except Exception:
+			frappe.throw(_("Invalid due date."))
+	else:
+		# Resolve current planning due the same way as get_pending_deliveries.
+		so_names = _sales_orders_for_dn(dn)
+		due_d = None
+		for so in so_names:
+			dd = frappe.db.get_value("Sales Order", so, "delivery_date")
+			if dd:
+				due_d = getdate(dd)
+				break
+		if due_d is None and frappe.db.has_column("Delivery Note", "custom_requested_delivery_date"):
+			rd = frappe.db.get_value("Delivery Note", dn, "custom_requested_delivery_date")
+			if rd:
+				due_d = getdate(rd)
+		if due_d is None:
+			due_d = getdate(frappe.db.get_value("Delivery Note", dn, "posting_date") or getdate())
+
+	meta = _apply_pending_delivery_due(dn, due_d, driver=drv)
+	if not meta.get("zone"):
+		frappe.throw(
+			_("No TMS zone for driver {0} on {1}. Assign the driver to a zone that visits that weekday.").format(
+				drv, str(due_d)
+			)
+		)
+	frappe.db.commit()
+	return {
+		"delivery_note": dn,
+		"due_date": str(due_d),
+		"zone": meta.get("zone"),
+		"driver": drv,
+	}
 
 
 def _is_desk_admin_user():
@@ -817,6 +1375,23 @@ def _list_claimable_preorders(company=None):
 		ignore_permissions=True,
 	)
 
+	so_names = [o.name for o in orders]
+	item_stats = {}
+	if so_names:
+		for row in frappe.db.sql(
+			"""
+			select parent,
+				count(*) as item_count,
+				sum(ifnull(qty, 0)) as qty_total
+			from `tabSales Order Item`
+			where parent in %(names)s
+			group by parent
+			""",
+			{"names": so_names},
+			as_dict=True,
+		):
+			item_stats[row.parent] = row
+
 	out = []
 	for o in orders:
 		if not _is_guest_preorder_sales_order(o):
@@ -828,6 +1403,8 @@ def _list_claimable_preorders(company=None):
 		if display in ("En Delivery", "Completado", "Closed", "Completed"):
 			continue
 		address_name = o.shipping_address_name or o.customer_address
+		stats = item_stats.get(o.name) or {}
+		due = o.delivery_date or o.transaction_date
 		out.append(
 			{
 				"kind": "preorder",
@@ -836,11 +1413,13 @@ def _list_claimable_preorders(company=None):
 				"customer": o.customer,
 				"customer_name": o.customer_name,
 				"address": address_name,
+				"address_name": address_name,
 				"grand_total": o.grand_total,
 				"posting_date": o.transaction_date or o.delivery_date,
+				"due_date": str(getdate(due)) if due else None,
 				"status": display,
-				"item_count": 0,
-				"qty_total": 0,
+				"item_count": cint(stats.get("item_count") or 0),
+				"qty_total": flt(stats.get("qty_total") or 0),
 				"geocoded": False,
 				"lat": None,
 				"lng": None,
@@ -862,14 +1441,21 @@ def list_claimable_orders(date=None, company=None):
 		deliveries.append(row)
 
 	preorders = _list_claimable_preorders(company=company)
-	# Attach geo for preorders that have an address
+	# Attach geo + street line for preorders that have an address
 	address_names = list({p["address"] for p in preorders if p.get("address")})
 	geo_by_address = {}
 	if address_names:
 		for row in frappe.get_all(
 			"Address",
 			filters={"name": ["in", address_names]},
-			fields=["name", "custom_latitude", "custom_longitude"],
+			fields=[
+				"name",
+				"address_line1",
+				"address_line2",
+				"city",
+				"custom_latitude",
+				"custom_longitude",
+			],
 			ignore_permissions=True,
 		):
 			geo_by_address[row.name] = row
@@ -878,6 +1464,14 @@ def list_claimable_orders(date=None, company=None):
 		p["geocoded"] = bool(geo.get("custom_latitude"))
 		p["lat"] = geo.get("custom_latitude")
 		p["lng"] = geo.get("custom_longitude")
+		street_bits = [
+			cstr(geo.get("address_line1") or "").strip(),
+			cstr(geo.get("address_line2") or "").strip(),
+			cstr(geo.get("city") or "").strip(),
+		]
+		street = ", ".join(b for b in street_bits if b)
+		if street:
+			p["address"] = street
 
 	return {"orders": deliveries + preorders, "deliveries": deliveries, "preorders": preorders}
 
@@ -940,15 +1534,23 @@ def claim_orders_to_trip(
 
 		dn_name = _delivery_note_for_sales_order(so_name)
 		if not dn_name:
+			from erpnext.erpnext_integrations.ecommerce_api.api import (
+				_submit_delivery_note_allowing_negative,
+			)
+
 			dn = make_delivery_note(so_name)
 			default_warehouse = frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
 			if default_warehouse:
 				for row in dn.items:
 					row.warehouse = default_warehouse
 				dn.set_warehouse = default_warehouse
+			for row in dn.items:
+				if hasattr(row, "allow_zero_valuation_rate"):
+					row.allow_zero_valuation_rate = 1
 			dn.insert(ignore_permissions=True)
 			dn.flags.ignore_permissions = True
-			dn.submit()
+			# Same as guest-preorder / CSV claim: don't block planning on bin qty.
+			_submit_delivery_note_allowing_negative(dn)
 			dn_name = dn.name
 			frappe.db.commit()
 		try:
@@ -1035,9 +1637,16 @@ def geocode_address(address_name):
 		},
 		update_modified=False,
 	)
+	# i044 flow B: first geocode of a client address → nearest under-cap zone.
+	assigned = _auto_assign_zone_if_missing(address_name)
 	frappe.db.commit()
 
-	return {"lat": location["lat"], "lng": location["lng"], "cached": False}
+	return {
+		"lat": location["lat"],
+		"lng": location["lng"],
+		"cached": False,
+		"zone": (assigned or {}).get("zone"),
+	}
 
 
 def _geocode_via_nominatim(address_str, country_code="ar"):
@@ -1168,15 +1777,207 @@ def geocode_query(query=None, region=None):
 	}
 
 
+def _resolve_default_vehicle(driver=None, vehicle=None):
+	"""Pick a Vehicle for Delivery Trip (core field is reqd=1).
+
+	Order: explicit → driver's Employee vehicle → sole Vehicle in site → None.
+	"""
+	veh = cstr(vehicle or "").strip() or None
+	if veh and veh.lower() in ("null", "undefined", "none"):
+		veh = None
+	if veh and frappe.db.exists("Vehicle", veh):
+		return veh
+	drv = cstr(driver or "").strip() or None
+	if drv and drv.lower() in ("null", "undefined", "none"):
+		drv = None
+	if drv:
+		emp = frappe.db.get_value("Driver", drv, "employee")
+		if emp:
+			rows = frappe.get_all(
+				"Vehicle",
+				filters={"employee": emp},
+				pluck="name",
+				limit=1,
+				ignore_permissions=True,
+			)
+			if rows:
+				return rows[0]
+	# Prefer any vehicle assigned to some employee (fleet), else first Vehicle.
+	rows = frappe.get_all(
+		"Vehicle",
+		filters={"employee": ["is", "set"]},
+		pluck="name",
+		limit=1,
+		ignore_permissions=True,
+	)
+	if rows:
+		return rows[0]
+	rows = frappe.get_all("Vehicle", pluck="name", limit=1, ignore_permissions=True)
+	return rows[0] if rows else None
+
+
+def _ensure_trip_vehicle(trip):
+	"""Fill missing required Vehicle so draft TMS saves don't fail validation."""
+	if cstr(getattr(trip, "vehicle", None) or "").strip():
+		return trip.vehicle
+	veh = _resolve_default_vehicle(getattr(trip, "driver", None), None)
+	if veh:
+		trip.vehicle = veh
+	return veh
+
+
+def _save_trip_doc(trip):
+	"""Save Delivery Trip for TMS, tolerating missing Vehicle when none exist yet."""
+	_ensure_trip_vehicle(trip)
+	trip.flags.ignore_permissions = True
+	if not cstr(getattr(trip, "vehicle", None) or "").strip():
+		# Core Delivery Trip.vehicle is reqd=1 — planning must still work before
+		# vehicles are configured.
+		trip.flags.ignore_mandatory = True
+	trip.save(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def _detach_cancelled_so_links_from_trip_dns(trip):
+	"""Clear Delivery Note Item → cancelled Sales Order links.
+
+	Draft trips often carry DNs whose against_sales_order was cancelled after
+	the note was created. Core DeliveryTrip.on_submit → update_delivery_notes
+	calls DN.save() and dies with CancelledLinkError — never block driving.
+	"""
+	if trip is None:
+		return
+	dns = list({s.delivery_note for s in (getattr(trip, "delivery_stops", None) or []) if s.delivery_note})
+	if not dns:
+		return
+	rows = frappe.db.sql(
+		"""
+		select dni.name
+		from `tabDelivery Note Item` dni
+		inner join `tabSales Order` so on so.name = dni.against_sales_order
+		where dni.parent in %(dns)s
+		  and so.docstatus = 2
+		""",
+		{"dns": dns},
+	)
+	for (row_name,) in rows or []:
+		frappe.db.set_value(
+			"Delivery Note Item",
+			row_name,
+			{"against_sales_order": None, "so_detail": None},
+			update_modified=False,
+		)
+	if rows:
+		frappe.db.commit()
+
+
+def _tms_update_delivery_notes_on_trip(trip, delete=False):
+	"""Like DeliveryTrip.update_delivery_notes but never fails on dirty DN links.
+
+	Uses db_set for driver/vehicle/lr fields so CancelledLinkError on DN.save
+	cannot abort route publish when the driver starts delivering.
+	"""
+	delivery_notes = list({s.delivery_note for s in (trip.delivery_stops or []) if s.delivery_note})
+	update_fields = {
+		"driver": None if delete else trip.driver,
+		"driver_name": None if delete else trip.driver_name,
+		"vehicle_no": None if delete else trip.vehicle,
+		"lr_no": None if delete else trip.name,
+		"lr_date": None if delete else trip.departure_time,
+	}
+	for delivery_note in delivery_notes:
+		if not frappe.db.exists("Delivery Note", delivery_note):
+			continue
+		for field, value in update_fields.items():
+			try:
+				frappe.db.set_value("Delivery Note", delivery_note, field, value, update_modified=False)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "_tms_update_delivery_notes_on_trip")
+	frappe.db.commit()
+
+
+def _ensure_trip_published_for_driving(trip):
+	"""Auto-submit a Draft trip and mark In Transit when the driver starts field work.
+
+	Recording a stop outcome / photo is the publish signal — never block with
+	"route has not been published yet" (or CancelledLinkError from stale SO links).
+	"""
+	name = trip.name
+	if cint(trip.docstatus) == 2:
+		frappe.throw(_("Cancelled trips cannot be updated."))
+
+	if cint(trip.docstatus) == 0:
+		if not trip.driver:
+			frappe.throw(_("Assign a driver before starting the route."))
+		_ensure_trip_vehicle(trip)
+		_detach_cancelled_so_links_from_trip_dns(trip)
+		trip.flags.ignore_permissions = True
+		if not cstr(getattr(trip, "vehicle", None) or "").strip():
+			trip.flags.ignore_mandatory = True
+		try:
+			trip.save(ignore_permissions=True)
+			frappe.db.commit()
+		except Exception:
+			frappe.db.rollback()
+			frappe.flags.ignore_permissions = True
+			trip = frappe.get_doc("Delivery Trip", name)
+			frappe.flags.ignore_permissions = False
+			_ensure_trip_vehicle(trip)
+			_detach_cancelled_so_links_from_trip_dns(trip)
+			trip.flags.ignore_permissions = True
+			trip.flags.ignore_mandatory = True
+			trip.save(ignore_permissions=True)
+			frappe.db.commit()
+		frappe.flags.ignore_permissions = True
+		trip = frappe.get_doc("Delivery Trip", name)
+		frappe.flags.ignore_permissions = False
+		trip.flags.ignore_permissions = True
+		if not cstr(getattr(trip, "vehicle", None) or "").strip():
+			trip.flags.ignore_mandatory = True
+		# Core on_submit → DN.save() blows up on cancelled Against Sales Order;
+		# replace with db_set-based updater for this submit only.
+		trip.update_delivery_notes = lambda delete=False: _tms_update_delivery_notes_on_trip(trip, delete=delete)
+		try:
+			trip.submit()
+			frappe.db.commit()
+		except frappe.CancelledLinkError:
+			frappe.db.rollback()
+			# Last resort: force docstatus + status without DN link validation.
+			_detach_cancelled_so_links_from_trip_dns(trip)
+			frappe.db.set_value(
+				"Delivery Trip",
+				name,
+				{"docstatus": 1, "status": "In Transit"},
+				update_modified=True,
+			)
+			_tms_update_delivery_notes_on_trip(trip, delete=False)
+			frappe.db.commit()
+		frappe.flags.ignore_permissions = True
+		trip = frappe.get_doc("Delivery Trip", name)
+		frappe.flags.ignore_permissions = False
+
+	# Prefer In Transit once the driver is actively delivering.
+	try:
+		st = cstr(getattr(trip, "status", None) or "")
+		if st not in ("Completed", "Cancelled"):
+			meta = frappe.get_meta("Delivery Trip")
+			status_field = meta.get_field("status")
+			options = (status_field.options or "") if status_field else ""
+			if "In Transit" in options.split("\n") and st != "In Transit":
+				frappe.db.set_value("Delivery Trip", name, "status", "In Transit")
+				frappe.db.commit()
+				trip.status = "In Transit"
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "_ensure_trip_published_for_driving")
+
+	return trip
+
+
 @frappe.whitelist(allow_guest=True)
 def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, company=None, pickup_warehouse=None):
 	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
 	if not delivery_note_names:
 		frappe.throw(_("Select at least one order to plan a route."))
-
-	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
-	if conflicts:
-		frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
 
 	company = company or frappe.defaults.get_user_default("Company")
 
@@ -1187,16 +1988,67 @@ def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, compa
 		if len(active_drivers) == 1:
 			driver = active_drivers[0].name
 
+	day = getdate(date)
+
+	# Reuse today's Draft for this driver instead of spawning a second trip.
+	if driver:
+		existing_drafts = frappe.get_all(
+			"Delivery Trip",
+			filters={
+				"driver": driver,
+				"docstatus": 0,
+				"departure_time": ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]],
+			},
+			pluck="name",
+			order_by="creation asc",
+			ignore_permissions=True,
+		)
+		if existing_drafts:
+			primary = existing_drafts[0]
+			frappe.flags.ignore_permissions = True
+			trip = frappe.get_doc("Delivery Trip", primary)
+			frappe.flags.ignore_permissions = False
+			already = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
+			to_add = [n for n in delivery_note_names if n not in already]
+			if to_add:
+				conflicts = [n for n in to_add if n in _assigned_delivery_note_names()]
+				if conflicts:
+					frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+				notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(to_add)
+				_append_delivery_stops(trip, to_add, notes_by_name, address_display_by_name)
+				_save_trip_doc(trip)
+			# Collapse newer duplicate drafts for the same driver/day (empty or subset).
+			for extra in existing_drafts[1:]:
+				try:
+					frappe.flags.ignore_permissions = True
+					extra_doc = frappe.get_doc("Delivery Trip", extra)
+					frappe.flags.ignore_permissions = False
+					extra_dns = {s.delivery_note for s in extra_doc.delivery_stops if s.delivery_note}
+					if not extra_dns or extra_dns.issubset(already | set(delivery_note_names)):
+						frappe.delete_doc("Delivery Trip", extra, ignore_permissions=True, force=True)
+						frappe.db.commit()
+				except Exception:
+					frappe.log_error(frappe.get_traceback(), "create_trip collapse draft")
+			try:
+				optimize_trip(primary)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "create_trip auto optimize_trip")
+			frappe.flags.ignore_permissions = True
+			trip = frappe.get_doc("Delivery Trip", primary)
+			frappe.flags.ignore_permissions = False
+			return {"trip": trip.name, "status": trip.status, "stop_count": len(trip.delivery_stops)}
+
+	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
+	if conflicts:
+		frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+
 	driver_doc = None
 	if driver:
 		driver_doc = frappe.db.get_value("Driver", driver, ["full_name", "address"], as_dict=True)
 
 	driver_address, resolved_warehouse = _resolve_pickup_address(company, driver_doc, pickup_warehouse)
 
-	if not vehicle:
-		vehicles = frappe.get_all("Vehicle", pluck="name", ignore_permissions=True)
-		if len(vehicles) == 1:
-			vehicle = vehicles[0]
+	vehicle = _resolve_default_vehicle(driver, vehicle)
 
 	trip = frappe.get_doc(
 		{
@@ -1207,7 +2059,7 @@ def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, compa
 			"driver_address": driver_address,
 			"custom_pickup_warehouse": resolved_warehouse,
 			"vehicle": vehicle,
-			"departure_time": get_datetime(f"{getdate(date)} 08:00:00"),
+			"departure_time": get_datetime(f"{day} 08:00:00"),
 			"delivery_stops": [],
 		}
 	)
@@ -1215,27 +2067,70 @@ def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, compa
 	notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(delivery_note_names)
 	_append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name)
 
+	trip.flags.ignore_permissions = True
+	if not vehicle:
+		trip.flags.ignore_mandatory = True
 	trip.insert(ignore_permissions=True)
 	frappe.db.commit()
+
+	# Closed TSP (warehouse → stops → warehouse) so the first draft order is already sorted.
+	try:
+		optimize_trip(trip.name)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "create_trip auto optimize_trip")
 
 	return {"trip": trip.name, "status": trip.status, "stop_count": len(trip.delivery_stops)}
 
 
 @frappe.whitelist(allow_guest=True)
 def optimize_trip(trip_name):
-	trip = frappe.get_doc("Delivery Trip", trip_name)
+	"""Autosort trip stops with a closed TSP (warehouse → stops → warehouse).
 
-	if not trip.driver_address:
-		frappe.throw(_("Set a home/depot address on the driver (or company) before optimizing."))
+	Uses haversine nearest-neighbor + 2-opt. Does not require Google Maps.
+	Visited stops stay pinned at the front; ungeocoded stops append after.
+	"""
+	name = cstr(trip_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required"))
+	if not frappe.db.exists("Delivery Trip", name):
+		frappe.throw(_("Delivery Trip {0} not found").format(name), frappe.DoesNotExistError)
 
-	# process_route() calls self.save() internally with no ignore_permissions
-	# kwarg, so it only bypasses the write-permission check if this is set on
-	# the *document instance* beforehand (the global frappe.flags is not what
-	# Document.has_permission reads).
-	trip.flags.ignore_permissions = True
-	trip.process_route(optimize=True)
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", name)
+	frappe.flags.ignore_permissions = False
 
-	return get_trip_map_data(trip_name)
+	if not trip.delivery_stops:
+		return get_trip_map_data(name)
+
+	if trip.docstatus == 2:
+		frappe.throw(_("Cancelled trips cannot be optimized."))
+
+	_assert_trip_unlocked(trip, _("optimizing"))
+
+	ordered = _delivery_note_order_tsp(trip)
+	if not ordered:
+		return get_trip_map_data(name)
+
+	# Draft: rewrite idx via save. Submitted: allow idx-only reorder (driver mid-route).
+	_apply_trip_stop_order(trip, ordered)
+
+	# Optional: fill Google leg distances without changing order (ignore failures).
+	# process_route() ends in Document.save() — ensure Vehicle is set / mandatory
+	# skipped so Google-maps enrichment never resurfaces "Value missing … Vehicle".
+	try:
+		frappe.flags.ignore_permissions = True
+		trip = frappe.get_doc("Delivery Trip", name)
+		trip.flags.ignore_permissions = True
+		_ensure_trip_vehicle(trip)
+		if not cstr(getattr(trip, "vehicle", None) or "").strip():
+			trip.flags.ignore_mandatory = True
+		if trip.driver_address:
+			trip.process_route(optimize=False)
+		frappe.flags.ignore_permissions = False
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "optimize_trip process_route")
+
+	return get_trip_map_data(name)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1261,6 +2156,7 @@ def get_trip_map_data(trip_name):
 		"trip": {
 			"name": trip.name,
 			"status": trip.status,
+			"docstatus": cint(trip.docstatus),
 			"driver": trip.driver,
 			"driver_name": trip.driver_name,
 			"vehicle": trip.vehicle,
@@ -1268,6 +2164,7 @@ def get_trip_map_data(trip_name):
 			"departure_time": trip.departure_time,
 			"total_distance": trip.total_distance,
 			"uom": trip.uom,
+			"locked": _trip_is_locked(trip),
 		},
 		"stops": stops,
 	}
@@ -1275,10 +2172,21 @@ def get_trip_map_data(trip_name):
 
 @frappe.whitelist(allow_guest=True)
 def publish_trip(trip_name):
+	frappe.flags.ignore_permissions = True
 	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
 
 	if not trip.driver:
 		frappe.throw(_("Assign a driver before publishing the route."))
+
+	_ensure_trip_vehicle(trip)
+	if not cstr(getattr(trip, "vehicle", None) or "").strip():
+		frappe.throw(_("Assign a vehicle before publishing the route."))
+	# Persist auto-filled Vehicle before submit (mandatory on Delivery Trip).
+	_save_trip_doc(trip)
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
 
 	# submit() takes no ignore_permissions kwarg - it only reads whatever is
 	# already set on the document instance's own flags.
@@ -1305,12 +2213,17 @@ def publish_trip(trip_name):
 
 
 @frappe.whitelist(allow_guest=True)
-def list_trips_for_date(date=None, company=None, horizon_days=1):
+def list_trips_for_date(date=None, company=None, horizon_days=1, include_open_backlog=1):
 	"""List trips for ``date`` (as-of day) or a trailing window of ``horizon_days``.
 
 	``horizon_days=1`` → that calendar day only.
 	``horizon_days=7`` → the 7 days ending on ``date`` (week view for fleet stats).
 	Each trip includes ``stop_count``, ``delivered_count``, ``pending_count``, ``vehicle_plate``.
+
+	When ``include_open_backlog`` is on (default), also include Draft / In Transit /
+	non-Completed trips whose departure is on or before ``date`` within the last
+	~120 days — so the planner left rail still shows unfinished routes when the
+	plan date moves forward (reduced bureaucracy).
 	"""
 	raw_date = date
 	if isinstance(raw_date, str):
@@ -1330,20 +2243,86 @@ def list_trips_for_date(date=None, company=None, horizon_days=1):
 
 	start = add_days(end, -(horizon - 1))
 
+	company_ok = (
+		company
+		and str(company).strip()
+		and str(company).strip().lower() not in ("null", "undefined", "none")
+	)
+	company_val = str(company).strip() if company_ok else None
+
 	filters = {
 		"docstatus": ["!=", 2],
 		"departure_time": ["between", [f"{start} 00:00:00", f"{end} 23:59:59"]],
 	}
-	if company and str(company).strip() and str(company).strip().lower() not in ("null", "undefined", "none"):
-		filters["company"] = str(company).strip()
+	if company_val:
+		filters["company"] = company_val
+
+	trip_fields = [
+		"name",
+		"status",
+		"docstatus",
+		"driver",
+		"driver_name",
+		"vehicle",
+		"departure_time",
+		"total_distance",
+		"uom",
+	]
+	if frappe.db.has_column("Delivery Trip", "custom_locked"):
+		trip_fields.append("custom_locked")
 
 	trips = frappe.get_all(
 		"Delivery Trip",
 		filters=filters,
-		fields=["name", "status", "docstatus", "driver", "driver_name", "vehicle", "departure_time", "total_distance", "uom"],
+		fields=trip_fields,
 		order_by="departure_time asc",
 		ignore_permissions=True,
 	)
+
+	# Open backlog: unfinished routes still sitting from earlier plan days.
+	try:
+		include_backlog = cint(include_open_backlog)
+	except (TypeError, ValueError):
+		include_backlog = 1
+	if isinstance(include_open_backlog, str) and include_open_backlog.strip().lower() in (
+		"0",
+		"false",
+		"no",
+		"null",
+		"undefined",
+		"none",
+		"",
+	):
+		include_backlog = 0
+
+	if include_backlog:
+		seen = {t.name for t in trips}
+		backlog_since = add_days(end, -120)
+		# Draft (docstatus 0) or submitted but not Completed
+		backlog = frappe.get_all(
+			"Delivery Trip",
+			filters={
+				"docstatus": ["!=", 2],
+				"departure_time": ["between", [f"{backlog_since} 00:00:00", f"{end} 23:59:59"]],
+				**({"company": company_val} if company_val else {}),
+			},
+			fields=trip_fields,
+			order_by="departure_time asc",
+			ignore_permissions=True,
+		)
+		for t in backlog:
+			if t.name in seen:
+				continue
+			st = str(t.status or "")
+			# Keep actionable routes only
+			if cint(t.docstatus) == 0 or st in ("Draft", "Scheduled", "In Transit", ""):
+				trips.append(t)
+				seen.add(t.name)
+			elif st != "Completed":
+				# e.g. custom statuses still open
+				trips.append(t)
+				seen.add(t.name)
+		trips.sort(key=lambda r: str(r.departure_time or ""))
 
 	trip_names = [t.name for t in trips]
 	stop_stats = {}
@@ -1389,6 +2368,10 @@ def list_trips_for_date(date=None, company=None, horizon_days=1):
 		t["delivered_count"] = delivered
 		t["pending_count"] = max(0, stop_count - delivered)
 		t["vehicle_plate"] = plate_by_vehicle.get(t.vehicle) if t.vehicle else None
+		if frappe.db.has_column("Delivery Trip", "custom_locked"):
+			t["locked"] = bool(cint(t.get("custom_locked") or 0))
+		else:
+			t["locked"] = False
 
 	return {
 		"date": str(end),
@@ -1399,16 +2382,356 @@ def list_trips_for_date(date=None, company=None, horizon_days=1):
 
 
 @frappe.whitelist(allow_guest=True)
-def add_stops_to_trip(trip_name, delivery_note_names):
+def list_fleet_day_routes(date=None, horizon_days=1, company=None, include_open_backlog=1):
+	"""Per-driver routes + last activity for the Fleet map (no GPS).
+
+	Last position = latest Delivery Stop activity from the Entregas app when
+	viewing calendar today. Otherwise (and when idle) units sit at their
+	assigned warehouse depot — never at the driver's home.
+	"""
+	trip_payload = list_trips_for_date(
+		date=date,
+		company=company,
+		horizon_days=horizon_days,
+		include_open_backlog=include_open_backlog,
+	)
+	trips = list(trip_payload.get("trips") or [])
+	trip_names = [t.name for t in trips]
+	by_driver = {}
+
+	# Seed every active driver so the UI can show waiting / at warehouse.
+	for d in frappe.get_all(
+		"Driver",
+		filters={"status": "Active"},
+		fields=["name", "full_name", "address", "employee"],
+		ignore_permissions=True,
+	):
+		by_driver[d.name] = {
+			"driver": d.name,
+			"driver_name": d.full_name or d.name,
+			"employee": d.employee,
+			"home_address": d.address,
+			"vehicle": None,
+			"vehicle_plate": None,
+			"has_vehicle": False,
+			"last_at": None,
+			"routes": [],
+		}
+
+	if not trip_names:
+		_fleet_fill_plates_and_depot(by_driver, company=company, as_of=date)
+		return {
+			"date": trip_payload.get("date"),
+			"from_date": trip_payload.get("from_date"),
+			"horizon_days": trip_payload.get("horizon_days"),
+			"drivers": list(by_driver.values()),
+		}
+
+	raw_stops = frappe.get_all(
+		"Delivery Stop",
+		filters={"parent": ["in", trip_names]},
+		fields=[
+			"name",
+			"parent",
+			"idx",
+			"customer",
+			"address",
+			"delivery_note",
+			"visited",
+			"lat",
+			"lng",
+			"customer_address",
+			"custom_outcome",
+			"custom_pod_captured_at",
+			"custom_pod_recipient_name",
+		],
+		order_by="parent asc, idx asc",
+		ignore_permissions=True,
+	)
+	addr_names = list({s.address for s in raw_stops if s.address})
+	# Also resolve driver home addresses
+	for d in by_driver.values():
+		if d.get("home_address"):
+			addr_names.append(d["home_address"])
+	addr_names = list({a for a in addr_names if a})
+	geo_by_address = {}
+	if addr_names:
+		fields = ["name", "custom_latitude", "custom_longitude", "address_line1", "city"]
+		for row in frappe.get_all(
+			"Address",
+			filters={"name": ["in", addr_names]},
+			fields=fields,
+			ignore_permissions=True,
+		):
+			geo_by_address[row.name] = row
+
+	cust_names = list({s.customer for s in raw_stops if s.customer})
+	cust_label = {}
+	if cust_names:
+		for row in frappe.get_all(
+			"Customer",
+			filters={"name": ["in", cust_names]},
+			fields=["name", "customer_name"],
+			ignore_permissions=True,
+		):
+			cust_label[row.name] = row.customer_name or row.name
+
+	stops_by_trip = {}
+	for s in raw_stops:
+		stops_by_trip.setdefault(s.parent, []).append(s)
+
+	for t in trips:
+		driver = cstr(t.get("driver") or "").strip()
+		if not driver:
+			continue
+		if driver not in by_driver:
+			by_driver[driver] = {
+				"driver": driver,
+				"driver_name": t.get("driver_name") or driver,
+				"employee": None,
+				"home_address": None,
+				"vehicle": None,
+				"vehicle_plate": None,
+				"has_vehicle": False,
+				"last_at": None,
+				"routes": [],
+			}
+		entry = by_driver[driver]
+		plate = t.get("vehicle_plate")
+		veh = t.get("vehicle")
+		if veh:
+			entry["vehicle"] = veh
+			entry["vehicle_plate"] = plate or veh
+			entry["has_vehicle"] = True
+
+		route_stops = []
+		best_activity = None  # (sort_key, payload)
+		for s in stops_by_trip.get(t.name) or []:
+			geo = geo_by_address.get(s.address) or {}
+			lat = _valid_map_coord(s.lat) or _valid_map_coord(geo.get("custom_latitude"))
+			lng = _valid_map_coord(s.lng) or _valid_map_coord(geo.get("custom_longitude"))
+			outcome = cstr(s.custom_outcome or "").strip() or None
+			visited = cint(s.visited) == 1 or bool(outcome)
+			cname = cust_label.get(s.customer) or s.customer
+			label = cname or _clean_address_display(s.customer_address) or s.delivery_note
+			stop_row = {
+				"idx": cint(s.idx),
+				"customer": s.customer,
+				"customer_name": cname,
+				"delivery_note": s.delivery_note,
+				"address": s.address,
+				"label": label,
+				"visited": visited,
+				"outcome": outcome,
+				"captured_at": str(s.custom_pod_captured_at) if s.custom_pod_captured_at else None,
+				"lat": lat,
+				"lng": lng,
+			}
+			route_stops.append(stop_row)
+			if visited and lat is not None and lng is not None:
+				# Prefer wall-clock POD time; else stop order (later idx = later on route).
+				ts = s.custom_pod_captured_at
+				sort_key = (1, str(ts), cint(s.idx)) if ts else (0, "", cint(s.idx))
+				payload = {
+					"lat": lat,
+					"lng": lng,
+					"label": label,
+					"stop_idx": cint(s.idx),
+					"outcome": outcome or ("Delivered" if visited else None),
+					"at": str(ts) if ts else None,
+					"trip_name": t.name,
+					"delivery_note": s.delivery_note,
+					"customer_name": cname,
+					"source": "stop",
+				}
+				if best_activity is None or sort_key >= best_activity[0]:
+					best_activity = (sort_key, payload)
+
+		entry["routes"].append(
+			{
+				"trip_name": t.name,
+				"status": t.get("status"),
+				"docstatus": cint(t.get("docstatus")),
+				"departure_time": str(t.get("departure_time") or "") or None,
+				"vehicle": veh,
+				"vehicle_plate": plate,
+				"stop_count": len(route_stops),
+				"stops": route_stops,
+			}
+		)
+		if best_activity:
+			prev = entry.get("last_at")
+			# Keep the chronologically latest activity across trips for this driver.
+			if not prev:
+				entry["last_at"] = best_activity[1]
+			else:
+				prev_at = prev.get("at") or ""
+				new_at = best_activity[1].get("at") or ""
+				if new_at and (not prev_at or new_at >= prev_at):
+					entry["last_at"] = best_activity[1]
+				elif not new_at and not prev_at:
+					if cint(best_activity[1].get("stop_idx")) >= cint(prev.get("stop_idx") or 0):
+						entry["last_at"] = best_activity[1]
+
+	_fleet_fill_plates_and_depot(by_driver, geo_by_address, company=company, as_of=date)
+	return {
+		"date": trip_payload.get("date"),
+		"from_date": trip_payload.get("from_date"),
+		"horizon_days": trip_payload.get("horizon_days"),
+		"drivers": list(by_driver.values()),
+	}
+
+
+def _warehouse_pins_index():
+	"""Map vehicle name/plate → warehouse pin; first warehouse pin as default."""
+	store = _load_tms_map_store()
+	by_veh = {}
+	default_pin = None
+	for p in store.get("pins") or []:
+		if not isinstance(p, dict) or cstr(p.get("kind") or "") != "warehouse":
+			continue
+		if default_pin is None:
+			default_pin = p
+		for v in p.get("vehicles") or []:
+			key = cstr(v or "").strip()
+			if key:
+				by_veh[key] = p
+	return by_veh, default_pin
+
+
+def _fleet_fill_plates_and_depot(by_driver, geo_by_address=None, company=None, as_of=None):
+	"""Attach vehicle plates and park idle units at their warehouse depot.
+
+	Never uses driver home. Non-today plan days always show the warehouse;
+	on calendar today, real stop/POD activity wins when present.
+	"""
+	emp_ids = [d["employee"] for d in by_driver.values() if d.get("employee")]
+	plate_by_emp = {}
+	vehicle_by_emp = {}
+	if emp_ids:
+		for row in frappe.get_all(
+			"Vehicle",
+			filters={"employee": ["in", emp_ids]},
+			fields=["employee", "license_plate", "name"],
+			ignore_permissions=True,
+		):
+			if row.employee and row.employee not in plate_by_emp:
+				plate_by_emp[row.employee] = row.license_plate or row.name
+				vehicle_by_emp[row.employee] = row.name
+
+	as_of_d = getdate(as_of) if as_of else getdate()
+	is_today = as_of_d == getdate()
+	if not is_today:
+		for d in by_driver.values():
+			d["last_at"] = None
+
+	by_veh, default_pin = _warehouse_pins_index()
+	depot_fb = _default_depot_latlng(company)
+
+	for d in by_driver.values():
+		emp = d.get("employee")
+		if emp and plate_by_emp.get(emp):
+			d["has_vehicle"] = True
+			if not d.get("vehicle_plate"):
+				d["vehicle_plate"] = plate_by_emp[emp]
+			if not d.get("vehicle"):
+				d["vehicle"] = vehicle_by_emp.get(emp)
+		src = cstr((d.get("last_at") or {}).get("source") or "")
+		# Keep live POD / stop activity only for calendar today.
+		if is_today and d.get("last_at") and src == "stop":
+			continue
+		veh_key = cstr(d.get("vehicle") or "").strip()
+		plate_key = cstr(d.get("vehicle_plate") or "").strip()
+		pin = by_veh.get(veh_key) or by_veh.get(plate_key) or default_pin
+		if pin and (pin.get("lat") is not None or pin.get("lng") is not None):
+			lat = flt(pin.get("lat"))
+			lng = flt(pin.get("lng"))
+			label = cstr(pin.get("label") or "").strip()
+			ref = cstr(pin.get("ref_name") or "").strip()
+			wh_name = ref or None
+			if ref and frappe.db.exists("Warehouse", ref):
+				wn = cstr(frappe.db.get_value("Warehouse", ref, "warehouse_name") or "").strip()
+				if wn:
+					label = wn
+			if not label:
+				label = cstr(pin.get("address") or "").strip() or _("Warehouse")
+		else:
+			lat = flt(depot_fb.get("lat"))
+			lng = flt(depot_fb.get("lng"))
+			label = _("Warehouse")
+			wh_name = None
+		d["last_at"] = {
+			"lat": lat,
+			"lng": lng,
+			"label": label,
+			"stop_idx": None,
+			"outcome": None,
+			"at": None,
+			"trip_name": None,
+			"delivery_note": None,
+			"customer_name": None,
+			"source": "warehouse",
+			"warehouse": wh_name,
+		}
+
+
+def _fleet_fill_home_and_plates(by_driver, geo_by_address=None, company=None, as_of=None):
+	"""Back-compat alias — parks at warehouse, never home."""
+	return _fleet_fill_plates_and_depot(
+		by_driver, geo_by_address=geo_by_address, company=company, as_of=as_of
+	)
+
+
+def _trip_owning_delivery_note(delivery_note, exclude_trip=None):
+	"""Active (non-cancelled) trip that currently holds this DN as a stop."""
+	dn = cstr(delivery_note or "").strip()
+	if not dn:
+		return None
+	locked_expr = (
+		"IFNULL(dt.custom_locked, 0)"
+		if frappe.db.has_column("Delivery Trip", "custom_locked")
+		else "0"
+	)
+	rows = frappe.db.sql(
+		f"""
+		SELECT ds.parent, dt.docstatus, {locked_expr} as locked, dt.status, dt.driver
+		FROM `tabDelivery Stop` ds
+		INNER JOIN `tabDelivery Trip` dt ON dt.name = ds.parent
+		WHERE ds.delivery_note = %s
+		  AND IFNULL(dt.docstatus, 0) < 2
+		  AND IFNULL(ds.custom_outcome, '') != 'Not Home'
+		ORDER BY dt.modified DESC
+		LIMIT 5
+		""",
+		(dn,),
+		as_dict=True,
+	)
+	for r in rows:
+		if exclude_trip and r.parent == exclude_trip:
+			continue
+		return r
+	return None
+
+
+@frappe.whitelist(allow_guest=True)
+def add_stops_to_trip(trip_name, delivery_note_names, allow_steal=0):
 	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
 	if not delivery_note_names:
 		frappe.throw(_("Select at least one order to add."))
+
+	try:
+		steal = cint(allow_steal)
+	except (TypeError, ValueError):
+		steal = 0
+	if isinstance(allow_steal, str) and allow_steal.strip().lower() in ("1", "true", "yes"):
+		steal = 1
 
 	frappe.flags.ignore_permissions = True
 	trip = frappe.get_doc("Delivery Trip", trip_name)
 	frappe.flags.ignore_permissions = False
 	if trip.docstatus != 0:
 		frappe.throw(_("Stops can only be added to a Draft trip."))
+	_assert_trip_unlocked(trip, _("adding stops"))
 
 	already_on_trip = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
 	dupes = [n for n in delivery_note_names if n in already_on_trip]
@@ -1416,16 +2739,44 @@ def add_stops_to_trip(trip_name, delivery_note_names):
 		frappe.throw(_("Already on this trip: {0}").format(", ".join(dupes)))
 
 	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
-	if conflicts:
+	if conflicts and not steal:
 		frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+
+	stolen_from = []
+	if conflicts and steal:
+		# Pull stops off other draft unlocked trips before attaching here.
+		by_src = {}
+		for dn in conflicts:
+			owner = _trip_owning_delivery_note(dn, exclude_trip=trip_name)
+			if not owner:
+				continue
+			if cint(owner.docstatus) != 0:
+				frappe.throw(
+					_("Cannot steal {0} — source trip {1} is not Draft.").format(dn, owner.parent)
+				)
+			if cint(owner.locked):
+				frappe.throw(
+					_("Cannot steal {0} — source trip {1} is locked.").format(dn, owner.parent)
+				)
+			by_src.setdefault(owner.parent, []).append(dn)
+		for src_name, dns in by_src.items():
+			remove_stops_from_trip(src_name, dns)
+			stolen_from.append({"trip": src_name, "delivery_notes": dns})
 
 	notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(delivery_note_names)
 	_append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name)
 
-	trip.save(ignore_permissions=True)
-	frappe.db.commit()
+	_save_trip_doc(trip)
 
-	return get_trip_map_data(trip_name)
+	try:
+		map_data = optimize_trip(trip_name)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "add_stops_to_trip auto optimize_trip")
+		map_data = get_trip_map_data(trip_name)
+	if stolen_from:
+		map_data = dict(map_data or {})
+		map_data["stolen_from"] = stolen_from
+	return map_data
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1439,6 +2790,7 @@ def remove_stops_from_trip(trip_name, delivery_note_names):
 	frappe.flags.ignore_permissions = False
 	if trip.docstatus != 0:
 		frappe.throw(_("Stops can only be removed from a Draft trip. Cancel the trip to free all its stops."))
+	_assert_trip_unlocked(trip, _("removing stops"))
 
 	names = set(delivery_note_names)
 	rows_to_remove = [s for s in trip.delivery_stops if s.delivery_note in names]
@@ -1451,8 +2803,7 @@ def remove_stops_from_trip(trip_name, delivery_note_names):
 	for row in rows_to_remove:
 		trip.remove(row)
 
-	trip.save(ignore_permissions=True)
-	frappe.db.commit()
+	_save_trip_doc(trip)
 
 	return get_trip_map_data(trip_name)
 
@@ -1514,15 +2865,15 @@ def _apply_trip_stop_order(trip, delivery_note_names):
 	if trip.docstatus == 0:
 		for i, row in enumerate(final_rows, start=1):
 			row.idx = i
-		trip.save(ignore_permissions=True)
+		_save_trip_doc(trip)
 	elif trip.docstatus == 1:
 		# Submitted trips can't use Document.save for child reorder — set idx directly.
 		for i, row in enumerate(final_rows, start=1):
 			frappe.db.set_value("Delivery Stop", row.name, "idx", i, update_modified=False)
+		frappe.db.commit()
 	else:
 		frappe.throw(_("Cancelled trips cannot be reordered."))
 
-	frappe.db.commit()
 	return names
 
 
@@ -1538,6 +2889,7 @@ def reorder_trip_stops(trip_name, delivery_note_names=None):
 	frappe.flags.ignore_permissions = False
 	if trip.docstatus != 0:
 		frappe.throw(_("Stops can only be reordered on a Draft trip."))
+	_assert_trip_unlocked(trip, _("reordering stops"))
 
 	_apply_trip_stop_order(trip, delivery_note_names)
 	return get_trip_map_data(trip_name)
@@ -1573,21 +2925,43 @@ def update_trip_assignment(trip_name, driver=None, vehicle=None, pickup_warehous
 		if not frappe.db.exists("Vehicle", vehicle):
 			frappe.throw(_("Vehicle {0} not found").format(vehicle), frappe.DoesNotExistError)
 		trip.vehicle = vehicle
+	else:
+		_ensure_trip_vehicle(trip)
 
-	trip.save(ignore_permissions=True)
-	frappe.db.commit()
+	_save_trip_doc(trip)
 
 	return get_trip_map_data(trip_name)
 
 
 @frappe.whitelist(allow_guest=True)
-def cancel_trip(trip_name):
+def cancel_trip(trip_name, force=0):
+	"""Reset / cancel a route (frees delivery notes back to the pending pool).
+
+	Locked routes require ``force=1`` (force-stop from the sidebar) or unlock first.
+	"""
 	frappe.flags.ignore_permissions = True
 	trip = frappe.get_doc("Delivery Trip", trip_name)
 	frappe.flags.ignore_permissions = False
 
 	if trip.docstatus == 2:
 		frappe.throw(_("Trip {0} is already cancelled.").format(trip_name))
+
+	try:
+		force_ok = cint(force)
+	except (TypeError, ValueError):
+		force_ok = 0
+	if isinstance(force, str) and force.strip().lower() in ("1", "true", "yes"):
+		force_ok = 1
+
+	if _trip_is_locked(trip) and not force_ok:
+		frappe.throw(
+			_("Route {0} is locked — unlock it first, or use force-stop.").format(trip_name)
+		)
+
+	# Force-stop clears the lock so cancel can proceed cleanly.
+	if force_ok and _trip_is_locked(trip) and frappe.db.has_column("Delivery Trip", "custom_locked"):
+		frappe.db.set_value("Delivery Trip", trip_name, "custom_locked", 0, update_modified=False)
+		trip.custom_locked = 0
 
 	if trip.docstatus == 0:
 		# Draft was never submitted - core Frappe disallows a 0->2 docstatus
@@ -1621,6 +2995,55 @@ def cancel_trip(trip_name):
 
 	frappe.db.commit()
 	return {"trip": trip.name, "status": trip.status}
+
+
+@frappe.whitelist(allow_guest=True)
+def set_trip_locked(trip_name, locked=1):
+	"""Toggle route lock. Locked trips keep visits fixed; outcomes / line edits still OK."""
+	_ensure_trip_locked_field()
+	name = cstr(trip_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required"))
+	if not frappe.db.exists("Delivery Trip", name):
+		frappe.throw(_("Delivery Trip {0} not found").format(name), frappe.DoesNotExistError)
+
+	try:
+		want = cint(locked)
+	except (TypeError, ValueError):
+		want = 0
+	if isinstance(locked, str) and locked.strip().lower() in ("1", "true", "yes"):
+		want = 1
+	elif isinstance(locked, str) and locked.strip().lower() in ("0", "false", "no", "null", "undefined", ""):
+		want = 0
+
+	frappe.db.set_value("Delivery Trip", name, "custom_locked", 1 if want else 0)
+	frappe.db.commit()
+	return get_trip_map_data(name)
+
+
+@frappe.whitelist(allow_guest=True)
+def start_trip(trip_name):
+	"""Mark a route as started (submit draft → In Transit, or Submitted → In Transit)."""
+	name = cstr(trip_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required"))
+
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", name)
+	frappe.flags.ignore_permissions = False
+
+	_ensure_trip_published_for_driving(trip)
+	return get_trip_map_data(name)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_delivery_note_route_lock(delivery_note=None):
+	"""Lookup helper for UI warnings when editing a pedido on a locked route."""
+	dn = cstr(delivery_note or "").strip()
+	if not dn or dn.lower() in ("null", "undefined", "none"):
+		return {"delivery_note": dn or None, "locked": False, "trip": None}
+	trip = _locked_trip_for_delivery_note(dn)
+	return {"delivery_note": dn, "locked": bool(trip), "trip": trip}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -2030,6 +3453,16 @@ TMS_SETTINGS_DEFAULTS = {
 	"auto_group_working_days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
 	"auto_group_use_time_slots": False,
 	"auto_group_excluded_slots": [],
+	# i045 packing strategies
+	"packing_strategy": "client_zone",  # client_zone | fast_deliver_greedy
+	"driver_day_max_orders": 30,
+	"driver_day_max_minutes": 480,
+	"default_stop_minutes": 15,
+	"avg_speed_kmh": 25,
+	"greedy_horizon_days": 14,
+	"delivery_lead_days": 1,
+	"drive_buffer_minutes_per_leg": 5,
+	"nearby_driver_max_km": 8,
 }
 
 
@@ -2066,6 +3499,15 @@ def save_tms_settings(
 	auto_group_working_days=None,
 	auto_group_use_time_slots=None,
 	auto_group_excluded_slots=None,
+	packing_strategy=None,
+	driver_day_max_orders=None,
+	driver_day_max_minutes=None,
+	default_stop_minutes=None,
+	avg_speed_kmh=None,
+	greedy_horizon_days=None,
+	delivery_lead_days=None,
+	drive_buffer_minutes_per_leg=None,
+	nearby_driver_max_km=None,
 ):
 	return _persist_tms_settings(
 		{
@@ -2083,6 +3525,15 @@ def save_tms_settings(
 			"auto_group_working_days": auto_group_working_days,
 			"auto_group_use_time_slots": auto_group_use_time_slots,
 			"auto_group_excluded_slots": auto_group_excluded_slots,
+			"packing_strategy": packing_strategy,
+			"driver_day_max_orders": driver_day_max_orders,
+			"driver_day_max_minutes": driver_day_max_minutes,
+			"default_stop_minutes": default_stop_minutes,
+			"avg_speed_kmh": avg_speed_kmh,
+			"greedy_horizon_days": greedy_horizon_days,
+			"delivery_lead_days": delivery_lead_days,
+			"drive_buffer_minutes_per_leg": drive_buffer_minutes_per_leg,
+			"nearby_driver_max_km": nearby_driver_max_km,
 		},
 		commit=True,
 	)
@@ -2102,13 +3553,39 @@ def _persist_tms_settings(raw, commit=True):
 		"auto_credit_note_on_partial",
 	}
 	list_keys = {"auto_group_working_days", "auto_group_excluded_slots"}
+	int_keys = {
+		"tracking_code_length",
+		"driver_day_max_orders",
+		"driver_day_max_minutes",
+		"default_stop_minutes",
+		"avg_speed_kmh",
+		"greedy_horizon_days",
+		"delivery_lead_days",
+		"drive_buffer_minutes_per_leg",
+		"nearby_driver_max_km",
+	}
 	for key, value in raw.items():
 		if value is None:
 			continue
 		if key in bool_keys:
 			current[key] = frappe.parse_json(value) if isinstance(value, str) else bool(value)
-		elif key == "tracking_code_length":
-			current[key] = cint(value) or TMS_SETTINGS_DEFAULTS["tracking_code_length"]
+		elif key in int_keys:
+			try:
+				n = cint(value)
+			except (TypeError, ValueError):
+				n = TMS_SETTINGS_DEFAULTS.get(key, 0)
+			if isinstance(value, str) and value.strip().lower() in ("", "null", "undefined", "none"):
+				n = TMS_SETTINGS_DEFAULTS.get(key, 0)
+			if key == "tracking_code_length":
+				n = n or TMS_SETTINGS_DEFAULTS["tracking_code_length"]
+			current[key] = max(0, n)
+		elif key == "packing_strategy":
+			s = cstr(value).strip().lower()
+			if s in ("", "null", "undefined", "none"):
+				s = TMS_SETTINGS_DEFAULTS["packing_strategy"]
+			if s not in ("client_zone", "fast_deliver_greedy"):
+				s = TMS_SETTINGS_DEFAULTS["packing_strategy"]
+			current[key] = s
 		elif key in list_keys:
 			parsed = frappe.parse_json(value) if isinstance(value, str) else value
 			if isinstance(parsed, str):
@@ -2223,6 +3700,9 @@ def _normalize_zone(raw, existing=None):
 		vehicles = [v.strip() for v in vehicles.split(",") if v.strip()]
 	if vehicles is None:
 		vehicles = existing.get("vehicles") or []
+	# Owning driver (i044 territory × day zones: one zone per driver per day).
+	driver = raw.get("driver") if "driver" in raw else existing.get("driver")
+	driver = cstr(driver or "").strip() or None
 	return {
 		"code": code,
 		"name": name,
@@ -2231,6 +3711,7 @@ def _normalize_zone(raw, existing=None):
 		"visit_days": list(visit_days or []),
 		"vehicles": list(vehicles or []),
 		"notes": str(raw.get("notes") or existing.get("notes") or ""),
+		"driver": driver,
 	}
 
 
@@ -2238,6 +3719,152 @@ def _normalize_zone(raw, existing=None):
 def list_tms_zones():
 	return _load_tms_zones()
 
+
+@frappe.whitelist(allow_guest=True)
+def list_delivery_clients(limit=2000, only_geocoded=1):
+	"""Active customers with shipping/primary geocoded Addresses for the Clients map tab.
+
+	Returns one row per address (a customer may appear more than once).
+	``zone`` is Address.custom_zone; ``visit_days`` filled from matching TMS zone when possible.
+	"""
+	raw_lim = limit
+	if raw_lim is None or (
+		isinstance(raw_lim, str)
+		and raw_lim.strip().lower() in ("", "null", "undefined", "none")
+	):
+		lim = 2000
+	else:
+		try:
+			lim = cint(raw_lim)
+		except (TypeError, ValueError):
+			lim = 2000
+	if lim < 1:
+		lim = 2000
+	if lim > 5000:
+		lim = 5000
+
+	if only_geocoded is None:
+		geo_only = True
+	elif isinstance(only_geocoded, str) and only_geocoded.strip().lower() in (
+		"",
+		"null",
+		"undefined",
+		"none",
+	):
+		geo_only = True
+	else:
+		geo_only = cint(only_geocoded) != 0
+
+	has_zone = frappe.db.has_column("Address", "custom_zone")
+	has_lat = frappe.db.has_column("Address", "custom_latitude")
+	has_lng = frappe.db.has_column("Address", "custom_longitude")
+	has_freq = frappe.db.has_column("Address", "custom_delivery_frequency")
+	if not has_lat or not has_lng:
+		return {"clients": [], "total": 0, "geocoded": 0}
+
+	zone_sel = "addr.custom_zone AS zone" if has_zone else "NULL AS zone"
+	freq_sel = (
+		"addr.custom_delivery_frequency AS frequency" if has_freq else "NULL AS frequency"
+	)
+	geo_clause = (
+		"AND IFNULL(addr.custom_latitude, 0) != 0 AND IFNULL(addr.custom_longitude, 0) != 0"
+		if geo_only
+		else ""
+	)
+
+	rows = frappe.db.sql(
+		f"""
+		SELECT
+			c.name AS customer,
+			c.customer_name AS customer_name,
+			addr.name AS address_name,
+			addr.address_line1 AS address_line1,
+			addr.city AS city,
+			addr.custom_latitude AS lat,
+			addr.custom_longitude AS lng,
+			{zone_sel},
+			{freq_sel},
+			IFNULL(addr.is_shipping_address, 0) AS is_shipping,
+			IFNULL(addr.is_primary_address, 0) AS is_primary
+		FROM `tabCustomer` c
+		INNER JOIN `tabDynamic Link` dl
+			ON dl.link_doctype = 'Customer'
+			AND dl.link_name = c.name
+			AND dl.parenttype = 'Address'
+		INNER JOIN `tabAddress` addr
+			ON addr.name = dl.parent
+		WHERE IFNULL(c.disabled, 0) = 0
+			AND IFNULL(addr.disabled, 0) = 0
+			{geo_clause}
+		ORDER BY c.customer_name ASC, addr.is_shipping_address DESC, addr.modified DESC
+		LIMIT %(lim)s
+		""",
+		{"lim": lim},
+		as_dict=True,
+	)
+
+	zones = _load_tms_zones().get("zones") or []
+	zone_by_key = {}
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		code = cstr(z.get("code") or "").strip().upper()
+		name = cstr(z.get("name") or "").strip().upper()
+		if code:
+			zone_by_key[code] = z
+		if name:
+			zone_by_key[name] = z
+
+	clients = []
+	geocoded = 0
+	for row in rows:
+		try:
+			lat = flt(row.get("lat"))
+			lng = flt(row.get("lng"))
+		except Exception:
+			lat = lng = 0
+		is_geo = bool(lat and lng)
+		if is_geo:
+			geocoded += 1
+		zone_label = cstr(row.get("zone") or "").strip()
+		visit_days = []
+		zone_color = None
+		if zone_label:
+			hit = zone_by_key.get(zone_label.upper())
+			if not hit:
+				for key, z in zone_by_key.items():
+					if zone_label.upper() in key or key in zone_label.upper():
+						hit = z
+						break
+			if hit:
+				visit_days = list(hit.get("visit_days") or [])
+				zone_color = hit.get("color")
+		clients.append(
+			{
+				"id": cstr(row.get("address_name") or ""),
+				"customer": cstr(row.get("customer") or ""),
+				"customer_name": cstr(row.get("customer_name") or row.get("customer") or ""),
+				"address_name": cstr(row.get("address_name") or ""),
+				"address": ", ".join(
+					p
+					for p in [
+						cstr(row.get("address_line1") or "").strip(),
+						cstr(row.get("city") or "").strip(),
+					]
+					if p
+				),
+				"lat": lat if is_geo else None,
+				"lng": lng if is_geo else None,
+				"geocoded": is_geo,
+				"zone": zone_label or None,
+				"zone_color": zone_color,
+				"visit_days": visit_days,
+				"frequency": cint(row.get("frequency")) if row.get("frequency") not in (None, "") else 1,
+				"is_shipping": cint(row.get("is_shipping")) == 1,
+			}
+		)
+
+	return {"clients": clients, "total": len(clients), "geocoded": geocoded}
 
 @frappe.whitelist(allow_guest=True)
 def save_tms_zone(zone=None):
@@ -2301,6 +3928,173 @@ def _haversine_km(lat1, lng1, lat2, lng2):
 	dlng = radians(lng2 - lng1)
 	a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
 	return 2 * r * asin(sqrt(a))
+
+
+def _address_latlng(address_name):
+	"""Return {lat,lng} for an Address, or None if ungeocoded."""
+	name = cstr(address_name or "").strip()
+	if not name or not frappe.db.has_column("Address", "custom_latitude"):
+		return None
+	row = frappe.db.get_value(
+		"Address", name, ["custom_latitude", "custom_longitude"], as_dict=True
+	)
+	if not row:
+		return None
+	lat = flt(row.custom_latitude)
+	lng = flt(row.custom_longitude)
+	if not lat and not lng:
+		return None
+	return {"lat": lat, "lng": lng}
+
+
+def _trip_depot_latlng(trip):
+	"""Warehouse pin / address used as TSP start+end (closed tour)."""
+	# 1) Explicit pickup warehouse on trip — prefer map pin, then Address geo
+	wh = cstr(getattr(trip, "custom_pickup_warehouse", None) or "").strip()
+	if wh:
+		pin_geo = _depot_from_warehouse_pin(wh)
+		if pin_geo:
+			return pin_geo, None, wh
+		addr = _default_address("Warehouse", wh)
+		geo = _address_latlng(addr) if addr else None
+		if geo:
+			return geo, addr, wh
+	# 2) Trip driver_address (often the resolved warehouse address)
+	addr = cstr(getattr(trip, "driver_address", None) or "").strip()
+	geo = _address_latlng(addr) if addr else None
+	if geo:
+		return geo, addr, wh or None
+	# 3) Company default warehouse pin / Address / BA fallback
+	depot = _default_depot_latlng(getattr(trip, "company", None))
+	return depot, None, wh or None
+
+
+def _tsp_closed_tour_order(depot, points):
+	"""Order ``points`` for a closed TSP: depot → … → depot (haversine).
+
+	``points``: list of dicts with ``lat``/``lng``. Returns permutation of indices.
+	Uses nearest-neighbor from the depot, then 2-opt until local optimum.
+	"""
+	n = len(points)
+	if n <= 1:
+		return list(range(n))
+
+	dlat = flt(depot.get("lat"))
+	dlng = flt(depot.get("lng"))
+	coords = [(flt(p["lat"]), flt(p["lng"])) for p in points]
+
+	def dist(i, j):
+		a, b = coords[i], coords[j]
+		return _haversine_km(a[0], a[1], b[0], b[1])
+
+	def depot_to(i):
+		a = coords[i]
+		return _haversine_km(dlat, dlng, a[0], a[1])
+
+	def tour_km(order):
+		if not order:
+			return 0.0
+		total = depot_to(order[0])
+		for a, b in zip(order, order[1:]):
+			total += dist(a, b)
+		total += depot_to(order[-1])
+		return total
+
+	# Nearest-neighbor seed starting from depot
+	remaining = set(range(n))
+	order = []
+	cur = None
+	while remaining:
+		best = None
+		best_d = None
+		for i in remaining:
+			d = depot_to(i) if cur is None else dist(cur, i)
+			if best_d is None or d < best_d:
+				best_d = d
+				best = i
+		order.append(best)
+		remaining.remove(best)
+		cur = best
+
+	# 2-opt improvement on the open path (tour cost still includes return to depot)
+	improved = True
+	while improved:
+		improved = False
+		best_delta = 0.0
+		best_i = best_j = None
+		for i in range(n - 1):
+			for j in range(i + 1, n):
+				# Reverse order[i:j+1]
+				cand = order[:i] + list(reversed(order[i : j + 1])) + order[j + 1 :]
+				delta = tour_km(cand) - tour_km(order)
+				if delta < best_delta - 1e-9:
+					best_delta = delta
+					best_i, best_j = i, j
+					improved = True
+		if improved and best_i is not None:
+			order = order[:best_i] + list(reversed(order[best_i : best_j + 1])) + order[best_j + 1 :]
+
+	return order
+
+
+def _delivery_note_order_tsp(trip):
+	"""Compute DN order for trip stops via warehouse-closed TSP.
+
+	Visited stops keep their relative order at the front. Ungeocoded stops
+	append after the optimized geocoded block (stable relative order).
+	"""
+	rows = sorted(trip.delivery_stops or [], key=lambda r: cint(r.idx) or 0)
+	visited = []
+	movable = []
+	for s in rows:
+		dn = cstr(getattr(s, "delivery_note", None) or "").strip()
+		if not dn:
+			continue
+		if cint(getattr(s, "visited", 0)):
+			visited.append(dn)
+		else:
+			movable.append(s)
+
+	depot, _addr, _wh = _trip_depot_latlng(trip)
+
+	# Resolve coords: stop lat/lng first, else address geo
+	addr_names = [cstr(s.address or "").strip() for s in movable if s.address]
+	geo_by = {}
+	names = [a for a in addr_names if a]
+	if names and frappe.db.has_column("Address", "custom_latitude"):
+		for row in frappe.get_all(
+			"Address",
+			filters={"name": ["in", names]},
+			fields=["name", "custom_latitude", "custom_longitude"],
+			ignore_permissions=True,
+		):
+			lat = flt(row.custom_latitude)
+			lng = flt(row.custom_longitude)
+			if lat or lng:
+				geo_by[row.name] = {"lat": lat, "lng": lng}
+
+	geocoded = []
+	ungeocoded_dns = []
+	for s in movable:
+		dn = cstr(s.delivery_note or "").strip()
+		lat = _valid_map_coord(getattr(s, "lat", None))
+		lng = _valid_map_coord(getattr(s, "lng", None))
+		if lat is None or lng is None:
+			g = geo_by.get(cstr(s.address or "").strip())
+			if g:
+				lat, lng = g["lat"], g["lng"]
+		if lat is None or lng is None:
+			ungeocoded_dns.append(dn)
+			continue
+		geocoded.append({"dn": dn, "lat": lat, "lng": lng})
+
+	if len(geocoded) <= 1:
+		ordered_geo = [g["dn"] for g in geocoded]
+	else:
+		perm = _tsp_closed_tour_order(depot, geocoded)
+		ordered_geo = [geocoded[i]["dn"] for i in perm]
+
+	return visited + ordered_geo + ungeocoded_dns
 
 
 def _nearest_zone_code(lat, lng, centers):
@@ -2557,21 +4351,27 @@ def _visit_tags_for_days(days, use_time_slots, slot, excluded_slots=None):
 	return out or ([days[0]] if days else [])
 
 
-def _next_due_on_weekdays(as_of, weekdays):
-	"""Next date >= as_of whose weekday is in ``weekdays`` (Mon..Sun)."""
+def _next_due_on_weekdays(as_of, weekdays, strictly_after=False):
+	"""Next date on a weekday in ``weekdays`` (Mon..Sun).
+
+	By default returns the soonest date >= ``as_of``.
+	With ``strictly_after=True`` (auto-group reschedule), skips ``as_of`` itself
+	so remitos move to a future delivery day after the plan/as-of date.
+	"""
 	from frappe.utils import add_days
 
 	as_of = getdate(as_of)
 	if not weekdays:
-		return as_of
+		return add_days(as_of, 1) if strictly_after else as_of
 	wanted = set(weekdays)
-	for i in range(0, 14):
+	start = 1 if strictly_after else 0
+	for i in range(start, start + 21):
 		d = add_days(as_of, i)
 		# Python: Mon=0 … Sun=6 → map to our labels
 		label = _WEEKDAY_ORDER[d.weekday()]
 		if label in wanted:
 			return d
-	return as_of
+	return add_days(as_of, 1) if strictly_after else as_of
 
 
 def _kmeans_cluster_indices(coords, k, max_iter=40):
@@ -2660,6 +4460,8 @@ def _build_auto_group_preview(
 	use_time_slots=None,
 	excluded_slots=None,
 	company=None,
+	delivery_notes=None,
+	reschedule_after_as_of=1,
 ):
 	settings = _load_tms_settings()
 	as_of_raw = date
@@ -2690,8 +4492,39 @@ def _build_auto_group_preview(
 	vehicles = _parse_json_list(vehicle_names, [])
 	warnings = []
 
+	# Optional allow-list (advance-select which remitos enter the cluster / reschedule set).
+	# null / dirty / empty → all pending (no filter).
+	note_filter = set()
+	raw_notes = delivery_notes
+	if isinstance(raw_notes, str):
+		s = raw_notes.strip()
+		if s and s.lower() not in ("null", "undefined", "none"):
+			try:
+				raw_notes = frappe.parse_json(s)
+			except Exception:
+				raw_notes = [x.strip() for x in s.split(",") if x.strip()]
+	if isinstance(raw_notes, (list, tuple, set)):
+		for n in raw_notes:
+			name = cstr(n or "").strip()
+			if name and name.lower() not in ("null", "undefined", "none"):
+				note_filter.add(name)
+
+	if reschedule_after_as_of is None:
+		strict_future = True
+	elif isinstance(reschedule_after_as_of, str) and reschedule_after_as_of.strip().lower() in (
+		"",
+		"null",
+		"undefined",
+		"none",
+	):
+		strict_future = True
+	else:
+		strict_future = cint(reschedule_after_as_of) != 0
+
 	pending = get_pending_deliveries(date=str(as_of), company=company)
 	deliveries = list(pending.get("deliveries") or [])
+	if note_filter:
+		deliveries = [d for d in deliveries if cstr(d.get("delivery_note") or "").strip() in note_filter]
 
 	geocoded = []
 	ungeocoded = []
@@ -2747,10 +4580,25 @@ def _build_auto_group_preview(
 	for d, lab in zip(geocoded, labels):
 		buckets[lab].append(d)
 
+	# Day sector from each cluster's centroid (same south-first compass as rebalance)
+	# so neighboring geo groups prefer neighboring / same visit days.
+	centroids = []
+	for b in buckets:
+		if not b:
+			centroids.append((0.0, 0.0))
+			continue
+		centroids.append(
+			(
+				sum(flt(o.get("lat")) for o in b) / len(b),
+				sum(flt(o.get("lng")) for o in b) / len(b),
+			)
+		)
+	sector_of_cluster = _day_sector_labels(centroids, max(1, len(work_days))) if centroids else []
+
 	# Drop empty clusters and reindex
 	nonempty = [(i, b) for i, b in enumerate(buckets) if b]
 	groups = []
-	for gi, (_old, orders) in enumerate(nonempty):
+	for gi, (old_i, orders) in enumerate(nonempty):
 		code = f"AG{gi + 1}"
 		color = _ZONE_DEFAULT_COLORS[gi % len(_ZONE_DEFAULT_COLORS)]
 		driver = drivers[gi % len(drivers)] if drivers else None
@@ -2760,7 +4608,13 @@ def _build_auto_group_preview(
 			freq_map.get(o.get("address_name"), 1) for o in orders if o.get("address_name")
 		] or [1]
 		zone_freq = max(freqs)
-		zone_days = _spaced_weekdays(work_days, zone_freq, offset=gi)
+		# Prefer the geographic day sector of this cluster, then space extras.
+		sector_idx = sector_of_cluster[old_i] if old_i < len(sector_of_cluster) else gi
+		sector_day = work_days[sector_idx % len(work_days)] if work_days else "Mon"
+		rotated = list(work_days)
+		if sector_day in rotated:
+			rotated = rotated[rotated.index(sector_day) :] + rotated[: rotated.index(sector_day)]
+		zone_days = _spaced_weekdays(rotated, zone_freq, offset=0)
 
 		# Prefer slot from first customer with a preference (stable by order)
 		slot = _TIME_SLOT_SHORT[0]
@@ -2783,7 +4637,7 @@ def _build_auto_group_preview(
 			addr = o.get("address_name")
 			f = freq_map.get(addr, 1) if addr else 1
 			client_days = _spaced_weekdays(zone_days, f, offset=0)
-			due = _next_due_on_weekdays(as_of, client_days)
+			due = _next_due_on_weekdays(as_of, client_days, strictly_after=strict_future)
 			cname = o.get("customer_name") or o.get("customer") or ""
 			if cname and cname not in clients_seen:
 				clients_seen.append(cname)
@@ -2846,11 +4700,16 @@ def preview_auto_delivery_groups(
 	excluded_slots=None,
 	company=None,
 	persist_settings=None,
+	delivery_notes=None,
+	reschedule_after_as_of=1,
 ):
 	"""Preview geo clusters → proposed zones + due dates.
 
 	No DB writes by default. Pass ``persist_settings=1`` only when intentionally
 	saving calendar prefs without committing zones.
+
+	``delivery_notes`` (optional): limit preview to those remitos.
+	``reschedule_after_as_of`` (default on): proposed dues are strictly after as-of.
 	"""
 	_ = strategy  # only geo_clusters in v1
 	preview = _build_auto_group_preview(
@@ -2862,6 +4721,8 @@ def preview_auto_delivery_groups(
 		use_time_slots=use_time_slots,
 		excluded_slots=excluded_slots,
 		company=company,
+		delivery_notes=delivery_notes,
+		reschedule_after_as_of=reschedule_after_as_of,
 	)
 	persist = persist_settings
 	if isinstance(persist, str):
@@ -2970,21 +4831,8 @@ def commit_auto_delivery_groups(preview=None, force_due_dates=1):
 				if due:
 					try:
 						due_d = getdate(due)
-						so_names = frappe.get_all(
-							"Delivery Note Item",
-							filters={"parent": dn, "against_sales_order": ["is", "set"]},
-							pluck="against_sales_order",
-							ignore_permissions=True,
-						)
-						so_names = list({s for s in so_names if s})
-						if not so_names:
-							dues_skipped += 1
-						else:
-							for so in so_names:
-								frappe.db.set_value(
-									"Sales Order", so, "delivery_date", due_d, update_modified=True
-								)
-							dues_updated += 1
+						_apply_pending_delivery_due(dn, due_d)
+						dues_updated += 1
 					except Exception as exc:
 						errors.append({"delivery_note": dn, "error": str(exc)})
 						dues_skipped += 1
@@ -3003,9 +4851,2082 @@ def commit_auto_delivery_groups(preview=None, force_due_dates=1):
 
 
 # ---------------------------------------------------------------------------
+# i044 — Zone rebalance from active geocoded clients (not day remitos)
+# ---------------------------------------------------------------------------
+
+
+def _truthy_flag(raw, default=False):
+	"""Coerce dirty whitelist flags (null/''/'null') to bool without crashing."""
+	if raw is None:
+		return default
+	if isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none"):
+		return default
+	if isinstance(raw, str):
+		return raw.strip().lower() in ("1", "true", "yes")
+	return bool(cint(raw)) if not isinstance(raw, bool) else raw
+
+
+def _active_geocoded_client_rows(limit=5000, only_missing_zone=0):
+	"""Active Customer + Address rows with lat/lng (shared by Clients tab / rebalance)."""
+	payload = list_delivery_clients(limit=limit, only_geocoded=1)
+	clients = list(payload.get("clients") or [])
+	ungeocoded_total = 0
+	# Optional count of active addresses missing geo (informational only).
+	try:
+		ungeocoded_total = cint(
+			frappe.db.sql(
+				"""
+				SELECT COUNT(*)
+				FROM `tabCustomer` c
+				INNER JOIN `tabDynamic Link` dl
+					ON dl.link_doctype = 'Customer'
+					AND dl.link_name = c.name
+					AND dl.parenttype = 'Address'
+				INNER JOIN `tabAddress` addr ON addr.name = dl.parent
+				WHERE IFNULL(c.disabled, 0) = 0
+					AND IFNULL(addr.disabled, 0) = 0
+					AND (
+						IFNULL(addr.custom_latitude, 0) = 0
+						OR IFNULL(addr.custom_longitude, 0) = 0
+					)
+				"""
+			)[0][0]
+		)
+	except Exception:
+		ungeocoded_total = 0
+
+	if _truthy_flag(only_missing_zone, False):
+		clients = [c for c in clients if not cstr(c.get("zone") or "").strip()]
+
+	# Deduplicate by address_name (primary unit for custom_zone writes).
+	seen = set()
+	unique = []
+	for c in clients:
+		addr = cstr(c.get("address_name") or c.get("id") or "").strip()
+		if not addr or addr in seen:
+			continue
+		seen.add(addr)
+		unique.append(c)
+	return unique, ungeocoded_total
+
+
+def _parse_zone_cap(raw):
+	"""Dirty ``max_clients_per_zone`` → int (0 = auto / tight balance)."""
+	if raw is None:
+		return 0
+	if isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none"):
+		return 0
+	try:
+		return max(0, cint(raw))
+	except (TypeError, ValueError):
+		return 0
+
+
+def _plane_coords(coords):
+	"""(lat, lng) → local planar km (equirectangular) so squared distance ≈ real geometry."""
+	if not coords:
+		return []
+	lat0 = sum(p[0] for p in coords) / len(coords)
+	kx = 111.32 * math.cos(math.radians(lat0))
+	ky = 110.57
+	return [(p[1] * kx, p[0] * ky) for p in coords]
+
+
+def _sq_dist(a, b):
+	return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+
+def _cluster_centroids(pts, labels, k, fallback):
+	sums = [[0.0, 0.0, 0] for _ in range(k)]
+	for p, lab in zip(pts, labels):
+		sums[lab][0] += p[0]
+		sums[lab][1] += p[1]
+		sums[lab][2] += 1
+	return [
+		(sx / cnt, sy / cnt) if cnt else fallback[ci] for ci, (sx, sy, cnt) in enumerate(sums)
+	]
+
+
+def _capacity_assign(pts, cents, cap):
+	"""Assign every point to its nearest centroid with room left (highest regret first)."""
+	k = len(cents)
+	dist = [[_sq_dist(p, c) for c in cents] for p in pts]
+	prefs = [sorted(range(k), key=lambda c, row=row: row[c]) for row in dist]
+	order = sorted(
+		range(len(pts)),
+		key=lambda i: -(dist[i][prefs[i][1]] - dist[i][prefs[i][0]]) if k > 1 else 0,
+	)
+	size = [0] * k
+	labels = [0] * len(pts)
+	for i in order:
+		for ci in prefs[i]:
+			if size[ci] < cap:
+				labels[i] = ci
+				size[ci] += 1
+				break
+	return labels, dist
+
+
+def _swap_improve(labels, dist, k, cap, passes=4):
+	"""Local search that keeps every cluster ≤ cap: moves into spare room + pairwise swaps."""
+	n = len(labels)
+	size = [0] * k
+	for lab in labels:
+		size[lab] += 1
+	for _ in range(passes):
+		improved = False
+		for i in range(n):
+			a = labels[i]
+			best = a
+			for b in range(k):
+				if b != a and size[b] < cap and dist[i][b] < dist[i][best]:
+					best = b
+			if best != a:
+				labels[i] = best
+				size[a] -= 1
+				size[best] += 1
+				improved = True
+		for a in range(k):
+			for b in range(a + 1, k):
+				a_to_b = sorted(
+					(
+						(dist[i][a] - dist[i][b], i)
+						for i in range(n)
+						if labels[i] == a and dist[i][b] < dist[i][a]
+					),
+					reverse=True,
+				)
+				if not a_to_b:
+					continue
+				b_to_a = sorted(
+					(
+						(dist[j][b] - dist[j][a], j)
+						for j in range(n)
+						if labels[j] == b and dist[j][a] < dist[j][b]
+					),
+					reverse=True,
+				)
+				for (_ga, i), (_gb, j) in zip(a_to_b, b_to_a):
+					labels[i] = b
+					labels[j] = a
+					improved = True
+		if not improved:
+			break
+	return labels
+
+
+def _balanced_partition(pts, k, cap=0, iters=20):
+	"""Capacity-constrained k-means on planar points.
+
+	Every cluster ends with ≤ ``cap`` members (cap is raised to ceil(n/k) so it is
+	always feasible), which keeps headcounts even while clusters stay compact.
+	Deterministic: farthest-point seeding, no randomness.
+	"""
+	n = len(pts)
+	if n == 0:
+		return []
+	k = max(1, min(cint(k) or 1, n))
+	if k == 1:
+		return [0] * n
+	cap = max(cint(cap) or 0, int(math.ceil(n / float(k))))
+
+	mean = (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
+	first = max(range(n), key=lambda i: _sq_dist(pts[i], mean))
+	cents = [pts[first]]
+	mind = [_sq_dist(p, cents[0]) for p in pts]
+	while len(cents) < k:
+		nxt = max(range(n), key=lambda j: mind[j])
+		cents.append(pts[nxt])
+		for j in range(n):
+			d = _sq_dist(pts[j], pts[nxt])
+			if d < mind[j]:
+				mind[j] = d
+
+	labels = None
+	for _ in range(iters):
+		new_labels, dist = _capacity_assign(pts, cents, cap)
+		new_labels = _swap_improve(new_labels, dist, k, cap)
+		cents = _cluster_centroids(pts, new_labels, k, cents)
+		if new_labels == labels:
+			break
+		labels = new_labels
+	return labels
+
+
+def _match_by_overlap(members_keys, available_keys):
+	"""Greedy max-overlap match cluster → previous key (keeps codes / days stable).
+
+	``members_keys``: per cluster, list of previous keys of its members.
+	Returns {cluster_index: key} for matched clusters only.
+	"""
+	avail = set(k for k in available_keys if k)
+	pairs = []
+	for ci, keys in enumerate(members_keys):
+		counts = {}
+		for key in keys:
+			if key in avail:
+				counts[key] = counts.get(key, 0) + 1
+		for key, cnt in counts.items():
+			pairs.append((cnt, ci, key))
+	pairs.sort(key=lambda x: (-x[0], x[1], x[2]))
+	out = {}
+	used = set()
+	for _cnt, ci, key in pairs:
+		if ci in out or key in used:
+			continue
+		out[ci] = key
+		used.add(key)
+	return out
+
+
+_TERRITORY_ZONE_RE = None
+
+
+def _split_territory_zone_code(code):
+	"""'T3-WED' → ('T3', 'Wed'); anything else → (None, None)."""
+	import re
+
+	global _TERRITORY_ZONE_RE
+	if _TERRITORY_ZONE_RE is None:
+		_TERRITORY_ZONE_RE = re.compile(r"^(T\d+)-([A-Z]{3})$")
+	m = _TERRITORY_ZONE_RE.match(cstr(code or "").strip().upper())
+	if not m:
+		return None, None
+	day = m.group(2).title()
+	return m.group(1), (day if day in _WEEKDAY_ORDER else None)
+
+
+def _territory_color(ti, di=None, days=1):
+	"""Territory = hue (golden angle), day = lightness step — 30 zones stay readable."""
+	import colorsys
+
+	hue = ((ti * 137.508) + 230.0) % 360.0
+	if di is None:
+		light = 0.45
+	else:
+		light = 0.34 + (0.30 * di / float(max(1, days - 1)))
+	r, g, b = colorsys.hls_to_rgb(hue / 360.0, light, 0.62)
+	return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
+
+
+def _zone_member_stats(clients, zones):
+	"""Per delivery zone: members count + centroid (only zones that have members)."""
+	by_zone = {}
+	for c in clients:
+		key = cstr(c.get("zone") or "").strip().upper()
+		if key:
+			by_zone.setdefault(key, []).append(c)
+	stats = []
+	for z in zones:
+		if not isinstance(z, dict) or (z.get("type") or "delivery") != "delivery":
+			continue
+		code = cstr(z.get("code") or "").strip().upper()
+		if not code:
+			continue
+		members = by_zone.get(code) or by_zone.get(cstr(z.get("name") or "").strip().upper()) or []
+		if not members:
+			continue
+		stats.append(
+			{
+				"code": code,
+				"zone": z,
+				"count": len(members),
+				"lat": sum(flt(m["lat"]) for m in members) / len(members),
+				"lng": sum(flt(m["lng"]) for m in members) / len(members),
+			}
+		)
+	if not stats:
+		# Fresh site: zones exist but nobody tagged yet → BA sector centers.
+		for z in zones:
+			if not isinstance(z, dict) or (z.get("type") or "delivery") != "delivery":
+				continue
+			code = cstr(z.get("code") or "").strip().upper()
+			pocket = _ZONE_BA_CENTERS.get(code)
+			if pocket:
+				stats.append({"code": code, "zone": z, "count": 0, "lat": pocket[0], "lng": pocket[1]})
+	return stats
+
+
+def _incremental_cap(total_clients, zone_count, cap=0):
+	"""Soft cap for flow B: explicit cap, else ceil(N/zones) + 15% slack."""
+	if cap:
+		return cap
+	ideal = int(math.ceil(total_clients / float(max(1, zone_count))))
+	return ideal + max(1, int(math.ceil(ideal * 0.15)))
+
+
+def _pick_zone_for_point(lat, lng, stats, cap):
+	"""Nearest zone under cap; else nearest (overflow). Mutates chosen count."""
+	ranked = sorted(stats, key=lambda s: _haversine_km(lat, lng, s["lat"], s["lng"]))
+	for s in ranked:
+		if s["count"] < cap:
+			s["count"] += 1
+			return s, False
+	ranked[0]["count"] += 1
+	return ranked[0], True
+
+
+def _build_assign_missing_preview(clients, zones, cap_raw, warnings, ungeocoded_count, work_days):
+	"""only_missing_zone: incremental assign of unzoned clients into existing zones."""
+	missing = [c for c in clients if not cstr(c.get("zone") or "").strip()]
+	stats = _zone_member_stats(clients, zones)
+	base = {
+		"strategy": "territory_days",
+		"mode": "assign_missing",
+		"working_days": work_days,
+		"territories_k": 0,
+		"k": 0,
+		"clients_total": len(missing),
+		"moved_total": 0,
+		"territories": [],
+		"groups": [],
+		"stale_zones": [],
+		"ungeocoded_count": ungeocoded_count,
+		"only_missing_zone": True,
+	}
+	if not missing:
+		return {**base, "ideal_per_zone": 0, "max_clients_per_zone": 0, "warnings": warnings + ["no_missing"]}
+	if not stats:
+		return {**base, "ideal_per_zone": 0, "max_clients_per_zone": 0, "warnings": warnings + ["no_zones"]}
+
+	cap = _incremental_cap(len(clients), len(stats), cap_raw)
+	added = {}
+	overflow_any = False
+	for c in missing:
+		s, over = _pick_zone_for_point(flt(c["lat"]), flt(c["lng"]), stats, cap)
+		overflow_any = overflow_any or over
+		added.setdefault(s["code"], []).append(c)
+
+	groups = []
+	for s in stats:
+		rows = added.get(s["code"])
+		if not rows:
+			continue
+		z = s["zone"]
+		groups.append(
+			{
+				"code": s["code"],
+				"name": z.get("name") or s["code"],
+				"color": z.get("color"),
+				"type": "delivery",
+				"vehicles": list(z.get("vehicles") or []),
+				"visit_days": list(z.get("visit_days") or []),
+				"client_count": s["count"],
+				"added": len(rows),
+				"moved": len(rows),
+				"overflow": max(0, s["count"] - cap),
+				"centroid": {"lat": s["lat"], "lng": s["lng"]},
+				"sample_clients": [r.get("customer_name") or r.get("customer") for r in rows[:5]],
+				"clients": [
+					{
+						"address_name": r.get("address_name"),
+						"customer": r.get("customer"),
+						"customer_name": r.get("customer_name"),
+						"lat": flt(r.get("lat")),
+						"lng": flt(r.get("lng")),
+						"previous_zone": None,
+					}
+					for r in rows
+				],
+				"keep_zone": True,
+			}
+		)
+	return {
+		**base,
+		"k": len(groups),
+		"moved_total": len(missing),
+		"ideal_per_zone": int(math.ceil(len(clients) / float(len(stats)))),
+		"max_clients_per_zone": cap,
+		"groups": groups,
+		"warnings": warnings + (["soft_max_overflow"] if overflow_any else []),
+	}
+
+
+def _day_sector_labels(latlng, n_days):
+	"""Assign each (lat, lng) to a weekday sector as a contiguous arc on the city circle.
+
+	Sectors are equal-sized by client count (balanced), ordered clockwise starting from
+	**south** so Mon ≈ south, next day ≈ southwest/west, … around the map. Same-day
+	zones therefore sit next to each other geographically.
+	"""
+	n = len(latlng)
+	if n == 0:
+		return []
+	n_days = max(1, min(cint(n_days) or 1, n))
+	if n_days == 1:
+		return [0] * n
+	clat = sum(p[0] for p in latlng) / n
+	clng = sum(p[1] for p in latlng) / n
+	# atan2(Δlng, -Δlat): 0 = south, increasing toward west/east (clockwise from south).
+	indexed = []
+	for i, (lat, lng) in enumerate(latlng):
+		ang = math.atan2(lng - clng, -(lat - clat)) % (2 * math.pi)
+		indexed.append((ang, i))
+	indexed.sort(key=lambda x: x[0])
+	labels = [0] * n
+	base = n // n_days
+	rem = n % n_days
+	pos = 0
+	for d in range(n_days):
+		size = base + (1 if d < rem else 0)
+		for j in range(size):
+			labels[indexed[pos + j][1]] = d
+		pos += size
+	return labels
+
+
+def _build_rebalance_zones_preview(
+	k=None,
+	max_clients_per_zone=None,
+	working_days=None,
+	only_missing_zone=0,
+	driver_names=None,
+	vehicle_names=None,
+):
+	"""Day-sector × driver zones from the active client book.
+
+	1. Slice the city into contiguous weekday arcs (south → Mon, then clockwise)
+	   so all Monday zones sit near each other, Tuesday next door, etc.
+	2. Within each day arc, balanced-partition into ``k`` territories (drivers).
+	3. Emit ``T{i}-{DAY}`` zones with ``visit_days=[day]``.
+	"""
+	settings = _load_tms_settings()
+	work_days = _normalize_working_days(
+		working_days if working_days is not None else settings.get("auto_group_working_days")
+	)
+	work_days = sorted(work_days, key=lambda d: _WEEKDAY_ORDER.index(d) if d in _WEEKDAY_ORDER else 99)
+	drivers = _parse_json_list(driver_names, [])
+	vehicles_in = _parse_json_list(vehicle_names, [])
+	cap_raw = _parse_zone_cap(max_clients_per_zone)
+	warnings = []
+
+	clients, ungeocoded_count = _active_geocoded_client_rows(limit=5000, only_missing_zone=0)
+	if not drivers:
+		drivers = [
+			d.name
+			for d in frappe.get_all(
+				"Driver",
+				filters={"status": "Active"},
+				fields=["name"],
+				order_by="name asc",
+				ignore_permissions=True,
+			)
+		]
+	if not drivers:
+		warnings.append("no_drivers")
+	if ungeocoded_count:
+		warnings.append("ungeocoded_skipped")
+
+	existing_zones = _load_tms_zones().get("zones") or []
+	if _truthy_flag(only_missing_zone, False):
+		return _build_assign_missing_preview(
+			clients, existing_zones, cap_raw, warnings, ungeocoded_count, work_days
+		)
+
+	if not clients:
+		return {
+			"strategy": "day_sectors",
+			"mode": "rebalance",
+			"territories_k": 0,
+			"k": 0,
+			"working_days": work_days,
+			"ideal_per_zone": 0,
+			"max_clients_per_zone": cap_raw,
+			"clients_total": 0,
+			"moved_total": 0,
+			"territories": [],
+			"groups": [],
+			"stale_zones": [],
+			"ungeocoded_count": ungeocoded_count,
+			"warnings": warnings + ["no_geocoded"],
+			"only_missing_zone": False,
+		}
+
+	n = len(clients)
+	n_days = max(1, len(work_days))
+	t_eff = cint(k) if k not in (None, "", "null", "undefined") else (len(drivers) or 1)
+	t_eff = max(1, min(t_eff, n))
+	zones_total = t_eff * n_days
+	ideal = int(math.ceil(n / float(zones_total)))
+	if cap_raw and cap_raw < ideal:
+		warnings.append("cap_infeasible")
+
+	latlng = [(flt(c["lat"]), flt(c["lng"])) for c in clients]
+	pts = _plane_coords(latlng)
+	prev = [_split_territory_zone_code(c.get("zone")) for c in clients]
+
+	# Level 1 — city-wide weekday sectors (contiguous arcs, south-first).
+	# Sector i → work_days[i] always (no sticky day remap — that would scatter
+	# "Monday" around the map when legacy zones were north-heavy).
+	day_labels = _day_sector_labels(latlng, n_days)
+	day_members = [[] for _ in range(n_days)]
+	for i, dlab in enumerate(day_labels):
+		day_members[dlab].append(i)
+	day_match = {di: work_days[di] for di in range(n_days)}
+
+	existing_by_code = {
+		cstr(z.get("code") or "").strip().upper(): z for z in existing_zones if isinstance(z, dict)
+	}
+
+	# Collect per-(territory index, day) member lists; assign T-codes globally by sticky.
+	# day_territory_members[day_i][ti] = client indices
+	day_territory_members = []
+	for di in range(n_days):
+		members = day_members[di]
+		if not members:
+			day_territory_members.append([[] for _ in range(t_eff)])
+			continue
+		sub_pts = [pts[i] for i in members]
+		# Cap per day-zone; soft.
+		t_labels = _balanced_partition(sub_pts, min(t_eff, len(members)), cap=cap_raw or 0)
+		buckets = [[] for _ in range(t_eff)]
+		for local, lab in enumerate(t_labels):
+			buckets[lab].append(members[local])
+		day_territory_members.append(buckets)
+
+	# Territory codes: sticky from previous T* on any day, then T1..Tk.
+	flat_prev_t = []
+	for ti in range(t_eff):
+		keys = []
+		for di in range(n_days):
+			for i in day_territory_members[di][ti]:
+				if prev[i][0]:
+					keys.append(prev[i][0])
+		flat_prev_t.append(keys)
+	t_prev_keys = sorted(
+		{p[0] for p in prev if p[0]},
+		key=lambda x: cint(x[1:]) if x and x[1:].isdigit() else 99,
+	)
+	t_match = _match_by_overlap(flat_prev_t, t_prev_keys)
+	used_codes = set(t_match.values())
+	next_no = 1
+	t_codes = []
+	for ti in range(t_eff):
+		code = t_match.get(ti)
+		if not code:
+			while f"T{next_no}" in used_codes:
+				next_no += 1
+			code = f"T{next_no}"
+			used_codes.add(code)
+		t_codes.append(code)
+	t_order = sorted(range(t_eff), key=lambda ti: cint(t_codes[ti][1:]))
+
+	# Vehicles per territory from existing zones / input list.
+	t_vehicles_by_code = {}
+	for z in existing_zones:
+		if not isinstance(z, dict):
+			continue
+		zt, _zd = _split_territory_zone_code(z.get("code"))
+		if zt and z.get("vehicles") and zt not in t_vehicles_by_code:
+			t_vehicles_by_code[zt] = list(z.get("vehicles"))
+
+	groups = []
+	territories_map = {
+		t_codes[ti]: {
+			"code": t_codes[ti],
+			"name": t_codes[ti],
+			"color": _territory_color(cint(t_codes[ti][1:]) - 1),
+			"driver": None,
+			"vehicles": t_vehicles_by_code.get(t_codes[ti])
+			or (
+				[vehicles_in[pos]]
+				if pos < len(vehicles_in) and vehicles_in[pos]
+				else []
+			),
+			"client_count": 0,
+			"centroid_lat_sum": 0.0,
+			"centroid_lng_sum": 0.0,
+			"zones": [],
+		}
+		for pos, ti in enumerate(t_order)
+	}
+	# Bind drivers in T1.. order.
+	for pos, ti in enumerate(t_order):
+		territories_map[t_codes[ti]]["driver"] = drivers[pos] if pos < len(drivers) else None
+		if not territories_map[t_codes[ti]]["vehicles"] and pos < len(vehicles_in) and vehicles_in[pos]:
+			territories_map[t_codes[ti]]["vehicles"] = [vehicles_in[pos]]
+
+	moved_total = 0
+	overflow_any = False
+	# Emit groups day-by-day so same-day zones stay adjacent in the UI list too.
+	for di in range(n_days):
+		day = day_match[di]
+		day_idx = work_days.index(day) if day in work_days else di
+		for pos, ti in enumerate(t_order):
+			m = day_territory_members[di][ti]
+			if not m:
+				continue
+			t_code = t_codes[ti]
+			t_no = cint(t_code[1:])
+			code = f"{t_code}-{day.upper()}"
+			rows = []
+			sample = []
+			moved = 0
+			for i in m:
+				c = clients[i]
+				prev_zone = cstr(c.get("zone") or "").strip().upper() or None
+				if prev_zone != code:
+					moved += 1
+				cname = c.get("customer_name") or c.get("customer") or ""
+				if cname and cname not in sample and len(sample) < 5:
+					sample.append(cname)
+				rows.append(
+					{
+						"address_name": c.get("address_name"),
+						"customer": c.get("customer"),
+						"customer_name": c.get("customer_name"),
+						"lat": latlng[i][0],
+						"lng": latlng[i][1],
+						"previous_zone": prev_zone,
+					}
+				)
+			moved_total += moved
+			count = len(m)
+			overflow = max(0, count - cap_raw) if cap_raw else 0
+			overflow_any = overflow_any or bool(overflow)
+			clat = sum(latlng[i][0] for i in m) / count
+			clng = sum(latlng[i][1] for i in m) / count
+			t_entry = territories_map[t_code]
+			t_entry["client_count"] += count
+			t_entry["centroid_lat_sum"] += clat * count
+			t_entry["centroid_lng_sum"] += clng * count
+			t_entry["zones"].append(code)
+			groups.append(
+				{
+					"code": code,
+					"name": f"{t_code} · {_WEEKDAY_SHORT.get(day, day)}",
+					"color": _territory_color(t_no - 1, day_idx, n_days),
+					"type": "delivery",
+					"territory": t_code,
+					"day": day,
+					"driver": t_entry["driver"],
+					"vehicles": list(
+						(existing_by_code.get(code) or {}).get("vehicles") or t_entry["vehicles"]
+					),
+					"visit_days": [day],
+					"client_count": count,
+					"ideal_per_zone": ideal,
+					"max_clients_per_zone": cap_raw or ideal,
+					"overflow": overflow,
+					"under": max(0, ideal - count),
+					"moved": moved,
+					"centroid": {"lat": clat, "lng": clng},
+					"sample_clients": sample,
+					"clients": rows,
+					"notes": "rebalance-clients",
+				}
+			)
+
+	territories = []
+	for pos, ti in enumerate(t_order):
+		t_code = t_codes[ti]
+		e = territories_map[t_code]
+		cc = e["client_count"] or 1
+		territories.append(
+			{
+				"code": t_code,
+				"name": t_code,
+				"color": e["color"],
+				"driver": e["driver"],
+				"vehicles": e["vehicles"],
+				"client_count": e["client_count"],
+				"centroid": {
+					"lat": e["centroid_lat_sum"] / cc,
+					"lng": e["centroid_lng_sum"] / cc,
+				},
+				"zones": e["zones"],
+			}
+		)
+
+	if overflow_any:
+		warnings.append("soft_max_overflow")
+	new_codes = {g["code"] for g in groups}
+	stale = [
+		{"code": cstr(z.get("code") or "").strip().upper(), "name": z.get("name")}
+		for z in existing_zones
+		if isinstance(z, dict)
+		and (z.get("type") or "delivery") == "delivery"
+		and cstr(z.get("code") or "").strip().upper() not in new_codes
+	]
+
+	return {
+		"strategy": "day_sectors",
+		"mode": "rebalance",
+		"territories_k": len(territories),
+		"k": len(groups),
+		"working_days": work_days,
+		"ideal_per_zone": ideal,
+		"max_clients_per_zone": cap_raw or ideal,
+		"clients_total": n,
+		"moved_total": moved_total,
+		"territories": territories,
+		"groups": groups,
+		"stale_zones": stale,
+		"ungeocoded_count": ungeocoded_count,
+		"warnings": warnings,
+		"only_missing_zone": False,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def preview_rebalance_zones(
+	k=None,
+	max_clients_per_zone=None,
+	working_days=None,
+	only_missing_zone=0,
+	driver_names=None,
+	vehicle_names=None,
+):
+	"""Preview day-sector × driver zones from the active client book.
+
+	Working days are contiguous geographic arcs (south → Mon, then clockwise),
+	then each arc is split into ``k`` territories (defaults to active drivers).
+	``only_missing_zone=1`` instead assigns unzoned clients into existing zones.
+	Does not write DB.
+	"""
+	return _build_rebalance_zones_preview(
+		k=k,
+		max_clients_per_zone=max_clients_per_zone,
+		working_days=working_days,
+		only_missing_zone=only_missing_zone,
+		driver_names=driver_names,
+		vehicle_names=vehicle_names,
+	)
+
+
+@frappe.whitelist(allow_guest=True)
+def commit_rebalance_zones(preview=None, refresh_pending_dues=0, remove_stale_zones=0):
+	"""Apply client-book rebalance: upsert zones + Address.custom_zone.
+
+	``remove_stale_zones=1`` drops delivery zones listed in ``preview.stale_zones``
+	that no client points to after the commit. Forced delivery dates (i043) are
+	never touched; ``refresh_pending_dues`` is reserved / no-op in v1.
+	"""
+	if isinstance(preview, str):
+		s = preview.strip()
+		if not s or s.lower() in ("null", "undefined", "none"):
+			preview = None
+		else:
+			try:
+				preview = frappe.parse_json(s)
+			except Exception:
+				preview = None
+	if not isinstance(preview, dict):
+		frappe.throw(_("Preview payload is required."))
+
+	groups = preview.get("groups")
+	if not isinstance(groups, list) or not groups:
+		frappe.throw(_("Preview has no groups to commit."))
+
+	if not frappe.db.has_column("Address", "custom_zone"):
+		frappe.throw(_("Address.custom_zone is not available on this site."))
+
+	zones_written = []
+	addresses_updated = 0
+	errors = []
+	is_rebalance = preview.get("mode") != "assign_missing"
+
+	if is_rebalance and preview.get("working_days"):
+		_persist_tms_settings(
+			{"auto_group_working_days": preview.get("working_days")},
+			commit=False,
+		)
+
+	zones = list((_load_tms_zones().get("zones") or []))
+
+	for g in groups:
+		if not isinstance(g, dict):
+			continue
+		zone_code = cstr(g.get("code") or "").strip().upper()
+		if not zone_code:
+			continue
+		if not g.get("keep_zone"):
+			zone_payload = {
+				"code": zone_code,
+				"name": g.get("name"),
+				"color": g.get("color"),
+				"type": g.get("type") or "delivery",
+				"visit_days": g.get("visit_days") or [],
+				"vehicles": g.get("vehicles") or [],
+				"driver": g.get("driver"),
+				"notes": g.get("notes") or "rebalance-clients",
+			}
+			try:
+				_upsert_zone_into_list(zones, zone_payload)
+				zones_written.append(zone_code)
+			except Exception as exc:
+				errors.append({"zone": zone_code, "error": str(exc)})
+				continue
+		elif zone_code not in {cstr(z.get("code") or "").upper() for z in zones}:
+			errors.append({"zone": zone_code, "error": "zone no longer exists"})
+			continue
+
+		for c in g.get("clients") or []:
+			if not isinstance(c, dict):
+				continue
+			addr = cstr(c.get("address_name") or "").strip()
+			if not addr or not frappe.db.exists("Address", addr):
+				continue
+			try:
+				frappe.db.set_value("Address", addr, "custom_zone", zone_code, update_modified=True)
+				addresses_updated += 1
+			except Exception as exc:
+				errors.append({"address": addr, "error": str(exc)})
+
+	zones_removed = []
+	if is_rebalance and _truthy_flag(remove_stale_zones, False):
+		stale_codes = {
+			cstr(s.get("code") if isinstance(s, dict) else s).strip().upper()
+			for s in (preview.get("stale_zones") or [])
+		}
+		stale_codes.discard("")
+		if stale_codes:
+			still_used = {
+				cstr(r[0] or "").strip().upper()
+				for r in frappe.db.sql(
+					"SELECT DISTINCT custom_zone FROM `tabAddress` WHERE IFNULL(custom_zone, '') != ''"
+				)
+			}
+			keep = []
+			for z in zones:
+				code = cstr(z.get("code") or "").strip().upper()
+				name = cstr(z.get("name") or "").strip().upper()
+				if code in stale_codes and code not in still_used and name not in still_used:
+					zones_removed.append(code)
+				else:
+					keep.append(z)
+			zones = keep
+
+	_save_tms_zones(zones, commit=False)
+	frappe.db.commit()
+	return {
+		"ok": not bool(errors),
+		"zones_written": zones_written,
+		"zones_removed": zones_removed,
+		"addresses_updated": addresses_updated,
+		"errors": errors,
+		"zones": zones,
+	}
+
+
+def _assign_zone_to_address(addr_name, max_clients_per_zone=None):
+	"""Flow B core: nearest under-cap zone for one geocoded address. Returns dict or throws."""
+	if not frappe.db.has_column("Address", "custom_latitude"):
+		frappe.throw(_("Address geocode fields are not available."))
+	lat = flt(frappe.db.get_value("Address", addr_name, "custom_latitude"))
+	lng = flt(frappe.db.get_value("Address", addr_name, "custom_longitude"))
+	if not lat or not lng:
+		frappe.throw(_("Address must be geocoded before zone assign."))
+
+	zones = _load_tms_zones().get("zones") or []
+	clients, _unused = _active_geocoded_client_rows(limit=5000, only_missing_zone=0)
+	# Exclude this address so re-assign doesn't count itself.
+	clients = [c for c in clients if c.get("address_name") != addr_name]
+	stats = _zone_member_stats(clients, zones)
+	if not stats:
+		frappe.throw(_("No delivery zones defined — run Rebalance first."))
+
+	cap = _incremental_cap(len(clients) + 1, len(stats), _parse_zone_cap(max_clients_per_zone))
+	chosen, overflow = _pick_zone_for_point(lat, lng, stats, cap)
+	frappe.db.set_value("Address", addr_name, "custom_zone", chosen["code"], update_modified=True)
+	return {
+		"address": addr_name,
+		"zone": chosen["code"],
+		"visit_days": list(chosen["zone"].get("visit_days") or []),
+		"overflow": overflow,
+		"max_clients_per_zone": cap,
+		"zone_client_count": chosen["count"],
+	}
+
+
+def _auto_assign_zone_if_missing(addr_name):
+	"""Best-effort flow B hook (geocode / CSV import). Never raises."""
+	try:
+		if not addr_name or not frappe.db.has_column("Address", "custom_zone"):
+			return None
+		if cstr(frappe.db.get_value("Address", addr_name, "custom_zone") or "").strip():
+			return None
+		return _assign_zone_to_address(addr_name)
+	except Exception:
+		return None
+
+
+@frappe.whitelist(allow_guest=True)
+def assign_zone_for_client(customer=None, address=None, max_clients_per_zone=None):
+	"""Incremental assign (flow B): nearest under-cap zone for a new geocoded client."""
+	addr_name = cstr(address or "").strip()
+	cust = cstr(customer or "").strip()
+	if addr_name.lower() in ("null", "undefined", "none"):
+		addr_name = ""
+	if cust.lower() in ("null", "undefined", "none"):
+		cust = ""
+	if not addr_name and cust:
+		rows = frappe.db.sql(
+			"""
+			SELECT addr.name
+			FROM `tabAddress` addr
+			INNER JOIN `tabDynamic Link` dl
+				ON dl.parent = addr.name AND dl.parenttype = 'Address'
+			WHERE dl.link_doctype = 'Customer' AND dl.link_name = %(c)s
+				AND IFNULL(addr.disabled, 0) = 0
+			ORDER BY IFNULL(addr.is_shipping_address, 0) DESC, addr.modified DESC
+			LIMIT 1
+			""",
+			{"c": cust},
+			as_dict=True,
+		)
+		addr_name = rows[0].name if rows else ""
+	if not addr_name or not frappe.db.exists("Address", addr_name):
+		frappe.throw(_("Address is required."))
+
+	out = _assign_zone_to_address(addr_name, max_clients_per_zone)
+	frappe.db.commit()
+	return out
+
+
+# ---------------------------------------------------------------------------
+# i045 — Fast-deliver greedy packing (due dates under soft caps)
+# ---------------------------------------------------------------------------
+
+
+def _packing_strategy(settings=None):
+	settings = settings or _load_tms_settings()
+	s = cstr(settings.get("packing_strategy") or "client_zone").strip().lower()
+	if s not in ("client_zone", "fast_deliver_greedy"):
+		return "client_zone"
+	return s
+
+
+def _drive_minutes(lat1, lng1, lat2, lng2, avg_speed_kmh, drive_buffer=0):
+	speed = flt(avg_speed_kmh) or 25.0
+	if speed <= 0:
+		speed = 25.0
+	km = _haversine_km(flt(lat1), flt(lng1), flt(lat2), flt(lng2))
+	return (km / speed) * 60.0 + max(0.0, flt(drive_buffer))
+
+
+def _stop_geo_key(stop):
+	"""Collapse same physical address for time (Q3)."""
+	addr = cstr(stop.get("address_name") or "").strip()
+	if addr:
+		return f"a:{addr}"
+	try:
+		lat = flt(stop.get("lat"))
+		lng = flt(stop.get("lng"))
+	except Exception:
+		return None
+	if not lat or not lng:
+		return None
+	return f"g:{round(lat, 5)}:{round(lng, 5)}"
+
+
+def _unique_stop_points(stops):
+	"""One lat/lng per unique address key (order of first appearance)."""
+	seen = set()
+	pts = []
+	for s in stops or []:
+		key = _stop_geo_key(s)
+		if not key or key in seen:
+			continue
+		try:
+			lat = flt(s.get("lat"))
+			lng = flt(s.get("lng"))
+		except Exception:
+			continue
+		if not lat or not lng:
+			continue
+		seen.add(key)
+		pts.append({"lat": lat, "lng": lng, "key": key})
+	return pts
+
+
+def _route_minutes(stops, depot, stop_minutes, avg_speed_kmh, drive_buffer=0):
+	"""NN tour minutes: unique addresses × dwell + drive(+buffer) per leg (Q3, Q14)."""
+	dwell = flt(stop_minutes) or 15.0
+	pts = _unique_stop_points(stops)
+	if not pts:
+		return 0.0
+	total = dwell * len(pts)
+	cur = {"lat": flt(depot.get("lat")), "lng": flt(depot.get("lng"))}
+	remaining = list(pts)
+	while remaining:
+		best_i = 0
+		best_d = None
+		for i, p in enumerate(remaining):
+			d = _drive_minutes(cur["lat"], cur["lng"], p["lat"], p["lng"], avg_speed_kmh, drive_buffer)
+			if best_d is None or d < best_d:
+				best_d = d
+				best_i = i
+		total += best_d or 0.0
+		cur = remaining.pop(best_i)
+	return total
+
+
+def _order_count(stops):
+	"""Remito count (not unique addresses) — Q3."""
+	return len(stops or [])
+
+
+def _fits_soft_cap(stops, depot, max_orders, max_minutes, stop_minutes, avg_speed, drive_buffer=0):
+	cnt = _order_count(stops)
+	if cnt > max_orders:
+		return False, cnt, _route_minutes(stops, depot, stop_minutes, avg_speed, drive_buffer)
+	mins = _route_minutes(stops, depot, stop_minutes, avg_speed, drive_buffer)
+	ok = cnt <= max_orders and mins <= max_minutes
+	return ok, cnt, mins
+
+
+def _limiting_resource(order_count, max_orders, minutes, max_minutes):
+	"""Which soft cap is closer to binding (Q15)."""
+	ord_ratio = (flt(order_count) / flt(max_orders)) if max_orders else 0
+	min_ratio = (flt(minutes) / flt(max_minutes)) if max_minutes else 0
+	if min_ratio >= ord_ratio:
+		return "time"
+	return "orders"
+
+
+def _weekday_label_for_date(d):
+	d = getdate(d)
+	return _WEEKDAY_ORDER[d.weekday()]
+
+
+def _parse_receive_days(raw):
+	"""Normalize receive_days list; empty = any working day (Q4)."""
+	if raw is None:
+		return []
+	if isinstance(raw, str):
+		s = raw.strip()
+		if not s or s.lower() in ("null", "undefined", "none"):
+			return []
+		try:
+			raw = frappe.parse_json(s)
+		except Exception:
+			raw = [x.strip() for x in s.split(",") if x.strip()]
+	if not isinstance(raw, (list, tuple, set)):
+		return []
+	out = []
+	for d in raw:
+		label = cstr(d or "").strip()
+		if not label:
+			continue
+		# Accept Mon / Mon(1 Man)
+		base = label.split("(", 1)[0].strip().title()[:3]
+		aliases = {
+			"Mon": "Mon",
+			"Tue": "Tue",
+			"Wed": "Wed",
+			"Thu": "Thu",
+			"Fri": "Fri",
+			"Sat": "Sat",
+			"Sun": "Sun",
+			"Lun": "Mon",
+			"Mar": "Tue",
+			"Mie": "Wed",
+			"Mié": "Wed",
+			"Jue": "Thu",
+			"Vie": "Fri",
+			"Sab": "Sat",
+			"Sáb": "Sat",
+			"Dom": "Sun",
+		}
+		canon = aliases.get(base) or aliases.get(label[:3].title())
+		if canon and canon not in out:
+			out.append(canon)
+	return out
+
+
+def _allowed_day_strs(day_strs, receive_days, work_days=None):
+	"""Filter calendar days by receive ∩ working (Q4). Empty receive = all work days."""
+	recv = set(_parse_receive_days(receive_days))
+	work = set(work_days) if work_days else None
+	out = []
+	for ds in day_strs or []:
+		label = _weekday_label_for_date(ds)
+		if work is not None and label not in work:
+			continue
+		if recv and label not in recv:
+			continue
+		out.append(str(ds))
+	return out
+
+
+def _should_soft_lock(due_date, as_of, lead_days, overdue=False):
+	"""True → do not move (Q10). Overdue always unlocked."""
+	if overdue:
+		return False
+	due = cstr(due_date or "").strip()
+	if not due:
+		return False
+	from frappe.utils import add_days
+
+	as_of_d = getdate(as_of)
+	try:
+		due_d = getdate(due)
+	except Exception:
+		return False
+	lock_until = add_days(as_of_d, max(0, cint(lead_days)))
+	return as_of_d <= due_d <= lock_until
+
+
+def _greedy_priority_tuple(r, as_of=None):
+	"""Sort key: overdue → single receive day → older due → name (Q13 priority ladder)."""
+	recv = _parse_receive_days(r.get("receive_days"))
+	single = 0 if len(recv) == 1 else 1
+	due = cstr(r.get("due_date") or "") or "9999-99-99"
+	return (
+		0 if r.get("overdue") else 1,
+		single,
+		due,
+		cstr(r.get("delivery_note") or ""),
+	)
+
+
+def _territory_id_from_zone(zone_code):
+	"""'T3-WED' → 'T3'; else zone code."""
+	code = cstr(zone_code or "").strip().upper()
+	t, _day = _split_territory_zone_code(code)
+	return t or code or None
+
+
+def _drivers_nearby_for_stop(stop, drivers, driver_centroids, preferred=None, max_km=8):
+	"""Preferred first, then drivers within max_km of stop (or same territory), else [] (Q7)."""
+	cands = []
+	pref = cstr(preferred or "").strip() or None
+	if pref and pref in drivers:
+		cands.append(pref)
+	try:
+		lat = flt(stop.get("lat"))
+		lng = flt(stop.get("lng"))
+	except Exception:
+		lat = lng = 0
+	stop_terr = _territory_id_from_zone(stop.get("zone"))
+	scored = []
+	for drv in drivers:
+		if drv == pref or drv == "__unassigned__":
+			continue
+		cent = (driver_centroids or {}).get(drv)
+		if not cent:
+			continue
+		same_terr = False
+		if stop_terr and cent.get("territory") and cent["territory"] == stop_terr:
+			same_terr = True
+		dist = None
+		if lat and lng and cent.get("lat") and cent.get("lng"):
+			dist = _haversine_km(lat, lng, cent["lat"], cent["lng"])
+		if same_terr or (dist is not None and dist <= flt(max_km)):
+			scored.append((dist if dist is not None else 999, drv))
+	scored.sort(key=lambda x: x[0])
+	for _d, drv in scored:
+		if drv not in cands:
+			cands.append(drv)
+	return cands
+
+
+def _depot_from_warehouse_pin(warehouse=None):
+	"""Prefer the map warehouse pin (user-dragged depot) over Address geocode."""
+	_by_veh, default_pin = _warehouse_pins_index()
+	wh = cstr(warehouse or "").strip()
+	if wh:
+		for p in (_load_tms_map_store().get("pins") or []):
+			if not isinstance(p, dict) or cstr(p.get("kind") or "") != "warehouse":
+				continue
+			ref = cstr(p.get("ref_name") or "").strip()
+			if ref == wh and (p.get("lat") is not None or p.get("lng") is not None):
+				return {"lat": flt(p.get("lat")), "lng": flt(p.get("lng"))}
+	if default_pin and (default_pin.get("lat") is not None or default_pin.get("lng") is not None):
+		return {"lat": flt(default_pin.get("lat")), "lng": flt(default_pin.get("lng"))}
+	return None
+
+
+def _default_depot_latlng(company=None):
+	"""Map warehouse pin → warehouse Address → BA center.
+
+	TSP / fleet sketches must start at the same pin the map shows as the depot.
+	"""
+	wh = None
+	try:
+		if company and frappe.db.has_column("Company", "custom_default_warehouse"):
+			wh = frappe.db.get_value("Company", company, "custom_default_warehouse")
+	except Exception:
+		wh = None
+	if not wh:
+		rows = frappe.get_all(
+			"Warehouse",
+			filters={"disabled": 0},
+			fields=["name"],
+			limit=1,
+			ignore_permissions=True,
+		)
+		wh = rows[0].name if rows else None
+
+	pin_geo = _depot_from_warehouse_pin(wh)
+	if pin_geo:
+		return pin_geo
+
+	if wh and frappe.db.exists("Warehouse", wh):
+		addr = None
+		links = frappe.get_all(
+			"Dynamic Link",
+			filters={"link_doctype": "Warehouse", "link_name": wh, "parenttype": "Address"},
+			fields=["parent"],
+			limit=1,
+			ignore_permissions=True,
+		)
+		addr = links[0].parent if links else None
+		if addr and frappe.db.has_column("Address", "custom_latitude"):
+			lat = flt(frappe.db.get_value("Address", addr, "custom_latitude"))
+			lng = flt(frappe.db.get_value("Address", addr, "custom_longitude"))
+			if lat and lng:
+				return {"lat": lat, "lng": lng}
+	return {"lat": -34.6037, "lng": -58.3816}
+
+
+def _so_delivery_forced(so_name):
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return False
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _delivery_date_forced_from_tags
+
+		return bool(_delivery_date_forced_from_tags(so_name))
+	except Exception:
+		return False
+
+
+def _zone_driver_map(zones=None):
+	zones = zones if zones is not None else (_load_tms_zones().get("zones") or [])
+	out = {}
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		code = cstr(z.get("code") or "").strip().upper()
+		name = cstr(z.get("name") or "").strip().upper()
+		driver = cstr(z.get("driver") or "").strip() or None
+		if code:
+			out[code] = driver
+		if name:
+			out[name] = driver
+	return out
+
+
+def _zone_centroids_by_driver(zones=None):
+	"""Approx driver home territory centroid from zone member codes (for nearby)."""
+	zones = zones if zones is not None else (_load_tms_zones().get("zones") or [])
+	# Use BA pocket centers keyed by territory / code
+	by_drv = {}
+	for z in zones:
+		if not isinstance(z, dict):
+			continue
+		drv = cstr(z.get("driver") or "").strip()
+		if not drv:
+			continue
+		code = cstr(z.get("code") or "").strip().upper()
+		terr = _territory_id_from_zone(code)
+		# Prefer stored lat/lng on zone if any; else BA pocket
+		lat = flt(z.get("lat")) if z.get("lat") not in (None, "") else None
+		lng = flt(z.get("lng")) if z.get("lng") not in (None, "") else None
+		if not lat or not lng:
+			pocket = _ZONE_BA_CENTERS.get(code) or _ZONE_BA_CENTERS.get(terr or "")
+			if pocket:
+				lat, lng = pocket
+			else:
+				# Hash spread
+				idx = abs(hash(code or drv)) % len(_ZONE_BA_CENTERS)
+				lat, lng = list(_ZONE_BA_CENTERS.values())[idx]
+		prev = by_drv.get(drv)
+		if not prev:
+			by_drv[drv] = {"lat": lat, "lng": lng, "territory": terr, "n": 1}
+		else:
+			n = prev["n"] + 1
+			by_drv[drv] = {
+				"lat": (prev["lat"] * prev["n"] + lat) / n,
+				"lng": (prev["lng"] * prev["n"] + lng) / n,
+				"territory": prev.get("territory") or terr,
+				"n": n,
+			}
+	return by_drv
+
+
+def _working_day_dates(as_of, work_days, horizon_days, lead_days):
+	from frappe.utils import add_days
+
+	as_of = getdate(as_of)
+	earliest = add_days(as_of, max(0, cint(lead_days)))
+	wanted = set(work_days or ["Mon", "Tue", "Wed", "Thu", "Fri"])
+	out = []
+	for i in range(0, max(1, cint(horizon_days)) * 2 + 14):
+		d = add_days(earliest, i)
+		label = _WEEKDAY_ORDER[d.weekday()]
+		if label in wanted:
+			out.append(d)
+		if len(out) >= max(1, cint(horizon_days)):
+			break
+	return out
+
+
+def _load_active_trip_capacity_stops(as_of, horizon_days, drivers):
+	"""Stops on Draft/In Transit trips in horizon — capacity only, not movable (Q1/Q12)."""
+	from frappe.utils import add_days
+
+	as_of_d = getdate(as_of)
+	end = add_days(as_of_d, max(1, cint(horizon_days)))
+	start = add_days(as_of_d, -1)
+	trips = frappe.get_all(
+		"Delivery Trip",
+		filters={
+			"docstatus": ["<", 2],
+			"status": ["in", ["Draft", "Scheduled", "In Transit"]],
+			"departure_time": ["between", [f"{start} 00:00:00", f"{end} 23:59:59"]],
+		},
+		fields=["name", "driver", "departure_time", "status"],
+		ignore_permissions=True,
+	)
+	if drivers:
+		allow = set(drivers)
+		trips = [t for t in trips if cstr(t.driver or "") in allow]
+	if not trips:
+		return []
+	trip_day = {}
+	for t in trips:
+		drv = cstr(t.driver or "").strip()
+		if not drv:
+			continue
+		day = str(getdate(t.departure_time)) if t.departure_time else None
+		if not day:
+			continue
+		trip_day[t.name] = (day, drv)
+	names = list(trip_day.keys())
+	raw = frappe.get_all(
+		"Delivery Stop",
+		filters={"parent": ["in", names]},
+		fields=["parent", "lat", "lng", "address", "delivery_note", "customer"],
+		ignore_permissions=True,
+	)
+	out = []
+	for s in raw:
+		meta = trip_day.get(s.parent)
+		if not meta:
+			continue
+		day, drv = meta
+		out.append(
+			{
+				"delivery_note": s.delivery_note,
+				"address_name": s.address,
+				"lat": flt(s.lat) if s.lat else None,
+				"lng": flt(s.lng) if s.lng else None,
+				"due_date": day,
+				"preferred_driver": drv,
+				"on_active_trip": True,
+				"forced": True,  # capacity seed only
+			}
+		)
+	return out
+
+
+def _address_receive_days_map(address_names):
+	out = {}
+	names = [a for a in (address_names or []) if a]
+	if not names:
+		return out
+	if not frappe.db.has_column("Address", "custom_receive_days"):
+		return out
+	for row in frappe.get_all(
+		"Address",
+		filters={"name": ["in", names]},
+		fields=["name", "custom_receive_days"],
+		ignore_permissions=True,
+	):
+		out[row.name] = _parse_receive_days(row.custom_receive_days)
+	return out
+
+
+def _pack_remitos_core(
+	movable,
+	fixed,
+	trip_capacity,
+	drivers,
+	day_strs,
+	depot,
+	*,
+	max_orders,
+	max_minutes,
+	stop_minutes,
+	avg_speed,
+	drive_buffer,
+	work_days,
+	as_of,
+	lead_days,
+	driver_centroids=None,
+	nearby_km=8,
+	zone_fallback_fn=None,
+	prefer_sticky=True,
+):
+	"""Pure packer (i045 decisions). Returns assignments, overflow, fills, locked.
+
+	``movable`` / ``fixed`` / ``trip_capacity`` are stop dicts.
+	``prefer_sticky`` (Q13): when True, try previous due first if it still fits.
+	"""
+	drivers = list(drivers) or ["__unassigned__"]
+	driver_centroids = driver_centroids or {}
+	buckets = {}  # (day, driver) -> [stops]
+	if isinstance(prefer_sticky, str):
+		prefer_sticky = prefer_sticky.strip().lower() in ("1", "true", "yes", "on")
+	else:
+		prefer_sticky = bool(prefer_sticky)
+
+	def seed(row, force_day=None, force_drv=None):
+		due = force_day or row.get("due_date")
+		if not due:
+			return
+		# Q2: no preferred driver → unassigned bucket (do not steal drivers[0] capacity)
+		drv = force_drv or row.get("preferred_driver") or "__unassigned__"
+		buckets.setdefault((str(due), drv), []).append(row)
+
+	for r in trip_capacity or []:
+		seed(r)
+	for r in fixed or []:
+		seed(r)
+
+	# Soft-lock movable that stay put (Q10)
+	locked = []
+	to_place = []
+	for r in movable or []:
+		if r.get("force_unlock"):
+			to_place.append(r)
+		elif _should_soft_lock(r.get("due_date"), as_of, lead_days, overdue=bool(r.get("overdue"))):
+			seed(r)
+			locked.append(
+				{
+					"delivery_note": r.get("delivery_note"),
+					"sales_order": r.get("sales_order"),
+					"customer_name": r.get("customer_name"),
+					"previous_due_date": r.get("due_date"),
+					"proposed_due_date": r.get("due_date"),
+					"driver": r.get("preferred_driver"),
+					"zone": r.get("zone"),
+					"overflow": False,
+					"forced": False,
+					"soft_locked": True,
+					"unassigned_driver": not bool(r.get("preferred_driver")),
+				}
+			)
+		else:
+			to_place.append(r)
+
+	# Soft-lock protects armado, but not over soft cap: release excess so greedy
+	# can rebalance tomorrow/near dues that would otherwise leave one driver at 42+.
+	locked_by_dn = {l["delivery_note"]: l for l in locked if l.get("delivery_note")}
+	released_rows = []
+	for key, stops in list(buckets.items()):
+		ok, _cnt, _mins = _fits_soft_cap(
+			stops, depot, max_orders, max_minutes, stop_minutes, avg_speed, drive_buffer
+		)
+		if ok:
+			continue
+		soft_rows = [s for s in stops if s.get("delivery_note") in locked_by_dn]
+		# Release least urgent first (reverse of pack priority)
+		soft_rows.sort(key=lambda r: _greedy_priority_tuple(r, as_of), reverse=True)
+		for s in soft_rows:
+			ok2, _, _ = _fits_soft_cap(
+				buckets.get(key) or [],
+				depot,
+				max_orders,
+				max_minutes,
+				stop_minutes,
+				avg_speed,
+				drive_buffer,
+			)
+			if ok2:
+				break
+			try:
+				buckets[key].remove(s)
+			except ValueError:
+				continue
+			released_rows.append(s)
+			locked_by_dn.pop(s.get("delivery_note"), None)
+
+	if released_rows:
+		locked = [l for l in locked if l.get("delivery_note") in locked_by_dn]
+		to_place.extend(released_rows)
+
+	to_place.sort(key=lambda r: _greedy_priority_tuple(r, as_of))
+
+	assignments = list(locked)
+	overflow = []
+
+	def try_fit(row, day_str, drv):
+		key = (day_str, drv)
+		trial = list(buckets.get(key) or []) + [row]
+		ok, cnt, mins = _fits_soft_cap(
+			trial, depot, max_orders, max_minutes, stop_minutes, avg_speed, drive_buffer
+		)
+		return ok, cnt, mins
+
+	for r in to_place:
+		allowed = _allowed_day_strs(day_strs, r.get("receive_days"), work_days)
+		# Soft sticky (Q13): optional — ASAP rebalance leaves chronological order.
+		prev = cstr(r.get("due_date") or "").strip()
+		ordered_days = list(allowed)
+		if prefer_sticky and prev and prev in ordered_days:
+			ordered_days = [prev] + [d for d in ordered_days if d != prev]
+
+		placed = False
+
+		for day_str in ordered_days:
+			pref = r.get("preferred_driver")
+			cands = _drivers_nearby_for_stop(
+				r, drivers, driver_centroids, preferred=pref, max_km=nearby_km
+			)
+			# Q2: if no preferred and no nearby, still try all drivers only as last resort for that day
+			if not cands:
+				cands = [d for d in drivers if d != "__unassigned__"] or ["__unassigned__"]
+
+			# Q7: prefer zone.driver exclusively first — only use others if pref cannot fit this day
+			day_cands = []
+			if pref and pref in drivers:
+				ok_p, cnt_p, mins_p = try_fit(r, day_str, pref)
+				if ok_p:
+					day_cands = [(cnt_p, mins_p, pref)]
+				else:
+					for drv in cands:
+						if drv == pref:
+							continue
+						ok, cnt, mins = try_fit(r, day_str, drv)
+						if ok:
+							day_cands.append((cnt, mins, drv))
+			else:
+				for drv in cands:
+					ok, cnt, mins = try_fit(r, day_str, drv)
+					if ok:
+						day_cands.append((cnt, mins, drv))
+
+			if not day_cands:
+				continue
+			day_cands.sort(key=lambda x: (x[0], x[1]))
+			cnt, mins, drv = day_cands[0]
+			# Sticky day wins immediately
+			buckets.setdefault((day_str, drv), []).append(r)
+			unassigned = drv == "__unassigned__" or not drv
+			assignments.append(
+				{
+					"delivery_note": r.get("delivery_note"),
+					"sales_order": r.get("sales_order"),
+					"customer_name": r.get("customer_name"),
+					"previous_due_date": r.get("due_date"),
+					"proposed_due_date": day_str,
+					"driver": None if unassigned else drv,
+					"zone": r.get("zone"),
+					"overflow": False,
+					"forced": False,
+					"soft_locked": False,
+					"unassigned_driver": unassigned,
+					"estimated_day_orders": cnt,
+					"estimated_day_minutes": round(mins, 1),
+					"limiting": _limiting_resource(cnt, max_orders, mins, max_minutes),
+				}
+			)
+			placed = True
+			break
+
+		if placed:
+			continue
+
+		# Overflow → zone visit day (may exceed soft cap) on preferred driver (Q7)
+		fallback = None
+		if callable(zone_fallback_fn):
+			try:
+				fallback = zone_fallback_fn(r.get("zone"), as_of)
+			except Exception:
+				fallback = None
+		if not fallback:
+			# Next allowed day or last horizon day
+			fallback = (allowed[-1] if allowed else None) or (day_strs[-1] if day_strs else None)
+		drv = r.get("preferred_driver")
+		unassigned = not drv or drv == "__unassigned__"
+		row_out = {
+			"delivery_note": r.get("delivery_note"),
+			"sales_order": r.get("sales_order"),
+			"customer_name": r.get("customer_name"),
+			"previous_due_date": r.get("due_date"),
+			"proposed_due_date": str(fallback) if fallback else None,
+			"driver": None if unassigned else drv,
+			"zone": r.get("zone"),
+			"overflow": True,
+			"forced": False,
+			"soft_locked": False,
+			"unassigned_driver": unassigned,
+		}
+		overflow.append(row_out)
+		assignments.append(row_out)
+		if fallback and drv:
+			buckets.setdefault((str(fallback), drv), []).append(r)
+
+	fills = []
+	for (day_str, drv), stops in sorted(buckets.items()):
+		ok, cnt, mins = _fits_soft_cap(
+			stops, depot, max_orders, max_minutes, stop_minutes, avg_speed, drive_buffer
+		)
+		fills.append(
+			{
+				"date": day_str,
+				"driver": None if drv == "__unassigned__" else drv,
+				"order_count": cnt,
+				"max_orders": max_orders,
+				"estimated_minutes": round(mins, 1),
+				"max_minutes": max_minutes,
+				"over_cap": not ok,
+				"limiting": _limiting_resource(cnt, max_orders, mins, max_minutes),
+			}
+		)
+
+	return {
+		"assignments": assignments,
+		"overflow": overflow,
+		"fills": fills,
+		"locked_count": len(locked),
+	}
+
+
+def _build_greedy_pack_preview(
+	as_of=None,
+	horizon_days=None,
+	driver_names=None,
+	company=None,
+	skip_tomorrow=None,
+	max_orders=None,
+	max_minutes=None,
+	avg_speed_kmh=None,
+	working_days=None,
+	prefer_sticky=None,
+):
+	settings = _load_tms_settings()
+	# Optional modal override for which weekdays may receive packed dues.
+	raw_wd = working_days
+	if isinstance(raw_wd, str):
+		s = raw_wd.strip()
+		if not s or s.lower() in ("null", "undefined", "none"):
+			raw_wd = None
+		else:
+			try:
+				raw_wd = frappe.parse_json(s)
+			except Exception:
+				raw_wd = [p.strip() for p in s.split(",") if p.strip()]
+	if isinstance(raw_wd, list) and raw_wd:
+		work_days = _normalize_working_days(raw_wd)
+	else:
+		work_days = _normalize_working_days(settings.get("auto_group_working_days"))
+	if not work_days:
+		work_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+	raw_as = as_of
+	if isinstance(raw_as, str):
+		raw_as = raw_as.strip()
+		if raw_as.lower() in ("", "null", "undefined", "none"):
+			raw_as = None
+	try:
+		as_of_d = getdate(raw_as) if raw_as else getdate()
+	except Exception:
+		as_of_d = getdate()
+
+	if skip_tomorrow is None:
+		skip_tm = False
+	elif isinstance(skip_tomorrow, str):
+		skip_tm = skip_tomorrow.strip().lower() in ("1", "true", "yes", "on")
+	else:
+		skip_tm = cint(skip_tomorrow) != 0
+
+	# ASAP rebalance default: prefer_sticky off so earlier weekdays fill before sticky Mon.
+	if prefer_sticky is None:
+		sticky = False
+	elif isinstance(prefer_sticky, str):
+		sticky = prefer_sticky.strip().lower() in ("1", "true", "yes", "on")
+	else:
+		sticky = cint(prefer_sticky) != 0
+
+	horizon = cint(horizon_days) if horizon_days not in (None, "", "null", "undefined") else cint(
+		settings.get("greedy_horizon_days") or 14
+	)
+	horizon = max(1, horizon)
+	lead = cint(settings.get("delivery_lead_days") or 1)
+	# Don't schedule tomorrow → earliest pack day one step past normal lead.
+	pack_lead = lead + (1 if skip_tm else 0)
+
+	def _opt_int(raw, fallback, minimum):
+		if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none")):
+			return max(minimum, cint(fallback))
+		try:
+			return max(minimum, cint(raw))
+		except Exception:
+			return max(minimum, cint(fallback))
+
+	max_orders = _opt_int(max_orders, settings.get("driver_day_max_orders") or 30, 1)
+	max_minutes = _opt_int(max_minutes, settings.get("driver_day_max_minutes") or 480, 30)
+	stop_minutes = max(1, cint(settings.get("default_stop_minutes") or 15))
+	avg_speed = _opt_int(avg_speed_kmh, settings.get("avg_speed_kmh") or 25, 5)
+	drive_buffer = max(0, cint(settings.get("drive_buffer_minutes_per_leg") or 5))
+	nearby_km = max(1, cint(settings.get("nearby_driver_max_km") or 8))
+
+	drivers = _parse_json_list(driver_names, [])
+	if not drivers:
+		drivers = [
+			d.name
+			for d in frappe.get_all(
+				"Driver", filters={"status": "Active"}, fields=["name"], ignore_permissions=True
+			)
+		]
+	if not drivers:
+		drivers = ["__unassigned__"]
+
+	depot = _default_depot_latlng(company)
+	zones = _load_tms_zones().get("zones") or []
+	zone_driver = _zone_driver_map(zones)
+	driver_centroids = _zone_centroids_by_driver(zones)
+
+	from frappe.utils import add_days
+
+	ceiling = add_days(as_of_d, horizon)
+	tomorrow_s = str(add_days(as_of_d, 1))
+	pending = get_pending_deliveries(date=str(ceiling), company=company)
+	deliveries = list(pending.get("deliveries") or [])
+
+	addr_names = [cstr(d.get("address_name") or "") for d in deliveries if d.get("address_name")]
+	recv_map = _address_receive_days_map(addr_names)
+
+	movable = []
+	fixed = []
+	for d in deliveries:
+		so = cstr(d.get("sales_order") or "").strip()
+		forced = _so_delivery_forced(so) if so else False
+		addr = cstr(d.get("address_name") or "").strip()
+		due_s = cstr(d.get("due_date") or "").strip() or None
+		try:
+			overdue = bool(due_s and getdate(due_s) < as_of_d)
+		except Exception:
+			overdue = bool(d.get("overdue"))
+		row = {
+			"delivery_note": d.get("delivery_note"),
+			"sales_order": so or None,
+			"customer": d.get("customer"),
+			"customer_name": d.get("customer_name"),
+			"address_name": addr or None,
+			"lat": flt(d.get("lat")) if d.get("lat") else None,
+			"lng": flt(d.get("lng")) if d.get("lng") else None,
+			"zone": cstr(d.get("zone") or "").strip() or None,
+			"due_date": due_s,
+			"overdue": overdue,
+			"forced": forced,
+			"receive_days": recv_map.get(addr) or [],
+			# Unlock remitos already due tomorrow so they can move later.
+			"force_unlock": bool(skip_tm and due_s == tomorrow_s),
+		}
+		zkey = (row["zone"] or "").upper()
+		row["preferred_driver"] = zone_driver.get(zkey) if zkey else None
+		if forced:
+			fixed.append(row)
+		else:
+			movable.append(row)
+
+	day_dates = _working_day_dates(as_of_d, work_days, horizon, pack_lead)
+	day_strs = [str(d) for d in day_dates]
+	if skip_tm:
+		day_strs = [ds for ds in day_strs if ds != tomorrow_s]
+	trip_cap = _load_active_trip_capacity_stops(as_of_d, horizon, [d for d in drivers if d != "__unassigned__"])
+
+	def _fallback(zone, as_of_s):
+		from erpnext.erpnext_integrations.ecommerce_api.api import _zone_visit_due_date
+
+		due = _zone_visit_due_date(zone, as_of=as_of_s)
+		if skip_tm and due and str(due) == tomorrow_s:
+			try:
+				return _zone_visit_due_date(zone, as_of=str(add_days(getdate(tomorrow_s), 1))) or due
+			except Exception:
+				return due
+		return due
+
+	core = _pack_remitos_core(
+		movable,
+		fixed,
+		trip_cap,
+		drivers,
+		day_strs,
+		depot,
+		max_orders=max_orders,
+		max_minutes=max_minutes,
+		stop_minutes=stop_minutes,
+		avg_speed=avg_speed,
+		drive_buffer=drive_buffer,
+		work_days=work_days,
+		as_of=str(as_of_d),
+		lead_days=pack_lead,
+		driver_centroids=driver_centroids,
+		nearby_km=nearby_km,
+		zone_fallback_fn=lambda z, a: _fallback(z, a),
+		prefer_sticky=sticky,
+	)
+
+	return {
+		"strategy": "fast_deliver_greedy",
+		"packing_strategy_setting": _packing_strategy(settings),
+		"as_of": str(as_of_d),
+		"horizon_days": horizon,
+		"lead_days": lead,
+		"pack_lead_days": pack_lead,
+		"skip_tomorrow": skip_tm,
+		"prefer_sticky": sticky,
+		"working_days": work_days,
+		"candidate_days": day_strs,
+		"max_orders": max_orders,
+		"max_minutes": max_minutes,
+		"default_stop_minutes": stop_minutes,
+		"avg_speed_kmh": avg_speed,
+		"drive_buffer_minutes_per_leg": drive_buffer,
+		"nearby_driver_max_km": nearby_km,
+		"assignments": core["assignments"],
+		"overflow": core["overflow"],
+		"fixed_forced": [
+			{
+				"delivery_note": r["delivery_note"],
+				"due_date": r.get("due_date"),
+				"driver": r.get("preferred_driver"),
+			}
+			for r in fixed
+		],
+		"fills": core["fills"],
+		"warnings": (["no_drivers"] if drivers == ["__unassigned__"] else [])
+		+ (["overflow"] if core["overflow"] else [])
+		+ (["skip_tomorrow"] if skip_tm else []),
+		"movable_count": len(movable),
+		"forced_count": len(fixed),
+		"soft_locked_count": core.get("locked_count") or 0,
+		"trip_capacity_stops": len(trip_cap),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def preview_greedy_pack(
+	as_of=None,
+	horizon_days=None,
+	driver_names=None,
+	company=None,
+	skip_tomorrow=None,
+	max_orders=None,
+	max_minutes=None,
+	avg_speed_kmh=None,
+	working_days=None,
+	prefer_sticky=None,
+):
+	"""Preview ASAP due dates under soft caps (does not write).
+
+	``skip_tomorrow``: when truthy, earliest pack day skips tomorrow and remitos
+	already due tomorrow are unlocked so they can move later.
+
+	``max_orders`` / ``max_minutes`` / ``avg_speed_kmh``: optional soft-cap overrides
+	for this preview (else TMS Settings defaults).
+
+	``working_days``: optional Mon..Sun list override for packable weekdays.
+	``prefer_sticky``: when truthy, keep previous due if it still fits (Q13); default off
+	so ASAP fills earlier weekdays (e.g. Friday before a sticky Monday).
+	"""
+	return _build_greedy_pack_preview(
+		as_of=as_of,
+		horizon_days=horizon_days,
+		driver_names=driver_names,
+		company=company,
+		skip_tomorrow=skip_tomorrow,
+		max_orders=max_orders,
+		max_minutes=max_minutes,
+		avg_speed_kmh=avg_speed_kmh,
+		working_days=working_days,
+		prefer_sticky=prefer_sticky,
+	)
+
+
+@frappe.whitelist(allow_guest=True)
+def commit_greedy_pack(preview=None):
+	"""Apply greedy pack: update SO.delivery_date or DN.custom_requested_delivery_date."""
+	if isinstance(preview, str):
+		s = preview.strip()
+		if not s or s.lower() in ("null", "undefined", "none"):
+			preview = None
+		else:
+			try:
+				preview = frappe.parse_json(s)
+			except Exception:
+				preview = None
+	if not isinstance(preview, dict):
+		frappe.throw(_("Preview payload is required."))
+
+	assignments = preview.get("assignments")
+	if not isinstance(assignments, list) or not assignments:
+		frappe.throw(_("Preview has no assignments to commit."))
+
+	updated = 0
+	skipped = 0
+	errors = []
+	for a in assignments:
+		if not isinstance(a, dict):
+			continue
+		if a.get("forced"):
+			skipped += 1
+			continue
+		# Soft-locked rows keep their due — skip noop writes (Q10)
+		if a.get("soft_locked") and cstr(a.get("proposed_due_date") or "") == cstr(
+			a.get("previous_due_date") or ""
+		):
+			skipped += 1
+			continue
+		dn = cstr(a.get("delivery_note") or "").strip()
+		due = cstr(a.get("proposed_due_date") or "").strip()
+		so = cstr(a.get("sales_order") or "").strip()
+		if not due or not dn:
+			skipped += 1
+			continue
+		if not frappe.db.exists("Delivery Note", dn):
+			skipped += 1
+			continue
+		so_names = _sales_orders_for_dn(dn) if not so else [so]
+		# Skip if any SO is forced
+		if so_names and any(_so_delivery_forced(s) for s in so_names):
+			skipped += 1
+			continue
+		try:
+			due_d = getdate(due)
+			drv = cstr(a.get("driver") or "").strip() or None
+			_apply_pending_delivery_due(dn, due_d, driver=drv)
+			updated += 1
+		except Exception as exc:
+			errors.append({"delivery_note": dn, "error": str(exc)})
+
+	frappe.db.commit()
+	return {
+		"ok": not bool(errors),
+		"updated": updated,
+		"skipped": skipped,
+		"errors": errors,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def propose_due_for_order(delivery_note=None, sales_order=None, address=None, zone=None, lat=None, lng=None):
+	"""Single-order due proposal for confirm-time branching (i045)."""
+	settings = _load_tms_settings()
+	strategy = _packing_strategy(settings)
+	if strategy != "fast_deliver_greedy":
+		# Zone path
+		z = cstr(zone or "").strip()
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.api import _zone_visit_due_date
+
+			due = _zone_visit_due_date(z) if z else None
+		except Exception:
+			due = None
+		return {"strategy": strategy, "proposed_due_date": due, "overflow": False}
+
+	# Build a one-shot pack including this order if present in pending, else synthetic
+	preview = _build_greedy_pack_preview()
+	dn = cstr(delivery_note or "").strip()
+	so = cstr(sales_order or "").strip()
+	for a in preview.get("assignments") or []:
+		if dn and a.get("delivery_note") == dn:
+			return {
+				"strategy": strategy,
+				"proposed_due_date": a.get("proposed_due_date"),
+				"overflow": bool(a.get("overflow")),
+				"driver": a.get("driver"),
+			}
+		if so and a.get("sales_order") == so:
+			return {
+				"strategy": strategy,
+				"proposed_due_date": a.get("proposed_due_date"),
+				"overflow": bool(a.get("overflow")),
+				"driver": a.get("driver"),
+			}
+	# Not in open queue yet — run mini fit for synthetic stop
+	lat_f = flt(lat) if lat not in (None, "", "null") else None
+	lng_f = flt(lng) if lng not in (None, "", "null") else None
+	if lat_f and lng_f:
+		synth = {
+			"delivery_note": dn or "__new__",
+			"sales_order": so or None,
+			"lat": lat_f,
+			"lng": lng_f,
+			"zone": cstr(zone or "").strip() or None,
+			"due_date": None,
+			"overdue": False,
+			"forced": False,
+			"preferred_driver": _zone_driver_map().get(cstr(zone or "").strip().upper()),
+		}
+		# Reuse preview fills: try first day that fits
+		work_days = _normalize_working_days(settings.get("auto_group_working_days"))
+		as_of_d = getdate()
+		lead = cint(settings.get("delivery_lead_days") or 1)
+		horizon = cint(settings.get("greedy_horizon_days") or 14)
+		max_orders = max(1, cint(settings.get("driver_day_max_orders") or 30))
+		max_minutes = max(30, cint(settings.get("driver_day_max_minutes") or 480))
+		stop_minutes = max(1, cint(settings.get("default_stop_minutes") or 15))
+		avg_speed = max(5, cint(settings.get("avg_speed_kmh") or 25))
+		drive_buffer = max(0, cint(settings.get("drive_buffer_minutes_per_leg") or 5))
+		depot = _default_depot_latlng()
+		drivers = [
+			d.name
+			for d in frappe.get_all(
+				"Driver", filters={"status": "Active"}, fields=["name"], ignore_permissions=True
+			)
+		] or ["__unassigned__"]
+		# Seed from preview fills as occupied
+		buckets = {}
+		for f in preview.get("fills") or []:
+			key = (f.get("date"), f.get("driver") or "__unassigned__")
+			# Approximate occupied with placeholder stops using count only
+			n = cint(f.get("order_count") or 0)
+			buckets[key] = [{"lat": depot["lat"], "lng": depot["lng"]}] * n
+		for day in _working_day_dates(as_of_d, work_days, horizon, lead):
+			day_str = str(day)
+			pref = synth.get("preferred_driver")
+			cands = ([pref] if pref in drivers else []) + [d for d in drivers if d != pref]
+			for drv in cands:
+				key = (day_str, drv)
+				trial = list(buckets.get(key) or []) + [synth]
+				ok, _cnt, _mins = _fits_soft_cap(
+					trial, depot, max_orders, max_minutes, stop_minutes, avg_speed, drive_buffer
+				)
+				if ok:
+					return {
+						"strategy": strategy,
+						"proposed_due_date": day_str,
+						"overflow": False,
+						"driver": None if drv == "__unassigned__" else drv,
+					}
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.api import _zone_visit_due_date
+
+			fb = _zone_visit_due_date(zone)
+		except Exception:
+			fb = None
+		return {"strategy": strategy, "proposed_due_date": fb, "overflow": True}
+	# No geo — zone fallback
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _zone_visit_due_date
+
+		fb = _zone_visit_due_date(zone)
+	except Exception:
+		fb = None
+	return {"strategy": strategy, "proposed_due_date": fb, "overflow": bool(not fb)}
+
+
+# ---------------------------------------------------------------------------
 # Map pins / temp locations / named plans (Routes map tools)
 # ---------------------------------------------------------------------------
 TMS_MAP_PINS_SCOPE = "settings.tms_map_pins"
+
+# Default service domain for a new warehouse pin (approx. CABA / BA metro).
+BA_COVERAGE_DEFAULT = {
+	"kind": "bbox",
+	"name": "Buenos Aires",
+	"south": -34.705,
+	"west": -58.531,
+	"north": -34.526,
+	"east": -58.335,
+}
 
 
 def _load_tms_map_store():
@@ -3048,7 +6969,35 @@ def _new_map_id(prefix="pin"):
 @frappe.whitelist(allow_guest=True)
 def list_map_pins_and_plans():
 	"""Temp locations + named map plans for the Routes map."""
-	return _load_tms_map_store()
+	store = _load_tms_map_store()
+	pins = list(store.get("pins") or [])
+	changed = False
+	for i, p in enumerate(pins):
+		if not isinstance(p, dict) or cstr(p.get("kind")) != "warehouse":
+			continue
+		row = dict(p)
+		if not row.get("coverage"):
+			row["coverage"] = dict(BA_COVERAGE_DEFAULT)
+			changed = True
+		if row.get("vehicles") is None:
+			row["vehicles"] = []
+			changed = True
+		pins[i] = row
+	# Single-depot convenience: if exactly one warehouse and no vehicles claimed yet,
+	# park every vehicle there.
+	wh_pins = [p for p in pins if isinstance(p, dict) and cstr(p.get("kind")) == "warehouse"]
+	if len(wh_pins) == 1 and not (wh_pins[0].get("vehicles") or []):
+		all_veh = frappe.get_all("Vehicle", pluck="name", ignore_permissions=True) or []
+		if all_veh:
+			for i, p in enumerate(pins):
+				if str(p.get("id")) == str(wh_pins[0].get("id")):
+					pins[i] = {**p, "vehicles": list(all_veh), "updated_at": str(now_datetime())}
+					changed = True
+					break
+	if changed:
+		store["pins"] = pins
+		_save_tms_map_store(store)
+	return {"pins": pins, "plans": store.get("plans") or []}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -3241,12 +7190,99 @@ def create_warehouse_at_location(
 		"ref_doctype": "Warehouse",
 		"ref_name": wh.name,
 		"address_name": addr.name,
+		"vehicles": [],
+		"coverage": dict(BA_COVERAGE_DEFAULT),
 		"created_at": str(now_datetime()),
 		"updated_at": str(now_datetime()),
 	}
+	# First warehouse: assign every active vehicle (single-depot setups).
+	existing_wh = [p for p in (store.get("pins") or []) if cstr(p.get("kind")) == "warehouse"]
+	if not existing_wh:
+		pin["vehicles"] = frappe.get_all(
+			"Vehicle", pluck="name", ignore_permissions=True
+		) or []
 	store["pins"] = list(store.get("pins") or []) + [pin]
 	_save_tms_map_store(store)
 	return {"warehouse": wh.name, "address": addr.name, "pin": pin, "pins": store["pins"]}
+
+
+@frappe.whitelist(allow_guest=True)
+def update_warehouse_depot(pin_id=None, vehicles=None, coverage=None):
+	"""Assign vehicles + service coverage domain on a warehouse map pin.
+
+	``vehicles``: list of Vehicle names (for now typically one warehouse owns all).
+	``coverage``: {kind, name, south, west, north, east} bbox — default Buenos Aires.
+	"""
+	pin_id = cstr(pin_id or "").strip()
+	if not pin_id or pin_id.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Warehouse pin is required."))
+
+	store = _load_tms_map_store()
+	pins = list(store.get("pins") or [])
+	idx = next((i for i, p in enumerate(pins) if str(p.get("id")) == pin_id), None)
+	if idx is None:
+		frappe.throw(_("Map pin {0} not found").format(pin_id))
+	pin = dict(pins[idx])
+	if cstr(pin.get("kind") or "") != "warehouse":
+		frappe.throw(_("Pin is not a warehouse."))
+
+	if vehicles is not None:
+		raw = vehicles
+		if isinstance(raw, str):
+			s = raw.strip()
+			if not s or s.lower() in ("null", "undefined", "none"):
+				raw = []
+			else:
+				try:
+					raw = frappe.parse_json(s)
+				except Exception:
+					raw = [x.strip() for x in s.split(",") if x.strip()]
+		if not isinstance(raw, (list, tuple)):
+			raw = []
+		# Unique vehicle names; also clear them from other warehouse pins (1 depot model).
+		wanted = []
+		seen = set()
+		for v in raw:
+			name = cstr(v or "").strip()
+			if not name or name in seen:
+				continue
+			seen.add(name)
+			wanted.append(name)
+		for i, p in enumerate(pins):
+			if i == idx or cstr(p.get("kind")) != "warehouse":
+				continue
+			others = [x for x in (p.get("vehicles") or []) if cstr(x) not in seen]
+			if others != (p.get("vehicles") or []):
+				pins[i] = {**p, "vehicles": others, "updated_at": str(now_datetime())}
+		pin["vehicles"] = wanted
+
+	if coverage is not None:
+		raw_c = coverage
+		if isinstance(raw_c, str):
+			s = raw_c.strip()
+			if not s or s.lower() in ("null", "undefined", "none"):
+				raw_c = None
+			else:
+				try:
+					raw_c = frappe.parse_json(s)
+				except Exception:
+					raw_c = None
+		if raw_c is None:
+			pin["coverage"] = dict(BA_COVERAGE_DEFAULT)
+		elif isinstance(raw_c, dict):
+			cov = dict(BA_COVERAGE_DEFAULT)
+			cov.update({k: raw_c[k] for k in raw_c if k in ("kind", "name", "south", "west", "north", "east")})
+			pin["coverage"] = cov
+
+	# Ensure coverage always present on warehouse pins.
+	if not pin.get("coverage"):
+		pin["coverage"] = dict(BA_COVERAGE_DEFAULT)
+
+	pin["updated_at"] = str(now_datetime())
+	pins[idx] = pin
+	store["pins"] = pins
+	_save_tms_map_store(store)
+	return {"pin": pin, "pins": pins}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -3539,6 +7575,52 @@ _TMS_BA_CUSTOMERS_SEED = [
 	{"name": "Taller Elcano", "area": "Chacarita", "addr_title": "Av. Elcano 3200, Chacarita", "addr": "Av. Elcano 3200, Chacarita, CABA", "lat": -34.5865, "lng": -58.4545, "zone": "Norte"},
 ]
 
+# Geo pockets for bulk clients (i044 rebalance showcase). Deterministic jitter — not real doors.
+_TMS_BA_BULK_POCKETS = (
+	{"zone": "Norte", "area": "Belgrano", "lat": -34.555, "lng": -58.455},
+	{"zone": "Centro", "area": "Almagro", "lat": -34.606, "lng": -58.420},
+	{"zone": "Sur", "area": "Barracas", "lat": -34.640, "lng": -58.380},
+	{"zone": "Oeste", "area": "Floresta", "lat": -34.630, "lng": -58.490},
+)
+
+_TMS_BA_BULK_CLIENT_COUNT = 400
+_TMS_BA_BULK_NAME_PREFIX = "BA Demo Cliente "
+
+
+def _tms_ba_bulk_customers(n=None):
+	"""Synthetic active geocoded clients for zone-rebalance demos (local BA demo only)."""
+	n = cint(n if n is not None else _TMS_BA_BULK_CLIENT_COUNT)
+	if n < 1:
+		return []
+	out = []
+	pockets = _TMS_BA_BULK_POCKETS
+	for i in range(1, n + 1):
+		p = pockets[(i - 1) % len(pockets)]
+		# Stable pseudo-random offset in ~±0.018° (~2 km) so clusters stay visible.
+		lat = p["lat"] + (((i * 17) % 101) - 50) * 0.00036
+		lng = p["lng"] + (((i * 31) % 101) - 50) * 0.00042
+		name = f"{_TMS_BA_BULK_NAME_PREFIX}{i:03d}"
+		street_n = 1000 + (i * 7) % 8000
+		addr_title = f"Calle Demo {street_n}, {p['area']}"
+		out.append(
+			{
+				"name": name,
+				"area": p["area"],
+				"addr_title": addr_title,
+				"addr": f"{addr_title}, CABA",
+				"lat": round(lat, 6),
+				"lng": round(lng, 6),
+				"zone": p["zone"],
+				"bulk": True,
+			}
+		)
+	return out
+
+
+def _tms_ba_all_demo_customers():
+	"""Named showcase shops + bulk book for clustering."""
+	return list(_TMS_BA_CUSTOMERS_SEED) + _tms_ba_bulk_customers()
+
 
 @frappe.whitelist(allow_guest=True)
 def seed_tms_demo(reset=False):
@@ -3550,14 +7632,23 @@ def seed_tms_demo(reset=False):
 	Creates:
 	  - 5 Drivers (each with Employee + geocoded home Address)
 	  - 5 Vehicles
-	  - 25 Customers with geocoded, zone-tagged shipping Addresses across BA
-	  - Delivery Notes + guest preorders per customer
+	  - ~25 named Customers + ~400 bulk ``BA Demo Cliente NNN`` (geocoded, zone-tagged)
+	  - Delivery Notes + guest preorders for **named** customers only
 	  - 4 planning Zones (Norte / Centro / Sur / Oeste)
 	  - Company.custom_default_warehouse set (depot demo)
 	  - 1 published trip with POD / cliente-debe demos + driver login User
+
+	Bulk clients are for **zone rebalance / map density** (i044), not site-provisioning seeds.
 	"""
 	reset = frappe.parse_json(reset) if isinstance(reset, str) else bool(reset)
+	# Demo company is "library"; fall back so a renamed/other company still seeds.
 	company = "library"
+	if not frappe.db.exists("Company", company):
+		company = (
+			frappe.defaults.get_global_default("company")
+			or frappe.db.get_value("Company", {}, "name", order_by="creation asc")
+			or company
+		)
 	warehouse = "POSNET Stores - L"
 	item_code = "24755"
 	item_name = "WHISKY MACALLAN ERATH ESTUCHE 1*700ML"
@@ -3569,9 +7660,14 @@ def seed_tms_demo(reset=False):
 	def _ex(doctype, name):
 		return bool(frappe.db.exists(doctype, name))
 
+	named_customers = list(_TMS_BA_CUSTOMERS_SEED)
+	customers_seed = _tms_ba_all_demo_customers()
+
 	if reset:
 		# Delete existing demo DNs and trips that use them, then customers/drivers/vehicles.
-		# Include legacy "TMS Demo Cliente%" names from older seeds.
+		# Include legacy "TMS Demo Cliente%" names from older seeds. Bulk "BA Demo Cliente%"
+		# have no transactions — they are kept and only re-tagged to their pocket zone
+		# below (deleting + recreating 400 customers made reset take minutes).
 		legacy_customers = frappe.get_all(
 			"Customer",
 			filters={"customer_name": ["like", "TMS Demo Cliente%"]},
@@ -3580,11 +7676,25 @@ def seed_tms_demo(reset=False):
 		)
 		demo_customer_ids = list(
 			{
-				*(frappe.db.get_value("Customer", {"customer_name": c["name"]}, "name") for c in _TMS_BA_CUSTOMERS_SEED),
+				*(frappe.db.get_value("Customer", {"customer_name": c["name"]}, "name") for c in named_customers),
 				*legacy_customers,
 			}
 		)
 		demo_customer_ids = [c for c in demo_customer_ids if c]
+		# Trips first — their stops link demo Addresses and block Customer delete.
+		if demo_customer_ids:
+			trip_names = {
+				r[0]
+				for r in frappe.db.sql(
+					"""SELECT DISTINCT parent FROM `tabDelivery Stop`
+					WHERE parenttype = 'Delivery Trip' AND customer IN %(c)s""",
+					{"c": tuple(demo_customer_ids)},
+				)
+			}
+			for trip_name in trip_names:
+				if frappe.db.get_value("Delivery Trip", trip_name, "docstatus") == 1:
+					frappe.db.set_value("Delivery Trip", trip_name, "docstatus", 2)
+				frappe.delete_doc("Delivery Trip", trip_name, force=True, ignore_permissions=True)
 		for dn in frappe.get_all(
 			"Delivery Note",
 			filters={"customer": ["in", demo_customer_ids]} if demo_customer_ids else {"customer": ["like", "TMS Demo Cliente%"]},
@@ -3622,7 +7732,13 @@ def seed_tms_demo(reset=False):
 					so_doc.cancel()
 				frappe.delete_doc("Sales Order", so_name, force=True, ignore_permissions=True)
 		for c in demo_customer_ids:
-			frappe.delete_doc("Customer", c, force=True, ignore_permissions=True)
+			# Customers with invoices / other ledgers can't go — keep them, don't abort reset.
+			frappe.db.savepoint("tms_demo_cust")
+			try:
+				frappe.delete_doc("Customer", c, force=True, ignore_permissions=True)
+			except frappe.LinkExistsError:
+				frappe.db.rollback(save_point="tms_demo_cust")
+				skipped.append(f"Customer kept (linked records): {c}")
 		frappe.db.commit()
 
 	# ── 1. Drivers (Employee → Driver → home Address) ─────────────────────────
@@ -3706,8 +7822,10 @@ def seed_tms_demo(reset=False):
 		created.append(f"Vehicle: {veh.name}")
 
 	# ── 3. Customers + geocoded, zone-tagged shipping addresses ────────────────
-	customers_seed = _TMS_BA_CUSTOMERS_SEED
-	for c in customers_seed:
+	# Named shops + bulk BA Demo Cliente NNN (i044 rebalance density).
+	has_freq = frappe.db.has_column("Address", "custom_delivery_frequency")
+	bulk_created = 0
+	for idx, c in enumerate(customers_seed):
 		if not frappe.db.exists("Customer", c["name"]):
 			cust = frappe.get_doc({
 				"doctype": "Customer",
@@ -3729,30 +7847,42 @@ def seed_tms_demo(reset=False):
 				})
 				cust.flags.ignore_mandatory = True
 				cust.insert(ignore_permissions=True)
-			created.append(f"Customer: {cust.name}")
+			if c.get("bulk"):
+				bulk_created += 1
+			else:
+				created.append(f"Customer: {cust.name}")
 		else:
-			skipped.append(f"Customer: {c['name']}")
+			if not c.get("bulk"):
+				skipped.append(f"Customer: {c['name']}")
 
 		addr_title = c["addr_title"]
 		existing_addr = frappe.db.get_value(
 			"Address", {"address_title": addr_title, "address_type": "Shipping"}, "name"
 		)
+		addr_vals = {
+			"address_line1": c["addr"],
+			"city": "Buenos Aires",
+			"country": "Argentina",
+			"custom_latitude": c["lat"],
+			"custom_longitude": c["lng"],
+			"custom_zone": c["zone"],
+		}
+		if has_freq:
+			addr_vals["custom_delivery_frequency"] = 1
 		if existing_addr:
+			# Keep a rebalanced zone (i044) unless this is an explicit reset.
+			if not reset and cstr(
+				frappe.db.get_value("Address", existing_addr, "custom_zone") or ""
+			).strip():
+				addr_vals.pop("custom_zone", None)
 			frappe.db.set_value(
 				"Address",
 				existing_addr,
-				{
-					"address_line1": c["addr"],
-					"city": "Buenos Aires",
-					"country": "Argentina",
-					"custom_latitude": c["lat"],
-					"custom_longitude": c["lng"],
-					"custom_zone": c["zone"],
-				},
+				addr_vals,
 				update_modified=False,
 			)
 		else:
-			addr = frappe.get_doc({
+			addr_doc = {
 				"doctype": "Address",
 				"address_title": addr_title,
 				"address_type": "Shipping",
@@ -3764,12 +7894,23 @@ def seed_tms_demo(reset=False):
 				"custom_longitude": c["lng"],
 				"custom_zone": c["zone"],
 				"links": [{"link_doctype": "Customer", "link_name": c["name"]}],
-			})
+			}
+			if has_freq:
+				addr_doc["custom_delivery_frequency"] = 1
+			addr = frappe.get_doc(addr_doc)
 			addr.insert(ignore_permissions=True)
-			created.append(f"Address: {addr.name}")
+			if not c.get("bulk"):
+				created.append(f"Address: {addr.name}")
+		# Keep bulk inserts from holding one giant uncommitted batch.
+		if c.get("bulk") and idx % 50 == 0:
+			frappe.db.commit()
 
-	# ── 4. Delivery Notes (force-submitted for demo) ───────────────────────────
-	for i, c in enumerate(customers_seed, 1):
+	if bulk_created:
+		created.append(f"Bulk customers: +{bulk_created} ({_TMS_BA_BULK_NAME_PREFIX}*)")
+	frappe.db.commit()
+
+	# ── 4. Delivery Notes (force-submitted for demo) — named shops only ────────
+	for i, c in enumerate(named_customers, 1):
 		existing_dn = frappe.get_all(
 			"Delivery Note",
 			filters={"customer": c["name"], "docstatus": 1},
@@ -3798,7 +7939,7 @@ def seed_tms_demo(reset=False):
 			"conversion_rate": 1.0,
 			"plc_conversion_rate": 1.0,
 			# Last 2 customers demo day-ahead planning (Scenario 3).
-			"custom_requested_delivery_date": frappe.utils.add_days(today, 1) if i > len(customers_seed) - 2 else None,
+			"custom_requested_delivery_date": frappe.utils.add_days(today, 1) if i > len(named_customers) - 2 else None,
 			"items": [{
 				"item_code": item_code,
 				"item_name": item_name,
@@ -3853,10 +7994,7 @@ def seed_tms_demo(reset=False):
 		created.append(f"Stock: +{STOCK_BUFFER - on_hand:.0f} {item_code} in {warehouse}")
 
 	# ── 6. Matching Guest Preorder per customer (Tables > Pedidos consistency) ──
-	# Independent record, not derived from the Delivery Note above - same
-	# customer name shows up in both places, but this isn't "the same order"
-	# (Pedidos' own "Crear remito" action on this preorder would create a
-	# second, separate Delivery Note if used).
+	# Named shops only — bulk clients are for zone density, not 400 pedidos.
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		GUEST_PREORDER_REMARKS_TAG,
 		_guest_preorder_tag_fieldname,
@@ -3865,7 +8003,7 @@ def seed_tms_demo(reset=False):
 	)
 
 	tag_fn = _guest_preorder_tag_fieldname()
-	for c in customers_seed:
+	for c in named_customers:
 		customer_id = frappe.db.get_value("Customer", {"customer_name": c["name"]}, "name")
 		if not customer_id:
 			continue
@@ -3917,7 +8055,7 @@ def seed_tms_demo(reset=False):
 	#      trip history, and payment collection all at once ─────────────────
 	demo_trip_dns = [
 		frappe.db.get_value("Delivery Note", {"customer": c["name"], "docstatus": 1}, "name")
-		for c in customers_seed[:3]
+		for c in named_customers[:3]
 	]
 	demo_trip_dns = [d for d in demo_trip_dns if d]
 	already_planned = _assigned_delivery_note_names() if demo_trip_dns else set()
@@ -3978,7 +8116,31 @@ def seed_tms_demo(reset=False):
 		{"code": "SUR", "name": "Zona Sur", "color": "#ea580c", "type": "delivery", "visit_days": ["Mon", "Thu"], "vehicles": ["BA-004-DD"]},
 		{"code": "OESTE", "name": "Zona Oeste", "color": "#db2777", "type": "delivery", "visit_days": ["Wed", "Fri"], "vehicles": ["BA-005-EE"]},
 	]
-	existing_zones = {str(z.get("code") or "").upper() for z in (_load_tms_zones().get("zones") or [])}
+	current_zones = _load_tms_zones().get("zones") or []
+	if reset:
+		# Reset returns the book to pocket tags → drop rebalance territories (i044).
+		kept = [z for z in current_zones if (z.get("notes") or "") != "rebalance-clients"]
+		if len(kept) != len(current_zones):
+			_save_tms_zones(kept, commit=False)
+			dropped = [
+				cstr(z.get("code") or "").strip().upper()
+				for z in current_zones
+				if (z.get("notes") or "") == "rebalance-clients"
+			]
+			if dropped and frappe.db.has_column("Address", "custom_zone"):
+				# Non-demo clients pointed at those zones → unzoned (flow B re-assigns).
+				frappe.db.sql(
+					"UPDATE `tabAddress` SET custom_zone = NULL WHERE UPPER(custom_zone) IN %(z)s",
+					{"z": tuple(dropped)},
+				)
+			created.append(f"Zones removed: {len(current_zones) - len(kept)} rebalance zones")
+		current_zones = kept
+	elif any(
+		(z.get("notes") or "") == "rebalance-clients" for z in current_zones if isinstance(z, dict)
+	):
+		# Book already rebalanced — don't re-add empty pocket zones next to T*-DAY zones.
+		zones_seed = []
+	existing_zones = {str(z.get("code") or "").upper() for z in current_zones}
 	for z in zones_seed:
 		if z["code"] in existing_zones:
 			skipped.append(f"Zone: {z['code']}")
@@ -4050,15 +8212,8 @@ def driver_get_trip_stops(trip_name):
 
 
 @frappe.whitelist()
-def driver_get_trip_delivery_summary(trip_name=None):
-	"""End-of-delivery / trip summary: planned, delivered, and returned items (all stops)."""
-	trip_name = cstr(trip_name or "").strip()
-	if not trip_name or trip_name.lower() in ("null", "undefined", "none"):
-		frappe.throw(_("Trip is required."))
-
-	driver = _get_current_driver()
-	trip = _require_owned_trip(trip_name, driver)
-
+def _build_trip_delivery_summary(trip):
+	"""Shared trip summary payload for driver app + dispatcher (Rutas)."""
 	address_names = list({s.address for s in trip.delivery_stops if s.address})
 	geo_by_address = {}
 	if address_names:
@@ -4099,12 +8254,11 @@ def driver_get_trip_delivery_summary(trip_name=None):
 				)
 			dn_items_by_name[dn_name] = items
 
-	# All return captures for this trip (includes earlier stops).
 	returns_by_stop = {}
 	if frappe.db.exists("DocType", "Mobile Return Capture"):
 		captures = frappe.get_all(
 			"Mobile Return Capture",
-			filters={"delivery_trip": trip_name},
+			filters={"delivery_trip": trip.name},
 			fields=["name", "stop_idx", "customer", "captured_at", "notes", "status"],
 			order_by="stop_idx asc, creation asc",
 			ignore_permissions=True,
@@ -4146,6 +8300,9 @@ def driver_get_trip_delivery_summary(trip_name=None):
 	total_planned = 0.0
 	total_delivered = 0.0
 	total_returned = 0.0
+	total_amount_due = 0.0
+	total_amount_collected = 0.0
+	total_balance = 0.0
 	for s in stops:
 		dn = cstr(s.get("delivery_note") or "").strip()
 		planned = list(dn_items_by_name.get(dn) or [])
@@ -4153,8 +8310,6 @@ def driver_get_trip_delivery_summary(trip_name=None):
 		visited = bool(s.get("visited"))
 		delivered = []
 		if visited and outcome in ("Delivered", "Partial"):
-			# Full DN as delivered when Delivered; Partial still lists planned lines
-			# (structured partial qtys are not stored server-side yet).
 			delivered = [dict(it) for it in planned]
 		returned_groups = returns_by_stop.get(cint(s.get("idx")), [])
 		returned_flat = []
@@ -4168,6 +8323,21 @@ def driver_get_trip_delivery_summary(trip_name=None):
 		total_delivered += delivered_qty
 		total_returned += returned_qty
 
+		pod = s.get("pod") or {}
+		amount_due = flt(pod.get("amount_due") if pod else None)
+		if not amount_due:
+			amount_due = flt(s.get("grand_total"))
+		amount_collected = flt(pod.get("amount_collected") if pod else None)
+		balance = pod.get("balance_after_stop") if pod else None
+		if balance is None and (amount_due or amount_collected):
+			balance = amount_due - amount_collected
+		else:
+			balance = flt(balance)
+		if visited and outcome in ("Delivered", "Partial"):
+			total_amount_due += amount_due
+			total_amount_collected += amount_collected
+			total_balance += balance
+
 		summary_stops.append(
 			{
 				**s,
@@ -4178,6 +8348,9 @@ def driver_get_trip_delivery_summary(trip_name=None):
 				"planned_qty": planned_qty,
 				"delivered_qty": delivered_qty,
 				"returned_qty": returned_qty,
+				"amount_due": amount_due,
+				"amount_collected": amount_collected,
+				"balance_after_stop": balance,
 			}
 		)
 
@@ -4187,6 +8360,8 @@ def driver_get_trip_delivery_summary(trip_name=None):
 			"status": trip.status,
 			"departure_time": trip.departure_time,
 			"driver": trip.driver,
+			"driver_name": trip.driver_name,
+			"vehicle": trip.vehicle,
 		},
 		"stops": summary_stops,
 		"totals": {
@@ -4195,8 +8370,37 @@ def driver_get_trip_delivery_summary(trip_name=None):
 			"returned_qty": total_returned,
 			"stops_total": len(summary_stops),
 			"stops_visited": sum(1 for s in summary_stops if s.get("visited")),
+			"amount_due": total_amount_due,
+			"amount_collected": total_amount_collected,
+			"balance": total_balance,
 		},
 	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_trip_delivery_summary(trip_name=None):
+	"""Dispatcher / Rutas: trip delivery summary (same payload as the driver app)."""
+	trip_name = cstr(trip_name or "").strip()
+	if not trip_name or trip_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required."))
+	if not frappe.db.exists("Delivery Trip", trip_name):
+		frappe.throw(_("Delivery Trip {0} not found").format(trip_name), frappe.DoesNotExistError)
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+	return _build_trip_delivery_summary(trip)
+
+
+@frappe.whitelist()
+def driver_get_trip_delivery_summary(trip_name=None):
+	"""End-of-delivery / trip summary: planned, delivered, and returned items (all stops)."""
+	trip_name = cstr(trip_name or "").strip()
+	if not trip_name or trip_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required."))
+
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+	return _build_trip_delivery_summary(trip)
 
 
 @frappe.whitelist()
@@ -4406,8 +8610,8 @@ def driver_record_stop_outcome(
 	driver = _get_current_driver()
 	trip = _require_owned_trip(trip_name, driver)
 
-	if trip.docstatus != 1:
-		frappe.throw(_("This route has not been published yet."))
+	# Driver starting field work is the publish signal — auto-submit Draft.
+	trip = _ensure_trip_published_for_driving(trip)
 
 	valid_outcomes = {"Delivered", "Not Home", "Partial", "Refused"}
 	if outcome not in valid_outcomes:
@@ -5144,8 +9348,8 @@ def driver_upload_stop_photo(trip_name, stop_idx, image_base64):
 	driver = _get_current_driver()
 	trip = _require_owned_trip(trip_name, driver)
 
-	if trip.docstatus != 1:
-		frappe.throw(_("This route has not been published yet."))
+	# Photo upload also means the driver is working the route — auto-publish.
+	trip = _ensure_trip_published_for_driving(trip)
 
 	stop_idx = cint(stop_idx)
 	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)

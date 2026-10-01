@@ -15,6 +15,8 @@ import frappe
 from frappe import _
 from frappe.utils import cint, flt, getdate, today
 
+from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
+
 
 # Internal EAN-13 prefix for armado sheets. Retail product barcodes must not use
 # 290… (in-store / internal range). Lookup on /armado prefers this prefix.
@@ -364,3 +366,71 @@ def get_delivery_check_items(delivery_note=None):
 			}
 		],
 	}
+
+
+CARGO_CHECK_SCOPE = "cargo_check"
+
+
+def _clean_dn_name(delivery_note) -> str:
+	raw = str(delivery_note or "").strip() if not isinstance(delivery_note, (list, dict, tuple)) else ""
+	if raw.lower() in ("null", "undefined", "none"):
+		return ""
+	return raw[:140]
+
+
+def _clean_cargo_qtys(qtys) -> dict:
+	if isinstance(qtys, str):
+		try:
+			qtys = json.loads(qtys) if qtys.strip() else {}
+		except Exception:
+			qtys = {}
+	if not isinstance(qtys, dict):
+		return {}
+	out = {}
+	for k, v in list(qtys.items())[:2000]:
+		key = str(k or "").strip()[:280]
+		if not key:
+			continue
+		try:
+			n = flt(v)
+		except Exception:
+			continue
+		out[key] = max(0.0, n)
+	return out
+
+
+@frappe.whitelist(allow_guest=True)
+def get_cargo_check(delivery_note=None):
+	"""Server copy of the truck-load checklist for a DN (``{qtys, updated_at}``)."""
+	dn = _clean_dn_name(delivery_note)
+	if not dn:
+		frappe.throw(_("delivery_note is required"))
+	_row, data = kv_get(CARGO_CHECK_SCOPE, dn)
+	return {
+		"ok": True,
+		"delivery_note": dn,
+		"qtys": _clean_cargo_qtys(data.get("qtys")),
+		"updated_at": cint(data.get("updated_at") or 0),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def save_cargo_check(delivery_note=None, qtys=None, updated_at=None):
+	"""Upsert the truck-load checklist for a DN (offline ops outbox ``cargo_check``).
+
+	Last-write-wins by client ``updated_at`` (ms epoch): an older replay is ignored.
+	"""
+	dn = _clean_dn_name(delivery_note)
+	if not dn:
+		frappe.throw(_("delivery_note is required"))
+	if not frappe.db.exists("Delivery Note", dn):
+		frappe.throw(_("Delivery Note not found"))
+	clean = _clean_cargo_qtys(qtys)
+	stamp = cint(updated_at or 0) or cint(frappe.utils.now_datetime().timestamp() * 1000)
+	_row, current = kv_get(CARGO_CHECK_SCOPE, dn)
+	current_stamp = cint(current.get("updated_at") or 0)
+	if current_stamp and stamp < current_stamp:
+		return {"ok": True, "delivery_note": dn, "stale": 1, "updated_at": current_stamp}
+	kv_set(CARGO_CHECK_SCOPE, dn, {"qtys": clean, "updated_at": stamp})
+	frappe.db.commit()
+	return {"ok": True, "delivery_note": dn, "stale": 0, "updated_at": stamp}

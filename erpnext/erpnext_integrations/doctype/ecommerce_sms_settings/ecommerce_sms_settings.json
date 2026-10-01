@@ -12,6 +12,12 @@
   "auth_token",
   "column_break_twilio",
   "from_number",
+  "section_bird",
+  "bird_api_key",
+  "bird_api_base",
+  "column_break_bird",
+  "bird_delivery_template_slug",
+  "bird_template_language",
   "section_status",
   "last_test_at",
   "last_error"
@@ -24,12 +30,12 @@
    "label": "Enabled"
   },
   {
-   "default": "Twilio",
+   "default": "Bird",
    "fieldname": "provider",
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Provider",
-   "options": "Twilio",
+   "options": "Bird\nTwilio",
    "reqd": 1
   },
   {
@@ -61,6 +67,43 @@
    "label": "Twilio Phone Number"
   },
   {
+   "depends_on": "eval:doc.provider==\"Bird\"",
+   "fieldname": "section_bird",
+   "fieldtype": "Section Break",
+   "label": "Bird.com"
+  },
+  {
+   "description": "Bird Access Key (Bearer). Stored encrypted; leave blank to keep the current value.",
+   "fieldname": "bird_api_key",
+   "fieldtype": "Password",
+   "label": "Bird API Key"
+  },
+  {
+   "default": "https://us1.platform.bird.com",
+   "description": "API host, e.g. https://us1.platform.bird.com",
+   "fieldname": "bird_api_base",
+   "fieldtype": "Data",
+   "label": "Bird API Base URL"
+  },
+  {
+   "fieldname": "column_break_bird",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "bird_delivery_update",
+   "description": "Template slug used for delivery SMS (manual button on Conductor).",
+   "fieldname": "bird_delivery_template_slug",
+   "fieldtype": "Data",
+   "label": "Delivery Template Slug"
+  },
+  {
+   "default": "en",
+   "description": "Template language code (e.g. en, es)",
+   "fieldname": "bird_template_language",
+   "fieldtype": "Data",
+   "label": "Template Language"
+  },
+  {
    "fieldname": "section_status",
    "fieldtype": "Section Break",
    "label": "Status"
@@ -80,7 +123,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-09-23 00:00:00.000000",
+ "modified": "2026-09-30 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERPNext Integrations",
  "name": "Ecommerce SMS Settings",

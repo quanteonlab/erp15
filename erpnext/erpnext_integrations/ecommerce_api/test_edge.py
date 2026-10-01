@@ -26,6 +26,7 @@ import traceback
 from pathlib import Path
 
 import frappe
+from frappe.utils import cstr
 
 _PASS = "\033[92m✓ PASS\033[0m"
 _FAIL = "\033[91m✗ FAIL\033[0m"
@@ -131,7 +132,11 @@ def _call(method: str, args: dict):
 def _run_one(case: dict) -> None:
 	case_id = case.get("id") or "unnamed"
 	method = case.get("method")
-	expect = (case.get("expect") or "no_500").lower()
+	raw_expect = case.get("expect")
+	# Dict expect = subset of the returned dict (e.g. {"ok": false}); a controlled
+	# throw is accepted too. Anything else is a mode string.
+	expect_subset = raw_expect if isinstance(raw_expect, dict) else None
+	expect = "no_500" if expect_subset is not None else cstr(raw_expect or "no_500").lower()
 	args = case.get("args") if isinstance(case.get("args"), dict) else {}
 
 	if not method:
@@ -140,7 +145,17 @@ def _run_one(case: dict) -> None:
 		return
 
 	try:
-		_call(method, args)
+		result = _call(method, args)
+		if expect_subset is not None:
+			mismatch = {
+				k: v
+				for k, v in expect_subset.items()
+				if not isinstance(result, dict) or result.get(k) != v
+			}
+			if mismatch:
+				_results.append((case_id, "FAIL", f"expected {expect_subset}, got {result!r}"[:300]))
+				print(f"  {_FAIL}  {case_id}: expected subset {mismatch}")
+				return
 		if expect == "fail":
 			_results.append((case_id, "FAIL", "expected controlled failure, got success"))
 			print(f"  {_FAIL}  {case_id}: expected fail, got ok")

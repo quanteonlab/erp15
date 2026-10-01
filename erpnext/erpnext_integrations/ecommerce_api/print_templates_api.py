@@ -81,7 +81,7 @@ _DELIVERY_CHECKLIST_CHILD_FIELDS = [
 	{"fieldname": "uom", "label": "Uni", "fieldtype": "Data"},
 	{"fieldname": "qty_display", "label": "Cantidad (con UOM)", "fieldtype": "Data"},
 	{"fieldname": "weight", "label": "Peso", "fieldtype": "Float"},
-	{"fieldname": "actual_weight", "label": "Peso real", "fieldtype": "Float"},
+	{"fieldname": "actual_weight", "label": "Peso medido", "fieldtype": "Float"},
 	{"fieldname": "total_weight", "label": "Peso total línea", "fieldtype": "Float"},
 	{"fieldname": "weight_uom", "label": "UOM peso", "fieldtype": "Data"},
 	{"fieldname": "confirm_uni", "label": "Armado Uni", "fieldtype": "Data"},
@@ -1965,7 +1965,7 @@ def _ar_entregas_checklist_a4_elements(
 ):
 	"""A4 armado layouts.
 
-	mode=peso_indefinido — Código, Descripción, Cantidad, Peso, Peso real + ARMADO Uni/Cantidad.
+	mode=peso_indefinido — Código, Descripción, Cantidad, Peso medido + ARMADO Uni/Cantidad.
 	mode=almacen — warehouse/location focused + ARMADO confirmation columns.
 	PEDIDO + ARMADO share one line-items table so row heights stay aligned.
 	Compressed header; larger type; no ENTREGAS title block.
@@ -1981,16 +1981,15 @@ def _ar_entregas_checklist_a4_elements(
 			{"fieldPath": "code_display", "label": "Codigo", "width": 34},
 			{"fieldPath": "item_name", "label": "Detalle", "width": 52},
 			{"fieldPath": "qty_display", "label": "Cantidad", "width": 26},
-			{"fieldPath": "weight", "label": "Peso", "width": 16, "fillIn": True},
-			{"fieldPath": "actual_weight", "label": "Peso Real", "width": 18, "fillIn": True},
+			{"fieldPath": "actual_weight", "label": "Peso medido", "width": 22, "fillIn": True},
 			{"fieldPath": "confirm_uni", "label": "Uni", "width": 14, "fillIn": True},
 			{"fieldPath": "confirm_qty", "label": "Cantidad", "width": 20, "fillIn": True},
 		]
-		table_w = 180
-		# PEDIDO: Codigo+Detalle+Cantidad; ARMADO: Peso… write-in cols
+		table_w = 168
+		# PEDIDO: Codigo+Detalle+Cantidad; ARMADO: Peso medido + confirm cols
 		pedido_label_w = 112
 		armado_label_x = 10 + 112
-		armado_label_w = 68
+		armado_label_w = 56
 	else:
 		cols = [
 			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
@@ -2062,7 +2061,7 @@ def _ar_entregas_checklist_a4_elements(
 	)
 	elements.append(
 		{
-			"id": f"{p}-items-v5",
+			"id": f"{p}-items-v6",
 			"kind": "line-items",
 			"x": 10,
 			"y": table_y,
@@ -2615,7 +2614,7 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-peso-items-v5",
+		"resync_if_missing_id": "starter-peso-items-v6",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-peso",
@@ -2782,7 +2781,8 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Descripción": ("Descripción", "描述"),
 		"Cantidad": ("Cantidad", "数量"),
 		"Peso": ("Peso", "重量"),
-		"Peso real": ("Peso real", "实重"),
+		"Peso real": ("Peso medido", "实称重量"),
+		"Peso medido": ("Peso medido", "实称重量"),
 		"Peso total": ("Peso total", "总重量"),
 		"Peso total:": ("Peso total:", "总重量："),
 		"P.tot": ("P.tot", "总重"),
@@ -2815,7 +2815,7 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Pedido:": ("Pedido:", "订单："),
 		"Codigo": ("Codigo", "编码"),
 		"Detalle": ("Detalle", "明细"),
-		"Peso Real": ("Peso Real", "实重"),
+		"Peso Real": ("Peso medido", "实称重量"),
 		"Peso tot:": ("Peso tot:", "总重："),
 		"Ubic.": ("Ubic.", "库位"),
 		"Barras": ("Barras", "条码"),

@@ -1482,11 +1482,45 @@
       "expect": "no_500"
     },
     {
+      "id": "tms_list_fleet_day_routes_nulls",
+      "source": "regression",
+      "bug": "list_fleet_day_routes with null date/horizon must return drivers list, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_fleet_day_routes",
+      "args": {
+        "date": null,
+        "horizon_days": null,
+        "company": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_list_zones_ok",
       "source": "regression",
       "bug": "list_tms_zones returns zones list",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_tms_zones",
       "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_delivery_clients_nulls",
+      "source": "regression",
+      "bug": "list_delivery_clients with null limit/only_geocoded must return clients dict, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_delivery_clients",
+      "args": {
+        "limit": null,
+        "only_geocoded": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_delivery_clients_dirty",
+      "source": "regression",
+      "bug": "list_delivery_clients with empty/string dirty args is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_delivery_clients",
+      "args": {
+        "limit": "",
+        "only_geocoded": "undefined"
+      },
       "expect": "ok"
     },
     {
@@ -1653,6 +1687,46 @@
       "expect": "fail"
     },
     {
+      "id": "sms_send_delivery_null_dn",
+      "source": "regression",
+      "bug": "send_delivery_sms with null delivery_note/to must controlled fail (no phone), not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sms_api.send_delivery_sms",
+      "args": {
+        "delivery_note": null,
+        "to_number": null,
+        "ref": null,
+        "date": null,
+        "customer": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "sms_send_delivery_empty_dn",
+      "source": "regression",
+      "bug": "send_delivery_sms with empty delivery_note must controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sms_api.send_delivery_sms",
+      "args": {
+        "delivery_note": "",
+        "to_number": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "sms_save_bird_null_key_keeps_existing",
+      "source": "regression",
+      "bug": "save_sms_settings with null bird_api_key must not wipe Password / not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sms_api.save_sms_settings",
+      "args": {
+        "enabled": null,
+        "provider": "Bird",
+        "bird_api_key": null,
+        "bird_api_base": null,
+        "bird_delivery_template_slug": null,
+        "bird_template_language": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "google_get_api_settings_ok",
       "source": "regression",
       "bug": "get_google_api_settings returns maps/translation flags without crashing",
@@ -1744,6 +1818,33 @@
       "expect": "ok"
     },
     {
+      "id": "tms_pending_deliveries_window_nulls",
+      "source": "regression",
+      "bug": "get_pending_deliveries window mode with null from/to/horizon must not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_pending_deliveries",
+      "args": {
+        "date": null,
+        "company": null,
+        "from_date": null,
+        "to_date": null,
+        "horizon_days": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_pending_deliveries_window_dirty",
+      "source": "regression",
+      "bug": "get_pending_deliveries window mode with empty/string dirty from_date/to_date/horizon is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_pending_deliveries",
+      "args": {
+        "date": "",
+        "from_date": "undefined",
+        "to_date": "null",
+        "horizon_days": "undefined"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_pending_deliveries_empty_date",
       "source": "regression",
       "bug": "get_pending_deliveries with empty date string must coerce like null (as-of today backlog)",
@@ -1777,6 +1878,28 @@
       "expect": "fail"
     },
     {
+      "id": "tms_update_pending_delivery_due_unknown_dn",
+      "source": "regression",
+      "bug": "Unknown DN is controlled ValidationError; remitos without SO write custom_requested_delivery_date (not 'No Sales Order linked')",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_due",
+      "args": {
+        "delivery_note": "__no_such_dn_unschedule__",
+        "due_date": "2099-01-15"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_pending_delivery_due_invalid_date",
+      "source": "regression",
+      "bug": "Invalid due_date string is controlled ValidationError (zone snap must not crash first)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_due",
+      "args": {
+        "delivery_note": "MAT-DN-2026-00014",
+        "due_date": "not-a-date"
+      },
+      "expect": "fail"
+    },
+    {
       "id": "tms_preview_auto_groups_nulls",
       "source": "regression",
       "bug": "preview_auto_delivery_groups with null date/strategy/drivers must return preview dict, never TypeError/500",
@@ -1788,7 +1911,21 @@
         "k": null,
         "working_days": null,
         "use_time_slots": null,
-        "excluded_slots": null
+        "excluded_slots": null,
+        "delivery_notes": null,
+        "reschedule_after_as_of": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_auto_groups_empty_notes",
+      "source": "regression",
+      "bug": "preview_auto_delivery_groups with empty delivery_notes list must not crash (treat as no filter)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_auto_delivery_groups",
+      "args": {
+        "date": "",
+        "delivery_notes": [],
+        "reschedule_after_as_of": ""
       },
       "expect": "ok"
     },
@@ -1800,6 +1937,331 @@
       "args": {
         "preview": null,
         "force_due_dates": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_preview_rebalance_zones_nulls",
+      "source": "regression",
+      "bug": "preview_rebalance_zones with null k/working_days/max must return preview dict, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_rebalance_zones",
+      "args": {
+        "k": null,
+        "max_clients_per_zone": null,
+        "working_days": null,
+        "only_missing_zone": null,
+        "driver_names": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_rebalance_zones_dirty",
+      "source": "regression",
+      "bug": "preview_rebalance_zones with empty/string dirty args is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_rebalance_zones",
+      "args": {
+        "k": "",
+        "max_clients_per_zone": "null",
+        "working_days": [],
+        "only_missing_zone": "",
+        "driver_names": []
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_commit_rebalance_zones_null_preview",
+      "source": "regression",
+      "bug": "commit_rebalance_zones with null preview is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.commit_rebalance_zones",
+      "args": {
+        "preview": null,
+        "refresh_pending_dues": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_assign_zone_for_client_null_strings",
+      "source": "regression",
+      "bug": "assign_zone_for_client with 'null'/'undefined' strings must be a controlled 'Address is required', not a lookup on customer 'null'",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.assign_zone_for_client",
+      "args": {
+        "customer": "null",
+        "address": "undefined",
+        "max_clients_per_zone": "null"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_get_pending_far_ceiling",
+      "source": "regression",
+      "bug": "get_pending_deliveries with far-future due ceiling (greedy all-open) must still return recent remitos — posting lookback anchors to today, not the ceiling",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_pending_deliveries",
+      "args": {
+        "date": "2099-12-31",
+        "company": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_greedy_pack_nulls",
+      "source": "regression",
+      "bug": "preview_greedy_pack with null as_of/horizon/drivers/skip_tomorrow/working_days/prefer_sticky must return preview dict, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_greedy_pack",
+      "args": {
+        "as_of": null,
+        "horizon_days": null,
+        "driver_names": null,
+        "company": null,
+        "skip_tomorrow": null,
+        "max_orders": null,
+        "max_minutes": null,
+        "avg_speed_kmh": null,
+        "working_days": null,
+        "prefer_sticky": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_greedy_pack_dirty",
+      "source": "regression",
+      "bug": "preview_greedy_pack with empty/string dirty args including skip_tomorrow/caps/working_days/prefer_sticky is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_greedy_pack",
+      "args": {
+        "as_of": "",
+        "horizon_days": "null",
+        "driver_names": [],
+        "company": "undefined",
+        "skip_tomorrow": "undefined",
+        "max_orders": "",
+        "max_minutes": "null",
+        "avg_speed_kmh": "undefined",
+        "working_days": "null",
+        "prefer_sticky": "undefined"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_commit_greedy_pack_null_preview",
+      "source": "regression",
+      "bug": "commit_greedy_pack with null preview is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.commit_greedy_pack",
+      "args": {
+        "preview": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_save_settings_drive_buffer_null",
+      "source": "regression",
+      "bug": "save_tms_settings with null drive_buffer/nearby_km must keep defaults, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_settings",
+      "args": {
+        "drive_buffer_minutes_per_leg": null,
+        "nearby_driver_max_km": null,
+        "packing_strategy": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_save_settings_drive_buffer_dirty",
+      "source": "regression",
+      "bug": "save_tms_settings with empty/string dirty buffer/km coerces to defaults",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_settings",
+      "args": {
+        "drive_buffer_minutes_per_leg": "",
+        "nearby_driver_max_km": "undefined",
+        "packing_strategy": "bogus"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_propose_due_for_order_nulls",
+      "source": "regression",
+      "bug": "propose_due_for_order with all nulls returns strategy dict, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.propose_due_for_order",
+      "args": {
+        "delivery_note": null,
+        "sales_order": null,
+        "address": null,
+        "zone": null,
+        "lat": null,
+        "lng": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_rebalance_only_missing_dirty",
+      "source": "regression",
+      "bug": "preview_rebalance_zones only_missing_zone=1 with dirty k/max returns assign_missing preview, never 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_rebalance_zones",
+      "args": {
+        "k": "undefined",
+        "max_clients_per_zone": "",
+        "working_days": null,
+        "only_missing_zone": "1",
+        "driver_names": null,
+        "vehicle_names": "null"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_commit_rebalance_zones_empty_groups_dirty_stale",
+      "source": "regression",
+      "bug": "commit_rebalance_zones with empty groups + dirty remove_stale_zones is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.commit_rebalance_zones",
+      "args": {
+        "preview": {
+          "mode": "rebalance",
+          "groups": [],
+          "stale_zones": null
+        },
+        "remove_stale_zones": "null"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_assign_zone_for_client_nulls",
+      "source": "regression",
+      "bug": "assign_zone_for_client with null customer/address is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.assign_zone_for_client",
+      "args": {
+        "customer": null,
+        "address": null,
+        "max_clients_per_zone": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_rutas_week_bundle_nulls",
+      "source": "regression",
+      "bug": "get_rutas_week_bundle with null date/company/flags must return bundle dict, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_rutas_week_bundle",
+      "args": {
+        "date": null,
+        "company": null,
+        "auto_assign_zones": null,
+        "include_master": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_rutas_week_bundle_dirty",
+      "source": "regression",
+      "bug": "get_rutas_week_bundle with empty/undefined dirty args is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_rutas_week_bundle",
+      "args": {
+        "date": "",
+        "company": "undefined",
+        "auto_assign_zones": "undefined",
+        "include_master": "null"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_optimize_trip_null",
+      "source": "regression",
+      "bug": "optimize_trip with null trip_name is controlled ValidationError, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.optimize_trip",
+      "args": {
+        "trip_name": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_optimize_trip_dirty",
+      "source": "regression",
+      "bug": "optimize_trip with empty/undefined trip_name is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.optimize_trip",
+      "args": {
+        "trip_name": "undefined"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_set_trip_locked_null",
+      "source": "regression",
+      "bug": "set_trip_locked with null trip_name is controlled ValidationError, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.set_trip_locked",
+      "args": {
+        "trip_name": null,
+        "locked": 1
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_get_delivery_note_route_lock_null",
+      "source": "regression",
+      "bug": "get_delivery_note_route_lock with null DN returns unlocked payload, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_delivery_note_route_lock",
+      "args": {
+        "delivery_note": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_start_trip_null",
+      "source": "regression",
+      "bug": "start_trip with null trip_name is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.start_trip",
+      "args": {
+        "trip_name": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_driver_record_stop_outcome_null_trip",
+      "source": "regression",
+      "bug": "driver_record_stop_outcome with null trip never 500; Draft routes auto-publish on real driver start instead of 'not published' ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_record_stop_outcome",
+      "args": {
+        "trip_name": null,
+        "stop_idx": null,
+        "outcome": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_detach_cancelled_so_links_null_safe",
+      "source": "regression",
+      "bug": "Publishing a trip whose DN items point at cancelled Sales Orders must not CancelledLinkError — null trip is a no-op",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api._detach_cancelled_so_links_from_trip_dns",
+      "args": {
+        "trip": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_driver_upload_stop_photo_null_trip",
+      "source": "regression",
+      "bug": "driver_upload_stop_photo with null trip is controlled error; Draft auto-publishes when a real driver uploads",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_upload_stop_photo",
+      "args": {
+        "trip_name": null,
+        "stop_idx": null,
+        "image_base64": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_pending_delivery_driver_null",
+      "source": "regression",
+      "bug": "update_pending_delivery_driver with null DN is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_driver",
+      "args": {
+        "delivery_note": null,
+        "driver": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_claim_orders_to_trip_empty",
+      "source": "regression",
+      "bug": "claim_orders_to_trip with empty lists is controlled ValidationError (stock shortfalls no longer block via negative allow)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.claim_orders_to_trip",
+      "args": {
+        "delivery_notes": [],
+        "preorder_names": [],
+        "pin": null
       },
       "expect": "fail"
     },
@@ -2131,6 +2593,16 @@
       "expect": "fail"
     },
     {
+      "id": "preorder_unarchive_missing_so",
+      "source": "regression",
+      "bug": "unarchive_guest_preorder on missing SO is controlled, not DuplicateEntryError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.unarchive_guest_preorder",
+      "args": {
+        "preorder_name": "__no_such_so_unarchive__"
+      },
+      "expect": "fail"
+    },
+    {
       "id": "preorder_update_details_null_name",
       "source": "regression",
       "bug": "update_guest_preorder_details with null name/data is controlled, not TypeError",
@@ -2396,6 +2868,152 @@
         "reason": null
       },
       "expect": "fail"
+    },
+    {
+      "id": "tms_update_warehouse_depot_null",
+      "source": "regression",
+      "bug": "update_warehouse_depot with null pin_id/vehicles/coverage is controlled ValidationError, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_warehouse_depot",
+      "args": {
+        "pin_id": null,
+        "vehicles": null,
+        "coverage": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_warehouse_depot_dirty",
+      "source": "regression",
+      "bug": "update_warehouse_depot with empty/undefined dirty args is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_warehouse_depot",
+      "args": {
+        "pin_id": "",
+        "vehicles": "undefined",
+        "coverage": "null"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_create_trip_null_vehicle_empty_dns",
+      "source": "regression",
+      "bug": "create_trip with null vehicle / empty delivery notes fails with controlled ValidationError (never MandatoryError Vehicle / 500)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": "2026-10-01",
+        "driver": null,
+        "vehicle": null,
+        "delivery_note_names": []
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_create_trip_dirty_vehicle_empty_dns",
+      "source": "regression",
+      "bug": "create_trip with dirty vehicle string and empty dns is controlled ValidationError before Vehicle mandatory check",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": "2026-10-01",
+        "driver": "",
+        "vehicle": "undefined",
+        "delivery_note_names": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_trip_assignment_nulls",
+      "source": "regression",
+      "bug": "update_trip_assignment with null trip/driver/vehicle is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_trip_assignment",
+      "args": {
+        "trip_name": null,
+        "driver": null,
+        "vehicle": null,
+        "pickup_warehouse": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_get_trip_delivery_summary_null",
+      "source": "regression",
+      "bug": "get_trip_delivery_summary with null trip_name is controlled ValidationError (dispatcher summary)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_trip_delivery_summary",
+      "args": {
+        "trip_name": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "create_po_client_request_id_dict",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
+      "args": {
+        "supplier": null,
+        "items": null,
+        "client_request_id": {
+          "x": 1
+        }
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013 outbox idempotency key: dict/garbage client_request_id must coerce to '' (not crash) before supplier validation"
+    },
+    {
+      "id": "create_po_client_request_id_unknown",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
+      "args": {
+        "supplier": "",
+        "items": "[]",
+        "client_request_id": "edge-po-unknown-req"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "unknown client_request_id falls through to normal validation"
+    },
+    {
+      "id": "get_cargo_check_null_dn",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_cargo_check",
+      "args": {
+        "delivery_note": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013 cargo_check: null DN is a controlled ValidationError"
+    },
+    {
+      "id": "get_cargo_check_unknown_dn",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_cargo_check",
+      "args": {
+        "delivery_note": "DN-DOES-NOT-EXIST-EDGE"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "unknown DN returns empty qtys"
+    },
+    {
+      "id": "save_cargo_check_garbage_qtys",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.save_cargo_check",
+      "args": {
+        "delivery_note": "DN-DOES-NOT-EXIST-EDGE",
+        "qtys": "not json{",
+        "updated_at": "abc"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013 cargo_check outbox replay with dirty qtys/updated_at must not TypeError"
+    },
+    {
+      "id": "save_cargo_check_list_dn",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.save_cargo_check",
+      "args": {
+        "delivery_note": [
+          "a"
+        ],
+        "qtys": {
+          "k": "x"
+        }
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "list DN coerces to '' → controlled error"
     }
   ]
 }

@@ -1679,6 +1679,42 @@ def suite_5_12_modules_read():
         except Exception as exc:
             assert "ValidationError" in type(exc).__name__ or "required" in str(exc).lower() or "due" in str(exc).lower(), exc
 
+        # Remitos without Sales Order (POS / CSV): due bump must use DN.custom_requested_delivery_date
+        if frappe.db.has_column("Delivery Note", "custom_requested_delivery_date"):
+            dn_no_so = frappe.db.sql(
+                """
+                select dn.name
+                from `tabDelivery Note` dn
+                where dn.docstatus = 1 and ifnull(dn.is_return, 0) = 0
+                  and not exists (
+                    select 1 from `tabDelivery Note Item` dni
+                    where dni.parent = dn.name and ifnull(dni.against_sales_order, '') != ''
+                  )
+                limit 1
+                """,
+                as_dict=True,
+            )
+            if dn_no_so:
+                from frappe.utils import add_days, getdate, today
+
+                name = dn_no_so[0].name
+                prev = frappe.db.get_value("Delivery Note", name, "custom_requested_delivery_date")
+                target = add_days(today(), 5)
+                res = tms.update_pending_delivery_due(delivery_note=name, due_date=str(target))
+                assert isinstance(res, dict), res
+                assert res.get("via") == "custom_requested_delivery_date", res
+                assert str(getdate(res.get("due_date"))) == str(getdate(target)), res
+                stored = frappe.db.get_value("Delivery Note", name, "custom_requested_delivery_date")
+                assert str(getdate(stored)) == str(getdate(target)), stored
+                frappe.db.set_value(
+                    "Delivery Note",
+                    name,
+                    "custom_requested_delivery_date",
+                    prev,
+                    update_modified=False,
+                )
+                frappe.db.commit()
+
         tmpl = tms.get_rutas_orders_csv_template()
         assert isinstance(tmpl, dict) and tmpl.get("csv_text")
         assert "Código de Orden" in tmpl["csv_text"]
@@ -1745,6 +1781,78 @@ def suite_5_12_modules_read():
         assert len(labels) == 4 and set(labels) <= {0, 1}
         # Nearby pairs should share a cluster more often than not
         assert labels[0] == labels[1] or labels[2] == labels[3]
+
+        # i044 client-book rebalance — dirty preview must not 500
+        rb = tms.preview_rebalance_zones(
+            k=None,
+            max_clients_per_zone=None,
+            working_days=None,
+            only_missing_zone=None,
+            driver_names=None,
+        )
+        assert isinstance(rb, dict) and "groups" in rb and "clients_total" in rb, rb
+        assert "ideal_per_zone" in rb and "max_clients_per_zone" in rb, rb
+
+        # i044 territories × days: 6 drivers × 5 days = 30 balanced zones (pure helper).
+        grid = [(-34.55 - (i % 20) * 0.004, -58.50 + (i // 20) * 0.006) for i in range(120)]
+        plane = tms._plane_coords(grid)
+        t_labels = tms._balanced_partition(plane, 6)
+        t_sizes = [t_labels.count(i) for i in range(6)]
+        assert max(t_sizes) - min(t_sizes) <= 1, t_sizes
+        for ti in range(6):
+            sub = [plane[i] for i, lab in enumerate(t_labels) if lab == ti]
+            d_labels = tms._balanced_partition(sub, 5)
+            d_sizes = [d_labels.count(i) for i in range(5)]
+            assert sum(d_sizes) == len(sub) and max(d_sizes) - min(d_sizes) <= 2, d_sizes
+        assert tms._split_territory_zone_code("t3-wed") == ("T3", "Wed")
+        assert tms._split_territory_zone_code("NORTE") == (None, None)
+        rb5 = tms.preview_rebalance_zones(k=2, working_days=["Mon", "Tue", "Wed"])
+        if rb5.get("clients_total", 0) >= 6:
+            assert rb5["k"] == 6 and rb5["territories_k"] == 2, (rb5["k"], rb5["territories_k"])
+            assert all(len(g["visit_days"]) == 1 for g in rb5["groups"]), rb5["groups"][:1]
+
+        try:
+            tms.commit_rebalance_zones(preview=None)
+            raise AssertionError("expected error for null rebalance preview commit")
+        except Exception as exc:
+            assert (
+                "ValidationError" in type(exc).__name__
+                or "preview" in str(exc).lower()
+                or "required" in str(exc).lower()
+            ), exc
+
+        try:
+            tms.assign_zone_for_client(customer=None, address=None)
+            raise AssertionError("expected error for null assign_zone_for_client")
+        except Exception as exc:
+            assert (
+                "ValidationError" in type(exc).__name__
+                or "address" in str(exc).lower()
+                or "required" in str(exc).lower()
+            ), exc
+
+        # i045 greedy pack — dirty preview / null commit + unit core
+        gp = tms.preview_greedy_pack(as_of=None, horizon_days=None, driver_names=None)
+        assert isinstance(gp, dict) and "assignments" in gp and "fills" in gp, gp
+        assert "max_orders" in gp and "max_minutes" in gp, gp
+        assert "drive_buffer_minutes_per_leg" in gp and "nearby_driver_max_km" in gp, gp
+        if gp.get("fills"):
+            assert "limiting" in gp["fills"][0], gp["fills"][0]
+        from erpnext.erpnext_integrations.ecommerce_api import test_greedy_pack as tgp
+
+        unit = tgp.run()
+        assert unit.get("failed") == 0, unit
+        prop = tms.propose_due_for_order(zone=None, lat=None, lng=None)
+        assert isinstance(prop, dict) and "strategy" in prop, prop
+        try:
+            tms.commit_greedy_pack(preview=None)
+            raise AssertionError("expected error for null greedy preview commit")
+        except Exception as exc:
+            assert (
+                "ValidationError" in type(exc).__name__
+                or "preview" in str(exc).lower()
+                or "required" in str(exc).lower()
+            ), exc
 
     def check_shop_ui():
         from erpnext.erpnext_integrations.ecommerce_api import shop_ui_settings as sui
@@ -2071,6 +2179,75 @@ def _print_summary():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+# ── Suite 5.13 — g013 offline ops outbox (idempotent replays) ────────────────
+
+def suite_5_13_offline_outbox():
+    print("\n▸ 5.13 Offline ops outbox (g013)")
+    from erpnext.erpnext_integrations.ecommerce_api import buying_api as ba
+    from erpnext.erpnext_integrations.ecommerce_api import ops_kiosk_api as ok_api
+
+    def _drop_kv(scope, row_key):
+        frappe.db.delete("Table Extra Data", {"scope": scope, "row_key": row_key})
+        frappe.db.commit()
+
+    def check_po_replay_idempotent():
+        supplier = (
+            frappe.db.get_value("Supplier", {"name": ["like", "SUP-%"]}, "name")
+            or frappe.db.get_value("Supplier", {"name": ["!=", "Uncategorized"]}, "name")
+        )
+        item = frappe.db.get_value(
+            "Item", {"disabled": 0, "is_stock_item": 1, "item_code": ["not like", "EDGE%"]}, "name"
+        )
+        if not (supplier and item):
+            raise AssertionError("no supplier/item fixture for PO replay")
+        req = f"smoke-po-{_uid()}"
+        first = second = None
+        try:
+            kwargs = dict(
+                supplier=supplier,
+                schedule_date=nowdate(),
+                submit=0,
+                items=[{"item_code": item, "qty": 1, "rate": 1}],
+                client_request_id=req,
+            )
+            first = ba.create_purchase_order(**kwargs)
+            second = ba.create_purchase_order(**kwargs)
+            assert first.get("ok") and first.get("name"), first
+            assert second.get("name") == first.get("name"), (first, second)
+            assert second.get("already_exists") == 1, second
+        finally:
+            name = (first or {}).get("name")
+            if name:
+                frappe.db.delete("Purchase Order Item", {"parent": name})
+                frappe.db.delete("Purchase Order", {"name": name})
+            _drop_kv(ba.PO_CLIENT_REQUEST_SCOPE, req)
+
+    def check_cargo_check_roundtrip():
+        dn = frappe.db.get_value("Delivery Note", {"docstatus": ["<", 2]}, "name")
+        if not dn:
+            raise AssertionError("no Delivery Note fixture")
+        prev_name, prev = None, None
+        from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
+        prev_name, prev = kv_get(ok_api.CARGO_CHECK_SCOPE, dn)
+        try:
+            saved = ok_api.save_cargo_check(delivery_note=dn, qtys={"c::A": 2, "c::B": "x"}, updated_at=2000)
+            assert saved.get("ok") and not saved.get("stale"), saved
+            got = ok_api.get_cargo_check(delivery_note=dn)
+            assert got["qtys"].get("c::A") == 2 and got["updated_at"] == 2000, got
+            stale = ok_api.save_cargo_check(delivery_note=dn, qtys={"c::A": 0}, updated_at=1000)
+            assert stale.get("stale") == 1, stale
+            assert ok_api.get_cargo_check(delivery_note=dn)["qtys"].get("c::A") == 2
+        finally:
+            if prev_name:
+                kv_set(ok_api.CARGO_CHECK_SCOPE, dn, prev)
+                frappe.db.commit()
+            else:
+                _drop_kv(ok_api.CARGO_CHECK_SCOPE, dn)
+
+    _run("5.13.1 create_purchase_order replay with client_request_id returns same PO", check_po_replay_idempotent, "S1")
+    _run("5.13.2 cargo_check save/get round-trip + stale replay ignored", check_cargo_check_roundtrip, "S2")
+
+
 def run(do_cleanup="1"):
     """
     Run all smoke suites and optionally clean up test records.
@@ -2097,6 +2274,7 @@ def run(do_cleanup="1"):
     suite_5_10_product_manager()
     suite_5_11_pos_session()
     suite_5_12_modules_read()
+    suite_5_13_offline_outbox()
 
     passed = _print_summary()
 
