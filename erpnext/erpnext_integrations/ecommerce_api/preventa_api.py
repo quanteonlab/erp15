@@ -1170,6 +1170,13 @@ def _do_convert_lead(
 		target.customer_type = customer_type
 	if customer_group:
 		target.customer_group = customer_group
+	# Customer is named by customer_name: an existing (different) customer with
+	# the same name must not block the conversion — suffix it like ERPNext does.
+	if target.customer_name and frappe.db.exists("Customer", target.customer_name):
+		from frappe.model.naming import append_number_if_name_exists
+
+		target.name = append_number_if_name_exists("Customer", target.customer_name)
+		target.flags.name_set = True
 	target.flags.ignore_permissions = True
 	target.insert(ignore_permissions=True)
 

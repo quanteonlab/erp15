@@ -2946,6 +2946,7 @@ def generate_barcodes_bulk(item_codes):
 
 
 @frappe.whitelist()
+@idempotent_request
 def apply_interest_adjustment_bulk(item_codes, percent, price_list=None, price_lists=None):
     """
     Multiply selling list prices by (1 + percent/100).

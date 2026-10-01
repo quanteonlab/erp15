@@ -3451,6 +3451,12 @@ def create_order(
 	so.order_type = order_type
 	so.transaction_date = nowdate()
 	so.delivery_date = delivery_date or add_days(nowdate(), 7)
+	# Clamp a past delivery date to the order date (ERPNext date rule).
+	try:
+		if getdate(so.delivery_date) < getdate(so.transaction_date):
+			so.delivery_date = so.transaction_date
+	except Exception:
+		so.delivery_date = add_days(nowdate(), 7)
 	so.company = company
 
 	company_currency = frappe.get_cached_value("Company", company, "default_currency")
@@ -4270,6 +4276,13 @@ def create_guest_preorder(
 	so.order_type = order_type or "Sales"
 	so.transaction_date = nowdate()
 	so.delivery_date = delivery_date or add_days(nowdate(), 7)
+	# ERPNext: delivery ≥ order date. A past order/delivery date (CSV backfill,
+	# replayed offline order) is clamped to the transaction date, not rejected.
+	try:
+		if getdate(so.delivery_date) < getdate(so.transaction_date):
+			so.delivery_date = so.transaction_date
+	except Exception:
+		so.delivery_date = add_days(nowdate(), 7)
 	so.company = company
 	so.selling_price_list = price_list
 	# Consultas are local quotes. Do not look up Currency Exchange (None → ARS).

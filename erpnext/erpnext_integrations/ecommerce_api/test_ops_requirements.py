@@ -163,6 +163,20 @@ def _cases(fx):
 	]
 
 
+def _driver_user_for_trip(trip_name):
+	driver = frappe.db.get_value("Delivery Trip", trip_name, "driver")
+	if not driver:
+		return None
+	user = None
+	if frappe.db.has_column("Driver", "user_id"):
+		user = frappe.db.get_value("Driver", driver, "user_id")
+	if not user:
+		emp = frappe.db.get_value("Driver", driver, "employee")
+		if emp:
+			user = frappe.db.get_value("Employee", emp, "user_id")
+	return user or None
+
+
 def _classify(exc) -> str:
 	name = type(exc).__name__
 	msg = str(exc)
@@ -192,10 +206,20 @@ def run(verbose=0):
 				results.append((label, "SKIP", f"no fixture: {', '.join(missing)}"))
 				continue
 			fn = frappe.get_attr(M + method)
+			# Driver-app endpoints only accept the trip's own driver — run as them.
+			run_as = None
+			if method.startswith("tms_api.driver_") and kwargs.get("trip_name"):
+				run_as = _driver_user_for_trip(kwargs["trip_name"])
+				if not run_as:
+					results.append((label, "SKIP", "trip driver has no login user"))
+					continue
 			sp = f"probe_{len(results)}"
 			frappe.db.savepoint(sp)
 			frappe.local.message_log = []
+			prev_user = frappe.session.user
 			try:
+				if run_as:
+					frappe.set_user(run_as)
 				fn(**kwargs)
 				results.append((label, "OK", ""))
 			except Exception as exc:  # noqa: BLE001 — classify everything
@@ -204,6 +228,8 @@ def run(verbose=0):
 					detail += "\n" + traceback.format_exc()[-900:]
 				results.append((label, _classify(exc), detail))
 			finally:
+				if run_as:
+					frappe.set_user(prev_user)
 				try:
 					frappe.db.rollback(save_point=sp)
 				except Exception:

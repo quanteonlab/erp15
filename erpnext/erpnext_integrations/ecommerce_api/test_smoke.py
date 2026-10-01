@@ -2074,6 +2074,9 @@ def suite_5_12_modules_read():
                 {
                     "doctype": "Purchase Order",
                     "supplier": suppliers[0],
+                    # title + status are reqd on this site (same as create_purchase_order sets).
+                    "title": frappe.db.get_value("Supplier", suppliers[0], "supplier_name") or suppliers[0],
+                    "status": "Draft",
                     "company": frappe.db.get_value("Company", {}, "name"),
                     "currency": "USD",
                     "conversion_rate": 1,
@@ -2319,6 +2322,19 @@ def suite_5_13_offline_outbox():
     _run("5.13.2 cargo_check save/get round-trip + stale replay ignored", check_cargo_check_roundtrip, "S2")
 
 
+# ── Suite 5.14 — g013 phase 2: every queued write replays without requirement gaps ──
+
+def suite_5_14_ops_requirements():
+    print("\n▸ 5.14 Offline-replayable writes — requirement probe (g013)")
+    from erpnext.erpnext_integrations.ecommerce_api import test_ops_requirements as probe
+
+    def check_probe_clean():
+        bad = probe.run()
+        assert not bad, "; ".join(f"{label}: {status} {detail}" for label, status, detail in bad[:6])
+
+    _run("5.14.1 every queued write accepts the minimal offline payload (auto-fill)", check_probe_clean, "S1")
+
+
 def run(do_cleanup="1"):
     """
     Run all smoke suites and optionally clean up test records.
@@ -2346,6 +2362,7 @@ def run(do_cleanup="1"):
     suite_5_11_pos_session()
     suite_5_12_modules_read()
     suite_5_13_offline_outbox()
+    suite_5_14_ops_requirements()
 
     passed = _print_summary()
 

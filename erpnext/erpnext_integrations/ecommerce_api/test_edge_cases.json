@@ -3146,8 +3146,14 @@
       "args": {
         "goods_total": 10,
         "payments": [
-          {"method": "Cash", "amount": 9},
-          {"method": "Transfer", "amount": 1}
+          {
+            "method": "Cash",
+            "amount": 9
+          },
+          {
+            "method": "Transfer",
+            "amount": 1
+          }
         ],
         "requires_factura_a": 0
       },
@@ -3161,8 +3167,14 @@
       "args": {
         "goods_total": 10,
         "payments": [
-          {"method": "Cash", "amount": 9},
-          {"method": "Transfer", "amount": 1}
+          {
+            "method": "Cash",
+            "amount": 9
+          },
+          {
+            "method": "Transfer",
+            "amount": 1
+          }
         ],
         "requires_factura_a": 1
       },
@@ -3404,6 +3416,106 @@
         "clear_trip": null
       },
       "expect": "no_500"
+    },
+    {
+      "id": "ops_idempotent_request_garbage_id",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_supplier",
+      "args": {
+        "supplier_name": null,
+        "client_request_id": [
+          "x"
+        ]
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013 @idempotent_request: list/garbage client_request_id coerces to '' and falls back to the plain endpoint"
+    },
+    {
+      "id": "tms_save_zone_name_only_autocode",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_zone",
+      "args": {
+        "zone": {
+          "name": "Edge Zona Norte"
+        }
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013: zone saved offline with only a label must auto-derive its code, not 'Zone code is required'"
+    },
+    {
+      "id": "tms_reorder_partial_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.reorder_trip_stops",
+      "args": {
+        "trip_name": "MAT-DOES-NOT-EXIST",
+        "delivery_note_names": "[\"DN-X\"]"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013: reorder replay with a stale/partial list must not crash (missing stops appended)"
+    },
+    {
+      "id": "tms_remove_stops_absent_noop",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.remove_stops_from_trip",
+      "args": {
+        "trip_name": "MAT-DOES-NOT-EXIST",
+        "delivery_note_names": [
+          "DN-NOT-ON-TRIP"
+        ]
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013: removing an already-removed stop (replay) is a no-op; removing the last stop deletes the empty draft trip"
+    },
+    {
+      "id": "tms_add_stops_dupe_noop",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.add_stops_to_trip",
+      "args": {
+        "trip_name": "MAT-DOES-NOT-EXIST",
+        "delivery_note_names": [
+          "DN-X",
+          "DN-X"
+        ]
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013: re-adding stops already on the trip (replay) is skipped, not an error"
+    },
+    {
+      "id": "preorder_details_past_delivery_clamped",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_details",
+      "args": {
+        "preorder_name": "SO-DOES-NOT-EXIST",
+        "data": {
+          "delivery_date": "2001-01-01",
+          "delivery_date_forced": true
+        }
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013: forced delivery date before the order date is clamped (ERPNext date rule) instead of failing the replay"
+    },
+    {
+      "id": "update_customer_unknown_territory_autocreate",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "CUST-DOES-NOT-EXIST",
+        "territory": "EDGE-T1-MON"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013: TMS zone code written as territory auto-creates the Territory (was LinkValidationError)"
+    },
+    {
+      "id": "po_create_past_eta_clamped",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
+      "args": {
+        "supplier": "",
+        "items": [],
+        "schedule_date": "2001-01-01"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "g013: PO ETA before today (replayed next day) is clamped to the transaction date"
     }
   ]
 }

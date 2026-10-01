@@ -2830,9 +2830,10 @@ def add_stops_to_trip(trip_name, delivery_note_names, allow_steal=0):
 	_assert_trip_unlocked(trip, _("adding stops"))
 
 	already_on_trip = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
-	dupes = [n for n in delivery_note_names if n in already_on_trip]
-	if dupes:
-		frappe.throw(_("Already on this trip: {0}").format(", ".join(dupes)))
+	# Already on this trip (offline outbox replay) → skip instead of failing.
+	delivery_note_names = [n for n in delivery_note_names if n not in already_on_trip]
+	if not delivery_note_names:
+		return get_trip_map_data(trip_name)
 
 	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
 	if conflicts and not steal:
@@ -2891,7 +2892,19 @@ def remove_stops_from_trip(trip_name, delivery_note_names):
 	names = set(delivery_note_names)
 	rows_to_remove = [s for s in trip.delivery_stops if s.delivery_note in names]
 	if not rows_to_remove:
-		frappe.throw(_("None of the given delivery notes are on this trip."))
+		# Already removed (offline outbox replay / another dispatcher) → no-op.
+		return get_trip_map_data(trip_name)
+
+	if len(rows_to_remove) >= len(trip.delivery_stops or []):
+		# A Delivery Trip needs at least one stop: removing the last one deletes
+		# the (draft) trip instead of failing with MandatoryError.
+		frappe.delete_doc("Delivery Trip", trip_name, ignore_permissions=True, force=1)
+		frappe.db.commit()
+		return {
+			"trip": {"name": trip_name, "status": "Deleted", "docstatus": 2, "locked": False},
+			"stops": [],
+			"deleted": 1,
+		}
 
 	# Snapshot list - trip.remove() mutates trip.delivery_stops in place and
 	# renumbers idx for the remaining rows, so iterate the snapshot, not the
@@ -9534,6 +9547,7 @@ def _record_stop_outcome_impl(
 
 
 @frappe.whitelist()
+@idempotent_request
 def driver_record_stop_outcome(
 	trip_name,
 	stop_idx,
@@ -9591,6 +9605,7 @@ def driver_record_stop_outcome(
 
 
 @frappe.whitelist(allow_guest=True)
+@idempotent_request
 def admin_record_stop_outcome(
 	trip_name=None,
 	stop_idx=None,
@@ -10175,6 +10190,7 @@ def _normalize_return_lines(lines):
 
 
 @frappe.whitelist()
+@idempotent_request
 def driver_record_return_capture(trip_name, stop_idx, lines, signature_base64, notes=None, photo_base64_list=None):
 	driver = _get_current_driver()
 	trip = _require_owned_trip(trip_name, driver)
