@@ -3248,6 +3248,17 @@ def update_customer(customer_name, **kwargs):
 
 	if customer.territory:
 		_ensure_territory(customer.territory)
+	# Cond. IVA typed in the CRM (possibly offline) may not exist yet — create it
+	# instead of failing the Link (same helper create_customer uses).
+	if cstr(customer.get("tax_category") or "").strip():
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+				ensure_or_create_tax_category,
+			)
+
+			ensure_or_create_tax_category(customer.tax_category)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "update_customer ensure tax_category")
 	customer.save(ignore_permissions=True)
 
 	# RM Zona → Address.custom_zone (committed TMS zone codes like T1-THU)
