@@ -410,8 +410,25 @@ def _stops_payload(trip, geo_by_address=None):
 			if code:
 				tracking_by_dn[row.name] = code
 
+	so_by_dn = {}
+	if dn_names:
+		for row in frappe.get_all(
+			"Delivery Note Item",
+			filters={"parent": ["in", dn_names], "against_sales_order": ["is", "set"]},
+			fields=["parent", "against_sales_order", "idx"],
+			order_by="idx asc",
+			ignore_permissions=True,
+		):
+			dn = cstr(row.parent or "").strip()
+			so = cstr(row.against_sales_order or "").strip()
+			if not dn or not so:
+				continue
+			bucket = so_by_dn.setdefault(dn, [])
+			if so not in bucket:
+				bucket.append(so)
+
 	return [
-		_stop_out(s, geo_by_address, customer_meta, address_meta, tracking_by_dn)
+		_stop_out(s, geo_by_address, customer_meta, address_meta, tracking_by_dn, so_by_dn)
 		for s in ordered
 	]
 
@@ -429,11 +446,12 @@ def _valid_map_coord(value):
 	return n
 
 
-def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tracking_by_dn=None):
+def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tracking_by_dn=None, so_by_dn=None):
 	address_geo = address_geo or {}
 	customer_meta = customer_meta or {}
 	address_meta = address_meta or {}
 	tracking_by_dn = tracking_by_dn or {}
+	so_by_dn = so_by_dn or {}
 	geo = address_geo.get(stop.address) or {}
 	outcome = stop.get("custom_outcome") if hasattr(stop, "get") else getattr(stop, "custom_outcome", None)
 	cust = customer_meta.get(stop.customer) or {}
@@ -454,6 +472,8 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 	tracking_code = tracking_by_dn.get(dn) if dn else None
 	if dn and not tracking_code and frappe.db.has_column("Delivery Note", "custom_tracking_code"):
 		tracking_code = _ensure_tracking_code(dn)
+	sales_orders = list(so_by_dn.get(dn) or []) if dn else []
+	sales_order = sales_orders[0] if sales_orders else None
 	phone = None
 	for raw in (
 		cust.get("custom_client_phone_e164"),
@@ -475,6 +495,8 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 		"preferred_hours": cust.get("custom_preferred_hours") or None,
 		"comments": cust.get("customer_details") or None,
 		"delivery_note": stop.delivery_note,
+		"sales_order": sales_order,
+		"sales_orders": sales_orders,
 		"tracking_code": tracking_code or None,
 		"phone": phone,
 		"grand_total": stop.grand_total,
@@ -497,6 +519,17 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 			"amount_due": getattr(stop, "custom_amount_due", None),
 			"amount_collected": getattr(stop, "custom_amount_collected", None),
 			"payment_method": getattr(stop, "custom_payment_method", None) or None,
+			"payments": (
+				frappe.parse_json(getattr(stop, "custom_payments_json", None))
+				if getattr(stop, "custom_payments_json", None)
+				else []
+			),
+			"payment_summary": getattr(stop, "custom_payment_summary", None) or None,
+			"requires_factura_a": bool(getattr(stop, "custom_requires_factura_a", 0)),
+			"factura_a_status": getattr(stop, "custom_factura_a_status", None) or None,
+			"surcharge_pct": getattr(stop, "custom_surcharge_pct", None),
+			"surcharge_amount": getattr(stop, "custom_surcharge_amount", None),
+			"surcharge_rule": getattr(stop, "custom_surcharge_rule", None) or None,
 			"cliente_debe": bool(getattr(stop, "custom_cliente_debe", 0)),
 			"balance_after_stop": getattr(stop, "custom_balance_after_stop", None),
 			"late_penalty_pct": getattr(stop, "custom_late_penalty_pct", None),
@@ -2274,6 +2307,8 @@ def list_trips_for_date(date=None, company=None, horizon_days=1, include_open_ba
 		"total_distance",
 		"uom",
 	]
+	if frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse"):
+		trip_fields.append("custom_pickup_warehouse")
 	if frappe.db.has_column("Delivery Trip", "custom_locked"):
 		trip_fields.append("custom_locked")
 
@@ -2374,6 +2409,11 @@ def list_trips_for_date(date=None, company=None, horizon_days=1, include_open_ba
 		t["delivered_count"] = delivered
 		t["pending_count"] = max(0, stop_count - delivered)
 		t["vehicle_plate"] = plate_by_vehicle.get(t.vehicle) if t.vehicle else None
+		t["pickup_warehouse"] = (
+			cstr(t.get("custom_pickup_warehouse") or "").strip() or None
+			if frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse")
+			else None
+		)
 		if frappe.db.has_column("Delivery Trip", "custom_locked"):
 			t["locked"] = bool(cint(t.get("custom_locked") or 0))
 		else:
@@ -3444,7 +3484,11 @@ TMS_SETTINGS_SCOPE = "settings.tms"
 
 TMS_SETTINGS_DEFAULTS = {
 	"delivery_payment_mode": "same_driver_collects",  # same_driver_collects | separate_collector | optional_collect_at_delivery
-	"late_payment_penalty_pct": 0.0,  # e.g. 3 = 3%; 0 disables
+	"late_payment_penalty_pct": 3.0,  # e.g. 3 = 3%; 0 disables
+	"transfer_surcharge_pct": 3.0,  # % on transfer portion when no Factura A
+	"factura_a_with_transfer_surcharge_pct": 3.0,  # % on full total when Factura A + transfer (not stacked)
+	# so_line | payment_entry | snapshot_only — how surcharge is booked
+	"surcharge_accounting_mode": "so_line",
 	"sync_delivery_payment_to_so": True,  # PE + Completado on delivery collection
 	"require_signature": "always",  # always | never | per_outcome
 	"require_photo_on_not_home": True,
@@ -3492,9 +3536,49 @@ def get_tms_settings():
 
 
 @frappe.whitelist(allow_guest=True)
+def preview_delivery_payment_surcharge(
+	goods_total=None,
+	payments=None,
+	requires_factura_a=None,
+	amount_collected=None,
+	payment_method=None,
+):
+	"""Preview surcharge for delivery multi-pay UI / regression tests. No writes."""
+	settings = _load_tms_settings()
+	goods = max(0.0, flt(goods_total))
+	req_fa = _truthy_flag(requires_factura_a, default=False)
+	pay_rows = _normalize_delivery_payments(
+		payments, amount_collected=amount_collected, payment_method=payment_method
+	)
+	pct, base, amount, rule = _compute_transfer_surcharge(
+		pay_rows,
+		requires_factura_a=req_fa,
+		goods_total=goods,
+		settings=settings,
+	)
+	collected = sum(flt(p.get("amount") or 0) for p in pay_rows)
+	return {
+		"goods_total": goods,
+		"payments": pay_rows,
+		"payment_summary": _payment_summary_label(pay_rows),
+		"requires_factura_a": req_fa,
+		"surcharge_pct": pct,
+		"surcharge_base": base,
+		"surcharge_amount": amount,
+		"surcharge_rule": rule,
+		"amount_due": round(goods + flt(amount), 2),
+		"amount_collected": collected,
+		"balance": round(goods + flt(amount) - collected, 2),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
 def save_tms_settings(
 	delivery_payment_mode=None,
 	late_payment_penalty_pct=None,
+	transfer_surcharge_pct=None,
+	factura_a_with_transfer_surcharge_pct=None,
+	surcharge_accounting_mode=None,
 	sync_delivery_payment_to_so=None,
 	require_signature=None,
 	require_photo_on_not_home=None,
@@ -3523,6 +3607,9 @@ def save_tms_settings(
 		{
 			"delivery_payment_mode": delivery_payment_mode,
 			"late_payment_penalty_pct": late_payment_penalty_pct,
+			"transfer_surcharge_pct": transfer_surcharge_pct,
+			"factura_a_with_transfer_surcharge_pct": factura_a_with_transfer_surcharge_pct,
+			"surcharge_accounting_mode": surcharge_accounting_mode,
 			"sync_delivery_payment_to_so": sync_delivery_payment_to_so,
 			"require_signature": require_signature,
 			"require_photo_on_not_home": require_photo_on_not_home,
@@ -3577,7 +3664,7 @@ def _persist_tms_settings(raw, commit=True):
 		"drive_buffer_minutes_per_leg",
 		"nearby_driver_max_km",
 	}
-	float_keys = {"late_payment_penalty_pct"}
+	float_keys = {"late_payment_penalty_pct", "transfer_surcharge_pct", "factura_a_with_transfer_surcharge_pct"}
 	for key, value in raw.items():
 		if value is None:
 			continue
@@ -3608,6 +3695,13 @@ def _persist_tms_settings(raw, commit=True):
 				s = TMS_SETTINGS_DEFAULTS["packing_strategy"]
 			if s not in ("client_zone", "fast_deliver_greedy"):
 				s = TMS_SETTINGS_DEFAULTS["packing_strategy"]
+			current[key] = s
+		elif key == "surcharge_accounting_mode":
+			s = cstr(value).strip().lower()
+			if s in ("", "null", "undefined", "none"):
+				s = TMS_SETTINGS_DEFAULTS["surcharge_accounting_mode"]
+			if s not in ("so_line", "payment_entry", "snapshot_only"):
+				s = TMS_SETTINGS_DEFAULTS["surcharge_accounting_mode"]
 			current[key] = s
 		elif key in list_keys:
 			parsed = frappe.parse_json(value) if isinstance(value, str) else value
@@ -8374,6 +8468,11 @@ def _build_trip_delivery_summary(trip):
 				"amount_due": amount_due,
 				"amount_collected": amount_collected,
 				"balance_after_stop": balance,
+				"payment_summary": pod.get("payment_summary") or pod.get("payment_method"),
+				"requires_factura_a": bool(pod.get("requires_factura_a")),
+				"factura_a_status": pod.get("factura_a_status"),
+				"surcharge_amount": pod.get("surcharge_amount"),
+				"payments": pod.get("payments") or [],
 			}
 		)
 
@@ -8604,6 +8703,182 @@ def driver_reorder_stops(trip_name, delivery_note_names=None):
 	}
 
 
+
+def _ensure_delivery_payment_split_fields():
+	"""Idempotent Delivery Stop / SO fields for multi-pay + Factura A + surcharge."""
+	if frappe.db.has_column("Delivery Stop", "custom_payments_json"):
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+	from erpnext.patches.v15_0.add_tms_delivery_payment_split_fields import CUSTOM_FIELDS
+
+	create_custom_fields(CUSTOM_FIELDS, update=True)
+	frappe.clear_cache(doctype="Delivery Stop")
+	frappe.clear_cache(doctype="Sales Order")
+
+
+_TRANSFER_METHODS = {
+	"transfer",
+	"transferencia",
+	"mobile money",
+	"mobile_money",
+	"bank transfer",
+	"bank_transfer",
+}
+
+
+def _is_transfer_method(method) -> bool:
+	return cstr(method or "").strip().lower() in _TRANSFER_METHODS
+
+
+def _normalize_delivery_payments(payments=None, amount_collected=None, payment_method=None):
+	"""Return list[{method, amount}] from JSON/list or legacy single mop+amount."""
+	rows = []
+	raw = payments
+	if isinstance(raw, str):
+		s = raw.strip()
+		if s.lower() in ("", "null", "undefined", "none"):
+			raw = None
+		else:
+			try:
+				raw = frappe.parse_json(s)
+			except Exception:
+				raw = None
+	if isinstance(raw, dict):
+		raw = [raw]
+	if isinstance(raw, (list, tuple)):
+		for p in raw:
+			if not isinstance(p, dict):
+				continue
+			amt = flt(p.get("amount") or p.get("paid_amount") or 0)
+			method = cstr(p.get("method") or p.get("mode_of_payment") or p.get("payment_method") or "").strip()
+			if amt <= 0:
+				continue
+			if not method:
+				method = "Cash"
+			rows.append({"method": method, "amount": round(amt, 2)})
+	if not rows and amount_collected is not None:
+		amt = flt(amount_collected)
+		if amt > 0:
+			rows.append(
+				{
+					"method": cstr(payment_method or "").strip() or "Cash",
+					"amount": round(amt, 2),
+				}
+			)
+	return rows
+
+
+def _payment_summary_label(payments) -> str:
+	parts = []
+	for p in payments or []:
+		method = cstr(p.get("method") or "")
+		label = {
+			"Cash": "Efectivo",
+			"Transfer": "Transferencia",
+			"Mobile Money": "Transferencia",
+			"Other": "Otro",
+		}.get(method, method or "Pago")
+		parts.append(f"{label} ${flt(p.get('amount') or 0):,.2f}")
+	return " + ".join(parts)
+
+
+def _compute_transfer_surcharge(payments, *, requires_factura_a: bool, goods_total: float, settings: dict):
+	"""Return (pct, base, amount, rule). Factura A alone → 0. Never stack both % knobs."""
+	transfer_amt = sum(flt(p.get("amount") or 0) for p in (payments or []) if _is_transfer_method(p.get("method")))
+	has_transfer = transfer_amt > 0.005
+	goods = max(0.0, flt(goods_total))
+	if requires_factura_a and has_transfer:
+		pct = flt(settings.get("factura_a_with_transfer_surcharge_pct") or 0)
+		base = goods
+		rule = "factura_a_total"
+	elif has_transfer:
+		pct = flt(settings.get("transfer_surcharge_pct") or 0)
+		base = transfer_amt
+		rule = "transfer_portion"
+	else:
+		return 0.0, 0.0, 0.0, None
+	if pct <= 0 or base <= 0:
+		return pct, base, 0.0, rule
+	amount = round(base * pct / 100.0, 2)
+	return pct, base, amount, rule
+
+
+def _write_stop_payment_snapshot(
+	stop,
+	*,
+	payments,
+	requires_factura_a: bool,
+	surcharge_pct,
+	surcharge_base,
+	surcharge_amount,
+	surcharge_rule,
+):
+	_ensure_delivery_payment_split_fields()
+	summary = _payment_summary_label(payments)
+	if frappe.db.has_column("Delivery Stop", "custom_payments_json"):
+		stop.custom_payments_json = frappe.as_json(payments or [])
+	if frappe.db.has_column("Delivery Stop", "custom_requires_factura_a"):
+		stop.custom_requires_factura_a = 1 if requires_factura_a else 0
+	if frappe.db.has_column("Delivery Stop", "custom_factura_a_status"):
+		cur = cstr(getattr(stop, "custom_factura_a_status", None) or "").strip()
+		if requires_factura_a:
+			if cur not in ("issued",):
+				stop.custom_factura_a_status = "pending"
+		elif not cur:
+			stop.custom_factura_a_status = "na"
+	if frappe.db.has_column("Delivery Stop", "custom_surcharge_pct"):
+		stop.custom_surcharge_pct = flt(surcharge_pct)
+		stop.custom_surcharge_base = flt(surcharge_base)
+		stop.custom_surcharge_amount = flt(surcharge_amount)
+		stop.custom_surcharge_rule = cstr(surcharge_rule or "") or None
+	if frappe.db.has_column("Delivery Stop", "custom_payment_summary"):
+		stop.custom_payment_summary = summary or None
+	# Legacy single mop = joined label for older UIs
+	if payments:
+		stop.custom_payment_method = " + ".join(
+			cstr(p.get("method") or "Cash") for p in payments
+		)[:140]
+	return summary
+
+
+def _sync_so_factura_and_surcharge_fields(
+	so_names,
+	*,
+	requires_factura_a: bool,
+	surcharge_amount: float,
+	payment_summary: str | None,
+	settings: dict,
+):
+	_ensure_delivery_payment_split_fields()
+	mode = cstr(settings.get("surcharge_accounting_mode") or "so_line").strip().lower()
+	for so_name in so_names or []:
+		if not so_name or not frappe.db.exists("Sales Order", so_name):
+			continue
+		updates = {}
+		if frappe.db.has_column("Sales Order", "custom_requires_factura_a"):
+			updates["custom_requires_factura_a"] = 1 if requires_factura_a else 0
+		if frappe.db.has_column("Sales Order", "custom_factura_a_status"):
+			cur = frappe.db.get_value("Sales Order", so_name, "custom_factura_a_status")
+			if requires_factura_a:
+				if cstr(cur or "") != "issued":
+					updates["custom_factura_a_status"] = "pending"
+			elif not cur:
+				updates["custom_factura_a_status"] = "na"
+		if frappe.db.has_column("Sales Order", "custom_delivery_surcharge_amount"):
+			updates["custom_delivery_surcharge_amount"] = flt(surcharge_amount)
+		if frappe.db.has_column("Sales Order", "custom_delivery_payment_summary") and payment_summary:
+			updates["custom_delivery_payment_summary"] = payment_summary
+		if updates:
+			frappe.db.set_value("Sales Order", so_name, updates, update_modified=True)
+		if mode == "snapshot_only":
+			continue
+		if mode in ("so_line", "payment_entry") and flt(surcharge_amount) > 0.005:
+			_append_so_payment_note(
+				so_name,
+				_("Recargo entrega {0} (modo {1})").format(flt(surcharge_amount), mode),
+			)
+
+
 def _ensure_late_penalty_fields():
 	"""Idempotent Delivery Stop late-penalty columns (patch may not have run)."""
 	if frappe.db.has_column("Delivery Stop", "custom_late_penalty_pct"):
@@ -8757,9 +9032,13 @@ def _sync_stop_collection_to_sales_orders(
 	*,
 	delta_collected: float,
 	payment_method=None,
+	payments=None,
 	complete: bool,
 	ledger_note: str | None = None,
 	settings: dict | None = None,
+	requires_factura_a: bool = False,
+	surcharge_amount: float = 0.0,
+	payment_summary: str | None = None,
 ):
 	"""Book PE for cash taken + optionally Completado on linked SOs."""
 	settings = settings or _load_tms_settings()
@@ -8769,15 +9048,37 @@ def _sync_stop_collection_to_sales_orders(
 	so_names = _sales_orders_for_dn(dn) if dn else []
 	if not so_names:
 		return
-	delta = flt(delta_collected)
-	# Split evenly across linked SOs when a DN covers multiple (rare).
-	per = round(delta / len(so_names), 2) if delta > 0 and so_names else 0.0
-	remainder = round(delta - per * len(so_names), 2) if delta > 0 else 0.0
+	_sync_so_factura_and_surcharge_fields(
+		so_names,
+		requires_factura_a=requires_factura_a,
+		surcharge_amount=surcharge_amount,
+		payment_summary=payment_summary,
+		settings=settings,
+	)
+	pay_rows = list(payments or [])
+	if not pay_rows and flt(delta_collected) > 0:
+		pay_rows = [
+			{
+				"method": cstr(payment_method or "").strip() or "Cash",
+				"amount": round(flt(delta_collected), 2),
+			}
+		]
+	# Scale payment rows to delta when absolute snapshot was larger than this delta
+	# (settle path may pass only the new delta as a single synthetic row).
 	for i, so_name in enumerate(so_names):
-		chunk = per + (remainder if i == 0 else 0.0)
-		if chunk > 0:
+		# Split each tender evenly across linked SOs (rare multi-SO DN).
+		n = len(so_names)
+		for pi, prow in enumerate(pay_rows):
+			amt = flt(prow.get("amount") or 0)
+			if amt <= 0:
+				continue
+			per = round(amt / n, 2)
+			remainder = round(amt - per * n, 2)
+			chunk = per + (remainder if i == 0 else 0.0)
+			if chunk <= 0:
+				continue
 			try:
-				_record_so_receive_payment(so_name, chunk, payment_method)
+				_record_so_receive_payment(so_name, chunk, prow.get("method") or payment_method)
 			except Exception:
 				frappe.log_error(frappe.get_traceback(), "delivery PE sync")
 		if ledger_note:
@@ -8793,8 +9094,12 @@ def _apply_collection_and_penalty(
 	prior_collected: float,
 	delta_collected: float,
 	payment_method=None,
+	payments=None,
 	settings: dict,
 	complete_so: bool,
+	requires_factura_a: bool = False,
+	surcharge_amount: float = 0.0,
+	payment_summary: str | None = None,
 ):
 	"""Update stop payment fields, snapshot/apply late penalty, sync SO."""
 	_ensure_late_penalty_fields()
@@ -8861,17 +9166,70 @@ def _apply_collection_and_penalty(
 			stop,
 			delta_collected=delta,
 			payment_method=payment_method,
+			payments=payments,
 			complete=complete_so,
 			ledger_note=tag,
 			settings=settings,
+			requires_factura_a=requires_factura_a,
+			surcharge_amount=surcharge_amount,
+			payment_summary=payment_summary,
 		)
 
 
-@frappe.whitelist()
-def driver_record_stop_outcome(
-	trip_name,
+def _stop_pod_snapshot(stop):
+	"""Flat PoD fields for Historial (Delivery Trip Version rows)."""
+	return {
+		"outcome": cstr(getattr(stop, "custom_outcome", None) or ""),
+		"recipient_name": cstr(getattr(stop, "custom_pod_recipient_name", None) or ""),
+		"recipient_id_number": cstr(getattr(stop, "custom_pod_recipient_id_number", None) or ""),
+		"signature": cstr(getattr(stop, "custom_pod_signature", None) or ""),
+		"notes": cstr(getattr(stop, "custom_pod_notes", None) or ""),
+		"attempt_note": cstr(getattr(stop, "custom_attempt_note", None) or ""),
+		"visited": "1" if cint(getattr(stop, "visited", 0)) else "0",
+	}
+
+
+def _log_stop_pod_audit(trip_name, stop_idx, before, after, source=None):
+	"""Commit who/what PoD changes into Version for HistorialPanel."""
+	prefix = f"stop_{cint(stop_idx)}"
+	changes = []
+	for key in (
+		"outcome",
+		"recipient_name",
+		"recipient_id_number",
+		"signature",
+		"notes",
+		"attempt_note",
+		"visited",
+	):
+		old_v = before.get(key) or ""
+		new_v = after.get(key) or ""
+		if key == "signature":
+			# Keep Historial readable — URLs are long private file paths.
+			old_v = "signed" if old_v else ""
+			new_v = "signed" if new_v else ""
+		if old_v == new_v:
+			continue
+		changes.append((f"{prefix}.{key}", old_v, new_v))
+	if changes and source:
+		changes.append((f"{prefix}.via", "", cstr(source)))
+	if not changes:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
+		log_field_changes("Delivery Trip", trip_name, changes)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "tms stop pod audit")
+
+
+def _record_stop_outcome_impl(
+	trip,
 	stop_idx,
 	outcome,
+	*,
+	source="driver",
+	require_signature=True,
 	recipient_name=None,
 	recipient_id_number=None,
 	signature_base64=None,
@@ -8881,55 +9239,71 @@ def driver_record_stop_outcome(
 	lng=None,
 	amount_collected=None,
 	payment_method=None,
+	payments=None,
+	requires_factura_a=None,
 	credit_items=None,
+	clear_signature=False,
 ):
-	"""Replaces/extends `driver_complete_stop` with an outcome enum.
-
-	- Delivered / Partial: recipient name/ID + signature required (same POD
-	  fields). Clarification notes are optional; Partial may still carry an
-	  auto-generated qty summary in notes.
-	- Not Home: a note is required. Deliberately does NOT mark the stop
-	  visited - the linked Delivery Note stays open for replanning (see
-	  `_assigned_delivery_note_names`).
-	- Refused: a note + signature are required. Marks visited.
-	"""
-	driver = _get_current_driver()
-	trip = _require_owned_trip(trip_name, driver)
-
-	# Driver starting field work is the publish signal — auto-submit Draft.
-	trip = _ensure_trip_published_for_driving(trip)
-
-	valid_outcomes = {"Delivered", "Not Home", "Partial", "Refused"}
-	if outcome not in valid_outcomes:
-		frappe.throw(_("Invalid outcome: {0}").format(outcome))
-
+	"""Shared PoD apply for driver + Tables→MATs admin. Always writes Historial."""
+	trip_name = trip.name
 	stop_idx = cint(stop_idx)
 	stop = next((s for s in trip.delivery_stops if s.idx == stop_idx), None)
 	if not stop:
 		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
 
-	settings = _load_tms_settings()
-	signature_required = cstr(settings.get("require_signature") or "always") != "never"
+	outcome_raw = cstr(outcome or "").strip()
+	reset = outcome_raw.lower() in ("", "pending", "none", "null", "undefined")
+	valid_outcomes = {"Delivered", "Not Home", "Partial", "Refused"}
+	if not reset and outcome_raw not in valid_outcomes:
+		frappe.throw(_("Invalid outcome: {0}").format(outcome_raw))
 
-	if outcome == "Delivered":
-		if not recipient_name or not recipient_id_number:
-			frappe.throw(_("Recipient name and ID/DNI are required to complete a delivery."))
-		if signature_required and not signature_base64:
-			frappe.throw(_("A signature is required to complete a delivery."))
-	elif outcome == "Partial":
-		# Same POD fields as Delivered (name / DNI / signature); clarification note is optional.
-		if not recipient_name or not recipient_id_number:
-			frappe.throw(_("Recipient name and ID/DNI are required for a partial delivery."))
-		if signature_required and not signature_base64:
-			frappe.throw(_("A signature is required for a partial delivery."))
-	elif outcome == "Not Home":
-		if not attempt_note:
-			frappe.throw(_("A note is required to record a failed delivery attempt."))
-	else:  # Refused
-		if not notes:
-			frappe.throw(_("A note is required for a {0} outcome.").format(outcome))
-		if signature_required and not signature_base64:
-			frappe.throw(_("A signature is required for a {0} outcome.").format(outcome))
+	before = _stop_pod_snapshot(stop)
+	settings = _load_tms_settings()
+	signature_required = bool(require_signature) and cstr(settings.get("require_signature") or "always") != "never"
+
+	if reset:
+		stop.custom_outcome = None
+		stop.custom_pod_recipient_name = None
+		stop.custom_pod_recipient_id_number = None
+		stop.custom_pod_notes = None
+		stop.custom_attempt_note = None
+		stop.custom_pod_captured_at = None
+		stop.custom_pod_captured_lat = None
+		stop.custom_pod_captured_lng = None
+		stop.visited = 0
+		if clear_signature:
+			stop.custom_pod_signature = None
+		after = _stop_pod_snapshot(stop)
+		_log_stop_pod_audit(trip_name, stop_idx, before, after, source=source)
+		trip.flags.ignore_validate_update_after_submit = True
+		trip.save(ignore_permissions=True)
+		frappe.db.commit()
+		payload = get_trip_map_data(trip_name)
+		payload["tracking_code"] = None
+		payload["credit_note"] = None
+		return payload
+
+	outcome = outcome_raw
+
+	if require_signature:
+		if outcome == "Delivered":
+			if not recipient_name or not recipient_id_number:
+				frappe.throw(_("Recipient name and ID/DNI are required to complete a delivery."))
+			if signature_required and not signature_base64 and not getattr(stop, "custom_pod_signature", None):
+				frappe.throw(_("A signature is required to complete a delivery."))
+		elif outcome == "Partial":
+			if not recipient_name or not recipient_id_number:
+				frappe.throw(_("Recipient name and ID/DNI are required for a partial delivery."))
+			if signature_required and not signature_base64 and not getattr(stop, "custom_pod_signature", None):
+				frappe.throw(_("A signature is required for a partial delivery."))
+		elif outcome == "Not Home":
+			if not attempt_note:
+				frappe.throw(_("A note is required to record a failed delivery attempt."))
+		else:  # Refused
+			if not notes:
+				frappe.throw(_("A note is required for a {0} outcome.").format(outcome))
+			if signature_required and not signature_base64 and not getattr(stop, "custom_pod_signature", None):
+				frappe.throw(_("A signature is required for a {0} outcome.").format(outcome))
 
 	if signature_base64:
 		file_doc = save_file(
@@ -8941,12 +9315,18 @@ def driver_record_stop_outcome(
 			is_private=1,
 		)
 		stop.custom_pod_signature = file_doc.file_url
+	elif clear_signature:
+		stop.custom_pod_signature = None
 
 	stop.custom_outcome = outcome
-	stop.custom_pod_recipient_name = recipient_name
-	stop.custom_pod_recipient_id_number = recipient_id_number
-	stop.custom_pod_notes = notes
-	stop.custom_attempt_note = attempt_note
+	if recipient_name is not None:
+		stop.custom_pod_recipient_name = recipient_name
+	if recipient_id_number is not None:
+		stop.custom_pod_recipient_id_number = recipient_id_number
+	if notes is not None:
+		stop.custom_pod_notes = notes
+	if attempt_note is not None:
+		stop.custom_attempt_note = attempt_note
 	stop.custom_pod_captured_at = now_datetime()
 	stop.custom_pod_captured_lat = flt(lat) if lat else None
 	stop.custom_pod_captured_lng = flt(lng) if lng else None
@@ -8956,46 +9336,95 @@ def driver_record_stop_outcome(
 	# "separate_collector" mode means someone else collects later, so the
 	# driver isn't asked for these fields at all - ignore anything sent.
 	if outcome in ("Delivered", "Partial"):
-		amount_due = flt(stop.grand_total)
+		goods_total = flt(stop.grand_total)
 		prior = flt(getattr(stop, "custom_amount_collected", 0) or 0)
-		if settings.get("delivery_payment_mode") != "separate_collector" and amount_collected is not None:
-			# Conductor sends the absolute cobrado amount for this stop.
-			absolute = max(0.0, flt(amount_collected))
+		# Factura A: explicit flag wins; else keep prior stop/SO flag.
+		if requires_factura_a is None:
+			req_fa = bool(cint(getattr(stop, "custom_requires_factura_a", 0) or 0))
+		else:
+			req_fa = _truthy_flag(requires_factura_a, default=False)
+		pay_rows = _normalize_delivery_payments(
+			payments, amount_collected=amount_collected, payment_method=payment_method
+		)
+		surch_pct, surch_base, surch_amt, surch_rule = _compute_transfer_surcharge(
+			pay_rows,
+			requires_factura_a=req_fa,
+			goods_total=goods_total,
+			settings=settings,
+		)
+		amount_due = goods_total + flt(surch_amt)
+		summary = _write_stop_payment_snapshot(
+			stop,
+			payments=pay_rows,
+			requires_factura_a=req_fa,
+			surcharge_pct=surch_pct,
+			surcharge_base=surch_base,
+			surcharge_amount=surch_amt,
+			surcharge_rule=surch_rule,
+		)
+		has_collection_input = (
+			amount_collected is not None
+			or payments is not None
+			or (isinstance(payments, str) and cstr(payments).strip() not in ("", "null", "undefined"))
+		)
+		if settings.get("delivery_payment_mode") != "separate_collector" and has_collection_input:
+			absolute = sum(flt(p.get("amount") or 0) for p in pay_rows)
+			if amount_collected is not None and not pay_rows:
+				absolute = max(0.0, flt(amount_collected))
+			elif amount_collected is not None and pay_rows:
+				# Prefer sum of splits; fall back to absolute if client sent both inconsistently.
+				absolute = max(absolute, 0.0)
 			delta = max(0.0, absolute - prior)
+			# Only sync the new delta as payment rows (scale if absolute snapshot).
+			delta_rows = pay_rows
+			if prior > 0.005 and absolute > prior + 0.005 and pay_rows:
+				# Fresh PoD usually prior=0; if settling atop prior, treat pay_rows as the delta.
+				delta_rows = pay_rows
+			elif absolute <= prior + 0.005:
+				delta_rows = []
 			_apply_collection_and_penalty(
 				stop,
 				amount_due=amount_due,
 				prior_collected=prior,
 				delta_collected=delta,
-				payment_method=payment_method,
+				payment_method=payment_method or (pay_rows[0]["method"] if pay_rows else None),
+				payments=delta_rows if delta > 0.005 else [],
 				settings=settings,
 				complete_so=True,
+				requires_factura_a=req_fa,
+				surcharge_amount=surch_amt,
+				payment_summary=summary,
 			)
-			# Ensure collected reflects the absolute the driver entered.
 			stop.custom_amount_collected = absolute
 			goods_bal = max(0.0, amount_due - absolute)
 			pen = _pending_penalty_amount(stop)
 			stop.custom_balance_after_stop = goods_bal + pen
 			stop.custom_cliente_debe = 1 if stop.custom_balance_after_stop > 0.005 else 0
 		else:
-			# Separate collector or no amount: still mark due + Completado (unpaid).
 			stop.custom_amount_due = amount_due
 			stop.custom_balance_after_stop = max(0.0, amount_due - prior)
 			stop.custom_cliente_debe = 1 if stop.custom_balance_after_stop > 0.005 else 0
 			if stop.custom_balance_after_stop > 0.005:
-				_snapshot_late_penalty(stop, stop.custom_balance_after_stop, settings)
+				_snapshot_late_penalty(stop, max(0.0, goods_total - prior), settings)
 				pen = _pending_penalty_amount(stop)
 				stop.custom_balance_after_stop = max(0.0, amount_due - prior) + pen
 			_sync_stop_collection_to_sales_orders(
 				stop,
 				delta_collected=0,
 				payment_method=None,
+				payments=[],
 				complete=True,
 				ledger_note=_(
 					"[entrega {0}] sin cobro en parada — pendiente {1}"
 				).format(nowdate(), flt(stop.custom_balance_after_stop)),
 				settings=settings,
+				requires_factura_a=req_fa,
+				surcharge_amount=surch_amt,
+				payment_summary=summary,
 			)
+
+	after = _stop_pod_snapshot(stop)
+	_log_stop_pod_audit(trip_name, stop_idx, before, after, source=source)
 
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)
@@ -9017,12 +9446,7 @@ def driver_record_stop_outcome(
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
 
-		if outcome == "Delivered":
-			evt = "delivered"
-		elif outcome == "Not Home":
-			evt = "failed"
-		else:
-			evt = "failed"
+		evt = "delivered" if outcome == "Delivered" else "failed"
 		emit_ecommerce_webhook(
 			evt,
 			{
@@ -9033,6 +9457,7 @@ def driver_record_stop_outcome(
 				"delivery_note": stop.delivery_note,
 				"tracking_code": tracking_code,
 				"credit_note": credit_note,
+				"source": source,
 			},
 		)
 	except Exception:
@@ -9042,6 +9467,124 @@ def driver_record_stop_outcome(
 	payload["tracking_code"] = tracking_code
 	payload["credit_note"] = credit_note
 	return payload
+
+
+@frappe.whitelist()
+def driver_record_stop_outcome(
+	trip_name,
+	stop_idx,
+	outcome,
+	recipient_name=None,
+	recipient_id_number=None,
+	signature_base64=None,
+	notes=None,
+	attempt_note=None,
+	lat=None,
+	lng=None,
+	amount_collected=None,
+	payment_method=None,
+	payments=None,
+	requires_factura_a=None,
+	credit_items=None,
+):
+	"""Replaces/extends `driver_complete_stop` with an outcome enum.
+
+	- Delivered / Partial: recipient name/ID + signature required (same POD
+	  fields). Clarification notes are optional; Partial may still carry an
+	  auto-generated qty summary in notes.
+	- Not Home: a note is required. Deliberately does NOT mark the stop
+	  visited - the linked Delivery Note stays open for replanning (see
+	  `_assigned_delivery_note_names`).
+	- Refused: a note + signature are required. Marks visited.
+
+	Every change is written to Delivery Trip Historial (who + via=driver).
+	"""
+	driver = _get_current_driver()
+	trip = _require_owned_trip(trip_name, driver)
+
+	# Driver starting field work is the publish signal — auto-submit Draft.
+	trip = _ensure_trip_published_for_driving(trip)
+
+	return _record_stop_outcome_impl(
+		trip,
+		stop_idx,
+		outcome,
+		source="driver",
+		require_signature=True,
+		recipient_name=recipient_name,
+		recipient_id_number=recipient_id_number,
+		signature_base64=signature_base64,
+		notes=notes,
+		attempt_note=attempt_note,
+		lat=lat,
+		lng=lng,
+		amount_collected=amount_collected,
+		payment_method=payment_method,
+		payments=payments,
+		requires_factura_a=requires_factura_a,
+		credit_items=credit_items,
+	)
+
+
+@frappe.whitelist(allow_guest=True)
+def admin_record_stop_outcome(
+	trip_name=None,
+	stop_idx=None,
+	outcome=None,
+	recipient_name=None,
+	recipient_id_number=None,
+	signature_base64=None,
+	notes=None,
+	attempt_note=None,
+	lat=None,
+	lng=None,
+	amount_collected=None,
+	payment_method=None,
+	payments=None,
+	requires_factura_a=None,
+	credit_items=None,
+	clear_signature=0,
+):
+	"""Tables→MATs admin PoD editor — no driver ownership check.
+
+	Allows setting Delivered / Partial / Not Home / Refused / Pending, plus
+	recipient / DNI-CUIT / signature / notes. Soft validation (admin may omit
+	signature). Historial records ``via=admin`` and the session user.
+	"""
+	name = cstr(trip_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required"))
+	if stop_idx is None or cstr(stop_idx).strip().lower() in ("", "null", "undefined", "none"):
+		frappe.throw(_("Stop is required"))
+
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", name)
+	frappe.flags.ignore_permissions = False
+
+	# Admin edits on a draft still publish so SO / remito side-effects stay consistent.
+	if cint(trip.docstatus) == 0:
+		trip = _ensure_trip_published_for_driving(trip)
+
+	return _record_stop_outcome_impl(
+		trip,
+		stop_idx,
+		outcome,
+		source="admin",
+		require_signature=False,
+		recipient_name=recipient_name,
+		recipient_id_number=recipient_id_number,
+		signature_base64=signature_base64,
+		notes=notes,
+		attempt_note=attempt_note,
+		lat=lat,
+		lng=lng,
+		amount_collected=amount_collected,
+		payment_method=payment_method,
+		payments=payments,
+		requires_factura_a=requires_factura_a,
+		credit_items=credit_items,
+		clear_signature=cint(clear_signature),
+	)
 
 
 @frappe.whitelist()
@@ -9113,7 +9656,14 @@ def list_cliente_debe_stops(date=None):
 
 
 @frappe.whitelist()
-def driver_settle_payment(trip_name, stop_idx, amount_collected, payment_method=None):
+def driver_settle_payment(
+	trip_name,
+	stop_idx,
+	amount_collected=None,
+	payment_method=None,
+	payments=None,
+	requires_factura_a=None,
+):
 	"""Record a later payment collection against an existing stop (the
 	"separate collector" flow). Applies pending late-payment penalty when due."""
 	driver = _get_current_driver()
@@ -9126,16 +9676,52 @@ def driver_settle_payment(trip_name, stop_idx, amount_collected, payment_method=
 
 	settings = _load_tms_settings()
 	prior = flt(getattr(stop, "custom_amount_collected", 0) or 0)
-	due = flt(getattr(stop, "custom_amount_due", 0) or stop.grand_total or 0)
-	delta = max(0.0, flt(amount_collected))
+	goods_total = flt(stop.grand_total or 0)
+	if requires_factura_a is None:
+		req_fa = bool(cint(getattr(stop, "custom_requires_factura_a", 0) or 0))
+	else:
+		req_fa = _truthy_flag(requires_factura_a, default=False)
+	pay_rows = _normalize_delivery_payments(
+		payments, amount_collected=amount_collected, payment_method=payment_method
+	)
+	surch_pct, surch_base, surch_amt, surch_rule = _compute_transfer_surcharge(
+		pay_rows,
+		requires_factura_a=req_fa,
+		goods_total=goods_total,
+		settings=settings,
+	)
+	# Keep prior due if already snapshotted higher; else goods + new surcharge.
+	prior_due = flt(getattr(stop, "custom_amount_due", 0) or 0)
+	due = max(prior_due, goods_total + flt(surch_amt))
+	delta = sum(flt(p.get("amount") or 0) for p in pay_rows)
+	if amount_collected is not None and not pay_rows:
+		delta = max(0.0, flt(amount_collected))
+	summary = _write_stop_payment_snapshot(
+		stop,
+		payments=pay_rows
+		or _normalize_delivery_payments(
+			getattr(stop, "custom_payments_json", None),
+			amount_collected=prior + delta,
+			payment_method=payment_method,
+		),
+		requires_factura_a=req_fa,
+		surcharge_pct=surch_pct,
+		surcharge_base=surch_base,
+		surcharge_amount=surch_amt,
+		surcharge_rule=surch_rule,
+	)
 	_apply_collection_and_penalty(
 		stop,
 		amount_due=due,
 		prior_collected=prior,
 		delta_collected=delta,
-		payment_method=payment_method,
+		payment_method=payment_method or (pay_rows[0]["method"] if pay_rows else None),
+		payments=pay_rows,
 		settings=settings,
 		complete_so=True,
+		requires_factura_a=req_fa,
+		surcharge_amount=surch_amt,
+		payment_summary=summary,
 	)
 
 	trip.flags.ignore_validate_update_after_submit = True
@@ -9173,8 +9759,18 @@ def get_delivery_print_data(trip_name, stop_idx):
 		dn_data = dn.as_dict()
 		line_items = [row.as_dict() for row in dn.items]
 
-	stop_out = _stop_out(stop)
+	so_by_dn = {}
+	if stop.delivery_note:
+		for so in _sales_orders_for_dn(stop.delivery_note):
+			so_by_dn.setdefault(stop.delivery_note, []).append(so)
 
+	stop_out = _stop_out(stop, so_by_dn=so_by_dn)
+
+	pod = stop_out.get("pod") or {}
+	services = []
+	if pod.get("requires_factura_a"):
+		services.append({"code": "factura_a", "label": "Factura A", "amount": 0})
+	services_summary = ", ".join(s["label"] for s in services) if services else None
 	return {
 		"doc": {
 			**dn_data,
@@ -9182,9 +9778,14 @@ def get_delivery_print_data(trip_name, stop_idx):
 			"driver_name": trip.driver_name,
 			"stop_customer": stop.customer,
 			"stop_address": stop.customer_address,
-			**(stop_out.get("pod") or {}),
+			**pod,
+			"services": services,
+			"services_summary": services_summary,
+			"payment_summary": pod.get("payment_summary") or pod.get("payment_method"),
 		},
 		"lineItems": line_items,
+		"payments": pod.get("payments") or [],
+		"services": services,
 	}
 
 
@@ -9706,6 +10307,20 @@ def driver_upload_stop_photo(trip_name, stop_idx, image_base64):
 	existing.append(file_doc.file_url)
 
 	stop.custom_photo_urls = frappe.as_json(existing)
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
+		log_field_changes(
+			"Delivery Trip",
+			trip_name,
+			[
+				(f"stop_{stop_idx}.photo", "", f"+1 ({len(existing)})"),
+				(f"stop_{stop_idx}.via", "", "driver"),
+			],
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "tms stop photo audit")
 
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)

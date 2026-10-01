@@ -829,6 +829,8 @@ def _ensure_pack_columns_nullable() -> None:
         ("custom_pack_qty", "int(11) NULL DEFAULT NULL"),
         ("custom_pack_size", "decimal(21,9) NULL DEFAULT NULL"),
         ("custom_pack_unit", f"varchar({frappe.db.VARCHAR_LEN}) NULL DEFAULT NULL"),
+        ("custom_unit_weight_min", "decimal(21,9) NULL DEFAULT NULL"),
+        ("custom_unit_weight_max", "decimal(21,9) NULL DEFAULT NULL"),
     )
     for fieldname, ddl_type in alters:
         if not frappe.db.has_column("Item", fieldname):
@@ -1719,6 +1721,34 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
             )
         unit_sku = (changes.get("unit_sku") or "").strip()
         item_doc.custom_unit_sku = unit_sku or None
+
+    def _coerce_float(raw):
+        if raw in (None, "", "null", "undefined"):
+            return None
+        try:
+            return max(0.0, flt(raw))
+        except (TypeError, ValueError):
+            return None
+
+    if "weight_per_unit" in changes and frappe.db.has_column("Item", "weight_per_unit"):
+        item_doc.weight_per_unit = _coerce_float(changes.get("weight_per_unit"))
+    if "unit_weight_min" in changes and frappe.db.has_column("Item", "custom_unit_weight_min"):
+        item_doc.custom_unit_weight_min = _coerce_float(changes.get("unit_weight_min"))
+    if "unit_weight_max" in changes and frappe.db.has_column("Item", "custom_unit_weight_max"):
+        item_doc.custom_unit_weight_max = _coerce_float(changes.get("unit_weight_max"))
+    wmin = getattr(item_doc, "custom_unit_weight_min", None)
+    wmax = getattr(item_doc, "custom_unit_weight_max", None)
+    if wmin is not None and wmax is not None and flt(wmin) > flt(wmax):
+        frappe.throw(_("Min unit weight cannot be greater than max unit weight"))
+    if "sell_by_days" in changes and frappe.db.has_column("Item", "shelf_life_in_days"):
+        raw = changes.get("sell_by_days")
+        if raw in (None, "", "null", "undefined"):
+            item_doc.shelf_life_in_days = 0
+        else:
+            try:
+                item_doc.shelf_life_in_days = max(0, cint(raw))
+            except (TypeError, ValueError):
+                item_doc.shelf_life_in_days = 0
 
     item_doc.insert(ignore_permissions=True)
 

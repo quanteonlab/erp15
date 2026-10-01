@@ -2209,6 +2209,18 @@
       "expect": "fail"
     },
     {
+      "id": "tms_admin_record_stop_outcome_null_trip",
+      "source": "regression",
+      "bug": "admin_record_stop_outcome with null trip/stop never 500 — controlled ValidationError for Tables MAT PoD editor",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.admin_record_stop_outcome",
+      "args": {
+        "trip_name": null,
+        "stop_idx": null,
+        "outcome": null
+      },
+      "expect": "fail"
+    },
+    {
       "id": "tms_driver_record_stop_outcome_null_trip",
       "source": "regression",
       "bug": "driver_record_stop_outcome with null trip never 500; Draft routes auto-publish on real driver start instead of 'not published' ValidationError",
@@ -2640,10 +2652,43 @@
     {
       "id": "list_crm_customer_options_null_safe",
       "source": "regression",
-      "bug": "list_crm_customer_options must return territories/tax_categories/preferred_hours without crashing when DocTypes empty",
+      "bug": "list_crm_customer_options must return zones/territories/tax_categories/preferred_hours without crashing when DocTypes empty",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_crm_customer_options",
       "args": {},
       "expect": "ok"
+    },
+    {
+      "id": "update_customer_null_zone",
+      "source": "regression",
+      "bug": "update_customer with null zone must controlled error (missing customer), never AttributeError on custom_zone write",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "",
+        "zone": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_customer_zone_null_string",
+      "source": "regression",
+      "bug": "update_customer zone='null' string must controlled error (missing customer), never write literal 'null' zone",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "",
+        "zone": "null"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "create_customer_null_zone",
+      "source": "regression",
+      "bug": "create_customer with null zone + empty name is controlled error, not TypeError on custom_zone",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_customer",
+      "args": {
+        "customer_name": "",
+        "zone": null
+      },
+      "expect": "error"
     },
     {
       "id": "list_preferred_delivery_hours_null_flag",
@@ -3070,6 +3115,60 @@
       "expect": "ok"
     },
     {
+      "id": "tms_save_settings_transfer_surcharge_dirty",
+      "source": "regression",
+      "bug": "transfer/factura_a surcharge pct dirty strings and accounting mode coerce; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_settings",
+      "args": {
+        "transfer_surcharge_pct": "",
+        "factura_a_with_transfer_surcharge_pct": "null",
+        "surcharge_accounting_mode": "undefined"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_delivery_surcharge_nulls",
+      "source": "regression",
+      "bug": "preview_delivery_payment_surcharge with null goods/payments never 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_delivery_payment_surcharge",
+      "args": {
+        "goods_total": null,
+        "payments": null,
+        "requires_factura_a": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_delivery_surcharge_mixed_transfer",
+      "source": "regression",
+      "bug": "preview mixed cash+transfer without Factura A returns transfer_portion rule",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_delivery_payment_surcharge",
+      "args": {
+        "goods_total": 10,
+        "payments": [
+          {"method": "Cash", "amount": 9},
+          {"method": "Transfer", "amount": 1}
+        ],
+        "requires_factura_a": 0
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_preview_delivery_surcharge_factura_a_transfer",
+      "source": "regression",
+      "bug": "preview Factura A + transfer uses factura_a_total rule once (not stacked)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.preview_delivery_payment_surcharge",
+      "args": {
+        "goods_total": 10,
+        "payments": [
+          {"method": "Cash", "amount": 9},
+          {"method": "Transfer", "amount": 1}
+        ],
+        "requires_factura_a": 1
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_list_cliente_debe_null_date",
       "source": "regression",
       "bug": "list_cliente_debe_stops with null date returns stops list; penalty fields optional if unmigrated",
@@ -3139,6 +3238,150 @@
         "source": "null"
       },
       "expect": "fail"
+    },
+    {
+      "id": "pm_save_unit_weight_band_dirty",
+      "source": "regression",
+      "bug": "save_product_row unit_weight_min/max/sell_by_days dirty strings coerce; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.save_product_row",
+      "args": {
+        "item_code": null,
+        "changes": {
+          "unit_weight_min": "",
+          "unit_weight_max": "undefined",
+          "sell_by_days": "null",
+          "weight_per_unit": " "
+        }
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "pm_save_unit_weight_min_gt_max",
+      "source": "regression",
+      "bug": "unit_weight_min > max is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.save_product_row",
+      "args": {
+        "item_code": "ITEM-DOES-NOT-EXIST-I047",
+        "changes": {
+          "unit_weight_min": 10,
+          "unit_weight_max": 1
+        }
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "commit_receiving_sell_by_days_dirty",
+      "source": "regression",
+      "bug": "commit_receiving_session with dirty sell_by_days on lines never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.commit_receiving_session",
+      "args": {
+        "session_id": null,
+        "reference": null,
+        "supplier": null,
+        "warehouse": null,
+        "lines": [
+          {
+            "item_code": null,
+            "qty": null,
+            "sell_by_days": "undefined"
+          }
+        ],
+        "draft_items": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "get_receiving_item_meta_null_codes",
+      "source": "regression",
+      "bug": "get_receiving_item_meta with null item_codes returns empty items",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_receiving_item_meta",
+      "args": {
+        "item_codes": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_stock_lots_null_filters",
+      "source": "regression",
+      "bug": "list_stock_lots with null filters returns rows dict, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.list_stock_lots",
+      "args": {
+        "status": null,
+        "item_code": null,
+        "supplier": null,
+        "purchase_order": null,
+        "warehouse": null,
+        "search": null,
+        "days_within": null,
+        "only_with_remaining": null,
+        "limit": null,
+        "offset": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_stock_lot_null_name",
+      "source": "regression",
+      "bug": "get_stock_lot with null name is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.get_stock_lot",
+      "args": {
+        "name": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "consume_lots_null_qty",
+      "source": "regression",
+      "bug": "consume_lots with null item/qty returns ok allocations",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.consume_lots",
+      "args": {
+        "item_code": null,
+        "qty": null,
+        "warehouse": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "commit_receiving_null_purchase_order",
+      "source": "regression",
+      "bug": "commit_receiving_session with null purchase_order never TypeError (auto-PO path coerced)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.commit_receiving_session",
+      "args": {
+        "session_id": null,
+        "reference": null,
+        "supplier": null,
+        "warehouse": null,
+        "lines": null,
+        "draft_items": null,
+        "purchase_order": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "list_available_mats_null",
+      "source": "regression",
+      "bug": "list_available_mats with null search/limit never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_available_mats",
+      "args": {
+        "search": null,
+        "limit": null,
+        "include_completed": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "update_guest_preorder_logistics_null",
+      "source": "regression",
+      "bug": "update_guest_preorder_logistics with null name is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_logistics",
+      "args": {
+        "preorder_name": null,
+        "warehouse": null,
+        "trip_name": null,
+        "vehicle": null,
+        "clear_trip": null
+      },
+      "expect": "no_500"
     }
   ]
 }

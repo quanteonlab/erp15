@@ -1471,6 +1471,7 @@ def _compact_party_doc_header_elements(
 	doc_badge_field: str = "name",
 	meta_rows: list | None = None,
 	font: int = 10,
+	y0: int = 10,
 ) -> list:
 	"""Compressed two-column header (Armado style): party box + doc badge + meta grid.
 
@@ -1485,7 +1486,6 @@ def _compact_party_doc_header_elements(
 		("Facturado:", "facturado_flag", "CUIT:", "tax_id"),
 	]
 	els = []
-	y0 = 10
 	# Left: party box
 	els.extend(
 		[
@@ -1671,9 +1671,9 @@ def _compact_party_doc_header_elements(
 	return els
 
 
-def _armado_meta_header_elements(p: str, *, font: int = 10) -> list:
+def _armado_meta_header_elements(p: str, *, font: int = 10, y0: int = 10) -> list:
 	"""Compressed header (screenshot-style): meta grid + cliente + pedido — no ENTREGAS title."""
-	return _compact_party_doc_header_elements(p, font=font)
+	return _compact_party_doc_header_elements(p, font=font, y0=y0)
 
 
 def _compact_commercial_a4_elements(
@@ -1972,7 +1972,10 @@ def _ar_entregas_checklist_a4_elements(
 	"""
 	p = id_prefix
 	font = 12
-	header_h = 44
+	# Leave top strip for scannable EAN (left) so it does not cover Pedido meta.
+	barcode_h = 16
+	header_y0 = 3 + barcode_h + 3  # 22
+	header_h = header_y0 + 34  # ~56 — party box 28 + meta rows
 	table_y = header_h + 4
 
 	if mode == "peso_indefinido":
@@ -2013,16 +2016,16 @@ def _ar_entregas_checklist_a4_elements(
 
 	items_h = 95 if with_map else 175
 
-	elements = _armado_meta_header_elements(p, font=font)
-	# Scannable armado EAN-13 (prefix 290…) — filters /armado when scanned
+	elements = _armado_meta_header_elements(p, font=font, y0=header_y0)
+	# Scannable armado EAN-13 (prefix 290…) — top-left so Pedido meta stays readable
 	elements.append(
 		{
-			"id": f"{p}-order-ean13",
+			"id": f"{p}-order-ean13-left",
 			"kind": "barcode",
-			"x": 148,
-			"y": 4,
-			"width": 52,
-			"height": 18,
+			"x": 10,
+			"y": 3,
+			"width": 55,
+			"height": barcode_h,
 			"fieldPath": "order_ean13",
 			"barcodeFormat": "EAN13",
 			"displayValue": True,
@@ -2614,7 +2617,7 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-peso-items-v6",
+		"resync_if_missing_id": "starter-peso-order-ean13-left",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-peso",
@@ -2630,7 +2633,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-alm-items-v5",
+		"resync_if_missing_id": "starter-alm-order-ean13-left",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-alm",
@@ -2646,7 +2649,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-almmap-items-v5",
+		"resync_if_missing_id": "starter-almmap-order-ean13-left",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-almmap",

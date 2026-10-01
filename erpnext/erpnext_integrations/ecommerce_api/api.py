@@ -2754,6 +2754,11 @@ def create_customer(
 		_update_customer_primary_address_line(customer, addr_val)
 		customer.save(ignore_permissions=True)
 
+	# RM Zona → Address.custom_zone (same codes as Planificación de entregas)
+	zone_val = cstr(kwargs.get("zone") or "").strip() or None
+	if zone_val:
+		_set_customer_zone_and_address(customer.name, zone=zone_val)
+
 	frappe.db.commit()
 
 	# Create contact if email or phone provided
@@ -2783,7 +2788,9 @@ def create_customer(
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "webhook customer_created")
 
-	return customer.as_dict()
+	out = customer.as_dict()
+	out["zone"] = _customer_delivery_zone_map([customer.name]).get(customer.name)
+	return out
 
 
 def _default_customer_group_and_territory():
@@ -2958,6 +2965,8 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 		limit_page_length=limit,
 		ignore_permissions=True,
 	)
+	# RM Zona = Address.custom_zone (committed Planificación de entregas codes), not Territory.
+	zone_by_customer = _customer_delivery_zone_map([r.name for r in rows])
 	return {
 		"customers": [
 			{
@@ -2967,6 +2976,7 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"email": r.email_id,
 				"customer_group": r.customer_group,
 				"territory": r.territory,
+				"zone": zone_by_customer.get(r.name),
 				"tax_id": r.tax_id,
 				"tax_category": r.tax_category,
 				"primary_address": r.primary_address,
@@ -3060,7 +3070,12 @@ def search_suppliers(search_term="", page_length=20, ensure_buckets=0):
 
 @frappe.whitelist(allow_guest=True)
 def list_crm_customer_options():
-	"""CRM clients table: territories, tax categories, preferred delivery hours (by priority)."""
+	"""CRM clients table: TMS zones, tax categories, preferred delivery hours (by priority).
+
+	``zones`` are committed Planificación de entregas codes (``list_tms_zones``),
+	the same values stored on Address.custom_zone. ``territories`` remain for
+	legacy consumers but RM Zona should use ``zones``.
+	"""
 	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
 		ensure_argentina_iva_conditions,
 		list_preferred_delivery_hours,
@@ -3087,9 +3102,31 @@ def list_crm_customer_options():
 			order_by="name asc",
 			ignore_permissions=True,
 		)
+	zones = []
+	seen = set()
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _load_tms_zones
+
+		payload = _load_tms_zones() or {}
+		raw = payload.get("zones") if isinstance(payload, dict) else payload
+		if isinstance(raw, list):
+			for z in raw:
+				if not isinstance(z, dict):
+					continue
+				code = cstr(z.get("code") or "").strip()
+				if not code:
+					continue
+				key = code.upper()
+				if key in seen:
+					continue
+				seen.add(key)
+				zones.append(code)
+	except Exception:
+		pass
 	return {
 		"preferred_hours": hours.get("hours") or [],
 		"territories": [r.name for r in territories],
+		"zones": zones,
 		"tax_categories": [r.name for r in tax_categories],
 	}
 
@@ -3176,9 +3213,21 @@ def update_customer(customer_name, **kwargs):
 		_update_customer_primary_address_line(customer, cstr(addr_line).strip())
 
 	customer.save(ignore_permissions=True)
+
+	# RM Zona → Address.custom_zone (committed TMS zone codes like T1-THU)
+	if "zone" in kwargs:
+		raw_zone = kwargs.get("zone")
+		if raw_zone is None or cstr(raw_zone).strip().lower() in ("null", "undefined"):
+			zone_val = ""
+		else:
+			zone_val = cstr(raw_zone).strip()
+		_set_customer_zone_and_address(customer_name, zone=zone_val)
+
 	frappe.db.commit()
 
-	return customer.as_dict()
+	out = customer.as_dict()
+	out["zone"] = _customer_delivery_zone_map([customer_name]).get(customer_name)
+	return out
 
 
 def _update_customer_primary_address_line(customer, address_line1: str):
@@ -3650,6 +3699,37 @@ def _customer_address_zone_map(customer_names):
 	return out
 
 
+def _customer_delivery_zone_map(customer_names):
+	"""customer → Address.custom_zone only (committed TMS codes). No Territory fallback."""
+	out = {}
+	names = list({cstr(c).strip() for c in (customer_names or []) if cstr(c).strip()})
+	if not names:
+		return out
+	if not frappe.db.has_column("Address", "custom_zone"):
+		return {n: None for n in names}
+	customers = frappe.get_all(
+		"Customer",
+		filters={"name": ["in", names]},
+		fields=["name", "customer_primary_address"],
+		ignore_permissions=True,
+	)
+	addr_names = [c.customer_primary_address for c in customers if c.customer_primary_address]
+	addr_zone = {}
+	if addr_names:
+		for row in frappe.get_all(
+			"Address",
+			filters={"name": ["in", addr_names]},
+			fields=["name", "custom_zone"],
+			ignore_permissions=True,
+		):
+			addr_zone[row.name] = cstr(row.custom_zone or "").strip() or None
+	for c in customers:
+		out[c.name] = addr_zone.get(c.customer_primary_address) if c.customer_primary_address else None
+	for n in names:
+		out.setdefault(n, None)
+	return out
+
+
 def _tms_zone_visit_days(zone_label):
 	label = cstr(zone_label or "").strip()
 	if not label:
@@ -3754,7 +3834,11 @@ def _zone_matching_weekday(weekday_label, prefer=None):
 
 
 def _set_customer_zone_and_address(customer, *, territory=None, zone=None, address_line1=None):
-	"""Update Customer.territory / primary address / Address.custom_zone."""
+	"""Update Customer.territory / primary address / Address.custom_zone.
+
+	When ``zone`` is passed (including empty string), Address.custom_zone is set
+	or cleared. Empty ``zone`` clears the delivery zone without touching territory.
+	"""
 	cust_name = cstr(customer or "").strip()
 	if not cust_name or not frappe.db.exists("Customer", cust_name):
 		frappe.throw(_("Customer {0} not found").format(cust_name or "?"))
@@ -3763,18 +3847,26 @@ def _set_customer_zone_and_address(customer, *, territory=None, zone=None, addre
 	frappe.flags.ignore_permissions = False
 	if territory is not None:
 		doc.territory = cstr(territory or "").strip() or doc.territory
+	zone_explicit = zone is not None
 	zone_val = cstr(zone if zone is not None else territory or "").strip()
 	if address_line1 is not None:
 		_update_customer_primary_address_line(doc, cstr(address_line1).strip())
 	doc.save(ignore_permissions=True)
-	if zone_val:
+	if zone_explicit or zone_val:
 		addr_name = doc.customer_primary_address
+		if zone_val and not addr_name:
+			# Zone needs an Address row; create a minimal primary address.
+			_update_customer_primary_address_line(doc, "-")
+			doc.save(ignore_permissions=True)
+			addr_name = doc.customer_primary_address
 		if addr_name and frappe.db.exists("Address", addr_name) and frappe.db.has_column(
 			"Address", "custom_zone"
 		):
-			frappe.db.set_value("Address", addr_name, "custom_zone", zone_val, update_modified=True)
+			frappe.db.set_value(
+				"Address", addr_name, "custom_zone", zone_val or "", update_modified=True
+			)
 		# Keep territory aligned with delivery zona when CRM territory is empty or zone-like.
-		if not doc.territory or doc.territory == "All Territories":
+		if zone_val and (not doc.territory or doc.territory == "All Territories"):
 			if frappe.db.exists("Territory", zone_val):
 				frappe.db.set_value("Customer", cust_name, "territory", zone_val, update_modified=True)
 			elif territory is not None and cstr(territory).strip():
@@ -4177,6 +4269,10 @@ def create_guest_preorder(
 	cashier = _resolve_order_cashier(cashier_id)
 	if cashier:
 		remarks_parts.append(f"cashier:{_sanitize_guest_tag(cashier)}")
+	# Preferred salida warehouse (TMS depot) — default company/only warehouse.
+	default_wh = _default_company_warehouse(company)
+	if default_wh:
+		remarks_parts.append(f"warehouse:{_sanitize_guest_tag(default_wh)}")
 	tag_text = " | ".join(remarks_parts)
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -4463,6 +4559,25 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			tags = _parse_remarks_tags(_guest_preorder_tag_text(o))
 			o["address"] = tags.get("guest_address") or None
 
+	# TMS logistics: warehouse / MAT / car / PoD (+ transit → En Delivery).
+	logistics = _tms_logistics_map_for_orders([o["name"] for o in filtered])
+	for o in filtered:
+		lg = logistics.get(o["name"]) or {}
+		tag_wh = _warehouse_from_guest_tags(o)
+		o["warehouse"] = lg.get("warehouse") or tag_wh
+		o["warehouse_defaulted"] = lg.get("warehouse_defaulted") if lg.get("warehouse") else 1
+		o["delivery_note"] = lg.get("delivery_note") or o.get("delivery_note")
+		o["trip_name"] = lg.get("trip_name")
+		o["trip_status"] = lg.get("trip_status")
+		o["vehicle"] = lg.get("vehicle")
+		o["vehicle_plate"] = lg.get("vehicle_plate")
+		o["driver"] = lg.get("driver")
+		o["driver_name"] = lg.get("driver_name")
+		o["delivery_at"] = lg.get("delivery_at")
+		o["pod"] = lg.get("pod")
+		_apply_tms_display_status(o)
+
+	_attach_factura_a_fields(filtered)
 	return {"preorders": filtered, "total_count": total_count}
 
 
@@ -4489,7 +4604,7 @@ def get_guest_preorder(preorder_name):
 
 	geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
 
-	return {
+	payload = {
 		"name": so.name,
 		"order_type": so.order_type,
 		"customer": so.customer,
@@ -4542,6 +4657,24 @@ def get_guest_preorder(preorder_name):
 			for d in (so.items or [])
 		],
 	}
+	lg = (_tms_logistics_map_for_orders([preorder_name]).get(preorder_name) or {})
+	tag_wh = tags.get("warehouse")
+	payload["warehouse"] = lg.get("warehouse") or tag_wh
+	payload["warehouse_defaulted"] = lg.get("warehouse_defaulted") if lg.get("warehouse") else (0 if tag_wh else 1)
+	payload["trip_name"] = lg.get("trip_name")
+	payload["trip_status"] = lg.get("trip_status")
+	payload["vehicle"] = lg.get("vehicle")
+	payload["vehicle_plate"] = lg.get("vehicle_plate")
+	payload["driver"] = lg.get("driver")
+	payload["driver_name"] = lg.get("driver_name")
+	payload["delivery_at"] = lg.get("delivery_at")
+	payload["departure_time"] = lg.get("departure_time")
+	payload["pod"] = lg.get("pod")
+	if lg.get("delivery_note"):
+		payload["delivery_note"] = lg.get("delivery_note")
+	_apply_tms_display_status(payload)
+	_attach_factura_a_fields([payload])
+	return payload
 
 
 @frappe.whitelist()
@@ -4837,6 +4970,113 @@ def _erp_status_for_display(display_status):
 
 
 @frappe.whitelist(allow_guest=True)
+def _attach_factura_a_fields(rows):
+	"""Attach Sales Order Factura A / delivery payment differential fields onto list/detail rows."""
+	names = [cstr(r.get("name")).strip() for r in (rows or []) if r.get("name")]
+	names = [n for n in names if n]
+	if not names:
+		return
+	if not frappe.db.has_column("Sales Order", "custom_requires_factura_a"):
+		for r in rows:
+			r.setdefault("requires_factura_a", False)
+			r.setdefault("factura_a_status", None)
+			r.setdefault("delivery_surcharge_amount", None)
+			r.setdefault("delivery_payment_summary", None)
+		return
+	fields = ["name", "custom_requires_factura_a", "custom_factura_a_status"]
+	if frappe.db.has_column("Sales Order", "custom_delivery_surcharge_amount"):
+		fields.append("custom_delivery_surcharge_amount")
+	if frappe.db.has_column("Sales Order", "custom_delivery_payment_summary"):
+		fields.append("custom_delivery_payment_summary")
+	so_rows = frappe.get_all(
+		"Sales Order",
+		filters={"name": ["in", names]},
+		fields=fields,
+		ignore_permissions=True,
+	)
+	by_name = {r.name: r for r in so_rows}
+	for r in rows:
+		so = by_name.get(r.get("name")) or {}
+		req = bool(cint(so.get("custom_requires_factura_a") or 0))
+		# Prefer SO flag; fall back to PoD stop flag if SO not yet synced.
+		pod = r.get("pod") or {}
+		if not req and pod.get("requires_factura_a"):
+			req = True
+		status = cstr(so.get("custom_factura_a_status") or "").strip() or None
+		if not status and pod.get("factura_a_status"):
+			status = cstr(pod.get("factura_a_status")).strip() or None
+		if req and not status:
+			status = "pending"
+		if not req:
+			status = status if status in ("issued",) else ("na" if status == "na" else None)
+		r["requires_factura_a"] = req
+		r["factura_a_status"] = status
+		r["delivery_surcharge_amount"] = (
+			flt(so.get("custom_delivery_surcharge_amount"))
+			if so.get("custom_delivery_surcharge_amount") is not None
+			else (flt(pod.get("surcharge_amount")) if pod.get("surcharge_amount") is not None else None)
+		)
+		r["delivery_payment_summary"] = (
+			cstr(so.get("custom_delivery_payment_summary") or "").strip()
+			or cstr(pod.get("payment_summary") or pod.get("payment_method") or "").strip()
+			or None
+		)
+
+
+@frappe.whitelist(allow_guest=True)
+def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, factura_a_status=None):
+	"""Mark/unmark Factura A on a guest Pedido, or set checklist status (pending|issued|na)."""
+	name = cstr(preorder_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Sales Order is required"))
+	if not frappe.db.exists("Sales Order", name):
+		frappe.throw(_("Sales Order {0} not found").format(name))
+
+	from erpnext.erpnext_integrations.ecommerce_api.tms_api import _ensure_delivery_payment_split_fields
+
+	_ensure_delivery_payment_split_fields()
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+
+	updates = {}
+	if requires_factura_a is not None:
+		req = 1 if str(requires_factura_a).strip().lower() in ("1", "true", "yes", "y", "on") else (
+			0 if str(requires_factura_a).strip().lower() in ("0", "false", "no", "n", "off", "", "null", "none", "undefined")
+			else (1 if requires_factura_a else 0)
+		)
+		updates["custom_requires_factura_a"] = req
+		if req:
+			cur = cstr(getattr(so, "custom_factura_a_status", None) or "").strip()
+			if cur != "issued":
+				updates["custom_factura_a_status"] = "pending"
+		else:
+			updates["custom_factura_a_status"] = "na"
+	if factura_a_status is not None:
+		st = cstr(factura_a_status).strip().lower()
+		if st in ("", "null", "undefined", "none"):
+			st = "na"
+		if st not in ("pending", "issued", "na"):
+			frappe.throw(_("Invalid Factura A status: {0}").format(factura_a_status))
+		updates["custom_factura_a_status"] = st
+		if st == "pending":
+			updates["custom_requires_factura_a"] = 1
+		elif st == "na":
+			updates.setdefault("custom_requires_factura_a", 0)
+		elif st == "issued":
+			updates["custom_requires_factura_a"] = 1
+
+	if updates:
+		frappe.db.set_value("Sales Order", name, updates, update_modified=True)
+		frappe.db.commit()
+
+	return get_guest_preorder(name)
+
+
 def set_guest_preorder_status(preorder_name, target_status, source=None):
 	"""
 	Unified status transition for the custom workflow.
@@ -5996,6 +6236,440 @@ def _delivery_note_for_sales_order(sales_order):
 	)
 
 
+def _default_company_warehouse(company=None):
+	"""Company default depot, or the only active warehouse when uniquely defined."""
+	company = (
+		cstr(company or "").strip()
+		or frappe.defaults.get_user_default("Company")
+		or frappe.db.get_single_value("Global Defaults", "default_company")
+	)
+	if not company:
+		return None
+	wh = cstr(frappe.db.get_value("Company", company, "custom_default_warehouse") or "").strip()
+	if wh:
+		return wh
+	rows = frappe.get_all(
+		"Warehouse",
+		filters={"company": company, "is_group": 0, "disabled": 0},
+		pluck="name",
+		order_by="name asc",
+		limit_page_length=2,
+		ignore_permissions=True,
+	)
+	if len(rows) == 1:
+		return rows[0]
+	return rows[0] if rows else None
+
+
+def _warehouse_from_guest_tags(so_or_dict):
+	return _parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("warehouse") or None
+
+
+def _tms_logistics_map_for_orders(order_names):
+	"""Batch-enrich Sales Orders with DN / MAT (Delivery Trip) / vehicle / PoD.
+
+	Returns ``{ so_name: { warehouse, delivery_note, trip_name, trip_status,
+	vehicle, vehicle_plate, driver, driver_name, delivery_at, pod } }``.
+	"""
+	names = [cstr(n).strip() for n in (order_names or []) if cstr(n).strip()]
+	out = {n: {} for n in names}
+	if not names:
+		return out
+
+	# SO → DN (latest non-cancelled)
+	dn_rows = frappe.db.sql(
+		"""
+		SELECT dni.against_sales_order AS so_name, dni.parent AS dn_name, dn.set_warehouse
+		FROM `tabDelivery Note Item` dni
+		INNER JOIN `tabDelivery Note` dn ON dn.name = dni.parent
+		WHERE dni.against_sales_order IN %(names)s
+		  AND dn.docstatus != 2
+		ORDER BY dn.creation DESC
+		""",
+		{"names": names},
+		as_dict=True,
+	)
+	dn_by_so = {}
+	dn_warehouse = {}
+	for r in dn_rows or []:
+		so = cstr(r.so_name)
+		if so and so not in dn_by_so:
+			dn_by_so[so] = r.dn_name
+			dn_warehouse[r.dn_name] = cstr(r.set_warehouse or "").strip() or None
+
+	dn_names = list({v for v in dn_by_so.values() if v})
+	trip_by_dn = {}
+	if dn_names:
+		# Prefer non-cancelled trips; Not Home attempts stay as audit but DN may be free.
+		stop_rows = frappe.db.sql(
+			"""
+			SELECT
+				ds.delivery_note AS dn,
+				ds.parent AS trip_name,
+				ds.visited AS visited,
+				ds.estimated_arrival AS estimated_arrival,
+				ds.custom_pod_recipient_name AS recipient_name,
+				ds.custom_pod_recipient_id_number AS recipient_id,
+				ds.custom_pod_signature AS signature,
+				ds.custom_pod_notes AS pod_notes,
+				ds.custom_pod_captured_at AS captured_at,
+				ds.custom_outcome AS outcome,
+				ds.custom_attempt_note AS attempt_note,
+				ds.custom_photo_urls AS photo_urls,
+				ds.custom_amount_due AS amount_due,
+				ds.custom_amount_collected AS amount_collected,
+				ds.custom_payment_method AS payment_method,
+				ds.custom_payments_json AS payments_json,
+				ds.custom_payment_summary AS payment_summary,
+				ds.custom_requires_factura_a AS stop_requires_factura_a,
+				ds.custom_factura_a_status AS stop_factura_a_status,
+				ds.custom_surcharge_pct AS surcharge_pct,
+				ds.custom_surcharge_amount AS surcharge_amount,
+				ds.custom_surcharge_rule AS surcharge_rule,
+				dt.status AS trip_status,
+				dt.docstatus AS trip_docstatus,
+				dt.vehicle AS vehicle,
+				dt.driver AS driver,
+				dt.driver_name AS driver_name,
+				dt.custom_pickup_warehouse AS pickup_warehouse,
+				dt.departure_time AS departure_time
+			FROM `tabDelivery Stop` ds
+			INNER JOIN `tabDelivery Trip` dt ON dt.name = ds.parent
+			WHERE ds.delivery_note IN %(dns)s
+			  AND dt.docstatus != 2
+			  AND ifnull(ds.custom_outcome, '') != 'Not Home'
+			ORDER BY dt.creation DESC
+			""",
+			{"dns": dn_names},
+			as_dict=True,
+		)
+		for r in stop_rows or []:
+			dn = cstr(r.dn)
+			if not dn or dn in trip_by_dn:
+				continue
+			pod = None
+			if cint(r.visited) or cstr(r.outcome or "").strip():
+				photos = []
+				if r.photo_urls:
+					try:
+						photos = frappe.parse_json(r.photo_urls) or []
+					except Exception:
+						photos = []
+					if not isinstance(photos, list):
+						photos = []
+				payments = []
+				if getattr(r, "payments_json", None):
+					try:
+						payments = frappe.parse_json(r.payments_json) or []
+					except Exception:
+						payments = []
+					if not isinstance(payments, list):
+						payments = []
+				pod = {
+					"recipient_name": r.recipient_name,
+					"recipient_id_number": r.recipient_id,
+					"signature": r.signature,
+					"notes": r.pod_notes,
+					"captured_at": str(r.captured_at) if r.captured_at else None,
+					"outcome": r.outcome,
+					"attempt_note": r.attempt_note,
+					"photo_urls": photos,
+					"amount_due": r.amount_due,
+					"amount_collected": r.amount_collected,
+					"payment_method": r.payment_method,
+					"payments": payments,
+					"payment_summary": getattr(r, "payment_summary", None) or r.payment_method,
+					"requires_factura_a": bool(cint(getattr(r, "stop_requires_factura_a", 0) or 0)),
+					"factura_a_status": cstr(getattr(r, "stop_factura_a_status", None) or "") or None,
+					"surcharge_pct": getattr(r, "surcharge_pct", None),
+					"surcharge_amount": getattr(r, "surcharge_amount", None),
+					"surcharge_rule": cstr(getattr(r, "surcharge_rule", None) or "") or None,
+				}
+			plate = None
+			veh = cstr(r.vehicle or "").strip() or None
+			if veh:
+				plate = frappe.db.get_value("Vehicle", veh, "license_plate") or veh
+			trip_by_dn[dn] = {
+				"trip_name": r.trip_name,
+				"trip_status": r.trip_status,
+				"vehicle": veh,
+				"vehicle_plate": plate,
+				"driver": cstr(r.driver or "").strip() or None,
+				"driver_name": cstr(r.driver_name or "").strip() or None,
+				"pickup_warehouse": cstr(r.pickup_warehouse or "").strip() or None,
+				"delivery_at": str(r.captured_at or r.estimated_arrival or "") or None,
+				"departure_time": str(r.departure_time) if r.departure_time else None,
+				"pod": pod,
+			}
+
+	# Company defaults for warehouse fallback (batched by SO company)
+	companies = frappe.get_all(
+		"Sales Order",
+		filters={"name": ["in", names]},
+		fields=["name", "company"],
+		ignore_permissions=True,
+	)
+	company_by_so = {r.name: r.company for r in companies}
+	default_wh_by_company = {}
+
+	for so in names:
+		dn = dn_by_so.get(so)
+		trip = trip_by_dn.get(dn) if dn else None
+		company = company_by_so.get(so)
+		if company not in default_wh_by_company:
+			default_wh_by_company[company] = _default_company_warehouse(company)
+		wh = None
+		if trip and trip.get("pickup_warehouse"):
+			wh = trip["pickup_warehouse"]
+		elif dn and dn_warehouse.get(dn):
+			wh = dn_warehouse[dn]
+		row = {
+			"delivery_note": dn,
+			"warehouse": wh or default_wh_by_company.get(company),
+			"warehouse_defaulted": 0 if wh else 1,
+			"trip_name": (trip or {}).get("trip_name"),
+			"trip_status": (trip or {}).get("trip_status"),
+			"vehicle": (trip or {}).get("vehicle"),
+			"vehicle_plate": (trip or {}).get("vehicle_plate"),
+			"driver": (trip or {}).get("driver"),
+			"driver_name": (trip or {}).get("driver_name"),
+			"delivery_at": (trip or {}).get("delivery_at"),
+			"departure_time": (trip or {}).get("departure_time"),
+			"pod": (trip or {}).get("pod"),
+		}
+		out[so] = row
+	return out
+
+
+def _apply_tms_display_status(row):
+	"""When the linked MAT trip is In Transit, surface pipeline as En Delivery."""
+	if not row:
+		return row
+	trip_st = cstr(row.get("trip_status") or "").strip()
+	disp = cstr(row.get("display_status") or row.get("status") or "")
+	if trip_st == "In Transit" and disp not in (
+		"Completado",
+		"Completado (no pagado)",
+		"Cancelled",
+		"Closed",
+	):
+		row["display_status"] = "En Delivery"
+	return row
+
+
+def _set_dn_warehouse(dn_name, warehouse):
+	wh = cstr(warehouse or "").strip()
+	if not wh or not dn_name:
+		return
+	if not frappe.db.exists("Warehouse", wh):
+		frappe.throw(_("Warehouse {0} not found").format(wh))
+	frappe.db.set_value("Delivery Note", dn_name, "set_warehouse", wh, update_modified=False)
+	frappe.db.sql(
+		"""
+		UPDATE `tabDelivery Note Item`
+		SET warehouse=%s
+		WHERE parent=%s AND docstatus != 2
+		""",
+		(wh, dn_name),
+	)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_available_mats(search=None, limit=50, include_completed=0):
+	"""Searchable Delivery Trips (MAT-DT-…) for Pedidos assignment.
+
+	Returns open MAT plans (Draft / Scheduled / In Transit) with driver + vehicle.
+	"""
+	limit = max(1, min(cint(limit) or 50, 200))
+	q = cstr(search or "").strip()
+	# Available = Draft/Scheduled. Search also surfaces In Transit MATs by name.
+	if cint(include_completed):
+		statuses = ["Draft", "Scheduled", "In Transit", "", "Completed"]
+	elif q:
+		statuses = ["Draft", "Scheduled", "In Transit", ""]
+	else:
+		statuses = ["Draft", "Scheduled", ""]
+	filters = {"docstatus": ["!=", 2], "status": ["in", statuses]}
+	or_filters = None
+	if q:
+		or_filters = [
+			["name", "like", f"%{q}%"],
+			["driver_name", "like", f"%{q}%"],
+			["driver", "like", f"%{q}%"],
+			["vehicle", "like", f"%{q}%"],
+		]
+	rows = frappe.get_all(
+		"Delivery Trip",
+		filters=filters,
+		or_filters=or_filters,
+		fields=[
+			"name",
+			"status",
+			"docstatus",
+			"driver",
+			"driver_name",
+			"vehicle",
+			"departure_time",
+			"custom_pickup_warehouse",
+			"company",
+		],
+		order_by="modified desc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	veh_names = [r.vehicle for r in rows if r.vehicle]
+	plate_map = {}
+	if veh_names:
+		for v in frappe.get_all(
+			"Vehicle",
+			filters={"name": ["in", veh_names]},
+			fields=["name", "license_plate"],
+			ignore_permissions=True,
+		):
+			plate_map[v.name] = v.license_plate or v.name
+	out = []
+	for r in rows:
+		out.append(
+			{
+				"name": r.name,
+				"status": r.status,
+				"docstatus": r.docstatus,
+				"driver": r.driver,
+				"driver_name": r.driver_name,
+				"vehicle": r.vehicle,
+				"vehicle_plate": plate_map.get(r.vehicle) if r.vehicle else None,
+				"warehouse": getattr(r, "custom_pickup_warehouse", None),
+				"departure_time": str(r.departure_time) if r.departure_time else None,
+				"company": r.company,
+			}
+		)
+	return {"rows": out, "total": len(out)}
+
+
+@frappe.whitelist(allow_guest=True)
+def update_guest_preorder_logistics(
+	preorder_name=None,
+	warehouse=None,
+	trip_name=None,
+	vehicle=None,
+	clear_trip=0,
+):
+	"""Admin Pedidos logistics: warehouse, MAT (Delivery Trip), and car.
+
+	Creates a Delivery Note when assigning a MAT / warehouse if missing.
+	Vehicle options for the UI should come from the selected MAT's vehicle
+	(and planner context); changing vehicle updates the trip.
+	"""
+	name = cstr(preorder_name or "").strip()
+	if not name or not frappe.db.exists("Sales Order", name):
+		frappe.throw(_("Sales Order {0} not found").format(name or "?"))
+
+	so = frappe.get_doc("Sales Order", name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+	if so.docstatus == 2:
+		frappe.throw(_("Cannot edit a cancelled order"))
+
+	wh_in = None if warehouse is None else cstr(warehouse).strip()
+	trip_in = None if trip_name is None else cstr(trip_name).strip()
+	veh_in = None if vehicle is None else cstr(vehicle).strip()
+	do_clear = cint(clear_trip)
+
+	if wh_in:
+		if not frappe.db.exists("Warehouse", wh_in):
+			frappe.throw(_("Warehouse {0} not found").format(wh_in))
+		_update_guest_preorder_tag(so, "warehouse", wh_in)
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn:
+			frappe.db.set_value("Sales Order", name, tag_fn, getattr(so, tag_fn, None))
+
+	# Ensure remito when assigning trip or warehouse on a confirmed order.
+	dn_name = _delivery_note_for_sales_order(name)
+	need_dn = bool(trip_in) or bool(wh_in) or bool(veh_in)
+	if need_dn and not dn_name and cint(so.docstatus) == 1:
+		created = create_delivery_note_for_preorder(name)
+		dn_name = (created or {}).get("delivery_note") or _delivery_note_for_sales_order(name)
+
+	if wh_in and dn_name:
+		_set_dn_warehouse(dn_name, wh_in)
+
+	# Current trip for this DN
+	current_trip = None
+	if dn_name:
+		current_trip = frappe.db.sql(
+			"""
+			SELECT ds.parent AS trip_name, dt.docstatus, dt.status
+			FROM `tabDelivery Stop` ds
+			INNER JOIN `tabDelivery Trip` dt ON dt.name = ds.parent
+			WHERE ds.delivery_note=%s AND dt.docstatus != 2
+			  AND ifnull(ds.custom_outcome, '') != 'Not Home'
+			ORDER BY dt.creation DESC
+			LIMIT 1
+			""",
+			(dn_name,),
+			as_dict=True,
+		)
+		current_trip = current_trip[0] if current_trip else None
+
+	from erpnext.erpnext_integrations.ecommerce_api import tms_api
+
+	if do_clear and current_trip and dn_name:
+		if cint(current_trip.docstatus) == 0:
+			tms_api.remove_stops_from_trip(current_trip.trip_name, [dn_name])
+		else:
+			frappe.throw(_("Cannot remove from a published MAT — cancel the trip in Rutas first."))
+		current_trip = None
+
+	if trip_in:
+		if not frappe.db.exists("Delivery Trip", trip_in):
+			frappe.throw(_("MAT / trip {0} not found").format(trip_in))
+		if not dn_name:
+			frappe.throw(_("Confirm the order and create a remito before assigning a MAT."))
+		# Move off previous draft trip if different.
+		if current_trip and current_trip.trip_name != trip_in and cint(current_trip.docstatus) == 0:
+			try:
+				tms_api.remove_stops_from_trip(current_trip.trip_name, [dn_name])
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "pedidos clear previous MAT")
+		# Add to target MAT (steal=True lets admin pull from other drafts).
+		try:
+			tms_api.add_stops_to_trip(trip_in, [dn_name], allow_steal=1)
+		except TypeError:
+			tms_api.add_stops_to_trip(trip_in, [dn_name])
+		set_guest_preorder_status(name, "En Delivery", source="tms_claim")
+		current_trip = frappe._dict(trip_name=trip_in, docstatus=frappe.db.get_value("Delivery Trip", trip_in, "docstatus"), status=frappe.db.get_value("Delivery Trip", trip_in, "status"))
+
+	target_trip = trip_in or (current_trip.trip_name if current_trip else None)
+
+	if wh_in and target_trip:
+		# Admin override — allow on Draft via API, force on published.
+		docstatus = cint(frappe.db.get_value("Delivery Trip", target_trip, "docstatus") or 0)
+		if docstatus == 0:
+			try:
+				tms_api.update_trip_assignment(target_trip, pickup_warehouse=wh_in)
+			except Exception:
+				frappe.db.set_value("Delivery Trip", target_trip, "custom_pickup_warehouse", wh_in)
+		else:
+			frappe.db.set_value("Delivery Trip", target_trip, "custom_pickup_warehouse", wh_in)
+
+	if veh_in is not None and target_trip:
+		if veh_in and not frappe.db.exists("Vehicle", veh_in):
+			frappe.throw(_("Vehicle {0} not found").format(veh_in))
+		docstatus = cint(frappe.db.get_value("Delivery Trip", target_trip, "docstatus") or 0)
+		if docstatus == 0 and veh_in:
+			try:
+				tms_api.update_trip_assignment(target_trip, vehicle=veh_in)
+			except Exception:
+				frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
+		else:
+			frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
+
+	frappe.db.commit()
+	return get_guest_preorder(name)
+
+
+
 @frappe.whitelist()
 def create_delivery_note_for_preorder(preorder_name):
 	"""Create + submit a real Delivery Note from a confirmed guest preorder,
@@ -6027,14 +6701,14 @@ def create_delivery_note_for_preorder(preorder_name):
 		# Guest preorder items never carry a warehouse (no picker in that
 		# flow), so make_delivery_note falls back to the Item's own default
 		# warehouse - which may not be the one this business actually stocks
-		# from. Force the company's TMS depot warehouse instead, same
-		# resolution the dispatcher's own trip creation uses, so the item is
-		# actually available and the note lands where Rutas expects it.
-		default_warehouse = frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
-		if default_warehouse:
+		# from. Prefer the SO warehouse tag (Pedidos), then company TMS depot.
+		preferred_wh = _warehouse_from_guest_tags(so) or frappe.db.get_value(
+			"Company", dn.company, "custom_default_warehouse"
+		) or _default_company_warehouse(dn.company)
+		if preferred_wh:
 			for row in dn.items:
-				row.warehouse = default_warehouse
-			dn.set_warehouse = default_warehouse
+				row.warehouse = preferred_wh
+			dn.set_warehouse = preferred_wh
 
 		stock_warnings = _delivery_note_stock_shortages(dn)
 		dn.insert(ignore_permissions=True)
@@ -7250,6 +7924,27 @@ def create_pos_sale(
 				stock_entry.insert(ignore_permissions=True)
 				_submit_stock_entry_allowing_negative(stock_entry)
 
+		# Soft FIFO: assume oldest Stock Lots are sold first (estimate only).
+		if not is_return:
+			try:
+				from erpnext.erpnext_integrations.ecommerce_api.lots_api import (
+					consume_stock_lots_fifo,
+				)
+
+				for item in items:
+					code = cstr(item.get("item_code") or "").strip()
+					qty = flt(item.get("qty") or 0)
+					if not code or qty <= 0:
+						continue
+					box = _linked_box_pack(code)
+					if box:
+						code = box["unit"]
+						qty = qty * box["pack"]
+					consume_stock_lots_fifo(code, qty, warehouse=warehouse, commit=False)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "pos soft FIFO lot consume")
+
+
 	# ── Create Payment Entry (one per split) — skip for credit notes ──────────
 	payment_ids = []
 	if not is_return:
@@ -7613,19 +8308,52 @@ def _linked_box_pack(item_code):
 
 
 @frappe.whitelist(allow_guest=True)
-def commit_receiving_session(session_id, reference, supplier, warehouse, lines, draft_items):
+def commit_receiving_session(
+	session_id,
+	reference,
+	supplier,
+	warehouse,
+	lines,
+	draft_items,
+	purchase_order=None,
+):
 	"""
 	Atomically:
 	1. Create new SilkOS Items for draft items (disabled/inactive until Review
 	   approves them — unless draft already has approved_at)
-	2. Create a submitted Stock Entry (Material Receipt)
-	Returns { stock_entry_id, new_item_codes }
+	2. If no Purchase Order linked, auto-create a Compra (PO) from the lines
+	3. Create a submitted Stock Entry (Material Receipt)
+	4. Create Stock Lot rows (logical lots) per line for Tables → Lotes
+	Returns { stock_entry_id, new_item_codes, purchase_order, lot_names }
 	"""
 	import json
 	if isinstance(lines, str):
-		lines = json.loads(lines)
+		try:
+			lines = json.loads(lines)
+		except Exception:
+			lines = []
+	if lines is None or lines == "" or (isinstance(lines, str) and lines.strip().lower() in ("null", "undefined", "none")):
+		lines = []
+	if not isinstance(lines, list):
+		lines = []
 	if isinstance(draft_items, str):
-		draft_items = json.loads(draft_items)
+		try:
+			draft_items = json.loads(draft_items)
+		except Exception:
+			draft_items = []
+	if draft_items is None or draft_items == "" or (
+		isinstance(draft_items, str) and draft_items.strip().lower() in ("null", "undefined", "none")
+	):
+		draft_items = []
+	if not isinstance(draft_items, list):
+		draft_items = []
+
+	purchase_order = cstr(purchase_order or "").strip()
+	if purchase_order.lower() in ("null", "undefined", "none"):
+		purchase_order = ""
+	if purchase_order and not frappe.db.exists("Purchase Order", purchase_order):
+		purchase_order = ""
+
 
 	def _upsert_receiving_item_price(item_code: str, rate: float) -> None:
 		pl = (
@@ -7844,6 +8572,57 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 	if not resolved_lines:
 		frappe.throw("No valid lines to receive")
 
+	# Auto-create Compra (Purchase Order) when recepción has no linked OC —
+	# assume the buyer forgot to register the compra; autofill from session lines.
+	po_created = False
+	if not purchase_order:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.buying_api import create_purchase_order
+
+			po_items = []
+			for line in lines:
+				code = line.get("item_code")
+				if not code and line.get("draft_item_id"):
+					code = new_item_codes.get(line["draft_item_id"])
+				if not code:
+					continue
+				qty = flt(line.get("qty") or 0)
+				if qty <= 0:
+					continue
+				box = _linked_box_pack(code)
+				rate = flt(line.get("unit_cost") or 0)
+				if box:
+					# PO should list the unit SKU at unit qty/cost (same as stock credit).
+					qty = qty * box["pack"]
+					if rate > 0:
+						rate = rate / box["pack"]
+					code = box["unit"]
+				po_items.append(
+					{
+						"item_code": code,
+						"qty": qty,
+						"rate": rate,
+						"cost_edited": 1 if cint(line.get("cost_edited")) else 0,
+					}
+				)
+			if po_items:
+				po_res = create_purchase_order(
+					supplier=supplier or "Uncategorized",
+					schedule_date=nowdate(),
+					items=po_items,
+					submit=1,
+					notes=(
+						f"Auto from recepción {cstr(session_id or '').strip()}"
+						+ (f" — ref: {reference}" if reference else "")
+					),
+					client_request_id=f"recv-auto-po:{cstr(session_id or '').strip()}"[:140] or None,
+				)
+				purchase_order = cstr((po_res or {}).get("name") or "").strip()
+				po_created = bool(purchase_order)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "receiving auto-create PO")
+			purchase_order = purchase_order or ""
+
 	# Optional: overwrite Item Default supplier when session supplier is set
 	supplier_name = (supplier or "").strip()
 	if supplier_name:
@@ -7868,6 +8647,7 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 		frappe.db.commit()
 
 	# 3. Create Stock Entry
+	se = None
 	try:
 		se = frappe.get_doc({
 			"doctype": "Stock Entry",
@@ -7875,7 +8655,9 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			"posting_date": nowdate(),
 			"to_warehouse": warehouse,
 			"items": resolved_lines,
-			"remarks": f"Receiving session {session_id}" + (f" — ref: {reference}" if reference else ""),
+			"remarks": f"Receiving session {session_id}"
+			+ (f" — ref: {reference}" if reference else "")
+			+ (f" — PO: {purchase_order}" if purchase_order else ""),
 		})
 		se.insert(ignore_permissions=True)
 		se.submit()
@@ -7888,9 +8670,64 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 		if reactivated:
 			frappe.db.commit()
 
+	# 4. Logical Stock Lots (Tables → Lotes) — one per received line.
+	lot_names = []
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.lots_api import create_stock_lot
+
+		company = frappe.db.get_single_value("Global Defaults", "default_company")
+		for line in lines:
+			code = line.get("item_code")
+			if not code and line.get("draft_item_id"):
+				code = new_item_codes.get(line["draft_item_id"])
+			if not code:
+				continue
+			qty = flt(line.get("qty") or 0)
+			if qty <= 0:
+				continue
+			basic_rate = flt(line.get("unit_cost") or 0)
+			box = _linked_box_pack(code)
+			if box:
+				qty = qty * box["pack"]
+				if basic_rate > 0:
+					basic_rate = basic_rate / box["pack"]
+				code = box["unit"]
+			sell_by = line.get("sell_by_days")
+			if sell_by in (None, "") and "shelf_life_in_days" in line:
+				sell_by = line.get("shelf_life_in_days")
+			# Prefer line sell_by; else Item master plazo comercial.
+			if sell_by in (None, "", "null", "undefined"):
+				sell_by = frappe.db.get_value("Item", code, "shelf_life_in_days")
+			try:
+				lot_name = create_stock_lot(
+					item_code=code,
+					qty=qty,
+					warehouse=warehouse,
+					receive_date=nowdate(),
+					sell_by_days=sell_by,
+					unit_cost=basic_rate,
+					stock_entry=se.name if se else None,
+					purchase_order=purchase_order or None,
+					supplier=supplier_name or None,
+					reference=reference,
+					session_id=session_id,
+					company=company,
+					commit=False,
+				)
+				lot_names.append(lot_name)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "receiving create stock lot")
+		if lot_names:
+			frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "receiving stock lots")
+
 	return {
-		"stock_entry_id": se.name,
+		"stock_entry_id": se.name if se else None,
 		"new_item_codes": new_item_codes,
+		"purchase_order": purchase_order or None,
+		"purchase_order_created": 1 if po_created else 0,
+		"lot_names": lot_names,
 	}
 
 

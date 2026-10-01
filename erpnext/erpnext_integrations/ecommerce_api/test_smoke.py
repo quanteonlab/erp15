@@ -767,6 +767,17 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_crm_rm_zone_options():
+        """RM Zona options = committed TMS zones; search_customers exposes zone (not Territory)."""
+        opts = api.list_crm_customer_options()
+        assert isinstance(opts, dict), opts
+        assert isinstance(opts.get("zones"), list), f"zones missing: {list(opts.keys())}"
+        listed = api.search_customers("", 5, 0)
+        rows = listed.get("customers") or []
+        assert isinstance(rows, list), listed
+        if rows:
+            assert "zone" in rows[0], f"search_customers must include zone key: {list(rows[0].keys())}"
+
     _run("5.9.1 get_item_groups", check_item_groups, "S3")
     _run("5.9.2 get_price_lists", check_price_lists, "S3")
     _run("5.9.3 get_warehouses", check_warehouses, "S3")
@@ -783,6 +794,7 @@ def suite_5_9_master_data():
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
     _run("5.9.15 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
     _run("5.9.16 external pipeline status audit", check_external_pipeline_status_audit, "S2")
+    _run("5.9.17 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
 
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────
