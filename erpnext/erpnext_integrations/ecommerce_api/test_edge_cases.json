@@ -3014,6 +3014,131 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "list DN coerces to '' → controlled error"
+    },
+    {
+      "id": "list_armado_orders_null_date_means_all",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.list_armado_orders",
+      "args": {
+        "delivery_date": null,
+        "limit": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "armado default is no date filter (all open orders); null/empty must not coerce to today"
+    },
+    {
+      "id": "list_armado_orders_all_token",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.list_armado_orders",
+      "args": {
+        "delivery_date": "all",
+        "limit": ""
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "delivery_date=all keeps unfiltered armado list"
+    },
+    {
+      "id": "tms_save_settings_late_penalty_dirty",
+      "source": "regression",
+      "bug": "save_tms_settings late_payment_penalty_pct/sync_delivery_payment_to_so dirty strings coerce; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_settings",
+      "args": {
+        "late_payment_penalty_pct": "",
+        "sync_delivery_payment_to_so": "undefined"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_save_settings_late_penalty_null_string",
+      "source": "regression",
+      "bug": "late_payment_penalty_pct='null' and oversized pct clamp to 0..100",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_settings",
+      "args": {
+        "late_payment_penalty_pct": "null",
+        "sync_delivery_payment_to_so": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_save_settings_late_penalty_over_100",
+      "source": "regression",
+      "bug": "late_payment_penalty_pct=999 clamps to 100 without crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.save_tms_settings",
+      "args": {
+        "late_payment_penalty_pct": 999
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_cliente_debe_null_date",
+      "source": "regression",
+      "bug": "list_cliente_debe_stops with null date returns stops list; penalty fields optional if unmigrated",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_cliente_debe_stops",
+      "args": {
+        "date": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_driver_settle_payment_nulls",
+      "source": "regression",
+      "bug": "driver_settle_payment with null trip/amount is controlled error, never 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_settle_payment",
+      "args": {
+        "trip_name": null,
+        "stop_idx": null,
+        "amount_collected": null,
+        "payment_method": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "ops_update_armado_items_null_items",
+      "source": "regression",
+      "bug": "update_armado_items with null/empty items is controlled ValidationError (Items required), never TypeError; promote Orden→Preparado only on real save",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.update_armado_items",
+      "args": {
+        "preorder_name": null,
+        "items": null,
+        "pin": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "ops_update_armado_items_empty_list",
+      "source": "regression",
+      "bug": "update_armado_items with [] fails controlled; never AttributeError on promote path",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.update_armado_items",
+      "args": {
+        "preorder_name": "",
+        "items": [],
+        "pin": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "set_guest_preorder_status_null_source",
+      "source": "regression",
+      "bug": "Optional source=null/\"null\" must not 500; only armado/remito/tms_* mark external_status_change",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": null,
+        "target_status": null,
+        "source": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "set_guest_preorder_status_dirty_source_string",
+      "source": "regression",
+      "bug": "source=\"null\" / unknown sources ignored for external highlight; still controlled error on bad name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Preparado",
+        "source": "null"
+      },
+      "expect": "fail"
     }
   ]
 }

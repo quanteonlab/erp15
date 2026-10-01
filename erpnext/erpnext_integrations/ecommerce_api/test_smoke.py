@@ -709,6 +709,64 @@ def suite_5_9_master_data():
                     frappe.delete_doc("Customer", tname, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_external_pipeline_status_audit():
+        """Armado-sourced Preparado writes Historial + external_status_change; manual does not."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1},
+            "name",
+        )
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 12}],
+                guest_notes="smoke external status",
+                guest_name="Smoke External Status",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            api.set_guest_preorder_status(so_name, "Orden")
+            manual = api.set_guest_preorder_status(so_name, "Preparado")
+            assert str(manual.get("display_status") or "") == "Preparado", manual
+            # Manual pipeline flip must not set external KV.
+            assert not manual.get("external_status_change"), manual.get("external_status_change")
+            # Back to Orden then promote via armado source.
+            api.set_guest_preorder_status(so_name, "Orden")
+            ext = api.set_guest_preorder_status(so_name, "Preparado", source="armado")
+            change = ext.get("external_status_change") or {}
+            assert change.get("source") == "armado", change
+            assert change.get("status") == "Preparado", change
+            assert change.get("fingerprint"), change
+            versions = frappe.get_all(
+                "Version",
+                filters={"ref_doctype": "Sales Order", "docname": so_name},
+                fields=["name", "data"],
+                order_by="creation desc",
+                limit=5,
+                ignore_permissions=True,
+            )
+            assert versions, "expected status Version rows for Historial"
+            blob = " ".join(str(v.get("data") or "") for v in versions)
+            assert "Preparado" in blob and "status" in blob, blob[:400]
+            listed = api.get_guest_preorders_list(page_length=50)
+            row = next(
+                (p for p in (listed.get("preorders") or []) if p.get("name") == so_name),
+                None,
+            )
+            assert row and (row.get("external_status_change") or {}).get("source") == "armado", row
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                docstatus = frappe.db.get_value("Sales Order", so_name, "docstatus")
+                if cint(docstatus) == 1:
+                    try:
+                        so = frappe.get_doc("Sales Order", so_name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    except Exception:
+                        pass
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     _run("5.9.1 get_item_groups", check_item_groups, "S3")
     _run("5.9.2 get_price_lists", check_price_lists, "S3")
     _run("5.9.3 get_warehouses", check_warehouses, "S3")
@@ -724,6 +782,7 @@ def suite_5_9_master_data():
     _run("5.9.13 empty-items Consulta header update", check_empty_items_consulta_update, "S2")
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
     _run("5.9.15 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
+    _run("5.9.16 external pipeline status audit", check_external_pipeline_status_audit, "S2")
 
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────

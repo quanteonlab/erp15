@@ -13,7 +13,7 @@ import string
 import frappe
 from frappe import _
 from frappe.contacts.doctype.address.address import get_address_display
-from frappe.utils import cint, cstr, flt, get_datetime, getdate, now_datetime
+from frappe.utils import cint, cstr, flt, get_datetime, getdate, now_datetime, nowdate
 from frappe.utils.file_manager import save_file
 
 from erpnext.stock.doctype.delivery_trip.delivery_trip import sanitize_address
@@ -499,6 +499,10 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 			"payment_method": getattr(stop, "custom_payment_method", None) or None,
 			"cliente_debe": bool(getattr(stop, "custom_cliente_debe", 0)),
 			"balance_after_stop": getattr(stop, "custom_balance_after_stop", None),
+			"late_penalty_pct": getattr(stop, "custom_late_penalty_pct", None),
+			"late_penalty_amount": getattr(stop, "custom_late_penalty_amount", None),
+			"late_penalty_applied": bool(getattr(stop, "custom_late_penalty_applied", 0)),
+			"late_penalty_note": getattr(stop, "custom_late_penalty_note", None) or None,
 		}
 		if (stop.visited or outcome)
 		else None,
@@ -1554,7 +1558,9 @@ def claim_orders_to_trip(
 			dn_name = dn.name
 			frappe.db.commit()
 		try:
-			frappe.db.set_value("Sales Order", so_name, "status", "En Delivery")
+			from erpnext.erpnext_integrations.ecommerce_api.api import set_guest_preorder_status
+
+			set_guest_preorder_status(so_name, "En Delivery", source="tms_claim")
 			frappe.db.commit()
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "claim_orders_to_trip status")
@@ -3438,6 +3444,8 @@ TMS_SETTINGS_SCOPE = "settings.tms"
 
 TMS_SETTINGS_DEFAULTS = {
 	"delivery_payment_mode": "same_driver_collects",  # same_driver_collects | separate_collector | optional_collect_at_delivery
+	"late_payment_penalty_pct": 0.0,  # e.g. 3 = 3%; 0 disables
+	"sync_delivery_payment_to_so": True,  # PE + Completado on delivery collection
 	"require_signature": "always",  # always | never | per_outcome
 	"require_photo_on_not_home": True,
 	"allow_driver_reorder": True,
@@ -3486,6 +3494,8 @@ def get_tms_settings():
 @frappe.whitelist(allow_guest=True)
 def save_tms_settings(
 	delivery_payment_mode=None,
+	late_payment_penalty_pct=None,
+	sync_delivery_payment_to_so=None,
 	require_signature=None,
 	require_photo_on_not_home=None,
 	allow_driver_reorder=None,
@@ -3512,6 +3522,8 @@ def save_tms_settings(
 	return _persist_tms_settings(
 		{
 			"delivery_payment_mode": delivery_payment_mode,
+			"late_payment_penalty_pct": late_payment_penalty_pct,
+			"sync_delivery_payment_to_so": sync_delivery_payment_to_so,
 			"require_signature": require_signature,
 			"require_photo_on_not_home": require_photo_on_not_home,
 			"allow_driver_reorder": allow_driver_reorder,
@@ -3551,6 +3563,7 @@ def _persist_tms_settings(raw, commit=True):
 		"auto_group_use_time_slots",
 		"auto_credit_note_on_return",
 		"auto_credit_note_on_partial",
+		"sync_delivery_payment_to_so",
 	}
 	list_keys = {"auto_group_working_days", "auto_group_excluded_slots"}
 	int_keys = {
@@ -3564,11 +3577,21 @@ def _persist_tms_settings(raw, commit=True):
 		"drive_buffer_minutes_per_leg",
 		"nearby_driver_max_km",
 	}
+	float_keys = {"late_payment_penalty_pct"}
 	for key, value in raw.items():
 		if value is None:
 			continue
 		if key in bool_keys:
-			current[key] = frappe.parse_json(value) if isinstance(value, str) else bool(value)
+			current[key] = _truthy_flag(value, default=bool(TMS_SETTINGS_DEFAULTS.get(key, False)))
+		elif key in float_keys:
+			try:
+				if isinstance(value, str) and value.strip().lower() in ("", "null", "undefined", "none"):
+					n = flt(TMS_SETTINGS_DEFAULTS.get(key, 0))
+				else:
+					n = flt(value)
+			except (TypeError, ValueError):
+				n = flt(TMS_SETTINGS_DEFAULTS.get(key, 0))
+			current[key] = max(0.0, min(100.0, n))
 		elif key in int_keys:
 			try:
 				n = cint(value)
@@ -8581,6 +8604,269 @@ def driver_reorder_stops(trip_name, delivery_note_names=None):
 	}
 
 
+def _ensure_late_penalty_fields():
+	"""Idempotent Delivery Stop late-penalty columns (patch may not have run)."""
+	if frappe.db.has_column("Delivery Stop", "custom_late_penalty_pct"):
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+	from erpnext.patches.v15_0.add_tms_late_penalty_fields import CUSTOM_FIELDS
+
+	create_custom_fields(CUSTOM_FIELDS, update=True)
+	frappe.clear_cache(doctype="Delivery Stop")
+
+
+def _pending_penalty_amount(stop) -> float:
+	if not frappe.db.has_column("Delivery Stop", "custom_late_penalty_amount"):
+		return 0.0
+	if cint(getattr(stop, "custom_late_penalty_applied", 0) or 0):
+		return 0.0
+	return max(0.0, flt(getattr(stop, "custom_late_penalty_amount", 0) or 0))
+
+
+def _snapshot_late_penalty(stop, goods_balance: float, settings: dict) -> str | None:
+	"""If underpaid and pct>0, snapshot penalty on the stop. Returns note text or None."""
+	_ensure_late_penalty_fields()
+	pct = flt(settings.get("late_payment_penalty_pct") or 0)
+	if goods_balance <= 0.005 or pct <= 0:
+		return None
+	amount = round(goods_balance * pct / 100.0, 2)
+	if amount <= 0:
+		return None
+	note = _(
+		"Recargo {0}% sobre {1} por pago incompleto el {2} "
+		"(pendiente próximo cobro: {3})"
+	).format(pct, goods_balance, nowdate(), amount)
+	stop.custom_late_penalty_pct = pct
+	stop.custom_late_penalty_base = goods_balance
+	stop.custom_late_penalty_amount = amount
+	stop.custom_late_penalty_applied = 0
+	stop.custom_late_penalty_note = note
+	return note
+
+
+def _clear_late_penalty(stop):
+	if not frappe.db.has_column("Delivery Stop", "custom_late_penalty_pct"):
+		return
+	stop.custom_late_penalty_pct = 0
+	stop.custom_late_penalty_base = 0
+	stop.custom_late_penalty_amount = 0
+	stop.custom_late_penalty_applied = 0
+	stop.custom_late_penalty_note = None
+
+
+def _append_so_payment_note(so_name: str, text: str):
+	so_name = cstr(so_name or "").strip()
+	text = cstr(text or "").strip()
+	if not so_name or not text or not frappe.db.exists("Sales Order", so_name):
+		return
+	try:
+		frappe.get_doc("Sales Order", so_name).add_comment("Info", text)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "delivery payment SO comment")
+
+
+def _record_so_receive_payment(so_name: str, paid_amount, mode_of_payment=None) -> str | None:
+	"""Create a Receive Payment Entry allocated to the Sales Order. Returns PE name."""
+	paid_amount = flt(paid_amount)
+	if paid_amount <= 0 or not so_name or not frappe.db.exists("Sales Order", so_name):
+		return None
+	from erpnext.erpnext_integrations.ecommerce_api.api import _resolve_preorder_payment_accounts
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	frappe.flags.ignore_permissions = False
+	mop = cstr(mode_of_payment or "").strip() or "Cash"
+	try:
+		receivable_account, cash_account, mop = _resolve_preorder_payment_accounts(
+			so.company, mop, so.customer
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "delivery payment accounts")
+		receivable_account, cash_account = None, None
+
+	if not receivable_account or not cash_account:
+		# Still bump advance_paid so Completado (no pagado) can clear when paid in full.
+		new_paid = flt(getattr(so, "advance_paid", 0) or 0) + paid_amount
+		cap = flt(so.grand_total) or new_paid
+		frappe.db.set_value(
+			"Sales Order",
+			so_name,
+			"advance_paid",
+			min(new_paid, cap) if cap > 0 else new_paid,
+			update_modified=True,
+		)
+		return None
+
+	outstanding = flt(so.grand_total) - flt(getattr(so, "advance_paid", 0) or 0)
+	allocated = min(paid_amount, outstanding) if outstanding > 0 else paid_amount
+	pe = frappe.new_doc("Payment Entry")
+	pe.payment_type = "Receive"
+	pe.company = so.company
+	pe.party_type = "Customer"
+	pe.party = so.customer
+	pe.mode_of_payment = mop
+	pe.paid_from = receivable_account
+	pe.paid_to = cash_account
+	pe.paid_from_account_currency = so.currency
+	pe.paid_to_account_currency = so.currency
+	pe.paid_amount = paid_amount
+	pe.received_amount = paid_amount
+	pe.reference_date = nowdate()
+	pe.reference_no = f"TMS-{so_name}"
+	if allocated > 0:
+		pe.append(
+			"references",
+			{
+				"reference_doctype": "Sales Order",
+				"reference_name": so_name,
+				"total_amount": flt(so.grand_total),
+				"outstanding_amount": outstanding,
+				"allocated_amount": allocated,
+			},
+		)
+	pe.insert(ignore_permissions=True)
+	pe.submit()
+	return pe.name
+
+
+def _mark_so_completado(so_name: str):
+	"""Move SO to Completado workflow (display Completado / Completado no pagado via advance_paid)."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_is_guest_preorder_sales_order,
+		set_guest_preorder_status,
+	)
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	frappe.flags.ignore_permissions = False
+	try:
+		if _is_guest_preorder_sales_order(so):
+			set_guest_preorder_status(so_name, "Completado", source="tms_pod")
+		else:
+			if cint(so.docstatus) == 1 and cstr(so.status) not in ("Completed", "Closed"):
+				so.db_set("status", "Completed", update_modified=True)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "delivery mark Completado")
+
+
+def _sync_stop_collection_to_sales_orders(
+	stop,
+	*,
+	delta_collected: float,
+	payment_method=None,
+	complete: bool,
+	ledger_note: str | None = None,
+	settings: dict | None = None,
+):
+	"""Book PE for cash taken + optionally Completado on linked SOs."""
+	settings = settings or _load_tms_settings()
+	if settings.get("sync_delivery_payment_to_so") is False:
+		return
+	dn = cstr(getattr(stop, "delivery_note", None) or "").strip()
+	so_names = _sales_orders_for_dn(dn) if dn else []
+	if not so_names:
+		return
+	delta = flt(delta_collected)
+	# Split evenly across linked SOs when a DN covers multiple (rare).
+	per = round(delta / len(so_names), 2) if delta > 0 and so_names else 0.0
+	remainder = round(delta - per * len(so_names), 2) if delta > 0 else 0.0
+	for i, so_name in enumerate(so_names):
+		chunk = per + (remainder if i == 0 else 0.0)
+		if chunk > 0:
+			try:
+				_record_so_receive_payment(so_name, chunk, payment_method)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "delivery PE sync")
+		if ledger_note:
+			_append_so_payment_note(so_name, ledger_note)
+		if complete:
+			_mark_so_completado(so_name)
+
+
+def _apply_collection_and_penalty(
+	stop,
+	*,
+	amount_due: float,
+	prior_collected: float,
+	delta_collected: float,
+	payment_method=None,
+	settings: dict,
+	complete_so: bool,
+):
+	"""Update stop payment fields, snapshot/apply late penalty, sync SO."""
+	_ensure_late_penalty_fields()
+	delta = max(0.0, flt(delta_collected))
+	prior = max(0.0, flt(prior_collected))
+	due = max(0.0, flt(amount_due))
+	new_collected = prior + delta
+	stop.custom_amount_due = due
+	stop.custom_amount_collected = new_collected
+	if payment_method:
+		stop.custom_payment_method = payment_method
+
+	goods_balance_before = max(0.0, due - prior)
+	goods_balance_after = max(0.0, due - new_collected)
+	penalty_pending_before = _pending_penalty_amount(stop)
+
+	ledger_note = None
+	if goods_balance_after > 0.005:
+		# Still owing goods — (re)snapshot penalty from current goods balance if none applied yet.
+		if not cint(getattr(stop, "custom_late_penalty_applied", 0) or 0):
+			# First underpay: snapshot. Later underpays keep existing pending unless none set.
+			if penalty_pending_before <= 0.005:
+				ledger_note = _snapshot_late_penalty(stop, goods_balance_after, settings)
+			else:
+				ledger_note = cstr(getattr(stop, "custom_late_penalty_note", "") or "") or None
+		stop.custom_balance_after_stop = goods_balance_after + _pending_penalty_amount(stop)
+		stop.custom_cliente_debe = 1
+	else:
+		# Goods covered — allocate excess toward pending penalty.
+		excess = max(0.0, new_collected - due)
+		penalty = _pending_penalty_amount(stop)
+		if penalty > 0.005:
+			if excess + 0.005 >= penalty:
+				stop.custom_late_penalty_applied = 1
+				stop.custom_balance_after_stop = 0
+				stop.custom_cliente_debe = 0
+				ledger_note = _(
+					"[cobro] Recargo {0} aplicado el {1}"
+				).format(penalty, nowdate())
+			else:
+				remaining = round(penalty - excess, 2)
+				stop.custom_balance_after_stop = remaining
+				stop.custom_cliente_debe = 1
+				ledger_note = _(
+					"[cobro] Abonado a mercadería; recargo pendiente {0}"
+				).format(remaining)
+		else:
+			_clear_late_penalty(stop)
+			stop.custom_balance_after_stop = 0
+			stop.custom_cliente_debe = 0
+
+	if delta > 0.005 or ledger_note or complete_so:
+		tag = _(
+			"[cobro-entrega {0}] cobrado={1} due={2} balance={3}"
+		).format(
+			nowdate(),
+			new_collected,
+			due,
+			flt(getattr(stop, "custom_balance_after_stop", 0) or 0),
+		)
+		if ledger_note and ledger_note not in tag:
+			tag = f"{tag}\n{ledger_note}"
+		_sync_stop_collection_to_sales_orders(
+			stop,
+			delta_collected=delta,
+			payment_method=payment_method,
+			complete=complete_so,
+			ledger_note=tag,
+			settings=settings,
+		)
+
+
 @frappe.whitelist()
 def driver_record_stop_outcome(
 	trip_name,
@@ -8671,13 +8957,45 @@ def driver_record_stop_outcome(
 	# driver isn't asked for these fields at all - ignore anything sent.
 	if outcome in ("Delivered", "Partial"):
 		amount_due = flt(stop.grand_total)
-		stop.custom_amount_due = amount_due
+		prior = flt(getattr(stop, "custom_amount_collected", 0) or 0)
 		if settings.get("delivery_payment_mode") != "separate_collector" and amount_collected is not None:
-			stop.custom_amount_collected = flt(amount_collected)
-			stop.custom_payment_method = payment_method
-			balance = amount_due - flt(amount_collected)
-			stop.custom_balance_after_stop = balance
-			stop.custom_cliente_debe = 1 if balance > 0 else 0
+			# Conductor sends the absolute cobrado amount for this stop.
+			absolute = max(0.0, flt(amount_collected))
+			delta = max(0.0, absolute - prior)
+			_apply_collection_and_penalty(
+				stop,
+				amount_due=amount_due,
+				prior_collected=prior,
+				delta_collected=delta,
+				payment_method=payment_method,
+				settings=settings,
+				complete_so=True,
+			)
+			# Ensure collected reflects the absolute the driver entered.
+			stop.custom_amount_collected = absolute
+			goods_bal = max(0.0, amount_due - absolute)
+			pen = _pending_penalty_amount(stop)
+			stop.custom_balance_after_stop = goods_bal + pen
+			stop.custom_cliente_debe = 1 if stop.custom_balance_after_stop > 0.005 else 0
+		else:
+			# Separate collector or no amount: still mark due + Completado (unpaid).
+			stop.custom_amount_due = amount_due
+			stop.custom_balance_after_stop = max(0.0, amount_due - prior)
+			stop.custom_cliente_debe = 1 if stop.custom_balance_after_stop > 0.005 else 0
+			if stop.custom_balance_after_stop > 0.005:
+				_snapshot_late_penalty(stop, stop.custom_balance_after_stop, settings)
+				pen = _pending_penalty_amount(stop)
+				stop.custom_balance_after_stop = max(0.0, amount_due - prior) + pen
+			_sync_stop_collection_to_sales_orders(
+				stop,
+				delta_collected=0,
+				payment_method=None,
+				complete=True,
+				ledger_note=_(
+					"[entrega {0}] sin cobro en parada — pendiente {1}"
+				).format(nowdate(), flt(stop.custom_balance_after_stop)),
+				settings=settings,
+			)
 
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)
@@ -8765,19 +9083,30 @@ def list_cliente_debe_stops(date=None):
 	if not trip_names:
 		return {"stops": []}
 
+	fields = [
+		"parent as trip_name",
+		"idx",
+		"customer",
+		"customer_address",
+		"delivery_note",
+		"custom_amount_due",
+		"custom_amount_collected",
+		"custom_balance_after_stop",
+	]
+	if frappe.db.has_column("Delivery Stop", "custom_late_penalty_pct"):
+		fields.extend(
+			[
+				"custom_late_penalty_pct",
+				"custom_late_penalty_amount",
+				"custom_late_penalty_applied",
+				"custom_late_penalty_note",
+			]
+		)
+
 	rows = frappe.get_all(
 		"Delivery Stop",
 		filters={**filters, "parent": ["in", trip_names]},
-		fields=[
-			"parent as trip_name",
-			"idx",
-			"customer",
-			"customer_address",
-			"delivery_note",
-			"custom_amount_due",
-			"custom_amount_collected",
-			"custom_balance_after_stop",
-		],
+		fields=fields,
 		ignore_permissions=True,
 	)
 	return {"stops": rows}
@@ -8786,7 +9115,7 @@ def list_cliente_debe_stops(date=None):
 @frappe.whitelist()
 def driver_settle_payment(trip_name, stop_idx, amount_collected, payment_method=None):
 	"""Record a later payment collection against an existing stop (the
-	"separate collector" flow)."""
+	"separate collector" flow). Applies pending late-payment penalty when due."""
 	driver = _get_current_driver()
 	trip = _require_owned_trip(trip_name, driver)
 
@@ -8795,13 +9124,19 @@ def driver_settle_payment(trip_name, stop_idx, amount_collected, payment_method=
 	if not stop:
 		frappe.throw(_("Stop {0} not found on this trip").format(stop_idx), frappe.DoesNotExistError)
 
-	collected_so_far = flt(stop.custom_amount_collected) + flt(amount_collected)
-	balance = flt(stop.custom_amount_due) - collected_so_far
-
-	stop.custom_amount_collected = collected_so_far
-	stop.custom_payment_method = payment_method or stop.custom_payment_method
-	stop.custom_balance_after_stop = balance
-	stop.custom_cliente_debe = 1 if balance > 0 else 0
+	settings = _load_tms_settings()
+	prior = flt(getattr(stop, "custom_amount_collected", 0) or 0)
+	due = flt(getattr(stop, "custom_amount_due", 0) or stop.grand_total or 0)
+	delta = max(0.0, flt(amount_collected))
+	_apply_collection_and_penalty(
+		stop,
+		amount_due=due,
+		prior_collected=prior,
+		delta_collected=delta,
+		payment_method=payment_method,
+		settings=settings,
+		complete_so=True,
+	)
 
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)

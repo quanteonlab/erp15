@@ -39,3 +39,29 @@ def kv_set(scope: str, row_key: str, data: dict) -> None:
 			"data_json": payload,
 		}
 	).insert(ignore_permissions=True)
+
+
+def kv_get_many(scope: str, row_keys: list[str]) -> dict[str, dict]:
+	"""Batch-read KV rows for one scope. Returns ``{row_key: data_dict}``."""
+	keys = [str(k).strip() for k in (row_keys or []) if str(k).strip()]
+	if not scope or not keys:
+		return {}
+	rows = frappe.get_all(
+		"Table Extra Data",
+		filters={"scope": scope, "row_key": ["in", keys]},
+		fields=["row_key", "data_json"],
+		ignore_permissions=True,
+	)
+	out: dict[str, dict] = {}
+	for row in rows or []:
+		rk = str(row.get("row_key") or "").strip()
+		if not rk:
+			continue
+		raw = row.get("data_json")
+		try:
+			data = json.loads(raw) if raw else {}
+		except Exception:
+			data = {}
+		if isinstance(data, dict):
+			out[rk] = data
+	return out

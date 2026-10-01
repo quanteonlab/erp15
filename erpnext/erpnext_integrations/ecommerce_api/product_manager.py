@@ -795,6 +795,22 @@ def ensure_product_manager_custom_fields() -> None:
                     "description": "Cumulative qty returned via POS Sesiones → Devolver.",
                     "reqd": 0,
                 },
+                {
+                    "fieldname": "custom_unit_weight_min",
+                    "fieldtype": "Float",
+                    "label": "Min Unit Weight",
+                    "insert_after": "weight_uom",
+                    "description": "Soft min weight per stock unit (Armado advisory). Same UOM as Weight UOM.",
+                    "reqd": 0,
+                },
+                {
+                    "fieldname": "custom_unit_weight_max",
+                    "fieldtype": "Float",
+                    "label": "Max Unit Weight",
+                    "insert_after": "custom_unit_weight_min",
+                    "description": "Soft max weight per stock unit (Armado advisory). Same UOM as Weight UOM.",
+                    "reqd": 0,
+                },
             ]
         },
         ignore_validate=True,
@@ -1106,6 +1122,34 @@ def get_product_rows(
         if has_return_qty_col
         else "0 AS return_qty"
     )
+    has_wmin = frappe.db.has_column("Item", "custom_unit_weight_min")
+    has_wmax = frappe.db.has_column("Item", "custom_unit_weight_max")
+    wmin_select = (
+        "COALESCE(i.custom_unit_weight_min, NULL) AS unit_weight_min" if has_wmin else "NULL AS unit_weight_min"
+    )
+    wmax_select = (
+        "COALESCE(i.custom_unit_weight_max, NULL) AS unit_weight_max" if has_wmax else "NULL AS unit_weight_max"
+    )
+    wpu_select = (
+        "COALESCE(i.weight_per_unit, NULL) AS weight_per_unit"
+        if frappe.db.has_column("Item", "weight_per_unit")
+        else "NULL AS weight_per_unit"
+    )
+    wuom_select = (
+        "COALESCE(i.weight_uom, NULL) AS weight_uom"
+        if frappe.db.has_column("Item", "weight_uom")
+        else "NULL AS weight_uom"
+    )
+    sell_by_select = (
+        "COALESCE(i.shelf_life_in_days, NULL) AS sell_by_days"
+        if frappe.db.has_column("Item", "shelf_life_in_days")
+        else "NULL AS sell_by_days"
+    )
+    batch_select = (
+        "COALESCE(i.has_batch_no, 0) AS has_batch_no, COALESCE(i.has_expiry_date, 0) AS has_expiry_date"
+        if frappe.db.has_column("Item", "has_batch_no")
+        else "0 AS has_batch_no, 0 AS has_expiry_date"
+    )
 
     sql = f"""
         SELECT
@@ -1119,6 +1163,12 @@ def get_product_rows(
             COALESCE(i.custom_pack_unit, NULL)         AS unit,
             {unit_sku_select},
             {return_qty_select},
+            {wpu_select},
+            {wuom_select},
+            {wmin_select},
+            {wmax_select},
+            {sell_by_select},
+            {batch_select},
             i.disabled               AS _disabled,
             COALESCE(i.custom_normalized_title, NULL)  AS _raw_norm,
             COALESCE(NULLIF(TRIM(i.custom_normalized_title), ''), i.item_name) AS normalized_title,
@@ -1294,6 +1344,10 @@ _ITEM_HISTORY_FIELD_LABEL = {
     "custom_unit_sku": "unit_sku",
     "custom_normalized_title": "normalized_title",
     "custom_review_notes": "review_notes",
+    "weight_per_unit": "weight_per_unit",
+    "custom_unit_weight_min": "unit_weight_min",
+    "custom_unit_weight_max": "unit_weight_max",
+    "shelf_life_in_days": "sell_by_days",
     "disabled": "is_active",
 }
 
@@ -1370,7 +1424,46 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             "review_notes": "custom_review_notes",
             "image": "image",
             "source_category": "item_group",
+            "weight_per_unit": "weight_per_unit",
+            "weight_uom": "weight_uom",
+            "unit_weight_min": "custom_unit_weight_min",
+            "unit_weight_max": "custom_unit_weight_max",
+            "sell_by_days": "shelf_life_in_days",
         }
+        direct_field_map = {
+            k: v for k, v in direct_field_map.items() if frappe.db.has_column("Item", v)
+        }
+
+        # Coerce / validate weight band + sell-by (plazo comercial) days.
+        for weight_key in ("weight_per_unit", "unit_weight_min", "unit_weight_max"):
+            if weight_key not in changes:
+                continue
+            raw = changes.get(weight_key)
+            if raw in (None, "", "null", "undefined"):
+                changes[weight_key] = None
+            else:
+                try:
+                    changes[weight_key] = max(0.0, flt(raw))
+                except (TypeError, ValueError):
+                    changes[weight_key] = None
+        if "sell_by_days" in changes:
+            raw = changes.get("sell_by_days")
+            if raw in (None, "", "null", "undefined"):
+                changes["sell_by_days"] = None
+            else:
+                try:
+                    changes["sell_by_days"] = max(0, cint(raw))
+                except (TypeError, ValueError):
+                    changes["sell_by_days"] = None
+        wmin = changes.get("unit_weight_min") if "unit_weight_min" in changes else None
+        wmax = changes.get("unit_weight_max") if "unit_weight_max" in changes else None
+        if wmin is None and "unit_weight_min" not in changes and frappe.db.has_column("Item", "custom_unit_weight_min"):
+            wmin = frappe.db.get_value("Item", item_code, "custom_unit_weight_min")
+        if wmax is None and "unit_weight_max" not in changes and frappe.db.has_column("Item", "custom_unit_weight_max"):
+            wmax = frappe.db.get_value("Item", item_code, "custom_unit_weight_max")
+        if wmin is not None and wmax is not None and flt(wmin) > flt(wmax):
+            frappe.throw(_("Min unit weight cannot be greater than max unit weight"))
+
         if "unit_sku" in changes:
             if not _ensure_unit_sku_column():
                 frappe.throw(
@@ -1471,10 +1564,31 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
         if history:
             _log_item_field_history(item_code, history)
 
+        warnings = []
+        sell_by = None
+        if "sell_by_days" in changes:
+            sell_by = changes.get("sell_by_days")
+        elif frappe.db.has_column("Item", "shelf_life_in_days"):
+            sell_by = frappe.db.get_value("Item", item_code, "shelf_life_in_days")
+        if cint(sell_by or 0) > 0 and frappe.db.has_column("Item", "has_batch_no"):
+            has_batch = cint(frappe.db.get_value("Item", item_code, "has_batch_no") or 0)
+            has_exp = cint(frappe.db.get_value("Item", item_code, "has_expiry_date") or 0)
+            if not (has_batch and has_exp):
+                warnings.append(
+                    _(
+                        "Sell-by days are set, but lot/expiry tracking is off on this item. "
+                        "Enable Has Batch No and Has Expiry Date in Desk if you need FEFO — "
+                        "not auto-enabled."
+                    )
+                )
+
         if commit:
             frappe.db.commit()
         modified = frappe.db.get_value("Item", item_code, "modified")
-        return {"ok": True, "modified": str(modified)}
+        out = {"ok": True, "modified": str(modified)}
+        if warnings:
+            out["warnings"] = warnings
+        return out
     finally:
         frappe.flags.ignore_permissions = False
 

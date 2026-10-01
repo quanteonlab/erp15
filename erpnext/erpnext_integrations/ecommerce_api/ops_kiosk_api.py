@@ -88,17 +88,30 @@ def resolve_armado_ean13(code=None):
 
 @frappe.whitelist(allow_guest=True)
 def list_armado_orders(delivery_date=None, limit=80):
-	"""Orders due on delivery_date (default today) for the armado kiosk."""
-	delivery_date = getdate(delivery_date or today())
-	limit = max(1, min(cint(limit) or 80, 200))
+	"""Orders for the armado kiosk.
+
+	``delivery_date`` empty / null / ``"all"`` → no date filter (default).
+	Otherwise only orders due that day.
+	Also returns ``delivery_dates`` (distinct due dates among open armado orders)
+	so the UI can offer a day picker.
+	"""
+	raw = delivery_date
+	if isinstance(raw, str):
+		raw = raw.strip()
+	# Default: no filter. Explicit "all"/""/None → all open orders.
+	filter_all = raw in (None, "", "all", "null", "undefined")
+	due = None if filter_all else getdate(raw)
+	limit = max(1, min(cint(limit) or (200 if filter_all else 80), 300))
 	tag_field = _guest_tag_field()
 
 	frappe.flags.ignore_permissions = True
 	filters = {
 		"docstatus": ["<", 2],
-		"delivery_date": delivery_date,
 		"status": ["not in", ["Closed", "Completed"]],
 	}
+	if due is not None:
+		filters["delivery_date"] = due
+
 	fields = [
 		"name",
 		"customer",
@@ -118,12 +131,28 @@ def list_armado_orders(delivery_date=None, limit=80):
 		"Sales Order",
 		filters=filters,
 		fields=fields,
-		order_by="customer_name asc, name asc",
+		order_by="delivery_date asc, customer_name asc, name asc",
 		limit_page_length=limit,
 		ignore_permissions=True,
 	)
 
-	# Prefer guest preorders when tag exists; still include non-guest due today.
+	# Distinct due dates for the filter UI (open armado pool, not just this page).
+	date_rows = frappe.get_all(
+		"Sales Order",
+		filters={
+			"docstatus": ["<", 2],
+			"status": ["not in", ["Closed", "Completed"]],
+			"delivery_date": ["is", "set"],
+		},
+		fields=["delivery_date"],
+		order_by="delivery_date asc",
+		limit_page_length=500,
+		ignore_permissions=True,
+	)
+	delivery_dates = sorted(
+		{str(r.delivery_date) for r in date_rows if r.delivery_date}
+	)
+
 	out = []
 	for r in rows:
 		tag = str(r.get(tag_field) or "") if tag_field else ""
@@ -145,7 +174,12 @@ def list_armado_orders(delivery_date=None, limit=80):
 				"items_count": frappe.db.count("Sales Order Item", {"parent": r.name}),
 			}
 		)
-	return {"ok": True, "delivery_date": str(delivery_date), "orders": out}
+	return {
+		"ok": True,
+		"delivery_date": "" if due is None else str(due),
+		"delivery_dates": delivery_dates,
+		"orders": out,
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -276,6 +310,7 @@ def update_armado_items(preorder_name=None, items=None, pin=None):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if _is_guest_preorder_sales_order(so):
 		detail = update_guest_preorder_items(preorder_name, items)
+		detail = _maybe_promote_armado_to_preparado(detail.get("name") or preorder_name, detail)
 		return {"ok": True, "order": {**detail, "ean13": armado_ean13_for_order(detail.get("name") or preorder_name)}}
 
 	# Non-guest: edit draft in place only
@@ -295,6 +330,35 @@ def update_armado_items(preorder_name=None, items=None, pin=None):
 	so.save(ignore_permissions=True)
 	frappe.db.commit()
 	return get_armado_order(so.name)
+
+
+def _maybe_promote_armado_to_preparado(so_name: str, detail: dict | None = None):
+	"""After armado qty commit: Orden → Preparado (idempotent; never regress later steps)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_display_status,
+		_is_guest_preorder_sales_order,
+		set_guest_preorder_status,
+	)
+
+	so_name = str(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return detail
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		return detail
+	current = _display_status(so)
+	base = "Completado" if str(current).startswith("Completado") else current
+	# Only promote confirmed Orden (To Deliver and Bill / Orden marker).
+	if base != "Orden":
+		return detail
+	try:
+		promoted = set_guest_preorder_status(so_name, "Preparado", source="armado")
+		return promoted if isinstance(promoted, dict) else detail
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "armado promote Preparado")
+		return detail
 
 
 @frappe.whitelist(allow_guest=True)

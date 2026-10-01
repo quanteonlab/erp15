@@ -143,9 +143,12 @@ def get_products(
 			if frappe.db.has_column("Item", custom):
 				fields.append(custom)
 		# Standard Item fields used by catalog mayorista weight estimates (units × kg).
-		for std in ("weight_per_unit", "weight_uom"):
+		for std in ("weight_per_unit", "weight_uom", "shelf_life_in_days", "has_batch_no", "has_expiry_date"):
 			if std not in fields and frappe.db.has_column("Item", std):
 				fields.append(std)
+		for custom in ("custom_unit_weight_min", "custom_unit_weight_max"):
+			if custom not in fields and frappe.db.has_column("Item", custom):
+				fields.append(custom)
 
 	if isinstance(filters, str):
 		import json
@@ -218,6 +221,15 @@ def get_products(
 	_attach_barcodes(items)
 	_attach_receiving_meta(items, price_list)
 	_attach_item_group_meta(items)
+
+	# Alias native shelf_life as sell-by (plazo comercial) + weight band for frontends.
+	for item in items:
+		if "shelf_life_in_days" in item and "sell_by_days" not in item:
+			item["sell_by_days"] = item.get("shelf_life_in_days")
+		if "custom_unit_weight_min" in item and "unit_weight_min" not in item:
+			item["unit_weight_min"] = item.get("custom_unit_weight_min")
+		if "custom_unit_weight_max" in item and "unit_weight_max" not in item:
+			item["unit_weight_max"] = item.get("custom_unit_weight_max")
 
 	return {
 		"items": items,
@@ -384,6 +396,27 @@ def get_receiving_item_meta(item_codes=None, price_list=None):
 			"price_list_rate": get_item_price(code, price_list) or 0,
 			"stock_qty": get_stock_balance(code) or 0,
 		}
+		if frappe.db.exists("Item", code):
+			fields = ["shelf_life_in_days", "has_batch_no", "has_expiry_date", "weight_per_unit"]
+			if frappe.db.has_column("Item", "custom_unit_weight_min"):
+				fields.append("custom_unit_weight_min")
+			if frappe.db.has_column("Item", "custom_unit_weight_max"):
+				fields.append("custom_unit_weight_max")
+			row = frappe.db.get_value("Item", code, fields, as_dict=True) or {}
+			out[code]["sell_by_days"] = cint(row.get("shelf_life_in_days") or 0) or None
+			out[code]["has_batch_no"] = cint(row.get("has_batch_no") or 0)
+			out[code]["has_expiry_date"] = cint(row.get("has_expiry_date") or 0)
+			out[code]["weight_per_unit"] = flt(row.get("weight_per_unit") or 0) or None
+			out[code]["unit_weight_min"] = (
+				flt(row.get("custom_unit_weight_min"))
+				if row.get("custom_unit_weight_min") not in (None, "")
+				else None
+			)
+			out[code]["unit_weight_max"] = (
+				flt(row.get("custom_unit_weight_max"))
+				if row.get("custom_unit_weight_max") not in (None, "")
+				else None
+			)
 	return {"items": out}
 
 
@@ -3760,17 +3793,26 @@ def _item_line_weight_fields(
 	line_qty=None,
 ):
 	stock_uom, weight_per_unit, weight_uom = "", 0.0, ""
+	unit_weight_min, unit_weight_max = None, None
 	unit = ""
 	try:
 		fields = ["stock_uom", "weight_per_unit", "weight_uom"]
 		if frappe.db.has_column("Item", "custom_unit"):
 			fields.append("custom_unit")
+		if frappe.db.has_column("Item", "custom_unit_weight_min"):
+			fields.append("custom_unit_weight_min")
+		if frappe.db.has_column("Item", "custom_unit_weight_max"):
+			fields.append("custom_unit_weight_max")
 		row = frappe.db.get_value("Item", item_code, fields, as_dict=True) if item_code else None
 		if row:
 			stock_uom = row.get("stock_uom") or ""
 			weight_per_unit = float(row.get("weight_per_unit") or 0)
 			weight_uom = row.get("weight_uom") or ""
 			unit = row.get("custom_unit") or ""
+			if row.get("custom_unit_weight_min") not in (None, ""):
+				unit_weight_min = float(row.get("custom_unit_weight_min") or 0)
+			if row.get("custom_unit_weight_max") not in (None, ""):
+				unit_weight_max = float(row.get("custom_unit_weight_max") or 0)
 	except Exception:
 		pass
 	sell_uom = cstr(line_uom or "").strip() or stock_uom
@@ -3811,6 +3853,8 @@ def _item_line_weight_fields(
 		"item_stock_uom": stock_uom,
 		"weight_uom": weight_uom,
 		"weight_per_unit": weight_per_unit,
+		"unit_weight_min": unit_weight_min,
+		"unit_weight_max": unit_weight_max,
 		"total_weight": total_weight or None,
 		"unit": unit,
 		"is_weight_based": is_weight_based,
@@ -4404,6 +4448,10 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		)
 		o["delivery_date_forced"] = _delivery_date_forced_from_tags(o)
 
+	ext_map = _external_status_change_map([o["name"] for o in filtered])
+	for o in filtered:
+		o["external_status_change"] = ext_map.get(o["name"]) or None
+
 	geo = _customer_address_zone_map([o.get("customer") for o in filtered])
 	for o in filtered:
 		info = geo.get(o.get("customer")) or {}
@@ -4474,6 +4522,7 @@ def get_guest_preorder(preorder_name):
 		"amended_from": so.amended_from or None,
 		"delivery_note": _delivery_note_for_sales_order(preorder_name),
 		"payments": _payments_for_sales_order(preorder_name, flt(so.grand_total)),
+		"external_status_change": _external_status_change_for(preorder_name),
 		"items": [
 			{
 				"item_code": d.item_code,
@@ -4571,6 +4620,82 @@ def get_guest_preorder_history(preorder_name):
 
 WORKFLOW_STATUSES = ["Consulta", "Orden", "Preparado", "En Delivery", "Completado"]
 COMPLETED_UNPAID_LABEL = "Completado (no pagado)"
+# Status transitions done outside the Órdenes table UI (armado / remito / TMS).
+EXTERNAL_PIPELINE_SOURCES = frozenset({"armado", "remito", "tms_claim", "tms_pod"})
+EXTERNAL_STATUS_KV_SCOPE = "pedidos.external_status"
+
+
+def _normalize_pipeline_source(source):
+	src = cstr(source or "").strip().lower()
+	if src in ("null", "undefined", "none"):
+		return None
+	return src or None
+
+
+def _record_guest_preorder_status_audit(so_name, old_display, new_display, source=None):
+	"""Version Historial row + optional external-change KV for Órdenes highlight/banner."""
+	old_s = cstr(old_display or "").strip()
+	new_s = cstr(new_display or "").strip()
+	if not so_name or old_s == new_s:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
+		changes = [("status", old_s, new_s)]
+		src = _normalize_pipeline_source(source)
+		if src in EXTERNAL_PIPELINE_SOURCES:
+			changes.append(("status_via", "", src))
+		log_field_changes("Sales Order", so_name, changes)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "guest preorder status audit")
+
+	src = _normalize_pipeline_source(source)
+	if src not in EXTERNAL_PIPELINE_SOURCES:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+		at = str(now_datetime())
+		kv_set(
+			EXTERNAL_STATUS_KV_SCOPE,
+			so_name,
+			{
+				"status": new_s,
+				"previous": old_s,
+				"source": src,
+				"at": at,
+				"by": frappe.session.user,
+				"fingerprint": f"{src}:{new_s}:{at}",
+			},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "guest preorder external status kv")
+
+
+def _external_status_change_for(so_name):
+	so_name = cstr(so_name or "").strip()
+	if not so_name:
+		return None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+		_name, data = kv_get(EXTERNAL_STATUS_KV_SCOPE, so_name)
+		return data or None
+	except Exception:
+		return None
+
+
+def _external_status_change_map(so_names):
+	names = [cstr(n).strip() for n in (so_names or []) if cstr(n).strip()]
+	if not names:
+		return {}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get_many
+
+		return kv_get_many(EXTERNAL_STATUS_KV_SCOPE, names)
+	except Exception:
+		return {}
+
 
 
 def _so_is_fully_paid(so) -> bool:
@@ -4712,21 +4837,26 @@ def _erp_status_for_display(display_status):
 
 
 @frappe.whitelist(allow_guest=True)
-def set_guest_preorder_status(preorder_name, target_status):
+def set_guest_preorder_status(preorder_name, target_status, source=None):
 	"""
 	Unified status transition for the custom workflow.
 
 	Accepts target_status as one of: Consulta, Orden, Preparado, En Delivery, Completado.
 	Consulta on a submitted order is a soft marker (db_set status) — it does **not**
 	cancel/archive. Explicit archive uses ``cancel_guest_preorder``.
-	Backward moves among submitted custom statuses use db_set so SilkOS
+	 Backward moves among submitted custom statuses use db_set so SilkOS
 	update_status does not block with an opaque error.
+
+	``source`` (optional): when one of armado / remito / tms_claim / tms_pod, the
+	transition is treated as external to the Órdenes table (highlight + banner).
 	"""
 	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
 
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	pipeline_source = _normalize_pipeline_source(source)
 
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
@@ -4740,7 +4870,9 @@ def set_guest_preorder_status(preorder_name, target_status):
 		new_detail = unarchive_guest_preorder(preorder_name)
 		if target_status == "Consulta":
 			return new_detail
-		return set_guest_preorder_status(new_detail["name"], target_status)
+		return set_guest_preorder_status(
+			new_detail["name"], target_status, source=pipeline_source
+		)
 
 	current = _display_status(so)
 	current_base = "Completado" if str(current).startswith("Completado") else current
@@ -4750,6 +4882,9 @@ def set_guest_preorder_status(preorder_name, target_status):
 		if so.docstatus == 1 and cstr(so.status) != "Consulta":
 			so.db_set("status", "Consulta", update_modified=True)
 			so.reload()
+			_record_guest_preorder_status_audit(
+				preorder_name, current_base, "Consulta", source=pipeline_source
+			)
 		return get_guest_preorder(preorder_name)
 
 	# Submit draft if needed for forward transitions
@@ -4794,6 +4929,11 @@ def set_guest_preorder_status(preorder_name, target_status):
 		)
 
 	so.reload()
+	new_display = _display_status(so)
+	new_base = "Completado" if str(new_display).startswith("Completado") else new_display
+	_record_guest_preorder_status_audit(
+		preorder_name, current_base, new_base, source=pipeline_source
+	)
 	return get_guest_preorder(preorder_name)
 
 
@@ -5903,7 +6043,7 @@ def create_delivery_note_for_preorder(preorder_name):
 		dn_name = dn.name
 		frappe.db.commit()
 
-	updated = set_guest_preorder_status(preorder_name, "En Delivery")
+	updated = set_guest_preorder_status(preorder_name, "En Delivery", source="remito")
 	updated["delivery_note"] = dn_name
 	if stock_warnings:
 		updated["stock_warnings"] = stock_warnings
@@ -7594,6 +7734,28 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 			item_fields["custom_review_notes"] = d.get("review_notes")
 		if frappe.db.has_column("Item", "custom_unit_sku") and d.get("unit_sku"):
 			item_fields["custom_unit_sku"] = d.get("unit_sku")
+		# Sell-by / plazo comercial (days from receive) — native shelf_life_in_days.
+		sell_by = d.get("sell_by_days")
+		if sell_by in (None, "", "null", "undefined") and d.get("shelf_life_in_days") not in (None, ""):
+			sell_by = d.get("shelf_life_in_days")
+		if sell_by not in (None, "", "null", "undefined"):
+			try:
+				item_fields["shelf_life_in_days"] = max(0, cint(sell_by))
+			except (TypeError, ValueError):
+				pass
+		for wk, fk in (
+			("weight_per_unit", "weight_per_unit"),
+			("unit_weight_min", "custom_unit_weight_min"),
+			("unit_weight_max", "custom_unit_weight_max"),
+		):
+			if d.get(wk) in (None, "", "null", "undefined"):
+				continue
+			if fk.startswith("custom_") and not frappe.db.has_column("Item", fk):
+				continue
+			try:
+				item_fields[fk] = max(0.0, flt(d.get(wk)))
+			except (TypeError, ValueError):
+				pass
 		if d.get("image"):
 			item_fields["image"] = d.get("image")
 		item_doc = frappe.get_doc(item_fields)
@@ -7663,6 +7825,21 @@ def commit_receiving_session(session_id, reference, supplier, warehouse, lines, 
 				_upsert_item_price_buying,
 			)
 			_upsert_item_price_buying(item_code, basic_rate)
+
+		# Persist sell-by days (plazo comercial) from recepción — days since receive, not a date.
+		# Only write when the line sends a numeric value (0 clears). Missing/dirty strings skip.
+		raw = line.get("sell_by_days")
+		if raw in (None, "") and "shelf_life_in_days" in line:
+			raw = line.get("shelf_life_in_days")
+		if isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none"):
+			raw = None
+		if raw is not None:
+			try:
+				days = max(0, cint(raw))
+			except (TypeError, ValueError):
+				days = None
+			if days is not None:
+				frappe.db.set_value("Item", item_code, "shelf_life_in_days", days)
 
 	if not resolved_lines:
 		frappe.throw("No valid lines to receive")
