@@ -21,6 +21,9 @@ PERM_STORE_SCOPE = "settings.staff_group_permissions"
 STAFF_LOGIN_SCOPE = "settings.staff_login_barcodes"
 STAFF_LOGIN_PREFIX = "99"
 STAFF_LOGIN_LEN = 12
+# Employee -> 6-digit ops PIN (armado/check/roleplay). Plaintext, unique vs admin PIN.
+STAFF_OPS_PIN_SCOPE = "settings.staff_ops_pins"
+STAFF_OPS_PIN_LEN = 6
 
 # App permissions that match the current Next.js UI (not ERPNext desk roles).
 APP_PERMISSIONS = [
@@ -819,6 +822,11 @@ def _serialize_employee(name: str) -> dict:
 	entry = (store.get("by_employee") or {}).get(emp.name)
 	if isinstance(entry, dict):
 		login_barcode = str(entry.get("code") or "").strip() or None
+	ops_pin = None
+	ops_store = _load_ops_pin_store()
+	ops_entry = (ops_store.get("by_employee") or {}).get(emp.name)
+	if isinstance(ops_entry, dict):
+		ops_pin = str(ops_entry.get("pin") or "").strip() or None
 	row = {
 		"name": emp.name,
 		"employee_name": emp.employee_name,
@@ -843,6 +851,7 @@ def _serialize_employee(name: str) -> dict:
 		"permissions": _permission_ids_for_employee(emp.name),
 		"groups": groups,
 		"login_barcode": login_barcode,
+		"ops_pin": ops_pin,
 		"date_of_joining": str(emp.date_of_joining) if emp.date_of_joining else None,
 		"modified": str(emp.modified) if emp.modified else None,
 	}
@@ -1647,9 +1656,80 @@ def _gen_staff_login_code(used: set[str]) -> str:
 	frappe.throw(_("Could not allocate a unique staff login barcode"))
 
 
+def _load_ops_pin_store() -> dict:
+	if not frappe.db.exists("Table Extra Schema", STAFF_OPS_PIN_SCOPE):
+		return {"by_employee": {}, "by_pin": {}}
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Table Extra Schema", STAFF_OPS_PIN_SCOPE)
+	data = _parse_json(doc.columns_json, {})
+	if not isinstance(data, dict):
+		return {"by_employee": {}, "by_pin": {}}
+	by_employee = data.get("by_employee") if isinstance(data.get("by_employee"), dict) else {}
+	by_pin = data.get("by_pin") if isinstance(data.get("by_pin"), dict) else {}
+	return {"by_employee": by_employee, "by_pin": by_pin}
+
+
+def _save_ops_pin_store(data: dict) -> None:
+	payload = json.dumps(
+		{
+			"by_employee": data.get("by_employee") or {},
+			"by_pin": data.get("by_pin") or {},
+		},
+		ensure_ascii=False,
+	)
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", STAFF_OPS_PIN_SCOPE):
+		doc = frappe.get_doc("Table Extra Schema", STAFF_OPS_PIN_SCOPE)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc(
+			{"doctype": "Table Extra Schema", "scope": STAFF_OPS_PIN_SCOPE, "columns_json": payload}
+		)
+		doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def _normalize_ops_pin(pin) -> str:
+	raw = str(pin or "").strip()
+	if not raw.isdigit() or len(raw) != STAFF_OPS_PIN_LEN:
+		return ""
+	return raw
+
+
+def employee_ops_pin_taken(pin: str) -> bool:
+	"""True when ``pin`` is already assigned to an employee."""
+	raw = _normalize_ops_pin(pin)
+	if not raw:
+		return False
+	store = _load_ops_pin_store()
+	return raw in (store.get("by_pin") or {})
+
+
+def _admin_pin_matches(pin: str) -> bool:
+	"""Lazy import — avoid circular import with pos_session_api."""
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import _verify_pin_value
+
+	return bool(_verify_pin_value(pin))
+
+
+def _gen_ops_pin(used: set[str]) -> str:
+	for _ in range(120):
+		candidate = "".join(secrets.choice(string.digits) for _ in range(STAFF_OPS_PIN_LEN))
+		if candidate in used:
+			continue
+		if _admin_pin_matches(candidate):
+			continue
+		return candidate
+	frappe.throw(_("Could not allocate a unique employee PIN"))
+
+
 def _normalize_employee_list(employees) -> list[str]:
 	if isinstance(employees, str):
-		employees = frappe.parse_json(employees)
+		raw = employees.strip()
+		if not raw or raw in ("null", "undefined", "None"):
+			return []
+		employees = frappe.parse_json(raw)
 	if not isinstance(employees, list):
 		return []
 	out = []
@@ -1847,4 +1927,157 @@ def resolve_staff_login_barcode(code=None):
 		"employee": emp.name,
 		"employee_name": emp.employee_name,
 		"login_barcode": raw,
+	}
+
+
+@frappe.whitelist()
+def ensure_employee_ops_pins(employees=None, rotate=0):
+	"""Issue (or rotate) unique 6-digit ops PINs for employees.
+
+	No User required — used for kiosk identity / roleplay. Requires employees permission.
+	"""
+	if not (
+		_can_app("tables.employees")
+		or _can_app("employees.edit")
+		or _can_app("employees.create_user")
+		or _can_app("tools.settings")
+	):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	names = _normalize_employee_list(employees)
+	if not names:
+		frappe.throw(_("employees is required"))
+
+	rotate = cint(rotate)
+	store = _load_ops_pin_store()
+	by_employee = dict(store.get("by_employee") or {})
+	by_pin = dict(store.get("by_pin") or {})
+	used = set(str(k) for k in by_pin.keys())
+	rows = []
+	changed = False
+
+	for emp_name in names:
+		if not frappe.db.exists("Employee", emp_name):
+			rows.append({"name": emp_name, "ok": False, "error": "not_found"})
+			continue
+		frappe.flags.ignore_permissions = True
+		emp = frappe.get_doc("Employee", emp_name)
+		existing = by_employee.get(emp.name) if isinstance(by_employee.get(emp.name), dict) else None
+		pin = str((existing or {}).get("pin") or "").strip()
+		if rotate or not _normalize_ops_pin(pin):
+			if pin and pin in by_pin:
+				by_pin.pop(pin, None)
+				used.discard(pin)
+			pin = _gen_ops_pin(used)
+			used.add(pin)
+			by_employee[emp.name] = {"pin": pin}
+			by_pin[pin] = emp.name
+			changed = True
+		else:
+			by_employee[emp.name] = {"pin": pin}
+			by_pin[pin] = emp.name
+
+		rows.append(
+			{
+				"name": emp.name,
+				"employee_name": emp.employee_name,
+				"user_id": (emp.user_id or "").strip() or None,
+				"ops_pin": pin,
+				"ok": True,
+			}
+		)
+
+	if changed:
+		_save_ops_pin_store({"by_employee": by_employee, "by_pin": by_pin})
+
+	return {"rows": rows}
+
+
+@frappe.whitelist(allow_guest=True)
+def resolve_ops_pin(pin=None):
+	"""Resolve a 6-digit PIN to admin or employee identity (kiosk / roleplay)."""
+	raw = _normalize_ops_pin(pin)
+	if not raw:
+		return {
+			"authorized": False,
+			"kind": None,
+			"employee": None,
+			"employee_name": None,
+			"user_id": None,
+			"permissions": [],
+			"pin_configured": False,
+		}
+
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+		_pin_configured,
+		_verify_pin_value,
+	)
+
+	if _verify_pin_value(raw):
+		return {
+			"authorized": True,
+			"kind": "admin",
+			"employee": None,
+			"employee_name": None,
+			"user_id": None,
+			"permissions": ["*"],
+			"pin_configured": _pin_configured(),
+		}
+
+	store = _load_ops_pin_store()
+	emp_name = (store.get("by_pin") or {}).get(raw)
+	if not emp_name:
+		return {
+			"authorized": False,
+			"kind": None,
+			"employee": None,
+			"employee_name": None,
+			"user_id": None,
+			"permissions": [],
+			"pin_configured": _pin_configured() or bool(store.get("by_pin")),
+		}
+
+	frappe.flags.ignore_permissions = True
+	if not frappe.db.exists("Employee", emp_name):
+		return {
+			"authorized": False,
+			"kind": None,
+			"employee": None,
+			"employee_name": None,
+			"user_id": None,
+			"permissions": [],
+			"pin_configured": True,
+		}
+	emp = frappe.get_doc("Employee", emp_name)
+	if (emp.status or "") != "Active":
+		return {
+			"authorized": False,
+			"kind": None,
+			"employee": None,
+			"employee_name": None,
+			"user_id": None,
+			"permissions": [],
+			"pin_configured": True,
+		}
+	entry = (store.get("by_employee") or {}).get(emp.name)
+	if isinstance(entry, dict) and str(entry.get("pin") or "") != raw:
+		return {
+			"authorized": False,
+			"kind": None,
+			"employee": None,
+			"employee_name": None,
+			"user_id": None,
+			"permissions": [],
+			"pin_configured": True,
+		}
+
+	user_id = (emp.user_id or "").strip() or None
+	return {
+		"authorized": True,
+		"kind": "employee",
+		"employee": emp.name,
+		"employee_name": emp.employee_name,
+		"user_id": user_id,
+		"permissions": _permission_ids_for_employee(emp.name),
+		"pin_configured": True,
 	}

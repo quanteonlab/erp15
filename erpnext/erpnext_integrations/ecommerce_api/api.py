@@ -3581,6 +3581,19 @@ def update_order_status(order_name, status):
 GUEST_PREORDER_REMARKS_TAG = "guest_preorder=1"
 
 
+def _normalize_create_initial_status(initial_status) -> str:
+	"""Map create_guest_preorder.initial_status → Consulta | Orden (default Consulta)."""
+	raw = cstr(initial_status or "").strip().lower()
+	if raw in ("", "null", "none", "undefined", "consulta", "inquiry", "draft"):
+		return "Consulta"
+	if raw in ("orden", "order", "1", "true", "yes", "y"):
+		return "Orden"
+	# Allow exact workflow label passthrough for Orden only (other stages still go Consulta).
+	if cstr(initial_status or "").strip() == "Orden":
+		return "Orden"
+	return "Consulta"
+
+
 def _sales_order_table_columns():
 	return set(frappe.db.get_table_columns("Sales Order") or [])
 
@@ -4188,6 +4201,7 @@ def create_guest_preorder(
 	cashier_id=None,
 	pin_allowed_countries=None,
 	send_client_pin=1,
+	initial_status=None,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -4202,6 +4216,10 @@ def create_guest_preorder(
 	a repeat order placed from the client tracking portal for a known
 	customer) - default behaviour (anonymous guest -> "Consumidor Final") is
 	unchanged when omitted.
+
+	``initial_status``: optional pipeline status after create. Default leaves
+	the SO as Consulta (draft). Pass ``Orden`` (e.g. Operaciones → Orden page)
+	to submit and skip Inquiry.
 
 	Returns: { preorder_name, estimated_total, currency, status }
 	"""
@@ -4468,6 +4486,15 @@ def create_guest_preorder(
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "webhook order_created")
 
+	# Operaciones → Orden (and similar staff entry points): skip Inquiry / Consulta.
+	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
+	if want_orden and resolved_rows:
+		promoted = set_guest_preorder_status(so.name, "Orden")
+		so_name = cstr((promoted or {}).get("name") or so.name)
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+
 	payload = {
 		"preorder_name": so.name,
 		"estimated_total": flt(so.grand_total),
@@ -4475,6 +4502,8 @@ def create_guest_preorder(
 		"status": so.status,
 		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
 	}
+	if want_orden and resolved_rows:
+		payload["display_status"] = "Orden"
 	if client_access and client_access.get("ok"):
 		payload["client_access"] = {
 			"pin": client_access.get("pin"),
@@ -5238,7 +5267,13 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 	_record_guest_preorder_status_audit(
 		preorder_name, current_base, new_base, source=pipeline_source
 	)
-	return get_guest_preorder(preorder_name)
+	detail = get_guest_preorder(preorder_name)
+	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
+	if target_status in ("Orden", "Preparado"):
+		so.reload()
+		gate = _ensure_planner_delivery_note(so)
+		_attach_planner_gate_fields(detail, gate)
+	return detail
 
 
 @frappe.whitelist()
@@ -6738,6 +6773,325 @@ def update_guest_preorder_logistics(
 	return get_guest_preorder(name)
 
 
+def _preorder_address_line(so) -> str:
+	"""Best-effort street text for a guest preorder (Address doc or guest tag)."""
+	addr_name = cstr(
+		getattr(so, "shipping_address_name", None) or getattr(so, "customer_address", None) or ""
+	).strip()
+	if addr_name and frappe.db.exists("Address", addr_name):
+		row = frappe.db.get_value(
+			"Address",
+			addr_name,
+			["address_line1", "address_line2", "city"],
+			as_dict=True,
+		) or {}
+		bits = [
+			cstr(row.get("address_line1") or "").strip(),
+			cstr(row.get("address_line2") or "").strip(),
+			cstr(row.get("city") or "").strip(),
+		]
+		street = ", ".join(b for b in bits if b and b != "-")
+		if street:
+			return street
+
+	tags = _parse_remarks_tags(_guest_preorder_tag_text(so))
+	guest = cstr(tags.get("guest_address") or "").strip()
+	if guest and guest not in ("-", "null", "undefined"):
+		return guest
+
+	cust = cstr(getattr(so, "customer", None) or "").strip()
+	if cust:
+		geo = _customer_address_zone_map([cust]).get(cust) or {}
+		fallback = cstr(geo.get("address") or "").strip()
+		if fallback and fallback != "-":
+			return fallback
+	return ""
+
+
+def _materialize_preorder_shipping_address(so):
+	"""Ensure SO has a linked shipping Address from guest_address / customer primary.
+
+	Guest consultas often only store ``guest_address`` in remarks/terms — the
+	planner / remito path needs a real Address on ``shipping_address_name``.
+	"""
+	existing = cstr(
+		getattr(so, "shipping_address_name", None) or getattr(so, "customer_address", None) or ""
+	).strip()
+	if existing and frappe.db.exists("Address", existing):
+		line = _preorder_address_line(so)
+		return {
+			"address_name": existing,
+			"address_line": line,
+			"created": False,
+		}
+
+	line = _preorder_address_line(so)
+	if not line:
+		return {"address_name": None, "address_line": "", "created": False}
+
+	customer = cstr(getattr(so, "customer", None) or "").strip()
+	if not customer or not frappe.db.exists("Customer", customer):
+		return {"address_name": None, "address_line": line, "created": False}
+
+	country = frappe.db.get_default("country") or "Argentina"
+	# Reuse matching customer address when present.
+	existing_rows = frappe.db.sql(
+		"""
+		SELECT addr.name
+		FROM `tabAddress` addr
+		INNER JOIN `tabDynamic Link` link ON link.parent = addr.name
+		WHERE link.link_doctype = 'Customer'
+		  AND link.link_name = %s
+		  AND TRIM(IFNULL(addr.address_line1, '')) = %s
+		LIMIT 1
+		""",
+		(customer, line),
+		as_dict=True,
+	)
+	if existing_rows:
+		addr_name = existing_rows[0].name
+	else:
+		cust_title = (
+			frappe.db.get_value("Customer", customer, "customer_name") or customer
+		)
+		addr = frappe.get_doc(
+			{
+				"doctype": "Address",
+				"address_title": cust_title,
+				"address_type": "Shipping",
+				"address_line1": line,
+				"city": "-",
+				"country": country,
+				"links": [{"link_doctype": "Customer", "link_name": customer}],
+			}
+		)
+		addr.insert(ignore_permissions=True)
+		addr_name = addr.name
+		# Keep customer primary in sync when empty / placeholder.
+		cust_doc = frappe.get_doc("Customer", customer)
+		primary = cstr(getattr(cust_doc, "customer_primary_address", None) or "").strip()
+		primary_line = cstr(getattr(cust_doc, "primary_address", None) or "").strip()
+		if not primary or primary_line in ("", "-"):
+			cust_doc.customer_primary_address = addr_name
+			cust_doc.primary_address = line
+			cust_doc.save(ignore_permissions=True)
+
+	frappe.db.set_value(
+		"Sales Order",
+		so.name,
+		{
+			"shipping_address_name": addr_name,
+			"customer_address": addr_name,
+		},
+		update_modified=False,
+	)
+	so.shipping_address_name = addr_name
+	so.customer_address = addr_name
+	return {"address_name": addr_name, "address_line": line, "created": True}
+
+
+def _try_geocode_address_soft(address_name):
+	"""Best-effort geocode; never raises — returns {geocoded, warning?}."""
+	name = cstr(address_name or "").strip()
+	if not name or not frappe.db.exists("Address", name):
+		return {"geocoded": False}
+	if not frappe.db.has_column("Address", "custom_latitude"):
+		return {"geocoded": False}
+	lat = flt(frappe.db.get_value("Address", name, "custom_latitude") or 0)
+	lng = flt(frappe.db.get_value("Address", name, "custom_longitude") or 0)
+	if lat and lng:
+		return {"geocoded": True, "lat": lat, "lng": lng, "cached": True}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api import tms_api
+
+		# Prefer Google when configured; Nominatim via geocode_query fallback.
+		try:
+			geo = tms_api.geocode_address(name)
+			return {
+				"geocoded": True,
+				"lat": geo.get("lat"),
+				"lng": geo.get("lng"),
+				"cached": bool(geo.get("cached")),
+			}
+		except Exception:
+			line = cstr(frappe.db.get_value("Address", name, "address_line1") or "").strip()
+			if not line:
+				return {
+					"geocoded": False,
+					"warning": _(
+						"No se pudo validar la dirección en el mapa; el pedido igual puede programarse."
+					),
+				}
+			hit = tms_api.geocode_query(query=line, region="ar") or {}
+			if not hit.get("lat") or not hit.get("lng"):
+				return {
+					"geocoded": False,
+					"warning": _(
+						"No se pudo validar la dirección en el mapa; el pedido igual puede programarse."
+					),
+				}
+			frappe.db.set_value(
+				"Address",
+				name,
+				{
+					"custom_latitude": hit.get("lat"),
+					"custom_longitude": hit.get("lng"),
+				},
+				update_modified=False,
+			)
+			return {
+				"geocoded": True,
+				"lat": hit.get("lat"),
+				"lng": hit.get("lng"),
+				"cached": False,
+			}
+	except Exception:
+		return {
+			"geocoded": False,
+			"warning": _(
+				"No se pudo validar la dirección en el mapa; el pedido igual puede programarse."
+			),
+		}
+
+
+def _no_address_delivery_warning():
+	return _(
+		"Este pedido no tiene dirección — no se entregará ni aparecerá en el "
+		"planificador hasta asignar una dirección."
+	)
+
+
+def _ensure_planner_delivery_note(so):
+	"""Create a submitted remito so Orden/Preparado appears on the TMS planner.
+
+	``get_pending_deliveries`` only lists Delivery Notes. Without a remito, Orden
+	SOs stay invisible on Rutas. When there is no deliverable address we skip
+	remito creation and return ``not_deliverable`` + warning.
+
+	Does **not** change pipeline status (Orden stays Orden until claim / manual remito).
+	"""
+	warnings = []
+	if cint(getattr(so, "docstatus", 0)) != 1:
+		return {
+			"ok": False,
+			"planner_ready": False,
+			"not_deliverable": False,
+			"delivery_note": None,
+			"delivery_warning": _("Confirm the order before creating a delivery note."),
+			"warnings": warnings,
+		}
+
+	addr = _materialize_preorder_shipping_address(so)
+	addr_name = addr.get("address_name")
+	addr_line = cstr(addr.get("address_line") or "").strip()
+	if not addr_name or not addr_line:
+		warn = _no_address_delivery_warning()
+		warnings.append(warn)
+		return {
+			"ok": False,
+			"planner_ready": False,
+			"not_deliverable": True,
+			"delivery_note": _delivery_note_for_sales_order(so.name),
+			"delivery_warning": warn,
+			"address_name": None,
+			"address_line": addr_line or None,
+			"geocoded": False,
+			"warnings": warnings,
+		}
+
+	geo = _try_geocode_address_soft(addr_name)
+	if geo.get("warning"):
+		warnings.append(geo["warning"])
+
+	dn_name = _delivery_note_for_sales_order(so.name)
+	stock_warnings = []
+	created = False
+	if not dn_name:
+		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
+
+		dn = make_delivery_note(so.name)
+		# Ensure remito carries the shipping address we just materialized.
+		if addr_name:
+			dn.shipping_address_name = addr_name
+			dn.customer_address = addr_name
+		preferred_wh = (
+			_warehouse_from_guest_tags(so)
+			or frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
+			or _default_company_warehouse(dn.company)
+		)
+		if preferred_wh:
+			for row in dn.items:
+				row.warehouse = preferred_wh
+			dn.set_warehouse = preferred_wh
+		for row in dn.items:
+			if hasattr(row, "allow_zero_valuation_rate"):
+				row.allow_zero_valuation_rate = 1
+		stock_warnings = _delivery_note_stock_shortages(dn)
+		dn.insert(ignore_permissions=True)
+		dn.flags.ignore_permissions = True
+		_submit_delivery_note_allowing_negative(dn)
+		dn_name = dn.name
+		created = True
+		frappe.db.commit()
+
+	return {
+		"ok": True,
+		"planner_ready": True,
+		"not_deliverable": False,
+		"delivery_note": dn_name,
+		"delivery_note_created": created,
+		"delivery_warning": warnings[0] if warnings else None,
+		"address_name": addr_name,
+		"address_line": addr_line,
+		"geocoded": bool(geo.get("geocoded")),
+		"stock_warnings": stock_warnings,
+		"warnings": warnings,
+	}
+
+
+def _attach_planner_gate_fields(payload, gate):
+	"""Merge planner address/remito gate onto a guest-preorder API payload."""
+	if not isinstance(payload, dict) or not isinstance(gate, dict):
+		return payload
+	payload["planner_ready"] = bool(gate.get("planner_ready"))
+	payload["not_deliverable"] = bool(gate.get("not_deliverable"))
+	payload["delivery_warning"] = gate.get("delivery_warning")
+	payload["geocoded"] = bool(gate.get("geocoded"))
+	if gate.get("delivery_note"):
+		payload["delivery_note"] = gate.get("delivery_note")
+	if gate.get("address_line"):
+		payload["address"] = gate.get("address_line")
+	if gate.get("stock_warnings"):
+		payload["stock_warnings"] = gate["stock_warnings"]
+	if gate.get("warnings"):
+		payload["warnings"] = gate["warnings"]
+	return payload
+
+
+def sync_orden_planner_remitos(company=None):
+	"""Ensure Orden/Preparado guest preorders with an address have a remito.
+
+	Called from the Rutas week bundle so already-confirmed orders (created
+	before this gate) become visible without a manual "Crear remito".
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.tms_api import _list_claimable_preorders
+
+	created = []
+	skipped = []
+	for row in _list_claimable_preorders(company=company) or []:
+		so_name = cstr(row.get("preorder_name") or "").strip()
+		if not so_name or not frappe.db.exists("Sales Order", so_name):
+			continue
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+		gate = _ensure_planner_delivery_note(so)
+		if gate.get("delivery_note_created") and gate.get("delivery_note"):
+			created.append(gate["delivery_note"])
+		elif gate.get("not_deliverable"):
+			skipped.append(so_name)
+	return {"created": created, "skipped_no_address": skipped}
+
 
 @frappe.whitelist()
 @idempotent_request
@@ -6761,37 +7115,12 @@ def create_delivery_note_for_preorder(preorder_name):
 	if so.docstatus != 1:
 		frappe.throw(_("Confirm the order before creating a delivery note."))
 
-	stock_warnings = []
-	dn_name = _delivery_note_for_sales_order(preorder_name)
-	if not dn_name:
-		from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
-
-		dn = make_delivery_note(preorder_name)
-
-		# Guest preorder items never carry a warehouse (no picker in that
-		# flow), so make_delivery_note falls back to the Item's own default
-		# warehouse - which may not be the one this business actually stocks
-		# from. Prefer the SO warehouse tag (Pedidos), then company TMS depot.
-		preferred_wh = _warehouse_from_guest_tags(so) or frappe.db.get_value(
-			"Company", dn.company, "custom_default_warehouse"
-		) or _default_company_warehouse(dn.company)
-		if preferred_wh:
-			for row in dn.items:
-				row.warehouse = preferred_wh
-			dn.set_warehouse = preferred_wh
-
-		stock_warnings = _delivery_note_stock_shortages(dn)
-		dn.insert(ignore_permissions=True)
-		dn.flags.ignore_permissions = True
-		_submit_delivery_note_allowing_negative(dn)
-		dn_name = dn.name
-		frappe.db.commit()
+	gate = _ensure_planner_delivery_note(so)
+	if gate.get("not_deliverable"):
+		frappe.throw(gate.get("delivery_warning") or _no_address_delivery_warning())
 
 	updated = set_guest_preorder_status(preorder_name, "En Delivery", source="remito")
-	updated["delivery_note"] = dn_name
-	if stock_warnings:
-		updated["stock_warnings"] = stock_warnings
-	return updated
+	return _attach_planner_gate_fields(updated, gate)
 
 
 def _delivery_note_stock_shortages(dn):

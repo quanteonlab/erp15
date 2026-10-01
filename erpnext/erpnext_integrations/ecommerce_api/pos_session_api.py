@@ -491,8 +491,12 @@ def save_pos_admin_settings(
 		cfg.pop("pin_salt", None)
 	elif pin not in (None, ""):
 		pin = str(pin).strip()
-		if len(pin) < 4:
-			frappe.throw(_("Admin PIN must be at least 4 characters"))
+		if not pin.isdigit() or len(pin) != 6:
+			frappe.throw(_("Admin PIN must be exactly 6 digits"))
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import employee_ops_pin_taken
+
+		if employee_ops_pin_taken(pin):
+			frappe.throw(_("This PIN is already assigned to an employee"))
 		salt = secrets.token_hex(16)
 		cfg["pin_salt"] = salt
 		cfg["pin_hash"] = _hash_pin(pin, salt)

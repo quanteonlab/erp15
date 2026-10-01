@@ -60,9 +60,47 @@ def _require_pin(pin: str | None) -> None:
 		frappe.throw(_("Incorrect admin PIN"), frappe.AuthenticationError)
 
 
+def _require_ops_operator(pin: str | None) -> dict:
+	"""Require admin or employee 6-digit PIN; return resolve_ops_pin payload."""
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import resolve_ops_pin
+
+	res = resolve_ops_pin(pin)
+	if not (isinstance(res, dict) and res.get("authorized")):
+		frappe.throw(_("Incorrect PIN"), frappe.AuthenticationError)
+	return res
+
+
+def _operator_label(identity: dict | None) -> str:
+	if not isinstance(identity, dict):
+		return "—"
+	if identity.get("kind") == "admin":
+		return "Admin"
+	name = str(identity.get("employee_name") or identity.get("employee") or "").strip()
+	return name or "—"
+
+
+def _log_armado_operator(so_name: str, identity: dict, *, via: str = "armado") -> None:
+	so_name = str(so_name or "").strip()
+	if not so_name:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+
+		label = _operator_label(identity)
+		log_field_changes(
+			"Sales Order",
+			so_name,
+			[("weighed_by", "", label), ("weighed_via", "", via)],
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "armado operator audit")
+
+
 @frappe.whitelist(allow_guest=True)
 def resolve_armado_ean13(code=None):
-	"""Map a scanned armado EAN-13 → Sales Order name (exact match among recent orders)."""
+	"""Map a scanned armado EAN-13 → Sales Order name (Orden-stage only)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
+
 	code = str(code or "").strip()
 	if not is_armado_ean13(code):
 		return {"ok": False, "match": None}
@@ -73,14 +111,20 @@ def resolve_armado_ean13(code=None):
 		"Sales Order",
 		filters={
 			"docstatus": ["<", 2],
+			"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled"]],
 			"transaction_date": [">=", frappe.utils.add_days(today(), -14)],
 		},
-		fields=["name"],
+		fields=["name", "docstatus", "status", "grand_total", "advance_paid"],
 		order_by="modified desc",
 		limit_page_length=500,
 		ignore_permissions=True,
 	)
 	for row in rows:
+		disp = _display_status_from_row(
+			row.docstatus, row.status, row.grand_total, row.advance_paid
+		)
+		if disp != "Orden":
+			continue
 		if armado_ean13_for_order(row.name) == code:
 			return {"ok": True, "match": row.name, "ean13": code}
 	return {"ok": False, "match": None, "ean13": code}
@@ -90,15 +134,18 @@ def resolve_armado_ean13(code=None):
 def list_armado_orders(delivery_date=None, limit=80):
 	"""Orders for the armado kiosk.
 
-	``delivery_date`` empty / null / ``"all"`` → no date filter (default).
-	Otherwise only orders due that day.
-	Also returns ``delivery_dates`` (distinct due dates among open armado orders)
-	so the UI can offer a day picker.
+	Only **Orden**-stage open orders (not Consulta drafts, not already Preparado /
+	En Delivery / Completado). ``delivery_date`` empty / null / ``"all"`` → no date
+	filter (default). Otherwise only orders due that day.
+	Also returns ``delivery_dates`` (distinct due dates among Orden-stage armado
+	orders) so the UI can offer a day picker.
 	"""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
+
 	raw = delivery_date
 	if isinstance(raw, str):
 		raw = raw.strip()
-	# Default: no filter. Explicit "all"/""/None → all open orders.
+	# Default: no filter. Explicit "all"/""/None → all Orden-stage open orders.
 	filter_all = raw in (None, "", "all", "null", "undefined")
 	due = None if filter_all else getdate(raw)
 	limit = max(1, min(cint(limit) or (200 if filter_all else 80), 300))
@@ -107,7 +154,7 @@ def list_armado_orders(delivery_date=None, limit=80):
 	frappe.flags.ignore_permissions = True
 	filters = {
 		"docstatus": ["<", 2],
-		"status": ["not in", ["Closed", "Completed"]],
+		"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled"]],
 	}
 	if due is not None:
 		filters["delivery_date"] = due
@@ -122,6 +169,7 @@ def list_armado_orders(delivery_date=None, limit=80):
 		"currency",
 		"docstatus",
 		"status",
+		"advance_paid",
 		"modified",
 	]
 	if tag_field:
@@ -132,29 +180,42 @@ def list_armado_orders(delivery_date=None, limit=80):
 		filters=filters,
 		fields=fields,
 		order_by="delivery_date asc, customer_name asc, name asc",
-		limit_page_length=limit,
+		limit_page_length=max(limit * 3, 120),
 		ignore_permissions=True,
 	)
 
-	# Distinct due dates for the filter UI (open armado pool, not just this page).
+	# Distinct due dates for the filter UI (Orden-stage pool only).
 	date_rows = frappe.get_all(
 		"Sales Order",
 		filters={
 			"docstatus": ["<", 2],
-			"status": ["not in", ["Closed", "Completed"]],
+			"status": ["not in", ["Closed", "Completed", "Preparado", "En Delivery", "Cancelled"]],
 			"delivery_date": ["is", "set"],
 		},
-		fields=["delivery_date"],
+		fields=["delivery_date", "docstatus", "status", "grand_total", "advance_paid"],
 		order_by="delivery_date asc",
-		limit_page_length=500,
+		limit_page_length=800,
 		ignore_permissions=True,
 	)
 	delivery_dates = sorted(
-		{str(r.delivery_date) for r in date_rows if r.delivery_date}
+		{
+			str(r.delivery_date)
+			for r in date_rows
+			if r.delivery_date
+			and _display_status_from_row(
+				r.docstatus, r.status, r.grand_total, r.advance_paid
+			)
+			== "Orden"
+		}
 	)
 
 	out = []
 	for r in rows:
+		disp = _display_status_from_row(
+			r.docstatus, r.status, r.grand_total, getattr(r, "advance_paid", 0)
+		)
+		if disp != "Orden":
+			continue
 		tag = str(r.get(tag_field) or "") if tag_field else ""
 		is_guest = "guest_preorder=1" in tag
 		ean13 = armado_ean13_for_order(r.name)
@@ -169,11 +230,14 @@ def list_armado_orders(delivery_date=None, limit=80):
 				"currency": r.currency,
 				"docstatus": cint(r.docstatus),
 				"status": r.status,
+				"display_status": disp,
 				"is_guest": is_guest,
 				"ean13": ean13,
 				"items_count": frappe.db.count("Sales Order Item", {"parent": r.name}),
 			}
 		)
+		if len(out) >= limit:
+			break
 	return {
 		"ok": True,
 		"delivery_date": "" if due is None else str(due),
@@ -283,18 +347,30 @@ def _save_armado_notes(so_name: str, notes: str) -> None:
 
 @frappe.whitelist(allow_guest=True)
 def save_armado_notes(preorder_name=None, notes=None, pin=None):
-	_require_pin(pin)
+	identity = _require_ops_operator(pin)
 	preorder_name = str(preorder_name or "").strip()
 	if not preorder_name or not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Order not found"))
 	_save_armado_notes(preorder_name, str(notes or ""))
-	return {"ok": True, "notes": str(notes or "")}
+	_log_armado_operator(preorder_name, identity, via="armado_notes")
+	return {
+		"ok": True,
+		"notes": str(notes or ""),
+		"operator": {
+			"kind": identity.get("kind"),
+			"employee": identity.get("employee"),
+			"employee_name": identity.get("employee_name"),
+		},
+	}
 
 
 @frappe.whitelist(allow_guest=True)
 def update_armado_items(preorder_name=None, items=None, pin=None):
-	"""Update qty/weight on armado lines (reuses guest preorder item update when possible)."""
-	_require_pin(pin)
+	"""Update qty/weight on armado lines (reuses guest preorder item update when possible).
+
+	Does **not** advance pipeline — use ``confirm_armado`` to move Orden → Preparado.
+	"""
+	identity = _require_ops_operator(pin)
 	preorder_name = str(preorder_name or "").strip()
 	if isinstance(items, str):
 		items = json.loads(items)
@@ -310,8 +386,16 @@ def update_armado_items(preorder_name=None, items=None, pin=None):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if _is_guest_preorder_sales_order(so):
 		detail = update_guest_preorder_items(preorder_name, items)
-		detail = _maybe_promote_armado_to_preparado(detail.get("name") or preorder_name, detail)
-		return {"ok": True, "order": {**detail, "ean13": armado_ean13_for_order(detail.get("name") or preorder_name)}}
+		_log_armado_operator(detail.get("name") or preorder_name, identity, via="armado_items")
+		return {
+			"ok": True,
+			"order": {**detail, "ean13": armado_ean13_for_order(detail.get("name") or preorder_name)},
+			"operator": {
+				"kind": identity.get("kind"),
+				"employee": identity.get("employee"),
+				"employee_name": identity.get("employee_name"),
+			},
+		}
 
 	# Non-guest: edit draft in place only
 	if cint(so.docstatus) != 0:
@@ -329,36 +413,106 @@ def update_armado_items(preorder_name=None, items=None, pin=None):
 	so.flags.ignore_permissions = True
 	so.save(ignore_permissions=True)
 	frappe.db.commit()
-	return get_armado_order(so.name)
+	_log_armado_operator(so.name, identity, via="armado_items")
+	out = get_armado_order(so.name)
+	if isinstance(out, dict):
+		out["operator"] = {
+			"kind": identity.get("kind"),
+			"employee": identity.get("employee"),
+			"employee_name": identity.get("employee_name"),
+		}
+	return out
 
 
-def _maybe_promote_armado_to_preparado(so_name: str, detail: dict | None = None):
-	"""After armado qty commit: Orden → Preparado (idempotent; never regress later steps)."""
+@frappe.whitelist(allow_guest=True)
+def confirm_armado(preorder_name=None, items=None, pin=None):
+	"""Save armado quantities (optional) and move pipeline Orden → Preparado (armado).
+
+	``items`` when provided are persisted first via ``update_armado_items``; then the
+	order is promoted with ``source=armado``. Rejects non-Orden stages.
+	"""
+	identity = _require_ops_operator(pin)
+	preorder_name = str(preorder_name or "").strip()
+	if not preorder_name or not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Order not found"))
+
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		_display_status,
 		_is_guest_preorder_sales_order,
 		set_guest_preorder_status,
 	)
 
-	so_name = str(so_name or "").strip()
-	if not so_name or not frappe.db.exists("Sales Order", so_name):
-		return detail
+	# Persist qty edits before promoting when the kiosk sends the current sheet.
+	if items is not None and items != "" and items != "null":
+		if isinstance(items, str):
+			try:
+				items = json.loads(items)
+			except Exception:
+				items = None
+		if isinstance(items, list) and items:
+			update_armado_items(preorder_name=preorder_name, items=items, pin=pin)
+
 	frappe.flags.ignore_permissions = True
-	so = frappe.get_doc("Sales Order", so_name)
+	so = frappe.get_doc("Sales Order", preorder_name)
 	frappe.flags.ignore_permissions = False
+
 	if not _is_guest_preorder_sales_order(so):
-		return detail
+		frappe.throw(_("Only guest preorders can be confirmed in armado"))
+
 	current = _display_status(so)
 	base = "Completado" if str(current).startswith("Completado") else current
-	# Only promote confirmed Orden (To Deliver and Bill / Orden marker).
+	if base == "Preparado":
+		# Idempotent: already armado — return sheet without regressing.
+		out = get_armado_order(preorder_name)
+		order = out.get("order") if isinstance(out, dict) else None
+		return {
+			"ok": True,
+			"already_confirmed": 1,
+			"order": order,
+			"operator": {
+				"kind": identity.get("kind"),
+				"employee": identity.get("employee"),
+				"employee_name": identity.get("employee_name"),
+			},
+		}
 	if base != "Orden":
-		return detail
-	try:
-		promoted = set_guest_preorder_status(so_name, "Preparado", source="armado")
-		return promoted if isinstance(promoted, dict) else detail
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "armado promote Preparado")
-		return detail
+		frappe.throw(
+			_("Only Orden-stage orders can be confirmed in armado (current: {0})").format(base)
+		)
+
+	detail = set_guest_preorder_status(preorder_name, "Preparado", source="armado")
+	_log_armado_operator(
+		(detail or {}).get("name") or preorder_name, identity, via="armado_confirm"
+	)
+	name = (detail or {}).get("name") or preorder_name
+	sheet = get_armado_order(name)
+	order = sheet.get("order") if isinstance(sheet, dict) else detail
+	if isinstance(order, dict) and detail and isinstance(detail, dict):
+		order = {
+			**order,
+			"display_status": detail.get("display_status") or order.get("display_status"),
+			"status": detail.get("status") or order.get("status"),
+			"ean13": armado_ean13_for_order(name),
+		}
+	return {
+		"ok": True,
+		"already_confirmed": 0,
+		"order": order,
+		"operator": {
+			"kind": identity.get("kind"),
+			"employee": identity.get("employee"),
+			"employee_name": identity.get("employee_name"),
+		},
+	}
+
+
+def _maybe_promote_armado_to_preparado(so_name: str, detail: dict | None = None):
+	"""Deprecated path — kept for callers; prefer ``confirm_armado``.
+
+	After armado qty commit used to auto-promote Orden → Preparado. Promotion is
+	now explicit via ``confirm_armado`` so "Guardar cantidades" does not advance.
+	"""
+	return detail
 
 
 @frappe.whitelist(allow_guest=True)

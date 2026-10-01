@@ -3711,6 +3711,24 @@ def resolve_staff_login_barcode(code=None):
 
 
 @frappe.whitelist()
+def ensure_employee_ops_pins(employees=None, rotate=0):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        ensure_employee_ops_pins as _impl,
+    )
+
+    return _impl(employees=employees, rotate=rotate)
+
+
+@frappe.whitelist(allow_guest=True)
+def resolve_ops_pin(pin=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        resolve_ops_pin as _impl,
+    )
+
+    return _impl(pin=pin)
+
+
+@frappe.whitelist()
 def get_extra_fields_bundle(scope, row_keys=None):
     from erpnext.erpnext_integrations.ecommerce_api.extra_fields import (
         get_extra_fields_bundle as _impl,

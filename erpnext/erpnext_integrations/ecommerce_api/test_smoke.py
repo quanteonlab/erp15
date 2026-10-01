@@ -929,6 +929,38 @@ def suite_5_11_pos_session():
         assert isinstance(result, dict)
         assert "authorized" in result and "pin_configured" in result
 
+    def check_resolve_ops_pin_shape():
+        from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+
+        result = ea.resolve_ops_pin(pin="______")
+        assert isinstance(result, dict)
+        assert "authorized" in result and "kind" in result
+        assert result.get("authorized") is False
+
+    def check_ensure_ops_pin_roundtrip():
+        from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+
+        emp = frappe.get_all(
+            "Employee",
+            filters={"status": "Active"},
+            pluck="name",
+            limit_page_length=1,
+            ignore_permissions=True,
+        )
+        if not emp:
+            return
+        name = emp[0]
+        issued = ea.ensure_employee_ops_pins(employees=[name], rotate=0)
+        assert isinstance(issued, dict) and issued.get("rows")
+        row = issued["rows"][0]
+        assert row.get("ok"), row
+        pin = str(row.get("ops_pin") or "")
+        assert len(pin) == 6 and pin.isdigit(), pin
+        resolved = ea.resolve_ops_pin(pin=pin)
+        assert resolved.get("authorized") is True
+        assert resolved.get("kind") == "employee"
+        assert resolved.get("employee") == name
+
     def check_pos_profiles():
         rows = cra.list_pos_profiles(minimal=1)
         assert rows is not None
@@ -945,9 +977,11 @@ def suite_5_11_pos_session():
     _run("5.11.2 list_pos_cash_sessions", check_list_sessions, "S3")
     _run("5.11.3 list_recent_cashiers", check_recent_cashiers, "S3")
     _run("5.11.4 validate_admin_pin shape", check_validate_admin_pin_wrong, "S3")
-    _run("5.11.5 list_pos_profiles", check_pos_profiles, "S3")
-    _run("5.11.6 list_cash_register_sessions", check_cash_sessions, "S3")
-    _run("5.11.7 list_pos_profile_meta", check_pos_profile_meta, "S3")
+    _run("5.11.5 resolve_ops_pin shape", check_resolve_ops_pin_shape, "S3")
+    _run("5.11.6 ensure_employee_ops_pins + resolve", check_ensure_ops_pin_roundtrip, "S2")
+    _run("5.11.7 list_pos_profiles", check_pos_profiles, "S3")
+    _run("5.11.8 list_cash_register_sessions", check_cash_sessions, "S3")
+    _run("5.11.9 list_pos_profile_meta", check_pos_profile_meta, "S3")
 
 
 # ── Suite 5.12 — Preventa / staff / devices / floors / print / TMS ────────────
