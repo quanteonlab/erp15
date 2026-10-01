@@ -5140,6 +5140,7 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 	return get_guest_preorder(name)
 
 
+@frappe.whitelist(allow_guest=True)
 def set_guest_preorder_status(preorder_name, target_status, source=None):
 	"""
 	Unified status transition for the custom workflow.
