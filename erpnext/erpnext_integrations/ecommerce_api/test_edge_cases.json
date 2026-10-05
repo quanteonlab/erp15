@@ -2587,6 +2587,38 @@
       "expect": "no_500"
     },
     {
+      "id": "update_guest_preorder_items_measured_kg_no_float_drift",
+      "source": "regression",
+      "bug": "measured total_weight 2kg with qty 3 must not become 2.001 after float_precision rounds weight_per_unit",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_items",
+      "args": {
+        "preorder_name": "",
+        "items": [
+          {
+            "item_code": "",
+            "qty": 3,
+            "rate": 1,
+            "total_weight": 2
+          }
+        ],
+        "additional_discount_amount": 0
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "create_guest_preorder_side_effects_null_so",
+      "source": "regression",
+      "bug": "deferred create side effects with null/empty so_name must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._run_create_guest_preorder_side_effects",
+      "args": {
+        "so_name": null,
+        "ensure_remito": 1,
+        "guest_phone": "",
+        "send_client_pin": 0
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "create_delivery_note_for_preorder_empty_name",
       "source": "regression",
       "bug": "create_delivery_note_for_preorder with empty name is controlled error (not NegativeStockError/500)",
@@ -3664,6 +3696,124 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "get_guest_preorders_list: null paging + missing Delivery Stop custom_payments_json must not TypeError/1054"
+    },
+    {
+      "id": "list_customer_addresses_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_customer_addresses",
+      "args": {
+        "customer": null,
+        "search": "undefined",
+        "page_length": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_customer_addresses with null customer/dirty search returns empty list; never TypeError"
+    },
+    {
+      "id": "list_customer_addresses_lat_lng_order_by",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_customer_addresses",
+      "args": {
+        "customer": "Nuevo Nelson",
+        "page_length": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_customer_addresses with lat/lng fields must not 500 on ambiguous ORDER BY modified"
+    },
+    {
+      "id": "reverse_geocode_query_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.reverse_geocode_query",
+      "args": {
+        "lat": null,
+        "lng": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "reverse_geocode_query with null lat/lng is controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "update_supplier_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_supplier",
+      "args": {
+        "supplier_name": null,
+        "phone": "undefined"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "update_supplier with null name is controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "upsert_customer_address_place_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.upsert_customer_address_place",
+      "args": {
+        "customer": null,
+        "address_line1": "",
+        "city": "undefined",
+        "lat": null,
+        "lng": "null"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "upsert_customer_address_place with null customer/lat is controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "upsert_customer_address_place_tms_zone_select",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.upsert_customer_address_place",
+      "args": {
+        "customer": "Nuevo Nelson",
+        "address_line1": "Quintino Bocayuva 141",
+        "city": "Buenos Aires",
+        "state": "CABA",
+        "country": "Argentina",
+        "lat": -34.6158,
+        "lng": -58.4333
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "upsert must not 417 when Address.custom_zone holds TMS code (e.g. T1-TUE) outside Delivery Zone Select options"
+    },
+    {
+      "id": "list_creation_reviews_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_creation_reviews",
+      "args": {
+        "kind": null,
+        "status": "",
+        "limit": null,
+        "start": "null"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "list_creation_reviews with null kind must be controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "confirm_creation_review_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.confirm_creation_review",
+      "args": {
+        "kind": "customer",
+        "name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "confirm_creation_review with null name must not AttributeError"
+    },
+    {
+      "id": "delete_creation_review_null_kind",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.delete_creation_review",
+      "args": {
+        "kind": "",
+        "name": "does-not-exist"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "delete_creation_review with empty kind must be controlled ValidationError"
+    },
+    {
+      "id": "count_pending_creation_reviews_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.count_pending_creation_reviews",
+      "args": {},
+      "expect": "ok",
+      "source": "regression",
+      "bug": "badge count endpoint must return dict without crashing when custom field missing/empty"
     }
   ]
 }

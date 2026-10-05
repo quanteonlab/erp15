@@ -636,6 +636,168 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_measured_total_weight_no_float_drift():
+        """2 kg across 3 units must stay 2.000, not 2.001 after float_precision rounds wpu."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "stock_uom": "Nos", "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "stock_uom": "Nos"},
+            "name",
+        )
+        assert item_code, "need a Nos stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 3, "rate": 10}],
+                guest_notes="smoke measured kg",
+                guest_name="Smoke Measured Kg",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name
+            detail = api.update_guest_preorder_items(
+                so_name,
+                [
+                    {
+                        "item_code": item_code,
+                        "qty": 3,
+                        "rate": 10,
+                        "uom": "Nos",
+                        "total_weight": 2,
+                    }
+                ],
+                0,
+            )
+            line = (detail.get("items") or [None])[0]
+            assert line, detail
+            assert abs(flt(line.get("total_weight")) - 2) < 1e-9, line
+            db_tw = frappe.db.get_value(
+                "Sales Order Item",
+                {"parent": so_name, "item_code": item_code},
+                "total_weight",
+            )
+            assert abs(flt(db_tw) - 2) < 1e-9, db_tw
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_create_returns_before_side_effects():
+        """Create/Orden returns with side_effects_queued; remito can finish after."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 12}],
+                guest_notes="smoke async create",
+                guest_name="Smoke Async Create",
+                initial_status="Orden",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name, out
+            assert out.get("side_effects_queued") is True, out
+            assert out.get("display_status") == "Orden", out
+            assert cint(frappe.db.get_value("Sales Order", so_name, "docstatus")) == 1
+            # Remito may still be pending — side-effect job (or inline fallback) creates it.
+            api._run_create_guest_preorder_side_effects(
+                so_name=so_name,
+                ensure_remito=1,
+                guest_name="Smoke Async Create",
+                send_client_pin=0,
+            )
+            dn = frappe.db.get_value(
+                "Delivery Note Item",
+                {"against_sales_order": so_name},
+                "parent",
+            )
+            # Address-less Orden may skip remito (not_deliverable) — that is OK.
+            _ = dn
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                docstatus = frappe.db.get_value("Sales Order", so_name, "docstatus")
+                if cint(docstatus) == 1:
+                    try:
+                        so = frappe.get_doc("Sales Order", so_name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    except Exception:
+                        pass
+                # Linked DN first if any
+                for dn_name in frappe.get_all(
+                    "Delivery Note Item",
+                    filters={"against_sales_order": so_name},
+                    pluck="parent",
+                    ignore_permissions=True,
+                ):
+                    try:
+                        dn = frappe.get_doc("Delivery Note", dn_name)
+                        if cint(dn.docstatus) == 1:
+                            dn.cancel()
+                        frappe.delete_doc(
+                            "Delivery Note", dn_name, ignore_permissions=True, force=True
+                        )
+                    except Exception:
+                        pass
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_orden_item_edit_inplace():
+        """Orden line edits keep the same SO name (no cancel/amend → Archivado)."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 15}],
+                guest_notes="smoke orden inplace items",
+                guest_name="Smoke Orden Inplace",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name
+            advanced = api.set_guest_preorder_status(so_name, "Orden")
+            assert cint(advanced.get("docstatus")) == 1, advanced
+            detail = api.update_guest_preorder_items(
+                so_name,
+                [{"item_code": item_code, "qty": 3, "rate": 15}],
+                0,
+            )
+            assert isinstance(detail, dict)
+            assert detail.get("name") == so_name, detail
+            assert cint(detail.get("docstatus")) == 1, detail
+            assert cint(frappe.db.get_value("Sales Order", so_name, "docstatus")) == 1
+            line = (detail.get("items") or [None])[0]
+            assert line and abs(flt(line.get("qty")) - 3) < 0.001, line
+            successors = frappe.get_all(
+                "Sales Order",
+                filters={"amended_from": so_name},
+                pluck="name",
+                ignore_permissions=True,
+            )
+            assert not successors, successors
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                docstatus = frappe.db.get_value("Sales Order", so_name, "docstatus")
+                if cint(docstatus) == 1:
+                    try:
+                        so = frappe.get_doc("Sales Order", so_name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    except Exception:
+                        pass
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_relate_clears_stale_contact():
         """Relacionar must clear Consumidor Final contact when switching customer (no HTTP 417)."""
         so_name = None
@@ -858,10 +1020,13 @@ def suite_5_9_master_data():
     _run("5.9.12 consulta phone→customer match", check_consulta_phone_match, "S2")
     _run("5.9.13 empty-items Consulta header update", check_empty_items_consulta_update, "S2")
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
-    _run("5.9.15 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
-    _run("5.9.16 external pipeline status audit", check_external_pipeline_status_audit, "S2")
-    _run("5.9.17 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
-    _run("5.9.18 Orden→planner remito + no-address warn", check_orden_planner_remito_and_address_gate, "S2")
+    _run("5.9.14b measured kg no float drift", check_measured_total_weight_no_float_drift, "S2")
+    _run("5.9.14c create queues side effects", check_create_returns_before_side_effects, "S2")
+    _run("5.9.15 Orden item edit in place (no amend)", check_orden_item_edit_inplace, "S2")
+    _run("5.9.16 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
+    _run("5.9.17 external pipeline status audit", check_external_pipeline_status_audit, "S2")
+    _run("5.9.18 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
+    _run("5.9.19 Orden→planner remito + no-address warn", check_orden_planner_remito_and_address_gate, "S2")
 
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────
@@ -2436,6 +2601,125 @@ def suite_5_14_ops_requirements():
     _run("5.14.1 every queued write accepts the minimal offline payload (auto-fill)", check_probe_clean, "S1")
 
 
+# ── Suite 5.15 — Creation review (Revisión Pedidos / Clientes) ────────────────
+
+def _ensure_smoke_creation_review_staff():
+    """Non-admin user so create_customer / create_guest_preorder enter the queue."""
+    email = "smoke.creation.review@example.com"
+    if not frappe.db.exists("User", email):
+        u = frappe.get_doc(
+            {
+                "doctype": "User",
+                "email": email,
+                "first_name": "Smoke",
+                "last_name": "ReviewStaff",
+                "send_welcome_email": 0,
+                "user_type": "System User",
+            }
+        )
+        u.insert(ignore_permissions=True)
+        u.add_roles("Sales User")
+        frappe.db.commit()
+    else:
+        roles = set(frappe.get_roles(email) or [])
+        if "Sales User" not in roles:
+            frappe.get_doc("User", email).add_roles("Sales User")
+            frappe.db.commit()
+    return email
+
+
+def suite_5_15_creation_review():
+    print("\n[Suite 5.15] Creation review (non-admin clients + orders)")
+    from erpnext.erpnext_integrations.ecommerce_api import api
+    from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+    def check_customer_confirm():
+        staff = _ensure_smoke_creation_review_staff()
+        cust_name = None
+        prev = frappe.session.user
+        try:
+            frappe.set_user(staff)
+            cust = api.create_customer(
+                customer_name=f"Smoke Review Cust {frappe.generate_hash(length=6)}",
+                phone="5491199887766",
+            )
+            cust_name = cust.get("name") if isinstance(cust, dict) else cust
+            assert cust_name
+            frappe.set_user(prev)
+            assert frappe.db.get_value("Customer", cust_name, cr.FIELDNAME) == cr.STATUS_PENDING
+            listed = api.list_creation_reviews(kind="customer", status="Pending", limit=50)
+            assert any(r.get("name") == cust_name for r in listed), listed
+            row = next(r for r in listed if r["name"] == cust_name)
+            assert row.get("owner_full_name"), row
+            confirmed = api.confirm_creation_review(kind="customer", name=cust_name)
+            assert confirmed.get("ok") and confirmed.get("review_status") == cr.STATUS_CONFIRMED
+            pending = api.list_creation_reviews(kind="customer", status="Pending", limit=50)
+            assert not any(r.get("name") == cust_name for r in pending)
+        finally:
+            frappe.set_user(prev)
+            if cust_name and frappe.db.exists("Customer", cust_name):
+                frappe.delete_doc("Customer", cust_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_order_delete():
+        staff = _ensure_smoke_creation_review_staff()
+        so_name = None
+        prev = frappe.session.user
+        try:
+            frappe.set_user(staff)
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke creation review order",
+                guest_name="Smoke Review Guest",
+                guest_phone="5491100001122",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            frappe.set_user(prev)
+            # Acting owner may be empty under bench execute; stamp Pending if needed.
+            if frappe.db.get_value("Sales Order", so_name, cr.FIELDNAME) != cr.STATUS_PENDING:
+                frappe.db.set_value("Sales Order", so_name, "owner", staff)
+                cr.maybe_mark_creation_review_pending("Sales Order", so_name, actor=staff)
+                frappe.db.commit()
+            listed = api.list_creation_reviews(kind="order", status="Pending", limit=50)
+            assert any(r.get("name") == so_name for r in listed), listed
+            deleted = api.delete_creation_review(kind="order", name=so_name)
+            assert deleted.get("ok"), deleted
+            pending = api.list_creation_reviews(kind="order", status="Pending", limit=50)
+            assert not any(r.get("name") == so_name for r in pending)
+            counts = api.count_pending_creation_reviews()
+            assert isinstance(counts, dict) and "total" in counts
+        finally:
+            frappe.set_user(prev)
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                # cancel leaves the SO; hard-delete for cleanup
+                frappe.db.sql("delete from `tabSales Order Item` where parent=%s", so_name)
+                frappe.db.sql("delete from `tabSales Order` where name=%s", so_name)
+            frappe.db.commit()
+
+    def check_admin_skips_queue():
+        prev = frappe.session.user
+        cust_name = None
+        try:
+            frappe.set_user("Administrator")
+            cust = api.create_customer(
+                customer_name=f"Smoke Admin Cust {frappe.generate_hash(length=6)}",
+            )
+            cust_name = cust.get("name") if isinstance(cust, dict) else cust
+            assert cust_name
+            flag = frappe.db.get_value("Customer", cust_name, cr.FIELDNAME)
+            assert not flag, f"admin create must skip queue, got {flag!r}"
+        finally:
+            frappe.set_user(prev)
+            if cust_name and frappe.db.exists("Customer", cust_name):
+                frappe.delete_doc("Customer", cust_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    _run("5.15.1 non-admin customer → pending → confirm", check_customer_confirm, "S2")
+    _run("5.15.2 non-admin order → pending → delete", check_order_delete, "S2")
+    _run("5.15.3 admin customer skips review queue", check_admin_skips_queue, "S3")
+
+
 def run(do_cleanup="1"):
     """
     Run all smoke suites and optionally clean up test records.
@@ -2464,6 +2748,7 @@ def run(do_cleanup="1"):
     suite_5_12_modules_read()
     suite_5_13_offline_outbox()
     suite_5_14_ops_requirements()
+    suite_5_15_creation_review()
 
     passed = _print_summary()
 

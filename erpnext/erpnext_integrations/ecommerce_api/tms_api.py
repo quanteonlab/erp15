@@ -1714,6 +1714,45 @@ def geocode_address(address_name):
 	}
 
 
+def _nominatim_headers():
+	return {
+		"User-Agent": "NextERP-TMS-DriverGeocode/1.0 (local; contact ops)",
+		"Accept": "application/json",
+		"Accept-Language": "es,en",
+	}
+
+
+def _parse_nominatim_addressdetails(addr):
+	"""Map Nominatim addressdetails → ERPNext Address-shaped fields."""
+	if not isinstance(addr, dict):
+		return {}
+	road = cstr(addr.get("road") or addr.get("pedestrian") or addr.get("residential") or "").strip()
+	house = cstr(addr.get("house_number") or "").strip()
+	line1 = " ".join(p for p in (road, house) if p).strip() or None
+	city = (
+		cstr(addr.get("city") or "").strip()
+		or cstr(addr.get("town") or "").strip()
+		or cstr(addr.get("suburb") or "").strip()
+		or cstr(addr.get("neighbourhood") or "").strip()
+		or cstr(addr.get("city_district") or "").strip()
+		or None
+	)
+	state = (
+		cstr(addr.get("state") or "").strip()
+		or cstr(addr.get("province") or "").strip()
+		or None
+	)
+	pincode = cstr(addr.get("postcode") or "").strip() or None
+	country = cstr(addr.get("country") or "").strip() or None
+	return {
+		"address_line1": line1,
+		"city": city,
+		"state": state,
+		"pincode": pincode,
+		"country": country,
+	}
+
+
 def _geocode_via_nominatim(address_str, country_code="ar"):
 	"""Free fallback geocoder (OpenStreetMap Nominatim) when Google Maps key is unset."""
 	import urllib.error
@@ -1726,16 +1765,12 @@ def _geocode_via_nominatim(address_str, country_code="ar"):
 			"format": "json",
 			"limit": "1",
 			"countrycodes": cstr(country_code or "ar").lower(),
-			"addressdetails": "0",
+			"addressdetails": "1",
 		}
 	)
 	req = urllib.request.Request(
 		f"https://nominatim.openstreetmap.org/search?{params}",
-		headers={
-			"User-Agent": "NextERP-TMS-DriverGeocode/1.0 (local; contact ops)",
-			"Accept": "application/json",
-			"Accept-Language": "es,en",
-		},
+		headers=_nominatim_headers(),
 		method="GET",
 	)
 	try:
@@ -1763,7 +1798,63 @@ def _geocode_via_nominatim(address_str, country_code="ar"):
 	except (TypeError, ValueError):
 		return None
 	formatted = cstr(top.get("display_name") or address_str).strip()
-	return {"lat": lat, "lng": lng, "address": formatted, "provider": "nominatim"}
+	parsed = _parse_nominatim_addressdetails(top.get("address") or {})
+	return {
+		"lat": lat,
+		"lng": lng,
+		"address": formatted,
+		"provider": "nominatim",
+		**parsed,
+	}
+
+
+def _reverse_geocode_via_nominatim(lat, lng):
+	"""Reverse geocode lat/lng via Nominatim (browser Google Geocoder often REQUEST_DENIED)."""
+	import json
+	import urllib.error
+	import urllib.parse
+	import urllib.request
+
+	params = urllib.parse.urlencode(
+		{
+			"lat": f"{flt(lat):.7f}",
+			"lon": f"{flt(lng):.7f}",
+			"format": "json",
+			"addressdetails": "1",
+			"zoom": "18",
+		}
+	)
+	req = urllib.request.Request(
+		f"https://nominatim.openstreetmap.org/reverse?{params}",
+		headers=_nominatim_headers(),
+		method="GET",
+	)
+	try:
+		with urllib.request.urlopen(req, timeout=12) as resp:
+			payload = resp.read().decode("utf-8")
+	except Exception:
+		return None
+
+	try:
+		top = json.loads(payload) or {}
+	except Exception:
+		return None
+	if not isinstance(top, dict) or top.get("error"):
+		return None
+	try:
+		lat_f = float(top.get("lat"))
+		lng_f = float(top.get("lon"))
+	except (TypeError, ValueError):
+		lat_f, lng_f = flt(lat), flt(lng)
+	formatted = cstr(top.get("display_name") or "").strip()
+	parsed = _parse_nominatim_addressdetails(top.get("address") or {})
+	return {
+		"lat": lat_f,
+		"lng": lng_f,
+		"address": formatted,
+		"provider": "nominatim",
+		**parsed,
+	}
 
 
 def _resolve_maps_geocode_api_key():
@@ -1838,6 +1929,88 @@ def geocode_query(query=None, region=None):
 		"lng": hit["lng"],
 		"address": hit["address"],
 		"cached": False,
+		"provider": hit.get("provider") or "nominatim",
+		"address_line1": hit.get("address_line1"),
+		"city": hit.get("city"),
+		"state": hit.get("state"),
+		"pincode": hit.get("pincode"),
+		"country": hit.get("country"),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def reverse_geocode_query(lat=None, lng=None):
+	"""Reverse geocode coordinates → structured address (Address Complete modal).
+
+	Used when the browser Google Geocoder returns REQUEST_DENIED (restricted
+	browser keys). Prefers Google Geocoding API when a server key is set;
+	falls back to Nominatim.
+	"""
+	try:
+		lat_f = flt(lat)
+		lng_f = flt(lng)
+	except Exception:
+		lat_f, lng_f = 0.0, 0.0
+	if not lat_f and not lng_f:
+		frappe.throw(_("Latitude and longitude are required."), frappe.ValidationError)
+
+	api_key = _resolve_maps_geocode_api_key()
+	if api_key:
+		try:
+			import googlemaps
+
+			maps_client = googlemaps.Client(key=api_key)
+			results = maps_client.reverse_geocode((lat_f, lng_f), language="es")
+			if results:
+				top = results[0]
+				location = (top.get("geometry") or {}).get("location") or {}
+				comps = top.get("address_components") or []
+
+				def _long(type_name):
+					for c in comps:
+						if type_name in (c.get("types") or []):
+							return cstr(c.get("long_name") or "").strip()
+					return ""
+
+				route = _long("route")
+				number = _long("street_number")
+				line1 = " ".join(p for p in (route, number) if p).strip() or None
+				city = (
+					_long("locality")
+					or _long("sublocality")
+					or _long("neighborhood")
+					or _long("administrative_area_level_2")
+					or None
+				)
+				state = _long("administrative_area_level_1") or None
+				pincode = _long("postal_code") or None
+				country = _long("country") or None
+				return {
+					"lat": flt(location.get("lat"), lat_f),
+					"lng": flt(location.get("lng"), lng_f),
+					"address": cstr(top.get("formatted_address") or "").strip(),
+					"address_line1": line1,
+					"city": city,
+					"state": state,
+					"pincode": pincode,
+					"country": country,
+					"provider": "google",
+				}
+		except Exception as e:
+			frappe.log_error(title="reverse_geocode_query Google failed", message=cstr(e))
+
+	hit = _reverse_geocode_via_nominatim(lat_f, lng_f)
+	if not hit:
+		frappe.throw(_("Could not reverse-geocode that point."), frappe.ValidationError)
+	return {
+		"lat": hit["lat"],
+		"lng": hit["lng"],
+		"address": hit.get("address"),
+		"address_line1": hit.get("address_line1"),
+		"city": hit.get("city"),
+		"state": hit.get("state"),
+		"pincode": hit.get("pincode"),
+		"country": hit.get("country"),
 		"provider": hit.get("provider") or "nominatim",
 	}
 

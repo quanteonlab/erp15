@@ -2763,6 +2763,15 @@ def create_customer(
 	if zone_val:
 		_set_customer_zone_and_address(customer.name, zone=zone_val)
 
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			maybe_mark_creation_review_pending,
+		)
+
+		maybe_mark_creation_review_pending("Customer", customer.name)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "creation_review mark customer")
+
 	frappe.db.commit()
 
 	# Create contact if email or phone provided
@@ -3058,6 +3067,47 @@ def create_supplier(supplier_name, supplier_group=None):
 	doc.insert(ignore_permissions=True)
 	frappe.db.commit()
 	return doc.as_dict()
+
+
+@frappe.whitelist(allow_guest=True)
+def update_supplier(supplier_name=None, **kwargs):
+	"""Update Supplier contact fields for RM Proveedores detail edit."""
+	name = cstr(supplier_name or kwargs.get("name") or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Supplier is required."), frappe.ValidationError)
+	if not frappe.db.exists("Supplier", name):
+		frappe.throw(_("Supplier {0} not found").format(name), frappe.DoesNotExistError)
+	if (frappe.db.get_value("Supplier", name, "supplier_name") or name) == UNCATEGORIZED_SUPPLIER_NAME:
+		frappe.throw(_("Cannot edit Uncategorized supplier."), frappe.ValidationError)
+
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Supplier", name)
+	frappe.flags.ignore_permissions = False
+
+	# phone / mobile aliases
+	if "phone" in kwargs and "mobile_no" not in kwargs:
+		kwargs["mobile_no"] = kwargs.get("phone")
+	if "email" in kwargs and "email_id" not in kwargs:
+		kwargs["email_id"] = kwargs.get("email")
+
+	allowed = ["supplier_name", "mobile_no", "email_id", "supplier_group"]
+	for field in allowed:
+		if field in kwargs:
+			val = kwargs.get(field)
+			if val is None or cstr(val).strip().lower() in ("null", "undefined"):
+				val = ""
+			doc.set(field, cstr(val).strip() if field != "supplier_group" else (cstr(val).strip() or doc.supplier_group))
+
+	doc.save(ignore_permissions=True)
+	frappe.db.commit()
+	return {
+		"name": doc.name,
+		"supplier_name": doc.supplier_name,
+		"phone": doc.mobile_no,
+		"email": doc.email_id,
+		"supplier_group": doc.supplier_group,
+		"is_bucket": (doc.supplier_name or doc.name or "") == UNCATEGORIZED_SUPPLIER_NAME,
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -3386,6 +3436,286 @@ def create_address(
 	return address.as_dict()
 
 
+@frappe.whitelist(allow_guest=True)
+def list_customer_addresses(customer=None, search=None, page_length=20):
+	"""List Address docs linked to a Customer (for Orden location picker).
+
+	Returns street lines + flags so the UI can prefer primary / shipping.
+	Empty / missing customer → empty list (never 500).
+	"""
+	cust = cstr(customer or "").strip()
+	if not cust or cust.lower() in ("null", "undefined", "none"):
+		return {"addresses": []}
+
+	try:
+		limit = max(1, min(cint(page_length) or 20, 50))
+	except Exception:
+		limit = 20
+
+	needle = cstr(search or "").strip()
+	if needle.lower() in ("null", "undefined", "none"):
+		needle = ""
+
+	fields = [
+		"name",
+		"address_line1",
+		"address_line2",
+		"city",
+		"state",
+		"pincode",
+		"address_type",
+		"is_primary_address",
+		"is_shipping_address",
+	]
+	if frappe.db.has_column("Address", "custom_zone"):
+		fields.append("custom_zone")
+	if frappe.db.has_column("Address", "custom_latitude"):
+		fields.append("custom_latitude")
+	if frappe.db.has_column("Address", "custom_longitude"):
+		fields.append("custom_longitude")
+
+	rows = frappe.get_all(
+		"Address",
+		filters=[
+			["Dynamic Link", "link_doctype", "=", "Customer"],
+			["Dynamic Link", "link_name", "=", cust],
+			["disabled", "=", 0],
+		],
+		fields=fields,
+		# Qualify modified — Dynamic Link join makes bare `modified` ambiguous.
+		order_by="`tabAddress`.is_primary_address desc, `tabAddress`.is_shipping_address desc, `tabAddress`.modified desc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+
+	out = []
+	needle_l = needle.lower()
+	for r in rows or []:
+		bits = [
+			cstr(r.get("address_line1") or "").strip(),
+			cstr(r.get("address_line2") or "").strip(),
+			cstr(r.get("city") or "").strip(),
+		]
+		line = ", ".join(b for b in bits if b and b != "-")
+		if not line:
+			continue
+		if needle_l and needle_l not in line.lower() and needle_l not in cstr(r.get("name") or "").lower():
+			continue
+		lat_v = r.get("custom_latitude")
+		lng_v = r.get("custom_longitude")
+		try:
+			lat_f = flt(lat_v) if lat_v not in (None, "") else None
+			lng_f = flt(lng_v) if lng_v not in (None, "") else None
+		except Exception:
+			lat_f, lng_f = None, None
+		out.append(
+			{
+				"name": r.get("name"),
+				"address_line": line,
+				"address_line1": cstr(r.get("address_line1") or "").strip() or None,
+				"address_line2": cstr(r.get("address_line2") or "").strip() or None,
+				"city": cstr(r.get("city") or "").strip() or None,
+				"state": cstr(r.get("state") or "").strip() or None,
+				"pincode": cstr(r.get("pincode") or "").strip() or None,
+				"address_type": cstr(r.get("address_type") or "").strip() or None,
+				"zone": cstr(r.get("custom_zone") or "").strip() or None,
+				"lat": lat_f,
+				"lng": lng_f,
+				"is_primary": 1 if cint(r.get("is_primary_address")) else 0,
+				"is_shipping": 1 if cint(r.get("is_shipping_address")) else 0,
+			}
+		)
+	return {"addresses": out}
+
+
+@frappe.whitelist(allow_guest=True)
+def upsert_customer_address_place(
+	customer=None,
+	address_line1=None,
+	address_line2=None,
+	city=None,
+	state=None,
+	pincode=None,
+	country=None,
+	lat=None,
+	lng=None,
+	address_name=None,
+	address_type=None,
+):
+	"""Create or update a Customer Address with structured fields + lat/lng.
+
+	Used by Address Complete modal (Orden / CRM / consulta). Bucket customers
+	(Consumidor Final / Uncategorized) are rejected — callers should only
+	persist geo text locally for those.
+	"""
+	cust = cstr(customer or "").strip()
+	if not cust or cust.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Customer is required."), frappe.ValidationError)
+	if _is_bucket_customer(cust):
+		frappe.throw(
+			_("Cannot save a map address on Consumidor Final / Uncategorized."),
+			frappe.ValidationError,
+		)
+	if not frappe.db.exists("Customer", cust):
+		frappe.throw(_("Customer {0} not found").format(cust), frappe.DoesNotExistError)
+
+	line1 = cstr(address_line1 or "").strip()
+	if not line1 or line1.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Street address is required."), frappe.ValidationError)
+
+	try:
+		lat_f = flt(lat)
+		lng_f = flt(lng)
+	except Exception:
+		lat_f, lng_f = 0.0, 0.0
+	if not lat_f and not lng_f:
+		frappe.throw(_("Latitude and longitude are required."), frappe.ValidationError)
+
+	city_val = cstr(city or "").strip()
+	if not city_val or city_val.lower() in ("null", "undefined", "none", "-"):
+		city_val = "-"
+	state_val = cstr(state or "").strip()
+	if state_val.lower() in ("null", "undefined", "none"):
+		state_val = ""
+	pincode_val = cstr(pincode or "").strip()
+	if pincode_val.lower() in ("null", "undefined", "none"):
+		pincode_val = ""
+	line2_val = cstr(address_line2 or "").strip()
+	if line2_val.lower() in ("null", "undefined", "none"):
+		line2_val = ""
+	country_val = cstr(country or "").strip() or (frappe.db.get_default("country") or "Argentina")
+	if country_val.lower() in ("null", "undefined", "none"):
+		country_val = frappe.db.get_default("country") or "Argentina"
+	atype = cstr(address_type or "Shipping").strip() or "Shipping"
+	if atype.lower() in ("null", "undefined", "none"):
+		atype = "Shipping"
+
+	addr_name = cstr(address_name or "").strip()
+	if addr_name.lower() in ("null", "undefined", "none"):
+		addr_name = ""
+
+	# Prefer updating an existing linked address when name omitted.
+	if not addr_name:
+		primary = frappe.db.get_value("Customer", cust, "customer_primary_address")
+		if primary and frappe.db.exists("Address", primary):
+			addr_name = primary
+		else:
+			linked = frappe.get_all(
+				"Address",
+				filters=[
+					["Dynamic Link", "link_doctype", "=", "Customer"],
+					["Dynamic Link", "link_name", "=", cust],
+					["disabled", "=", 0],
+				],
+				pluck="name",
+				order_by="is_primary_address desc, is_shipping_address desc, modified desc",
+				limit_page_length=1,
+				ignore_permissions=True,
+			)
+			if linked:
+				addr_name = linked[0]
+
+	created = False
+	# Prefer db.set_value for updates: Address.custom_zone often holds TMS codes
+	# (e.g. T1-TUE) that fail Select validation on Document.save().
+	if addr_name and frappe.db.exists("Address", addr_name):
+		field_update = {
+			"address_line1": line1,
+			"address_line2": line2_val or "",
+			"city": city_val,
+			"state": state_val or "",
+			"pincode": pincode_val or "",
+			"country": country_val,
+			"address_type": atype,
+		}
+		if frappe.db.has_column("Address", "is_shipping_address"):
+			field_update["is_shipping_address"] = 1
+		if frappe.db.has_column("Address", "is_primary_address") and not frappe.db.get_value(
+			"Customer", cust, "customer_primary_address"
+		):
+			field_update["is_primary_address"] = 1
+		frappe.db.set_value("Address", addr_name, field_update, update_modified=True)
+	else:
+		frappe.flags.ignore_permissions = True
+		cust_label = frappe.db.get_value("Customer", cust, "customer_name") or cust
+		doc = frappe.get_doc(
+			{
+				"doctype": "Address",
+				"address_title": cust_label,
+				"address_type": atype,
+				"address_line1": line1,
+				"address_line2": line2_val or None,
+				"city": city_val,
+				"state": state_val or None,
+				"pincode": pincode_val or None,
+				"country": country_val,
+				"links": [{"link_doctype": "Customer", "link_name": cust}],
+			}
+		)
+		if hasattr(doc, "is_shipping_address"):
+			doc.is_shipping_address = 1
+		if hasattr(doc, "is_primary_address"):
+			doc.is_primary_address = 1
+		# Avoid Select validation on custom_zone if a default sneaks in.
+		if hasattr(doc, "custom_zone"):
+			doc.custom_zone = None
+		doc.insert(ignore_permissions=True)
+		frappe.flags.ignore_permissions = False
+		addr_name = doc.name
+		created = True
+
+	geo_update = {}
+	if frappe.db.has_column("Address", "custom_latitude"):
+		geo_update["custom_latitude"] = lat_f
+	if frappe.db.has_column("Address", "custom_longitude"):
+		geo_update["custom_longitude"] = lng_f
+	if frappe.db.has_column("Address", "custom_geocoded_on"):
+		from frappe.utils import now_datetime
+
+		geo_update["custom_geocoded_on"] = now_datetime()
+	if geo_update:
+		frappe.db.set_value("Address", addr_name, geo_update, update_modified=False)
+
+	# Ensure Customer points at this address as primary when unset.
+	primary = frappe.db.get_value("Customer", cust, "customer_primary_address")
+	if not primary:
+		frappe.db.set_value("Customer", cust, "customer_primary_address", addr_name)
+	frappe.db.set_value("Customer", cust, "primary_address", line1)
+
+	zone = None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api import tms_api
+
+		# Uses db.set_value internally — safe with TMS zone codes.
+		assigned = tms_api._auto_assign_zone_if_missing(addr_name)
+		if assigned:
+			zone = assigned.get("zone")
+		elif frappe.db.has_column("Address", "custom_zone"):
+			zone = cstr(frappe.db.get_value("Address", addr_name, "custom_zone") or "").strip() or None
+	except Exception:
+		zone = None
+
+	frappe.db.commit()
+
+	bits = [line1, line2_val, city_val if city_val != "-" else "", state_val]
+	address_line = ", ".join(b for b in bits if b)
+
+	return {
+		"name": addr_name,
+		"created": 1 if created else 0,
+		"address_line": address_line or line1,
+		"address_line1": line1,
+		"address_line2": line2_val or None,
+		"city": city_val if city_val != "-" else None,
+		"state": state_val or None,
+		"pincode": pincode_val or None,
+		"country": country_val,
+		"lat": lat_f,
+		"lng": lng_f,
+		"zone": zone,
+	}
+
+
 # ========================================
 # ORDER APIs
 # ========================================
@@ -3592,6 +3922,168 @@ def _normalize_create_initial_status(initial_status) -> str:
 	if cstr(initial_status or "").strip() == "Orden":
 		return "Orden"
 	return "Consulta"
+
+
+def _run_create_guest_preorder_side_effects(
+	so_name=None,
+	ensure_remito=0,
+	guest_name=None,
+	guest_phone=None,
+	guest_email=None,
+	seller_ref_user=None,
+	pin_allowed_countries=None,
+	send_client_pin=0,
+	client_access_pin=None,
+	phone_e164=None,
+):
+	"""Email / Twilio / Preventa / webhook / remito — after create returns to the UI.
+
+	Runs on the short queue (or inline when enqueue fails). Never raises to the
+	caller; each step is best-effort with its own error log.
+	"""
+	so_name = cstr(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return {"ok": False, "reason": "missing_so"}
+
+	# Inquiry email (SMTP) — catalog consultas + Orden creates.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import (
+			send_consulta_notification,
+		)
+
+		send_consulta_notification(so_name, guest_name=guest_name, guest_phone=guest_phone)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Inquiry email failed for {so_name}")
+
+	# Twilio PIN send when mint already happened in the request (send=0 there).
+	client_access = None
+	pin = cstr(client_access_pin or "").strip()
+	e164 = cstr(phone_e164 or guest_phone or "").strip()
+	if cint(send_client_pin) and pin and e164:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				_portal_base_url,
+				_send_pin_message,
+			)
+
+			portal = f"{_portal_base_url()}/cliente"
+			send_result = _send_pin_message(e164, pin, portal)
+			client_access = {"pin": pin, "phone_e164": e164, "send": send_result}
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"Client access PIN send failed for {so_name}")
+	elif cstr(guest_phone or "").strip() and not pin:
+		# No PIN minted in-request (e.g. no phone path) — full issue+send.
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				issue_client_access_pin,
+			)
+
+			customer = frappe.db.get_value("Sales Order", so_name, "customer")
+			client_access = issue_client_access_pin(
+				guest_phone=guest_phone,
+				guest_name=guest_name,
+				guest_email=guest_email,
+				customer=customer,
+				allowed_countries=pin_allowed_countries,
+				send=cint(send_client_pin),
+			)
+			pin = cstr((client_access or {}).get("pin") or "").strip()
+			e164 = cstr((client_access or {}).get("phone_e164") or guest_phone or "").strip()
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so_name}")
+
+	# Preventa Lead bridge + stamp PIN onto Lead when we have one.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import (
+			sync_lead_from_guest_preorder,
+		)
+
+		sync_lead_from_guest_preorder(
+			so_name,
+			guest_name=guest_name,
+			guest_phone=guest_phone,
+			guest_email=guest_email,
+			seller_ref_user=seller_ref_user,
+		)
+		lead_name = frappe.db.get_value(
+			"Preventa Lead Consulta", {"sales_order": so_name}, "lead"
+		)
+		if lead_name and pin:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				_stamp_party,
+			)
+
+			_stamp_party("Lead", lead_name, pin, e164 or guest_phone)
+			frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so_name}")
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		row = frappe.db.get_value(
+			"Sales Order",
+			so_name,
+			["customer", "grand_total", "currency"],
+			as_dict=True,
+		) or {}
+		emit_ecommerce_webhook(
+			"order_created",
+			{
+				"preorder_name": so_name,
+				"customer": row.get("customer"),
+				"grand_total": flt(row.get("grand_total")),
+				"currency": row.get("currency"),
+			},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook order_created")
+
+	# Orden / planner remito + soft geocode (was the main UI stall).
+	if cint(ensure_remito):
+		try:
+			frappe.flags.ignore_permissions = True
+			so = frappe.get_doc("Sales Order", so_name)
+			frappe.flags.ignore_permissions = False
+			if _is_guest_preorder_sales_order(so) and cint(so.docstatus) == 1:
+				_ensure_planner_delivery_note(so)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"deferred planner remito failed for {so_name}")
+
+	return {"ok": True, "so_name": so_name, "client_access": client_access}
+
+
+def _enqueue_create_guest_preorder_side_effects(**kwargs):
+	"""Queue post-create work; fall back to inline if Redis/workers unavailable."""
+	so_name = cstr(kwargs.get("so_name") or "").strip()
+	try:
+		enq = {
+			"queue": "short",
+			"timeout": 300,
+			"enqueue_after_commit": True,
+			**kwargs,
+		}
+		if so_name:
+			enq["job_id"] = f"guest_preorder_side:{so_name}"
+		frappe.enqueue(
+			"erpnext.erpnext_integrations.ecommerce_api.api._run_create_guest_preorder_side_effects",
+			**enq,
+		)
+		return {"queued": True}
+	except Exception:
+		frappe.log_error(
+			frappe.get_traceback(),
+			f"enqueue create side effects failed for {so_name or '?'}",
+		)
+		try:
+			_run_create_guest_preorder_side_effects(**kwargs)
+			return {"queued": False, "ran_inline": True}
+		except Exception:
+			frappe.log_error(
+				frappe.get_traceback(),
+				f"inline create side effects failed for {so_name or '?'}",
+			)
+			return {"queued": False, "ran_inline": False}
 
 
 def _sales_order_table_columns():
@@ -4411,17 +4903,27 @@ def create_guest_preorder(
 	if acting and frappe.db.exists("User", acting) and so.owner != acting:
 		so.db_set("owner", acting)
 
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			maybe_mark_creation_review_pending,
+		)
+
+		# Prefer the stamped owner / acting cashier over the API-key session user.
+		maybe_mark_creation_review_pending(
+			"Sales Order",
+			so.name,
+			actor=acting or getattr(so, "owner", None),
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "creation_review mark sales order")
+
 	paid = flt(paid_amount)
 	if paid > 0:
 		cap = flt(so.grand_total)
 		so.db_set("advance_paid", min(paid, cap) if cap > 0 else paid)
 
-	from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import send_consulta_notification
-
-	send_consulta_notification(so.name, guest_name=guest_name, guest_phone=guest_phone)
-
-	# Client access PIN (Twilio WhatsApp/SMS) — check "never seen" BEFORE lead sync
-	# so the brand-new Lead created below does not count as "already known".
+	# Mint PIN in-request (fast DB) so catalog can stash it locally; Twilio send
+	# + email + Preventa + remito run after the HTTP response (see side effects).
 	client_access = None
 	if cstr(guest_phone or "").strip():
 		try:
@@ -4435,62 +4937,18 @@ def create_guest_preorder(
 				guest_email=guest_email,
 				customer=so.customer,
 				allowed_countries=pin_allowed_countries,
-				send=cint(send_client_pin),
+				send=0,
 			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so.name}")
 
-	# Best-effort Pre-venta bridge: never let a Lead-sync problem affect the
-	# guest preorder response (see local_docs/proposals/i033_preventa_sales_kanban.md).
-	lead_name = None
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import sync_lead_from_guest_preorder
-
-		sync_lead_from_guest_preorder(
-			so.name,
-			guest_name=guest_name,
-			guest_phone=guest_phone,
-			guest_email=guest_email,
-			seller_ref_user=seller_ref_user,
-		)
-		lead_name = frappe.db.get_value(
-			"Preventa Lead Consulta", {"sales_order": so.name}, "lead"
-		)
-		if lead_name and client_access and client_access.get("pin"):
-			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
-				_stamp_party,
-			)
-
-			_stamp_party(
-				"Lead",
-				lead_name,
-				client_access.get("pin"),
-				client_access.get("phone_e164") or guest_phone,
-			)
-			frappe.db.commit()
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so.name}")
-
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
-
-		emit_ecommerce_webhook(
-			"order_created",
-			{
-				"preorder_name": so.name,
-				"customer": so.customer,
-				"grand_total": flt(so.grand_total),
-				"currency": so.currency,
-			},
-		)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "webhook order_created")
-
-	# Operaciones → Orden (and similar staff entry points): skip Inquiry / Consulta.
+	# Operaciones → Orden: submit now; remito/geocode deferred (was the long stall).
 	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
 	promoted = None
 	if want_orden and resolved_rows:
-		promoted = set_guest_preorder_status(so.name, "Orden")
+		promoted = set_guest_preorder_status(
+			so.name, "Orden", ensure_planner_remito=0
+		)
 		so_name = cstr((promoted or {}).get("name") or so.name)
 		frappe.flags.ignore_permissions = True
 		so = frappe.get_doc("Sales Order", so_name)
@@ -4502,12 +4960,14 @@ def create_guest_preorder(
 		"currency": so.currency,
 		"status": so.status,
 		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
+		"side_effects_queued": True,
 	}
 	if want_orden and resolved_rows:
 		payload["display_status"] = "Orden"
+		# Remito not ready yet — planner will pick it up after the background job.
+		payload["planner_ready"] = False
 		if isinstance(promoted, dict):
 			for key in (
-				"planner_ready",
 				"not_deliverable",
 				"delivery_warning",
 				"delivery_note",
@@ -4523,9 +4983,22 @@ def create_guest_preorder(
 			"phone_e164": client_access.get("phone_e164"),
 			"is_new_number": client_access.get("is_new_number"),
 			"portal_path": client_access.get("portal_path") or "/cliente",
-			"sent": (client_access.get("send") or {}).get("sent"),
-			"channel": (client_access.get("send") or {}).get("channel"),
+			"sent": False,
+			"channel": None,
 		}
+
+	_enqueue_create_guest_preorder_side_effects(
+		so_name=so.name,
+		ensure_remito=1 if (want_orden and resolved_rows) else 0,
+		guest_name=guest_name,
+		guest_phone=guest_phone,
+		guest_email=guest_email,
+		seller_ref_user=seller_ref_user,
+		pin_allowed_countries=pin_allowed_countries,
+		send_client_pin=cint(send_client_pin),
+		client_access_pin=(client_access or {}).get("pin") if client_access else None,
+		phone_e164=(client_access or {}).get("phone_e164") if client_access else None,
+	)
 	return payload
 
 
@@ -5194,7 +5667,7 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 
 
 @frappe.whitelist(allow_guest=True)
-def set_guest_preorder_status(preorder_name, target_status, source=None):
+def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_planner_remito=1):
 	"""
 	Unified status transition for the custom workflow.
 
@@ -5206,6 +5679,10 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 
 	``source`` (optional): when one of armado / remito / tms_claim / tms_pod, the
 	transition is treated as external to the Órdenes table (highlight + banner).
+
+	``ensure_planner_remito``: when truthy (default), Orden/Preparado creates the
+	Delivery Note for Rutas. Create-order paths pass 0 and enqueue remito instead
+	so the HTTP response is not blocked on remito/geocode.
 	"""
 	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
@@ -5228,7 +5705,10 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 		if target_status == "Consulta":
 			return new_detail
 		return set_guest_preorder_status(
-			new_detail["name"], target_status, source=pipeline_source
+			new_detail["name"],
+			target_status,
+			source=pipeline_source,
+			ensure_planner_remito=ensure_planner_remito,
 		)
 
 	current = _display_status(so)
@@ -5293,10 +5773,12 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 	)
 	detail = get_guest_preorder(preorder_name)
 	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
-	if target_status in ("Orden", "Preparado"):
+	if target_status in ("Orden", "Preparado") and cint(ensure_planner_remito):
 		so.reload()
 		gate = _ensure_planner_delivery_note(so)
 		_attach_planner_gate_fields(detail, gate)
+	elif target_status in ("Orden", "Preparado"):
+		detail["planner_ready"] = False
 	return detail
 
 
@@ -5648,10 +6130,11 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	"""
 	Full item replacement on a guest preorder.
 
-	For draft orders (docstatus=0): edits in place.
-	For submitted orders (docstatus=1): amends (cancel old, create amended copy, submit).
+	Draft (docstatus=0) and submitted (docstatus=1) orders both edit in place —
+	same name, no cancel/amend. Archivado is only via explicit archive
+	(``cancel_guest_preorder`` / CSV Eliminar), not line edits.
 
-	Returns the updated preorder detail (may have a new name if amended).
+	Returns the updated preorder detail (same ``preorder_name``).
 	"""
 	import json as _json
 
@@ -5672,44 +6155,53 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	if not items:
 		frappe.throw(_("Items list cannot be empty"))
 
-	if so.docstatus == 1 and cstr(so.status) == "Consulta":
-		# Soft Consulta: edit in place — do not cancel/archive.
-		_apply_item_changes(so, items, additional_discount_amount)
-		so.flags.ignore_pricing_rule = True
-		so.flags.ignore_validate_update_after_submit = True
-		with _allow_weight_fractional_stock_qty(so):
-			so.save(ignore_permissions=True)
-		so.reload()
-		return get_guest_preorder(preorder_name)
-
-	if so.docstatus == 1:
-		# Amend: cancel original, create amended copy with changes, submit
-		amended = frappe.copy_doc(so)
-		amended.amended_from = so.name
-		amended.docstatus = 0
-		so.flags.ignore_permissions = True
-		so.cancel()
-		_apply_item_changes(amended, items, additional_discount_amount)
-		amended.flags.ignore_pricing_rule = True
-		desired = _allocate_amend_name("Sales Order", so.name)
-		with _allow_weight_fractional_stock_qty(amended):
-			amended.insert(ignore_permissions=True, set_name=desired)
-			amended.submit()
-		amended.reload()
-		return get_guest_preorder(amended.name)
-
-	# Draft: edit in place. Keep operator rate/qty/uom (WEIGHT) — do not re-price from rules.
-	_apply_item_changes(so, items, additional_discount_amount)
+	# Draft + submitted: edit in place. Keep operator rate/qty/uom (WEIGHT) —
+	# do not re-price from rules. Submitted needs update-after-submit bypass.
+	measured = _apply_item_changes(so, items, additional_discount_amount)
 	so.flags.ignore_pricing_rule = True
+	if so.docstatus == 1:
+		so.flags.ignore_validate_update_after_submit = True
 	with _allow_weight_fractional_stock_qty(so):
 		so.save(ignore_permissions=True)
 	so.reload()
+	# float_precision rounds weight_per_unit; restamp measured kg so 2kg stays 2.
+	_restamp_measured_line_weights(so, measured)
 	return get_guest_preorder(preorder_name)
 
 
+def _restamp_measured_line_weights(so, measured_total_weight):
+	"""Keep scale ``total_weight`` exact after Frappe rounds ``weight_per_unit``.
+
+	Site float_precision is often 3, so ``2 kg / 3 units`` → wpu ``0.667`` →
+	``qty * wpu`` reconstitutes ``2.001``. Measured pack weight is authoritative.
+	"""
+	if not measured_total_weight:
+		return
+	for row in so.items or []:
+		code = row.item_code
+		if code not in measured_total_weight or not row.name:
+			continue
+		intended = flt(measured_total_weight[code])
+		if abs(flt(row.total_weight) - intended) <= 1e-12:
+			continue
+		frappe.db.set_value(
+			"Sales Order Item",
+			row.name,
+			"total_weight",
+			intended,
+			update_modified=False,
+		)
+		row.total_weight = intended
+
+
 def _apply_item_changes(so, items, additional_discount_amount):
-	"""Apply item list changes to a Sales Order document (not yet saved)."""
+	"""Apply item list changes to a Sales Order document (not yet saved).
+
+	Returns ``{item_code: measured_total_weight}`` for lines whose kg came from
+	the client (so callers can restamp after float_precision rounds wpu).
+	"""
 	new_item_map = {i["item_code"]: i for i in items}
+	measured_total_weight = {}
 
 	# Remove rows not in the new list
 	so.items = [row for row in so.items if row.item_code in new_item_map]
@@ -5731,6 +6223,7 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			row.total_weight = tw
 			if flt(row.qty) > 0:
 				row.weight_per_unit = tw / flt(row.qty)
+			measured_total_weight[row.item_code] = tw
 		elif "weight_per_unit" in override and override.get("weight_per_unit") is not None:
 			row.weight_per_unit = flt(override.get("weight_per_unit"))
 			row.total_weight = flt(row.qty) * flt(row.weight_per_unit)
@@ -5751,11 +6244,17 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			)
 			if item.get("uom") is not None or item.get("stock_uom") is not None:
 				_apply_so_line_uom(row, item.get("uom") or item.get("stock_uom"))
+			if item.get("total_weight") is not None:
+				tw = flt(item.get("total_weight"))
+				row.total_weight = tw
+				if flt(row.qty) > 0:
+					row.weight_per_unit = tw / flt(row.qty)
+				measured_total_weight[row.item_code] = tw
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
 	so.run_method("calculate_taxes_and_totals")
-
+	return measured_total_weight
 
 @frappe.whitelist()
 def update_guest_preorder_prices(preorder_name, items, additional_discount_amount=0):
@@ -10908,6 +11407,38 @@ def dismiss_catalog_import_review(name, note=None):
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
 
 	return cir.dismiss_import_review(name, note=note)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_creation_reviews(kind="customer", status="Pending", limit=100, start=0):
+	"""List non-admin Customer / guest-preorder creations awaiting admin review."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.list_creation_reviews(kind=kind, status=status, limit=limit, start=start)
+
+
+@frappe.whitelist(allow_guest=True)
+def confirm_creation_review(kind=None, name=None):
+	"""Confirm a pending creation review (remove from Revisión queue)."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.confirm_creation_review(kind=kind, name=name)
+
+
+@frappe.whitelist(allow_guest=True)
+def delete_creation_review(kind=None, name=None):
+	"""Delete/cancel a pending creation from the Revisión queue."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.delete_creation_review(kind=kind, name=name)
+
+
+@frappe.whitelist(allow_guest=True)
+def count_pending_creation_reviews():
+	"""Pending customer + order creation-review counts for nav badges."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.count_pending_creation_reviews()
 
 
 @frappe.whitelist()
