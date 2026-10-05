@@ -749,14 +749,33 @@ def suite_5_9_master_data():
             frappe.db.commit()
 
     def check_orden_item_edit_inplace():
-        """Orden line edits keep the same SO name (no cancel/amend → Archivado)."""
+        """Orden line edits keep the same SO name (no cancel/amend → Archivado).
+
+        Also: adding a *new* line on a submitted Orden must set item_name
+        (set_missing_values is skipped with ignore_validate_update_after_submit).
+        """
         so_name = None
         item_code = frappe.db.get_value(
             "Item",
             {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
             "name",
         ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        item2 = frappe.db.get_value(
+            "Item",
+            {
+                "disabled": 0,
+                "is_stock_item": 1,
+                "name": ["!=", item_code],
+                "item_code": ["like", "POSNET%"],
+            },
+            "name",
+        ) or frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["!=", item_code]},
+            "name",
+        )
         assert item_code, "need a stock item"
+        assert item2, "need a second stock item"
         try:
             out = api.create_guest_preorder(
                 items=[{"item_code": item_code, "qty": 1, "rate": 15}],
@@ -778,6 +797,19 @@ def suite_5_9_master_data():
             assert cint(frappe.db.get_value("Sales Order", so_name, "docstatus")) == 1
             line = (detail.get("items") or [None])[0]
             assert line and abs(flt(line.get("qty")) - 3) < 0.001, line
+            # Frontend omits item_name on save — API must fill from Item master.
+            added = api.update_guest_preorder_items(
+                so_name,
+                [
+                    {"item_code": item_code, "qty": 3, "rate": 15},
+                    {"item_code": item2, "qty": 1, "rate": 9},
+                ],
+                0,
+            )
+            codes = {i.get("item_code") for i in (added.get("items") or [])}
+            assert item_code in codes and item2 in codes, added
+            for i in added.get("items") or []:
+                assert cstr(i.get("item_name") or "").strip(), i
             successors = frappe.get_all(
                 "Sales Order",
                 filters={"amended_from": so_name},
@@ -1575,8 +1607,8 @@ def suite_5_12_modules_read():
         parent_g = f"SmokeClase-{frappe.generate_hash(length=4)}"
         leaf_g = f"SmokeEtiq-{frappe.generate_hash(length=4)}"
         at_csv = (
-            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Imagen\n"
-            f"{sku},Smoke Airtable Price,{leaf_g},{parent_g},SmokeBrand,Agotado,8800,9064,\n"
+            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Imagen,UOM\n"
+            f"{sku},Smoke Airtable Price,{leaf_g},{parent_g},SmokeBrand,Agotado,8800,9064,,WEIGHT\n"
         )
         at_report = ecommerce_api.import_catalog_csv_products(
             csv_text=at_csv,
@@ -1593,6 +1625,62 @@ def suite_5_12_modules_read():
         )
         assert at_report.get("created_items", 0) + at_report.get("updated_items", 0) >= 1, at_report
         assert at_report.get("price_updates", 0) >= 2, at_report
+        assert cstr(frappe.db.get_value("Item", sku, "stock_uom")) == "WEIGHT", (
+            f"Airtable import must set stock_uom=WEIGHT, got "
+            f"{frappe.db.get_value('Item', sku, 'stock_uom')!r}"
+        )
+        # force_update_uom: existing Nos SKU keeps Nos unless force=1 → WEIGHT
+        sku_force = f"SMOKE-ATU-{frappe.generate_hash(length=6)}"
+        nos_item = frappe.get_doc(
+            {
+                "doctype": "Item",
+                "item_code": sku_force,
+                "item_name": "Smoke Force UOM",
+                "item_group": "Products",
+                "stock_uom": "Nos",
+                "is_stock_item": 1,
+                "include_item_in_manufacturing": 0,
+            }
+        )
+        nos_item.insert(ignore_permissions=True)
+        frappe.db.commit()
+        keep_csv = (
+            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,UOM,Imagen\n"
+            f"{sku_force},Smoke Force UOM,Products,,SmokeBrand,En Stock,100,110,WEIGHT,\n"
+        )
+        keep_rep = ecommerce_api.import_catalog_csv_products(
+            csv_text=keep_csv,
+            price_list="Standard Selling",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            image_mode="none",
+            force_update_uom=0,
+            file_name="smoke-airtable-uom-keep.csv",
+        )
+        assert cint(keep_rep.get("uom_updates") or 0) == 0, keep_rep
+        assert cstr(frappe.db.get_value("Item", sku_force, "stock_uom")) == "Nos", (
+            "without force_update_uom, existing Nos must be preserved"
+        )
+        force_rep = ecommerce_api.import_catalog_csv_products(
+            csv_text=keep_csv,
+            price_list="Standard Selling",
+            update_existing=1,
+            create_missing_groups=0,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            image_mode="none",
+            force_update_uom=1,
+            file_name="smoke-airtable-uom-force.csv",
+        )
+        assert cint(force_rep.get("uom_updates") or 0) >= 1, force_rep
+        assert cstr(frappe.db.get_value("Item", sku_force, "stock_uom")) == "WEIGHT", (
+            f"force_update_uom must overwrite Nos→WEIGHT, got "
+            f"{frappe.db.get_value('Item', sku_force, 'stock_uom')!r}"
+        )
         # Agotado → Item.disabled=1 → hidden from catalog get_products
         assert cint(frappe.db.get_value("Item", sku, "disabled")) == 1, "Agotado must disable Item"
         hidden = ecommerce_api.get_products(search_term=sku, page_length=5, include_disabled=0)
@@ -2758,6 +2846,85 @@ def suite_5_15_creation_review():
     _run("5.15.3 admin customer skips review queue", check_admin_skips_queue, "S3")
 
 
+# ── Suite 5.16 — Presentation demo pack (seed / status / clear) ───────────────
+
+def suite_5_16_presentation_demo():
+    print("\n[Suite 5.16] Presentation demo pack (seed → clear, untagged SO kept)")
+
+    def check_seed_status_clear():
+        from erpnext.erpnext_integrations.ecommerce_api import presentation_demo_api as pd
+        from erpnext.erpnext_integrations.ecommerce_api import pos_session_api as psa
+        import secrets
+
+        # Preserve any existing admin PIN; install a known one for clear.
+        cfg = psa._load_pin_settings()
+        prev_hash, prev_salt = cfg.get("pin_hash"), cfg.get("pin_salt")
+        salt = secrets.token_hex(16)
+        cfg["pin_salt"] = salt
+        cfg["pin_hash"] = psa._hash_pin("654321", salt)
+        psa._save_pin_settings(cfg)
+
+        # Untagged control order must survive clear.
+        company = frappe.db.get_value("Company", {}, "name")
+        control_name = None
+        try:
+            pd.seed_presentation_demo(reset=1)
+            st = pd.presentation_demo_status()
+            assert st.get("seeded"), st
+            assert cint(st.get("orders")) > 0, st
+            assert cint(st.get("employees")) > 0, st
+
+            # Create a normal (untagged) draft SO if possible
+            cust = frappe.db.get_value("Customer", {}, "name")
+            item = frappe.db.get_value("Item", {"disabled": 0}, "name")
+            if cust and item and company:
+                so = frappe.new_doc("Sales Order")
+                so.customer = cust
+                so.company = company
+                so.delivery_date = frappe.utils.today()
+                so.append("items", {"item_code": item, "qty": 1, "rate": 10})
+                so.insert(ignore_permissions=True)
+                frappe.db.commit()
+                control_name = so.name
+                assert not frappe.db.get_value("Sales Order", control_name, pd.FIELDNAME)
+
+            # Wrong / missing pin → AuthenticationError
+            try:
+                pd.clear_presentation_demo(pin=None)
+                assert False, "expected AuthenticationError for missing pin"
+            except frappe.AuthenticationError:
+                pass
+            try:
+                pd.clear_presentation_demo(pin="000000")
+                assert False, "expected AuthenticationError for wrong pin"
+            except frappe.AuthenticationError:
+                pass
+
+            cleared = pd.clear_presentation_demo(pin="654321")
+            assert cleared.get("ok"), cleared
+            st2 = pd.presentation_demo_status()
+            assert not st2.get("seeded"), st2
+            assert cint(st2.get("orders")) == 0, st2
+            assert cint(st2.get("employees")) == 0, st2
+
+            if control_name:
+                assert frappe.db.exists("Sales Order", control_name), "untagged SO must survive clear"
+        finally:
+            cfg2 = psa._load_pin_settings()
+            if prev_hash and prev_salt:
+                cfg2["pin_hash"] = prev_hash
+                cfg2["pin_salt"] = prev_salt
+            else:
+                cfg2.pop("pin_hash", None)
+                cfg2.pop("pin_salt", None)
+            psa._save_pin_settings(cfg2)
+            if control_name and frappe.db.exists("Sales Order", control_name):
+                frappe.delete_doc("Sales Order", control_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    _run("5.16.1 seed → status → clear (untagged kept)", check_seed_status_clear, "S2")
+
+
 def run(do_cleanup="1"):
     """
     Run all smoke suites and optionally clean up test records.
@@ -2787,6 +2954,7 @@ def run(do_cleanup="1"):
     suite_5_13_offline_outbox()
     suite_5_14_ops_requirements()
     suite_5_15_creation_review()
+    suite_5_16_presentation_demo()
 
     passed = _print_summary()
 

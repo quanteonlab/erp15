@@ -60,6 +60,18 @@ def _require_pin(pin: str | None) -> None:
 		frappe.throw(_("Incorrect admin PIN"), frappe.AuthenticationError)
 
 
+def _require_admin_pin(pin: str | None) -> None:
+	"""Mandatory company admin PIN (archive / destructive kiosk actions)."""
+	pin = str(pin or "").strip()
+	if not pin:
+		frappe.throw(_("Admin PIN required"), frappe.AuthenticationError)
+	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import validate_admin_pin
+
+	res = validate_admin_pin(pin)
+	if not (isinstance(res, dict) and res.get("authorized")):
+		frappe.throw(_("Incorrect admin PIN"), frappe.AuthenticationError)
+
+
 def _require_ops_operator(pin: str | None) -> dict:
 	"""Require admin or employee 6-digit PIN; return resolve_ops_pin payload."""
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import resolve_ops_pin
@@ -526,6 +538,55 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 			"employee": identity.get("employee"),
 			"employee_name": identity.get("employee_name"),
 		},
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def archive_armado(preorder_name=None, pin=None):
+	"""Cancel/archive the current armado Sales Order. Requires company admin PIN.
+
+	Unlike other armado writes (operator PIN), archive is destructive and must
+	be unlocked with the admin PIN dialog — employee ops PINs are rejected.
+	"""
+	_require_admin_pin(pin)
+	preorder_name = str(preorder_name or "").strip()
+	if not preorder_name or not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Order not found"), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", preorder_name)
+	frappe.flags.ignore_permissions = False
+
+	if cint(so.docstatus) == 2:
+		return {"ok": True, "already_archived": 1, "name": so.name, "status": "Cancelled"}
+
+	so.flags.ignore_permissions = True
+	if cint(so.docstatus) == 1:
+		so.cancel()
+	else:
+		# Armado list is submitted Orden only; draft cancel is still supported.
+		frappe.delete_doc("Sales Order", so.name, ignore_permissions=True, force=True)
+		frappe.db.commit()
+		_log_armado_operator(
+			preorder_name,
+			{"kind": "admin", "employee": None, "employee_name": "Admin"},
+			via="armado_archive",
+		)
+		return {"ok": True, "already_archived": 0, "name": preorder_name, "status": "Deleted"}
+
+	so.reload()
+	_log_armado_operator(
+		so.name,
+		{"kind": "admin", "employee": None, "employee_name": "Admin"},
+		via="armado_archive",
+	)
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"already_archived": 0,
+		"name": so.name,
+		"status": "Cancelled",
+		"docstatus": cint(so.docstatus),
 	}
 
 

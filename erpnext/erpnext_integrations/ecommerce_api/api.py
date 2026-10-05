@@ -5538,7 +5538,9 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 
 
 @frappe.whitelist(allow_guest=True)
-def set_guest_preorder_status(preorder_name, target_status, source=None):
+def set_guest_preorder_status(
+	preorder_name, target_status, source=None, ensure_planner_remito=1
+):
 	"""
 	Unified status transition for the custom workflow.
 
@@ -5550,6 +5552,9 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 
 	``source`` (optional): when one of armado / remito / tms_claim / tms_pod, the
 	transition is treated as external to the Órdenes table (highlight + banner).
+
+	``ensure_planner_remito``: when 0, skip inline remito/geocode (caller may
+	enqueue it — e.g. armado kiosk confirm for a fast response).
 	"""
 	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
@@ -5564,7 +5569,9 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 	frappe.flags.ignore_permissions = False
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
-	_require_guest_preorder_visible(so)
+	# Kiosk / TMS transitions are PIN-gated upstream — do not apply Pedidos scope.
+	if not pipeline_source:
+		_require_guest_preorder_visible(so)
 
 	if so.docstatus == 2:
 		# Archivado → amend into a new Consulta draft, then optionally advance.
@@ -5572,7 +5579,10 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 		if target_status == "Consulta":
 			return new_detail
 		return set_guest_preorder_status(
-			new_detail["name"], target_status, source=pipeline_source
+			new_detail["name"],
+			target_status,
+			source=pipeline_source,
+			ensure_planner_remito=ensure_planner_remito,
 		)
 
 	current = _display_status(so)
@@ -5637,7 +5647,8 @@ def set_guest_preorder_status(preorder_name, target_status, source=None):
 	)
 	detail = get_guest_preorder(preorder_name)
 	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
-	if target_status in ("Orden", "Preparado"):
+	# Armado confirm enqueues remito separately for a fast kiosk response.
+	if target_status in ("Orden", "Preparado") and cint(ensure_planner_remito):
 		so.reload()
 		gate = _ensure_planner_delivery_note(so)
 		_attach_planner_gate_fields(detail, gate)
@@ -6058,13 +6069,28 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			row.total_weight = flt(row.qty) * flt(row.weight_per_unit)
 		row.amount = row.rate * row.qty
 
-	# Add new items
+	# Add new items. Submitted SOs use ignore_validate_update_after_submit, so
+	# set_missing_values never fills item_name/uom — set them explicitly or
+	# MandatoryError: "Sales Order Item Row #N: Value missing for: Item Name".
 	for item in items:
 		if item["item_code"] not in existing_codes:
+			code = item["item_code"]
+			item_meta = (
+				frappe.db.get_value(
+					"Item", code, ["item_name", "stock_uom"], as_dict=True
+				)
+				or {}
+			)
+			item_name = (
+				cstr(item.get("item_name") or "").strip()
+				or cstr(item_meta.get("item_name") or "").strip()
+				or code
+			)
 			row = so.append(
 				"items",
 				{
-					"item_code": item["item_code"],
+					"item_code": code,
+					"item_name": item_name,
 					"qty": flt(item.get("qty", 1)),
 					"rate": flt(item.get("rate", 0)),
 					"discount_percentage": flt(item.get("discount_percentage", 0)),
@@ -6073,6 +6099,18 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			)
 			if item.get("uom") is not None or item.get("stock_uom") is not None:
 				_apply_so_line_uom(row, item.get("uom") or item.get("stock_uom"))
+			elif not cstr(getattr(row, "uom", "") or "").strip():
+				# uom is mandatory on Sales Order Item — default from Item stock_uom.
+				_apply_so_line_uom(row, item_meta.get("stock_uom") or "Nos")
+			# total_weight / weight_per_unit on brand-new lines (same as update path)
+			if "total_weight" in item and item.get("total_weight") is not None:
+				tw = flt(item.get("total_weight"))
+				row.total_weight = tw
+				if flt(row.qty) > 0:
+					row.weight_per_unit = tw / flt(row.qty)
+			elif "weight_per_unit" in item and item.get("weight_per_unit") is not None:
+				row.weight_per_unit = flt(item.get("weight_per_unit"))
+				row.total_weight = flt(row.qty) * flt(row.weight_per_unit)
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
@@ -9792,6 +9830,7 @@ def _parse_airtable_catalog_csv(csv_text):
 		"offer_rate": "Oferta",
 		"offer_qty": "Cantidad",
 		"image_url": "Imagen",
+		"stock_uom": "UOM",
 	}
 	parsed, total, _headers = _parse_mapped_catalog_csv(csv_text, column_map)
 	for row in parsed:
@@ -9817,6 +9856,10 @@ def _parse_airtable_catalog_csv(csv_text):
 			row["parent_item_group"] = ""
 
 		row["disabled"] = _airtable_estado_to_disabled(row.pop("status", None))
+		# Airtable catalog is weighed stock: missing/blank UOM → WEIGHT
+		# (export always emits UOM=WEIGHT; older CSVs without the column still import correctly).
+		if not cstr(row.get("stock_uom") or "").strip():
+			row["stock_uom"] = "WEIGHT"
 	return parsed, total
 
 
@@ -10053,7 +10096,7 @@ _CUSTOM_FIELD_ALIASES = {
 	"brand": ("marca", "brand", "brand_name", "brand name"),
 	"status": ("estado", "status", "stock status", "availability", "disponibilidad"),
 	"barcode": ("barcode", "ean", "upc", "codigo_barras", "código de barras", "barras"),
-	"stock_uom": ("uom", "stock_uom", "unidad", "unit", "um"),
+	"stock_uom": ("uom", "stock_uom", "unidad", "unit", "um", "weight", "peso"),
 	# Catalog / POS list only — never alias Transferencia here (payment-method list).
 	"price": ("price", "precio", "rate", "standard selling", "precio lista", "selling price"),
 	"cash_price": ("efectivo", "cash", "cash_price", "precio efectivo", "precio_efectivo"),
@@ -10412,11 +10455,17 @@ def _ensure_brand_for_import(brand_name, *, create_missing=1):
 
 
 def _resolve_uom_for_import(uom):
-	if uom and frappe.db.exists("UOM", uom):
-		return uom
-	if frappe.db.exists("UOM", "Nos"):
-		return "Nos"
-	return frappe.db.get_value("UOM", {}, "name") or "Nos"
+	"""Resolve CSV stock_uom via product_manager aliases (WEIGHT / CAJA / Nos).
+
+	Creates missing UOM master rows (e.g. WEIGHT) instead of silently falling
+	back to Nos when the CSV asks for a weighed unit.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.product_manager import _normalize_stock_uom
+
+	raw = cstr(uom or "").strip()
+	if not raw:
+		return _normalize_stock_uom("Nos")
+	return _normalize_stock_uom(raw)
 
 
 def _root_item_group_name():
@@ -10701,6 +10750,7 @@ def import_catalog_csv_products(
 	image_mode="blank",
 	import_promotions=1,
 	promo_style="threshold",
+	force_update_uom=0,
 ):
 	"""
 	Create/update Item + Item Price records from catalog CSV (permissive).
@@ -10717,6 +10767,9 @@ def import_catalog_csv_products(
 	offer_qty) upsert Pricing Rules (Rate + min_qty).
 	promo_style: threshold (default, all units at Oferta once qty >= N; xCaja→4)
 	| pack (Nx complete packs at Oferta).
+	force_update_uom: when 1, overwrite Item.stock_uom from CSV for existing
+	SKUs even when already set (e.g. Nos → WEIGHT). When 0 (default), keep
+	existing stock_uom on update; new Items always get the CSV UOM.
 	Errors/conflicts are enqueued to Catalog Import Review by default.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
@@ -10724,6 +10777,8 @@ def import_catalog_csv_products(
 	image_mode = _normalize_catalog_image_mode(image_mode)
 	import_promotions = cint(import_promotions)
 	promo_style = _normalize_catalog_promo_style(promo_style)
+	# Dirty clients: null/"" → off (preserve existing UOM on update).
+	force_update_uom = 1 if cint(force_update_uom) else 0
 	resolved_map = {}
 	if source in ("airtable", "custom"):
 		# Dirty clients may send null/"" — keep catalog + payment lists usable.
@@ -10784,6 +10839,8 @@ def import_catalog_csv_products(
 		"image_failures": 0,
 		"image_mode": image_mode,
 		"promo_style": promo_style,
+		"force_update_uom": force_update_uom,
+		"uom_updates": 0,
 		"promo_updates": 0,
 		"promo_disabled": 0,
 		"items_enabled": 0,
@@ -10924,7 +10981,16 @@ def import_catalog_csv_products(
 			item_doc.item_name = item_name
 			item_doc.description = description
 			item_doc.item_group = target_group
-			item_doc.stock_uom = target_uom
+			# UOM by SKU: new Items always take CSV UOM. Existing Items keep
+			# their stock_uom unless empty or force_update_uom=1.
+			if not existing:
+				item_doc.stock_uom = target_uom
+			else:
+				prev_uom = cstr(item_doc.stock_uom or "").strip()
+				if not prev_uom or force_update_uom:
+					if prev_uom and prev_uom != cstr(target_uom):
+						report["uom_updates"] += 1
+					item_doc.stock_uom = target_uom
 			item_doc.is_stock_item = 1
 			item_doc.include_item_in_manufacturing = 0
 			# Estado (airtable) / status map → disabled (Agotado hides from catalog).
@@ -11262,6 +11328,30 @@ def count_pending_creation_reviews():
 	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
 
 	return cr.count_pending_creation_reviews()
+
+
+@frappe.whitelist(allow_guest=True)
+def presentation_demo_status():
+	"""Settings: whether the presentation demo pack is loaded."""
+	from erpnext.erpnext_integrations.ecommerce_api import presentation_demo_api as pd
+
+	return pd.presentation_demo_status()
+
+
+@frappe.whitelist(allow_guest=True)
+def seed_presentation_demo(reset=0):
+	"""Load sample orders + fake team tagged for Settings wipe."""
+	from erpnext.erpnext_integrations.ecommerce_api import presentation_demo_api as pd
+
+	return pd.seed_presentation_demo(reset=reset)
+
+
+@frappe.whitelist(allow_guest=True)
+def clear_presentation_demo(pin=None):
+	"""Wipe tagged presentation demo rows. Requires admin PIN."""
+	from erpnext.erpnext_integrations.ecommerce_api import presentation_demo_api as pd
+
+	return pd.clear_presentation_demo(pin=pin)
 
 
 @frappe.whitelist()

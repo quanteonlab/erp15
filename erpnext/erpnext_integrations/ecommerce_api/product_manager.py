@@ -439,13 +439,15 @@ def _ensure_uom(name: str) -> str | None:
         return None
     if frappe.db.exists("UOM", uom_name):
         return uom_name
-    frappe.get_doc(
-        {
-            "doctype": "UOM",
-            "uom_name": uom_name,
-            "enabled": 1,
-        }
-    ).insert(ignore_permissions=True)
+    doc = {
+        "doctype": "UOM",
+        "uom_name": uom_name,
+        "enabled": 1,
+    }
+    # Weighed sell units must allow fractional qty (POS WEIGHT path).
+    if uom_name.upper() in ("WEIGHT", "KG", "G", "LB", "OZ"):
+        doc["must_be_whole_number"] = 0
+    frappe.get_doc(doc).insert(ignore_permissions=True)
     return uom_name
 
 
