@@ -3924,168 +3924,6 @@ def _normalize_create_initial_status(initial_status) -> str:
 	return "Consulta"
 
 
-def _run_create_guest_preorder_side_effects(
-	so_name=None,
-	ensure_remito=0,
-	guest_name=None,
-	guest_phone=None,
-	guest_email=None,
-	seller_ref_user=None,
-	pin_allowed_countries=None,
-	send_client_pin=0,
-	client_access_pin=None,
-	phone_e164=None,
-):
-	"""Email / Twilio / Preventa / webhook / remito — after create returns to the UI.
-
-	Runs on the short queue (or inline when enqueue fails). Never raises to the
-	caller; each step is best-effort with its own error log.
-	"""
-	so_name = cstr(so_name or "").strip()
-	if not so_name or not frappe.db.exists("Sales Order", so_name):
-		return {"ok": False, "reason": "missing_so"}
-
-	# Inquiry email (SMTP) — catalog consultas + Orden creates.
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import (
-			send_consulta_notification,
-		)
-
-		send_consulta_notification(so_name, guest_name=guest_name, guest_phone=guest_phone)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), f"Inquiry email failed for {so_name}")
-
-	# Twilio PIN send when mint already happened in the request (send=0 there).
-	client_access = None
-	pin = cstr(client_access_pin or "").strip()
-	e164 = cstr(phone_e164 or guest_phone or "").strip()
-	if cint(send_client_pin) and pin and e164:
-		try:
-			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
-				_portal_base_url,
-				_send_pin_message,
-			)
-
-			portal = f"{_portal_base_url()}/cliente"
-			send_result = _send_pin_message(e164, pin, portal)
-			client_access = {"pin": pin, "phone_e164": e164, "send": send_result}
-		except Exception:
-			frappe.log_error(frappe.get_traceback(), f"Client access PIN send failed for {so_name}")
-	elif cstr(guest_phone or "").strip() and not pin:
-		# No PIN minted in-request (e.g. no phone path) — full issue+send.
-		try:
-			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
-				issue_client_access_pin,
-			)
-
-			customer = frappe.db.get_value("Sales Order", so_name, "customer")
-			client_access = issue_client_access_pin(
-				guest_phone=guest_phone,
-				guest_name=guest_name,
-				guest_email=guest_email,
-				customer=customer,
-				allowed_countries=pin_allowed_countries,
-				send=cint(send_client_pin),
-			)
-			pin = cstr((client_access or {}).get("pin") or "").strip()
-			e164 = cstr((client_access or {}).get("phone_e164") or guest_phone or "").strip()
-		except Exception:
-			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so_name}")
-
-	# Preventa Lead bridge + stamp PIN onto Lead when we have one.
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import (
-			sync_lead_from_guest_preorder,
-		)
-
-		sync_lead_from_guest_preorder(
-			so_name,
-			guest_name=guest_name,
-			guest_phone=guest_phone,
-			guest_email=guest_email,
-			seller_ref_user=seller_ref_user,
-		)
-		lead_name = frappe.db.get_value(
-			"Preventa Lead Consulta", {"sales_order": so_name}, "lead"
-		)
-		if lead_name and pin:
-			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
-				_stamp_party,
-			)
-
-			_stamp_party("Lead", lead_name, pin, e164 or guest_phone)
-			frappe.db.commit()
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so_name}")
-
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
-
-		row = frappe.db.get_value(
-			"Sales Order",
-			so_name,
-			["customer", "grand_total", "currency"],
-			as_dict=True,
-		) or {}
-		emit_ecommerce_webhook(
-			"order_created",
-			{
-				"preorder_name": so_name,
-				"customer": row.get("customer"),
-				"grand_total": flt(row.get("grand_total")),
-				"currency": row.get("currency"),
-			},
-		)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "webhook order_created")
-
-	# Orden / planner remito + soft geocode (was the main UI stall).
-	if cint(ensure_remito):
-		try:
-			frappe.flags.ignore_permissions = True
-			so = frappe.get_doc("Sales Order", so_name)
-			frappe.flags.ignore_permissions = False
-			if _is_guest_preorder_sales_order(so) and cint(so.docstatus) == 1:
-				_ensure_planner_delivery_note(so)
-		except Exception:
-			frappe.log_error(frappe.get_traceback(), f"deferred planner remito failed for {so_name}")
-
-	return {"ok": True, "so_name": so_name, "client_access": client_access}
-
-
-def _enqueue_create_guest_preorder_side_effects(**kwargs):
-	"""Queue post-create work; fall back to inline if Redis/workers unavailable."""
-	so_name = cstr(kwargs.get("so_name") or "").strip()
-	try:
-		enq = {
-			"queue": "short",
-			"timeout": 300,
-			"enqueue_after_commit": True,
-			**kwargs,
-		}
-		if so_name:
-			enq["job_id"] = f"guest_preorder_side:{so_name}"
-		frappe.enqueue(
-			"erpnext.erpnext_integrations.ecommerce_api.api._run_create_guest_preorder_side_effects",
-			**enq,
-		)
-		return {"queued": True}
-	except Exception:
-		frappe.log_error(
-			frappe.get_traceback(),
-			f"enqueue create side effects failed for {so_name or '?'}",
-		)
-		try:
-			_run_create_guest_preorder_side_effects(**kwargs)
-			return {"queued": False, "ran_inline": True}
-		except Exception:
-			frappe.log_error(
-				frappe.get_traceback(),
-				f"inline create side effects failed for {so_name or '?'}",
-			)
-			return {"queued": False, "ran_inline": False}
-
-
 def _sales_order_table_columns():
 	return set(frappe.db.get_table_columns("Sales Order") or [])
 
@@ -4922,8 +4760,12 @@ def create_guest_preorder(
 		cap = flt(so.grand_total)
 		so.db_set("advance_paid", min(paid, cap) if cap > 0 else paid)
 
-	# Mint PIN in-request (fast DB) so catalog can stash it locally; Twilio send
-	# + email + Preventa + remito run after the HTTP response (see side effects).
+	from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import send_consulta_notification
+
+	send_consulta_notification(so.name, guest_name=guest_name, guest_phone=guest_phone)
+
+	# Client access PIN (Twilio WhatsApp/SMS) — check "never seen" BEFORE lead sync
+	# so the brand-new Lead created below does not count as "already known".
 	client_access = None
 	if cstr(guest_phone or "").strip():
 		try:
@@ -4937,28 +4779,66 @@ def create_guest_preorder(
 				guest_email=guest_email,
 				customer=so.customer,
 				allowed_countries=pin_allowed_countries,
-				send=0,
+				send=cint(send_client_pin),
 			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so.name}")
 
-	# Operaciones → Orden: submit now; remito/geocode deferred (was the long stall).
+	# Best-effort Pre-venta bridge: never let a Lead-sync problem affect the
+	# guest preorder response (see local_docs/proposals/i033_preventa_sales_kanban.md).
+	lead_name = None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import sync_lead_from_guest_preorder
+
+		sync_lead_from_guest_preorder(
+			so.name,
+			guest_name=guest_name,
+			guest_phone=guest_phone,
+			guest_email=guest_email,
+			seller_ref_user=seller_ref_user,
+		)
+		lead_name = frappe.db.get_value(
+			"Preventa Lead Consulta", {"sales_order": so.name}, "lead"
+		)
+		if lead_name and client_access and client_access.get("pin"):
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				_stamp_party,
+			)
+
+			_stamp_party(
+				"Lead",
+				lead_name,
+				client_access.get("pin"),
+				client_access.get("phone_e164") or guest_phone,
+			)
+			frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so.name}")
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		emit_ecommerce_webhook(
+			"order_created",
+			{
+				"preorder_name": so.name,
+				"customer": so.customer,
+				"grand_total": flt(so.grand_total),
+				"currency": so.currency,
+			},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook order_created")
+
+	# Operaciones → Orden (and similar staff entry points): skip Inquiry / Consulta.
 	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
 	promoted = None
 	if want_orden and resolved_rows:
-		promoted = set_guest_preorder_status(
-			so.name, "Orden", ensure_planner_remito=0
-		)
+		promoted = set_guest_preorder_status(so.name, "Orden")
 		so_name = cstr((promoted or {}).get("name") or so.name)
 		frappe.flags.ignore_permissions = True
 		so = frappe.get_doc("Sales Order", so_name)
 		frappe.flags.ignore_permissions = False
-	else:
-		from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
-			safe_touch_sales_order_last_editor,
-		)
-
-		safe_touch_sales_order_last_editor(so.name, commit=True)
 
 	payload = {
 		"preorder_name": so.name,
@@ -4966,14 +4846,12 @@ def create_guest_preorder(
 		"currency": so.currency,
 		"status": so.status,
 		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
-		"side_effects_queued": True,
 	}
 	if want_orden and resolved_rows:
 		payload["display_status"] = "Orden"
-		# Remito not ready yet — planner will pick it up after the background job.
-		payload["planner_ready"] = False
 		if isinstance(promoted, dict):
 			for key in (
+				"planner_ready",
 				"not_deliverable",
 				"delivery_warning",
 				"delivery_note",
@@ -4989,22 +4867,9 @@ def create_guest_preorder(
 			"phone_e164": client_access.get("phone_e164"),
 			"is_new_number": client_access.get("is_new_number"),
 			"portal_path": client_access.get("portal_path") or "/cliente",
-			"sent": False,
-			"channel": None,
+			"sent": (client_access.get("send") or {}).get("sent"),
+			"channel": (client_access.get("send") or {}).get("channel"),
 		}
-
-	_enqueue_create_guest_preorder_side_effects(
-		so_name=so.name,
-		ensure_remito=1 if (want_orden and resolved_rows) else 0,
-		guest_name=guest_name,
-		guest_phone=guest_phone,
-		guest_email=guest_email,
-		seller_ref_user=seller_ref_user,
-		pin_allowed_countries=pin_allowed_countries,
-		send_client_pin=cint(send_client_pin),
-		client_access_pin=(client_access or {}).get("pin") if client_access else None,
-		phone_e164=(client_access or {}).get("phone_e164") if client_access else None,
-	)
 	return payload
 
 
@@ -5173,7 +5038,6 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		_apply_tms_display_status(o)
 
 	_attach_factura_a_fields(filtered)
-	_attach_ecommerce_tags(filtered)
 	return {"preorders": filtered, "total_count": total_count}
 
 
@@ -5270,7 +5134,6 @@ def get_guest_preorder(preorder_name):
 		payload["delivery_note"] = lg.get("delivery_note")
 	_apply_tms_display_status(payload)
 	_attach_factura_a_fields([payload])
-	_attach_ecommerce_tags([payload])
 	return payload
 
 
@@ -5363,22 +5226,11 @@ def _normalize_pipeline_source(source):
 
 
 def _record_guest_preorder_status_audit(so_name, old_display, new_display, source=None):
-	"""Version Historial row + optional external-change KV for Órdenes highlight/banner.
-
-	Also clears PRINTED (print/download are the same) so the print icon resets on
-	every pipeline move — other tags are left alone.
-	"""
+	"""Version Historial row + optional external-change KV for Órdenes highlight/banner."""
 	old_s = cstr(old_display or "").strip()
 	new_s = cstr(new_display or "").strip()
 	if not so_name or old_s == new_s:
 		return
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.tags_api import clear_sales_order_print_tags
-
-		clear_sales_order_print_tags(so_name, commit=False)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "clear print tags on status change")
-
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
 
@@ -5577,38 +5429,7 @@ def _erp_status_for_display(display_status):
 	}.get(display_status)
 
 
-def _stamp_and_get_guest_preorder(so_name, user=None):
-	"""Touch L_* last-editor tag then return guest-preorder detail."""
-	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
-		safe_touch_sales_order_last_editor,
-	)
-
-	safe_touch_sales_order_last_editor(so_name, user=user, commit=True)
-	return get_guest_preorder(so_name)
-
-
-def _attach_ecommerce_tags(rows):
-	"""Attach Ecommerce Tag names onto guest-preorder list/detail rows as ``tags``."""
-	names = [cstr(r.get("name")).strip() for r in (rows or []) if r and r.get("name")]
-	names = [n for n in names if n]
-	if not names:
-		for r in rows or []:
-			if isinstance(r, dict):
-				r.setdefault("tags", [])
-		return
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
-
-		by_name = tags_map_for_docs("Sales Order", names)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "attach_ecommerce_tags")
-		by_name = {}
-	for r in rows or []:
-		if not isinstance(r, dict):
-			continue
-		r["tags"] = by_name.get(cstr(r.get("name")), []) or []
-
-
+@frappe.whitelist(allow_guest=True)
 def _attach_factura_a_fields(rows):
 	"""Attach Sales Order Factura A / delivery payment differential fields onto list/detail rows."""
 	names = [cstr(r.get("name")).strip() for r in (rows or []) if r.get("name")]
@@ -5713,22 +5534,11 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 		frappe.db.set_value("Sales Order", name, updates, update_modified=True)
 		frappe.db.commit()
 
-	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
-		safe_sync_sales_order_service_tags,
-		safe_touch_sales_order_last_editor,
-	)
-
-	safe_touch_sales_order_last_editor(name, commit=False)
-	req = None
-	if "custom_requires_factura_a" in updates:
-		req = cint(updates.get("custom_requires_factura_a") or 0)
-	safe_sync_sales_order_service_tags(name, requires_factura_a=req, commit=True)
-
 	return get_guest_preorder(name)
 
 
 @frappe.whitelist(allow_guest=True)
-def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_planner_remito=1):
+def set_guest_preorder_status(preorder_name, target_status, source=None):
 	"""
 	Unified status transition for the custom workflow.
 
@@ -5740,10 +5550,6 @@ def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_
 
 	``source`` (optional): when one of armado / remito / tms_claim / tms_pod, the
 	transition is treated as external to the Órdenes table (highlight + banner).
-
-	``ensure_planner_remito``: when truthy (default), Orden/Preparado creates the
-	Delivery Note for Rutas. Create-order paths pass 0 and enqueue remito instead
-	so the HTTP response is not blocked on remito/geocode.
 	"""
 	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
@@ -5766,10 +5572,7 @@ def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_
 		if target_status == "Consulta":
 			return new_detail
 		return set_guest_preorder_status(
-			new_detail["name"],
-			target_status,
-			source=pipeline_source,
-			ensure_planner_remito=ensure_planner_remito,
+			new_detail["name"], target_status, source=pipeline_source
 		)
 
 	current = _display_status(so)
@@ -5783,22 +5586,10 @@ def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_
 			_record_guest_preorder_status_audit(
 				preorder_name, current_base, "Consulta", source=pipeline_source
 			)
-			from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
-				safe_touch_sales_order_last_editor,
-			)
-
-			safe_touch_sales_order_last_editor(preorder_name, commit=True)
 		return get_guest_preorder(preorder_name)
 
 	# Submit draft if needed for forward transitions
 	if so.docstatus == 0:
-		if not (so.items or []):
-			frappe.throw(
-				_(
-					"Add at least one item before moving from Consulta to {0}. "
-					"You can still link a customer while the order stays in Consulta."
-				).format(target_status)
-			)
 		try:
 			# Safety: stale Consumidor Final contact must not block Consulta→Orden.
 			if _resync_so_party_links(so):
@@ -5844,19 +5635,12 @@ def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_
 	_record_guest_preorder_status_audit(
 		preorder_name, current_base, new_base, source=pipeline_source
 	)
-	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
-		safe_touch_sales_order_last_editor,
-	)
-
-	safe_touch_sales_order_last_editor(preorder_name, commit=True)
 	detail = get_guest_preorder(preorder_name)
 	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
-	if target_status in ("Orden", "Preparado") and cint(ensure_planner_remito):
+	if target_status in ("Orden", "Preparado"):
 		so.reload()
 		gate = _ensure_planner_delivery_note(so)
 		_attach_planner_gate_fields(detail, gate)
-	elif target_status in ("Orden", "Preparado"):
-		detail["planner_ready"] = False
 	return detail
 
 
@@ -6137,30 +5921,10 @@ def update_guest_preorder_details(preorder_name, data=None):
 		_update_guest_preorder_tag(so, "cashier", str(data.get("cashier_user") or "").strip())
 
 	if so.docstatus == 0:
-		# Consulta drafts may have no lines yet (catalog chat / notes-only).
-		# Full Document.save() still hits Frappe "Data missing in table: Items"
-		# even with ignore_mandatory on some builds — persist header via db_set.
-		if not (so.items or []):
-			updates = {}
-			if so.customer:
-				updates["customer"] = so.customer
-			if so.delivery_date:
-				updates["delivery_date"] = so.delivery_date
-			tag_fn = _guest_preorder_tag_fieldname()
-			if tag_fn and (
-				data.get("customer")
-				or data.get("cashier_user") is not None
-				or guest_tags_touched
-				or so.customer
-				or force_flag is not None
-				or geo_touched
-			):
-				updates[tag_fn] = getattr(so, tag_fn, None)
-			if updates:
-				frappe.db.set_value("Sales Order", current_name, updates, update_modified=True)
-		else:
-			so.flags.ignore_mandatory = True
-			so.save(ignore_permissions=True)
+		# Consulta drafts may have no lines yet — Frappe "Data missing in table: Items"
+		# must not block header / tag updates from the Pedidos panel.
+		so.flags.ignore_mandatory = True
+		so.save(ignore_permissions=True)
 	else:
 		# Submitted: persist allowed header fields without full amend
 		updates = {}
@@ -6220,11 +5984,6 @@ def update_guest_preorder_details(preorder_name, data=None):
 		current_name = new_name
 
 	frappe.db.commit()
-	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
-		safe_touch_sales_order_last_editor,
-	)
-
-	safe_touch_sales_order_last_editor(current_name, commit=True)
 	return get_guest_preorder(current_name)
 
 
@@ -6260,51 +6019,19 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 
 	# Draft + submitted: edit in place. Keep operator rate/qty/uom (WEIGHT) —
 	# do not re-price from rules. Submitted needs update-after-submit bypass.
-	measured = _apply_item_changes(so, items, additional_discount_amount)
+	_apply_item_changes(so, items, additional_discount_amount)
 	so.flags.ignore_pricing_rule = True
 	if so.docstatus == 1:
 		so.flags.ignore_validate_update_after_submit = True
 	with _allow_weight_fractional_stock_qty(so):
 		so.save(ignore_permissions=True)
 	so.reload()
-	# float_precision rounds weight_per_unit; restamp measured kg so 2kg stays 2.
-	_restamp_measured_line_weights(so, measured)
 	return get_guest_preorder(preorder_name)
 
 
-def _restamp_measured_line_weights(so, measured_total_weight):
-	"""Keep scale ``total_weight`` exact after Frappe rounds ``weight_per_unit``.
-
-	Site float_precision is often 3, so ``2 kg / 3 units`` → wpu ``0.667`` →
-	``qty * wpu`` reconstitutes ``2.001``. Measured pack weight is authoritative.
-	"""
-	if not measured_total_weight:
-		return
-	for row in so.items or []:
-		code = row.item_code
-		if code not in measured_total_weight or not row.name:
-			continue
-		intended = flt(measured_total_weight[code])
-		if abs(flt(row.total_weight) - intended) <= 1e-12:
-			continue
-		frappe.db.set_value(
-			"Sales Order Item",
-			row.name,
-			"total_weight",
-			intended,
-			update_modified=False,
-		)
-		row.total_weight = intended
-
-
 def _apply_item_changes(so, items, additional_discount_amount):
-	"""Apply item list changes to a Sales Order document (not yet saved).
-
-	Returns ``{item_code: measured_total_weight}`` for lines whose kg came from
-	the client (so callers can restamp after float_precision rounds wpu).
-	"""
+	"""Apply item list changes to a Sales Order document (not yet saved)."""
 	new_item_map = {i["item_code"]: i for i in items}
-	measured_total_weight = {}
 
 	# Remove rows not in the new list
 	so.items = [row for row in so.items if row.item_code in new_item_map]
@@ -6326,7 +6053,6 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			row.total_weight = tw
 			if flt(row.qty) > 0:
 				row.weight_per_unit = tw / flt(row.qty)
-			measured_total_weight[row.item_code] = tw
 		elif "weight_per_unit" in override and override.get("weight_per_unit") is not None:
 			row.weight_per_unit = flt(override.get("weight_per_unit"))
 			row.total_weight = flt(row.qty) * flt(row.weight_per_unit)
@@ -6347,17 +6073,11 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			)
 			if item.get("uom") is not None or item.get("stock_uom") is not None:
 				_apply_so_line_uom(row, item.get("uom") or item.get("stock_uom"))
-			if item.get("total_weight") is not None:
-				tw = flt(item.get("total_weight"))
-				row.total_weight = tw
-				if flt(row.qty) > 0:
-					row.weight_per_unit = tw / flt(row.qty)
-				measured_total_weight[row.item_code] = tw
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
 	so.run_method("calculate_taxes_and_totals")
-	return measured_total_weight
+
 
 @frappe.whitelist()
 def update_guest_preorder_prices(preorder_name, items, additional_discount_amount=0):
@@ -6397,7 +6117,7 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	with _allow_weight_fractional_stock_qty(so):
 		so.save(ignore_permissions=True)
 	so.reload()
-	return _stamp_and_get_guest_preorder(preorder_name)
+	return get_guest_preorder(preorder_name)
 
 
 @frappe.whitelist()
@@ -6483,7 +6203,7 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 		})
 	pe.insert(ignore_permissions=True)
 	pe.submit()
-	return _stamp_and_get_guest_preorder(preorder_name)
+	return get_guest_preorder(preorder_name)
 
 
 @frappe.whitelist()
@@ -7413,7 +7133,7 @@ def update_guest_preorder_logistics(
 			frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
 
 	frappe.db.commit()
-	return _stamp_and_get_guest_preorder(name)
+	return get_guest_preorder(name)
 
 
 def _preorder_address_line(so, *, allow_customer_primary=True) -> str:
@@ -7634,55 +7354,6 @@ def _no_address_delivery_warning():
 		"Este pedido no tiene dirección — no se entregará ni aparecerá en el "
 		"planificador hasta asignar una dirección."
 	)
-
-
-def _run_planner_remito_side_effect(so_name=None):
-	"""Background: create planner Delivery Note for an Orden/Preparado guest SO."""
-	so_name = cstr(so_name or "").strip()
-	if not so_name or not frappe.db.exists("Sales Order", so_name):
-		return {"ok": False, "reason": "missing_so"}
-	try:
-		frappe.flags.ignore_permissions = True
-		so = frappe.get_doc("Sales Order", so_name)
-		frappe.flags.ignore_permissions = False
-		if not _is_guest_preorder_sales_order(so) or cint(so.docstatus) != 1:
-			return {"ok": False, "reason": "not_eligible"}
-		gate = _ensure_planner_delivery_note(so)
-		return {"ok": True, "gate": gate}
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), f"deferred planner remito failed for {so_name}")
-		return {"ok": False, "reason": "error"}
-
-
-def _enqueue_planner_remito(so_name):
-	"""Queue remito/geocode after status promote; fall back to inline if no workers."""
-	so_name = cstr(so_name or "").strip()
-	if not so_name:
-		return {"queued": False}
-	try:
-		frappe.enqueue(
-			"erpnext.erpnext_integrations.ecommerce_api.api._run_planner_remito_side_effect",
-			queue="short",
-			timeout=300,
-			enqueue_after_commit=True,
-			job_id=f"planner_remito:{so_name}",
-			so_name=so_name,
-		)
-		return {"queued": True}
-	except Exception:
-		frappe.log_error(
-			frappe.get_traceback(),
-			f"enqueue planner remito failed for {so_name}",
-		)
-		try:
-			_run_planner_remito_side_effect(so_name=so_name)
-			return {"queued": False, "ran_inline": True}
-		except Exception:
-			frappe.log_error(
-				frappe.get_traceback(),
-				f"inline planner remito failed for {so_name}",
-			)
-			return {"queued": False, "ran_inline": False}
 
 
 def _ensure_planner_delivery_note(so):
