@@ -3674,6 +3674,32 @@
       "bug": "set_guest_preorder_status Orden with null name is controlled (no AttributeError on planner gate)"
     },
     {
+      "id": "update_guest_preorder_details_empty_items_customer",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_details",
+      "args": {
+        "preorder_name": "",
+        "data": {
+          "customer": "Consumidor Final",
+          "customer_name": "Test Relate",
+          "guest_address": "Av. Santa Fe 3000"
+        }
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Relacionar on notes-only Consulta (no Items) must not HTTP 417 Data missing in table Items"
+    },
+    {
+      "id": "set_guest_preorder_status_orden_empty_name_controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Orden"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Consulta→Orden with empty/missing SO name is controlled, not Items 417"
+    },
+    {
       "id": "sync_orden_planner_remitos_null_company",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.sync_orden_planner_remitos",
       "args": {

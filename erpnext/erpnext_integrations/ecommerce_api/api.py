@@ -5792,6 +5792,13 @@ def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_
 
 	# Submit draft if needed for forward transitions
 	if so.docstatus == 0:
+		if not (so.items or []):
+			frappe.throw(
+				_(
+					"Add at least one item before moving from Consulta to {0}. "
+					"You can still link a customer while the order stays in Consulta."
+				).format(target_status)
+			)
 		try:
 			# Safety: stale Consumidor Final contact must not block Consulta→Orden.
 			if _resync_so_party_links(so):
@@ -6130,10 +6137,30 @@ def update_guest_preorder_details(preorder_name, data=None):
 		_update_guest_preorder_tag(so, "cashier", str(data.get("cashier_user") or "").strip())
 
 	if so.docstatus == 0:
-		# Consulta drafts may have no lines yet — Frappe "Data missing in table: Items"
-		# must not block header / tag updates from the Pedidos panel.
-		so.flags.ignore_mandatory = True
-		so.save(ignore_permissions=True)
+		# Consulta drafts may have no lines yet (catalog chat / notes-only).
+		# Full Document.save() still hits Frappe "Data missing in table: Items"
+		# even with ignore_mandatory on some builds — persist header via db_set.
+		if not (so.items or []):
+			updates = {}
+			if so.customer:
+				updates["customer"] = so.customer
+			if so.delivery_date:
+				updates["delivery_date"] = so.delivery_date
+			tag_fn = _guest_preorder_tag_fieldname()
+			if tag_fn and (
+				data.get("customer")
+				or data.get("cashier_user") is not None
+				or guest_tags_touched
+				or so.customer
+				or force_flag is not None
+				or geo_touched
+			):
+				updates[tag_fn] = getattr(so, tag_fn, None)
+			if updates:
+				frappe.db.set_value("Sales Order", current_name, updates, update_modified=True)
+		else:
+			so.flags.ignore_mandatory = True
+			so.save(ignore_permissions=True)
 	else:
 		# Submitted: persist allowed header fields without full amend
 		updates = {}
