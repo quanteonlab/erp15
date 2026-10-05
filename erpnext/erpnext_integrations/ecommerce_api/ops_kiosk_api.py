@@ -430,6 +430,9 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 
 	``items`` when provided are persisted first via ``update_armado_items``; then the
 	order is promoted with ``source=armado``. Rejects non-Orden stages.
+
+	Planner remito/geocode is enqueued (not inline) so the kiosk confirm button
+	returns quickly — same pattern as create_guest_preorder → Orden.
 	"""
 	identity = _require_ops_operator(pin)
 	preorder_name = str(preorder_name or "").strip()
@@ -480,7 +483,9 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 			_("Only Orden-stage orders can be confirmed in armado (current: {0})").format(base)
 		)
 
-	detail = set_guest_preorder_status(preorder_name, "Preparado", source="armado")
+	detail = set_guest_preorder_status(
+		preorder_name, "Preparado", source="armado", ensure_planner_remito=0
+	)
 	_log_armado_operator(
 		(detail or {}).get("name") or preorder_name, identity, via="armado_confirm"
 	)
@@ -501,18 +506,20 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "armado last-editor tag")
 	name = (detail or {}).get("name") or preorder_name
-	sheet = get_armado_order(name)
-	order = sheet.get("order") if isinstance(sheet, dict) else detail
-	if isinstance(order, dict) and detail and isinstance(detail, dict):
-		order = {
-			**order,
-			"display_status": detail.get("display_status") or order.get("display_status"),
-			"status": detail.get("status") or order.get("status"),
-			"ean13": armado_ean13_for_order(name),
-		}
+	# Remito + geocode used to run inline here and stall the kiosk — same deferral
+	# pattern as create_guest_preorder (Orden). Order is already Preparado.
+	from erpnext.erpnext_integrations.ecommerce_api.api import _enqueue_planner_remito
+
+	remito_job = _enqueue_planner_remito(name)
+	# Light payload — skip get_armado_order floor-map rebuild; UI drops the sheet.
+	order = dict(detail) if isinstance(detail, dict) else {"name": name}
+	order["ean13"] = armado_ean13_for_order(name)
+	order["display_status"] = order.get("display_status") or "Preparado"
+	order["status"] = order.get("status") or "Preparado"
 	return {
 		"ok": True,
 		"already_confirmed": 0,
+		"remito_queued": 1 if remito_job.get("queued") else 0,
 		"order": order,
 		"operator": {
 			"kind": identity.get("kind"),

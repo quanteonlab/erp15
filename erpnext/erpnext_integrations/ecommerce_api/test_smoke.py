@@ -2219,6 +2219,16 @@ def suite_5_12_modules_read():
             assert stamped.get("ok") and so in (stamped.get("names") or []), stamped
             got = ta.get_tags_for_doc("Sales Order", so)
             assert "PRINTED" in (got.get("tags") or []), got
+            # download is the same as print — stamps PRINTED, not DOWNLOADED
+            stamped2 = ta.mark_sales_orders_print_action(names=[so], action="downloaded", commit=True)
+            assert stamped2.get("action") == "printed", stamped2
+            got_dl = ta.get_tags_for_doc("Sales Order", so)
+            assert "PRINTED" in (got_dl.get("tags") or []), got_dl
+            assert "DOWNLOADED" not in (got_dl.get("tags") or []), got_dl
+            cleared = ta.clear_sales_order_print_tags(so, commit=True)
+            assert cleared.get("ok") is not False, cleared
+            got_clear = ta.get_tags_for_doc("Sales Order", so)
+            assert "PRINTED" not in (got_clear.get("tags") or []), got_clear
             ta.safe_touch_sales_order_last_editor(so, user="smoke_editor", commit=True)
             got2 = ta.get_tags_for_doc("Sales Order", so)
             assert any(str(t).startswith("L_") for t in (got2.get("tags") or [])), got2

@@ -5363,11 +5363,22 @@ def _normalize_pipeline_source(source):
 
 
 def _record_guest_preorder_status_audit(so_name, old_display, new_display, source=None):
-	"""Version Historial row + optional external-change KV for Órdenes highlight/banner."""
+	"""Version Historial row + optional external-change KV for Órdenes highlight/banner.
+
+	Also clears PRINTED (print/download are the same) so the print icon resets on
+	every pipeline move — other tags are left alone.
+	"""
 	old_s = cstr(old_display or "").strip()
 	new_s = cstr(new_display or "").strip()
 	if not so_name or old_s == new_s:
 		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import clear_sales_order_print_tags
+
+		clear_sales_order_print_tags(so_name, commit=False)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "clear print tags on status change")
+
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
 
@@ -6220,53 +6231,18 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	if not items:
 		frappe.throw(_("Items list cannot be empty"))
 
-<<<<<<< Updated upstream
 	# Draft + submitted: edit in place. Keep operator rate/qty/uom (WEIGHT) —
 	# do not re-price from rules. Submitted needs update-after-submit bypass.
 	measured = _apply_item_changes(so, items, additional_discount_amount)
-=======
-	if so.docstatus == 1 and cstr(so.status) == "Consulta":
-		# Soft Consulta: edit in place — do not cancel/archive.
-		_apply_item_changes(so, items, additional_discount_amount)
-		so.flags.ignore_pricing_rule = True
-		so.flags.ignore_validate_update_after_submit = True
-		with _allow_weight_fractional_stock_qty(so):
-			so.save(ignore_permissions=True)
-		so.reload()
-		return _stamp_and_get_guest_preorder(preorder_name)
-
-	if so.docstatus == 1:
-		# Amend: cancel original, create amended copy with changes, submit
-		amended = frappe.copy_doc(so)
-		amended.amended_from = so.name
-		amended.docstatus = 0
-		so.flags.ignore_permissions = True
-		so.cancel()
-		_apply_item_changes(amended, items, additional_discount_amount)
-		amended.flags.ignore_pricing_rule = True
-		desired = _allocate_amend_name("Sales Order", so.name)
-		with _allow_weight_fractional_stock_qty(amended):
-			amended.insert(ignore_permissions=True, set_name=desired)
-			amended.submit()
-		amended.reload()
-		return _stamp_and_get_guest_preorder(amended.name)
-
-	# Draft: edit in place. Keep operator rate/qty/uom (WEIGHT) — do not re-price from rules.
-	_apply_item_changes(so, items, additional_discount_amount)
->>>>>>> Stashed changes
 	so.flags.ignore_pricing_rule = True
 	if so.docstatus == 1:
 		so.flags.ignore_validate_update_after_submit = True
 	with _allow_weight_fractional_stock_qty(so):
 		so.save(ignore_permissions=True)
 	so.reload()
-<<<<<<< Updated upstream
 	# float_precision rounds weight_per_unit; restamp measured kg so 2kg stays 2.
 	_restamp_measured_line_weights(so, measured)
 	return get_guest_preorder(preorder_name)
-=======
-	return _stamp_and_get_guest_preorder(preorder_name)
->>>>>>> Stashed changes
 
 
 def _restamp_measured_line_weights(so, measured_total_weight):
@@ -7631,6 +7607,55 @@ def _no_address_delivery_warning():
 		"Este pedido no tiene dirección — no se entregará ni aparecerá en el "
 		"planificador hasta asignar una dirección."
 	)
+
+
+def _run_planner_remito_side_effect(so_name=None):
+	"""Background: create planner Delivery Note for an Orden/Preparado guest SO."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return {"ok": False, "reason": "missing_so"}
+	try:
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+		if not _is_guest_preorder_sales_order(so) or cint(so.docstatus) != 1:
+			return {"ok": False, "reason": "not_eligible"}
+		gate = _ensure_planner_delivery_note(so)
+		return {"ok": True, "gate": gate}
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"deferred planner remito failed for {so_name}")
+		return {"ok": False, "reason": "error"}
+
+
+def _enqueue_planner_remito(so_name):
+	"""Queue remito/geocode after status promote; fall back to inline if no workers."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name:
+		return {"queued": False}
+	try:
+		frappe.enqueue(
+			"erpnext.erpnext_integrations.ecommerce_api.api._run_planner_remito_side_effect",
+			queue="short",
+			timeout=300,
+			enqueue_after_commit=True,
+			job_id=f"planner_remito:{so_name}",
+			so_name=so_name,
+		)
+		return {"queued": True}
+	except Exception:
+		frappe.log_error(
+			frappe.get_traceback(),
+			f"enqueue planner remito failed for {so_name}",
+		)
+		try:
+			_run_planner_remito_side_effect(so_name=so_name)
+			return {"queued": False, "ran_inline": True}
+		except Exception:
+			frappe.log_error(
+				frappe.get_traceback(),
+				f"inline planner remito failed for {so_name}",
+			)
+			return {"queued": False, "ran_inline": False}
 
 
 def _ensure_planner_delivery_note(so):

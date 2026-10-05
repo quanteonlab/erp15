@@ -3698,7 +3698,6 @@
       "bug": "get_guest_preorders_list: null paging + missing Delivery Stop custom_payments_json must not TypeError/1054"
     },
     {
-<<<<<<< Updated upstream
       "id": "list_customer_addresses_dirty",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_customer_addresses",
       "args": {
@@ -3815,7 +3814,8 @@
       "expect": "ok",
       "source": "regression",
       "bug": "badge count endpoint must return dict without crashing when custom field missing/empty"
-=======
+    },
+    {
       "id": "get_field_acl_catalog_ok",
       "method": "erpnext.erpnext_integrations.ecommerce_api.field_acl.get_field_acl_catalog",
       "args": {},
@@ -3826,7 +3826,9 @@
     {
       "id": "get_group_field_acl_null_name",
       "method": "erpnext.erpnext_integrations.ecommerce_api.field_acl.get_group_field_acl",
-      "args": { "name": null },
+      "args": {
+        "name": null
+      },
       "expect": "controlled_error",
       "source": "regression",
       "bug": "get_group_field_acl(null) must not TypeError"
@@ -3834,7 +3836,10 @@
     {
       "id": "save_group_field_acl_null_acl",
       "method": "erpnext.erpnext_integrations.ecommerce_api.field_acl.save_group_field_acl",
-      "args": { "name": "", "acl": null },
+      "args": {
+        "name": "",
+        "acl": null
+      },
       "expect": "controlled_error",
       "source": "regression",
       "bug": "save_group_field_acl with empty name / null acl must not TypeError"
@@ -3842,7 +3847,9 @@
     {
       "id": "get_user_field_acl_null_user",
       "method": "erpnext.erpnext_integrations.ecommerce_api.field_acl.get_user_field_acl",
-      "args": { "username": null },
+      "args": {
+        "username": null
+      },
       "expect": "no_500",
       "source": "regression",
       "bug": "get_user_field_acl(null) falls back to acting user / empty acl"
@@ -3850,7 +3857,10 @@
     {
       "id": "mark_sales_orders_print_action_null_names",
       "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.mark_sales_orders_print_action",
-      "args": { "names": null, "action": "printed" },
+      "args": {
+        "names": null,
+        "action": "printed"
+      },
       "expect": "controlled_error",
       "source": "regression",
       "bug": "mark_sales_orders_print_action(null names) must not TypeError"
@@ -3858,19 +3868,34 @@
     {
       "id": "mark_sales_orders_print_action_null_action",
       "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.mark_sales_orders_print_action",
-      "args": { "names": [], "action": null },
+      "args": {
+        "names": [],
+        "action": null
+      },
       "expect": "controlled_error",
       "source": "regression",
       "bug": "mark_sales_orders_print_action(null action) must not TypeError"
     },
     {
+      "id": "clear_sales_order_print_tags_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tags_api.clear_sales_order_print_tags",
+      "args": {
+        "so_name": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "clear_sales_order_print_tags(null) returns ok=False; never TypeError; does not wipe other tags"
+    },
+    {
       "id": "list_tag_events_null_ref",
       "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.list_tag_events",
-      "args": { "reference_doctype": null, "reference_name": null },
+      "args": {
+        "reference_doctype": null,
+        "reference_name": null
+      },
       "expect": "controlled_error",
       "source": "regression",
       "bug": "list_tag_events(null refs) must not TypeError"
->>>>>>> Stashed changes
     }
-  ]
+]
 }

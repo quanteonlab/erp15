@@ -10,11 +10,14 @@ from frappe import _
 from frappe.utils import cint, cstr, now_datetime
 
 TAG_PRINTED = "PRINTED"
+# Legacy alias — print and download are the same; prefer TAG_PRINTED only.
 TAG_DOWNLOADED = "DOWNLOADED"
 TAG_SRV_FACTURA_A = "SRV-FACTURA_A"
 TAG_SRV_LATE = "SRV_LATE"
 LAST_EDITOR_PREFIX = "L_"
 SYSTEM_SO_TAGS = frozenset({TAG_PRINTED, TAG_DOWNLOADED, TAG_SRV_FACTURA_A, TAG_SRV_LATE})
+# Tags that mean “was printed/downloaded”; cleared on pipeline status change.
+PRINT_OUTPUT_TAGS = frozenset({TAG_PRINTED, TAG_DOWNLOADED})
 
 
 def _normalize_tag_name(name: str) -> str:
@@ -395,13 +398,13 @@ def mark_sales_orders_print_action(
 	*,
 	commit: bool = True,
 ) -> dict:
-	"""Stamp PRINTED or DOWNLOADED (+ last editor) on one or more Sales Orders."""
+	"""Stamp PRINTED (+ last editor) on one or more Sales Orders.
+
+	``printed`` and ``downloaded`` are the same action — both set PRINTED and
+	drop any legacy DOWNLOADED tag.
+	"""
 	action_raw = cstr(action or "").strip().lower()
-	if action_raw in ("print", "printed"):
-		tag = TAG_PRINTED
-	elif action_raw in ("pdf", "download", "downloaded"):
-		tag = TAG_DOWNLOADED
-	else:
+	if action_raw not in ("print", "printed", "pdf", "download", "downloaded"):
 		frappe.throw(_("action must be printed or downloaded"))
 
 	if isinstance(names, str):
@@ -420,13 +423,28 @@ def mark_sales_orders_print_action(
 	for name in order_names:
 		if not frappe.db.exists("Sales Order", name):
 			continue
-		add_tags_for_doc("Sales Order", name, tags=[tag], commit=False)
+		# Unify: always PRINTED; strip legacy DOWNLOADED so UI shows one icon.
+		remove_tags_for_doc("Sales Order", name, tags=[TAG_DOWNLOADED], commit=False)
+		add_tags_for_doc("Sales Order", name, tags=[TAG_PRINTED], commit=False)
 		touch_sales_order_last_editor(name, commit=False)
 		updated.append(name)
 
 	if commit:
 		frappe.db.commit()
-	return {"ok": True, "action": "printed" if tag == TAG_PRINTED else "downloaded", "names": updated}
+	return {"ok": True, "action": "printed", "names": updated}
+
+
+def clear_sales_order_print_tags(so_name, *, commit: bool = True) -> dict:
+	"""Remove only print-output tags (PRINTED / legacy DOWNLOADED); keep all other tags."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return {"ok": False, "cleared": False}
+	return remove_tags_for_doc(
+		"Sales Order",
+		so_name,
+		tags=list(PRINT_OUTPUT_TAGS),
+		commit=commit,
+	)
 
 
 @frappe.whitelist()
