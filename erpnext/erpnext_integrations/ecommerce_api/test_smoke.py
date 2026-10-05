@@ -2207,6 +2207,34 @@ def suite_5_12_modules_read():
         from erpnext.erpnext_integrations.ecommerce_api import tags_api as ta
         tags = ta.search_tags(query="a")
         assert tags is not None
+        # SO system tags: stamp print + last editor + list events (dirty names controlled)
+        so = frappe.db.get_value(
+            "Sales Order",
+            {"docstatus": ["<", 2]},
+            "name",
+            order_by="modified desc",
+        )
+        if so:
+            stamped = ta.mark_sales_orders_print_action(names=[so], action="printed", commit=True)
+            assert stamped.get("ok") and so in (stamped.get("names") or []), stamped
+            got = ta.get_tags_for_doc("Sales Order", so)
+            assert "PRINTED" in (got.get("tags") or []), got
+            ta.safe_touch_sales_order_last_editor(so, user="smoke_editor", commit=True)
+            got2 = ta.get_tags_for_doc("Sales Order", so)
+            assert any(str(t).startswith("L_") for t in (got2.get("tags") or [])), got2
+            ev = ta.list_tag_events(reference_doctype="Sales Order", reference_name=so, limit=5)
+            assert isinstance(ev.get("events"), list), ev
+        # Controlled dirty: empty names must ValidationError, not 500
+        try:
+            ta.mark_sales_orders_print_action(names=[], action="printed")
+            raise AssertionError("expected ValidationError for empty names")
+        except Exception as exc:
+            assert "ValidationError" in type(exc).__name__ or "name" in str(exc).lower() or "required" in str(exc).lower(), exc
+        try:
+            ta.mark_sales_orders_print_action(names=[so] if so else ["x"], action=None)
+            raise AssertionError("expected ValidationError for bad action")
+        except Exception as exc:
+            assert "ValidationError" in type(exc).__name__ or "action" in str(exc).lower(), exc
 
     def check_openapi():
         from erpnext.erpnext_integrations.ecommerce_api import openapi

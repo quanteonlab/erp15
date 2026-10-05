@@ -1069,6 +1069,27 @@ def _sales_orders_for_dn(dn):
 	return list({s for s in so_names if s})
 
 
+def _sync_stop_cliente_debe_tags(stop) -> None:
+	"""Mirror stop.custom_cliente_debe onto linked Sales Order SRV_LATE tags."""
+	try:
+		dn = cstr(getattr(stop, "delivery_note", None) or "").strip()
+		so_names = _sales_orders_for_dn(dn) if dn else []
+		if not so_names:
+			return
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+			safe_sync_sales_order_service_tags,
+			safe_touch_sales_order_last_editor,
+		)
+
+		flag = 1 if cint(getattr(stop, "custom_cliente_debe", 0) or 0) else 0
+		for so_name in so_names:
+			safe_touch_sales_order_last_editor(so_name, commit=False)
+			safe_sync_sales_order_service_tags(so_name, cliente_debe=flag, commit=False)
+		frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "sync_stop_cliente_debe_tags")
+
+
 def _weekday_tag_from_date(d):
 	tags = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 	try:
@@ -9144,6 +9165,18 @@ def _sync_so_factura_and_surcharge_fields(
 			updates["custom_delivery_payment_summary"] = payment_summary
 		if updates:
 			frappe.db.set_value("Sales Order", so_name, updates, update_modified=True)
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+				safe_sync_sales_order_service_tags,
+				safe_touch_sales_order_last_editor,
+			)
+
+			safe_touch_sales_order_last_editor(so_name, commit=False)
+			safe_sync_sales_order_service_tags(
+				so_name, requires_factura_a=requires_factura_a, commit=False
+			)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "sync SO service tags")
 		if mode == "snapshot_only":
 			continue
 		if mode in ("so_line", "payment_entry") and flt(surcharge_amount) > 0.005:
@@ -9329,6 +9362,7 @@ def _sync_stop_collection_to_sales_orders(
 		payment_summary=payment_summary,
 		settings=settings,
 	)
+	_sync_stop_cliente_debe_tags(stop)
 	pay_rows = list(payments or [])
 	if not pay_rows and flt(delta_collected) > 0:
 		pay_rows = [
@@ -9883,6 +9917,7 @@ def driver_mark_cliente_debe(trip_name, stop_idx, amount, note=None):
 	trip.flags.ignore_validate_update_after_submit = True
 	trip.save(ignore_permissions=True)
 	frappe.db.commit()
+	_sync_stop_cliente_debe_tags(stop)
 
 	return get_trip_map_data(trip_name)
 

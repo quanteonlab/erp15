@@ -484,6 +484,22 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 	_log_armado_operator(
 		(detail or {}).get("name") or preorder_name, identity, via="armado_confirm"
 	)
+	# Prefer ops PIN employee user_id / name for L_* over API-key session user.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+			safe_touch_sales_order_last_editor,
+		)
+
+		actor = None
+		if identity.get("kind") == "admin":
+			actor = "Admin"
+		else:
+			actor = identity.get("user_id") or identity.get("employee_name") or identity.get("employee")
+		safe_touch_sales_order_last_editor(
+			(detail or {}).get("name") or preorder_name, user=actor, commit=True
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "armado last-editor tag")
 	name = (detail or {}).get("name") or preorder_name
 	sheet = get_armado_order(name)
 	order = sheet.get("order") if isinstance(sheet, dict) else detail

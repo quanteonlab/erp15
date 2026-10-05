@@ -3728,6 +3728,42 @@ def resolve_ops_pin(pin=None):
     return _impl(pin=pin)
 
 
+@frappe.whitelist(allow_guest=True)
+def get_field_acl_catalog():
+    from erpnext.erpnext_integrations.ecommerce_api.field_acl import (
+        get_field_acl_catalog as _impl,
+    )
+
+    return _impl()
+
+
+@frappe.whitelist(allow_guest=True)
+def get_group_field_acl(name=None):
+    from erpnext.erpnext_integrations.ecommerce_api.field_acl import (
+        get_group_field_acl as _impl,
+    )
+
+    return _impl(name=name)
+
+
+@frappe.whitelist(allow_guest=True)
+def save_group_field_acl(name=None, acl=None):
+    from erpnext.erpnext_integrations.ecommerce_api.field_acl import (
+        save_group_field_acl as _impl,
+    )
+
+    return _impl(name=name, acl=acl)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_user_field_acl(username=None):
+    from erpnext.erpnext_integrations.ecommerce_api.field_acl import (
+        get_user_field_acl as _impl,
+    )
+
+    return _impl(username=username)
+
+
 @frappe.whitelist()
 def get_extra_fields_bundle(scope, row_keys=None):
     from erpnext.erpnext_integrations.ecommerce_api.extra_fields import (
@@ -4292,3 +4328,19 @@ def set_doc_tags(reference_doctype, reference_name, tags=None):
     from erpnext.erpnext_integrations.ecommerce_api.tags_api import set_doc_tags as _impl
 
     return _impl(reference_doctype, reference_name, tags=tags)
+
+
+@frappe.whitelist()
+def mark_sales_orders_print_action(names=None, action=None):
+    from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+        mark_sales_orders_print_action_api as _impl,
+    )
+
+    return _impl(names=names, action=action)
+
+
+@frappe.whitelist()
+def list_tag_events(reference_doctype=None, reference_name=None, limit=50):
+    from erpnext.erpnext_integrations.ecommerce_api.tags_api import list_tag_events as _impl
+
+    return _impl(reference_doctype=reference_doctype, reference_name=reference_name, limit=limit)

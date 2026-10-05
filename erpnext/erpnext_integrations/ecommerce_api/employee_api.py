@@ -170,12 +170,12 @@ APP_PERMISSIONS = [
 	{
 		"id": "tables.review",
 		"group": "tablas",
-		"label_en": "Review / approvals",
-		"label_es": "Review / aprobaciones",
-		"label_zh": "审核",
-		"desc_en": "Approve or reject new products from receiving.",
-		"desc_es": "Aprobar o rechazar productos nuevos de recepción.",
-		"desc_zh": "批准或拒绝收货产生的新商品。",
+		"label_en": "Suggestions",
+		"label_es": "Sugerencias",
+		"label_zh": "建议",
+		"desc_en": "Review product drafts and field-change suggestions from operaciones.",
+		"desc_es": "Revisar borradores de productos y sugerencias de campos desde operaciones.",
+		"desc_zh": "审核来自作业端的商品草稿与字段修改建议。",
 	},
 	{
 		"id": "tables.variants",
@@ -1417,6 +1417,12 @@ def delete_employee_group(name):
 	if name in store:
 		store.pop(name, None)
 		_save_perm_store(store)
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.field_acl import drop_group_field_acl
+
+		drop_group_field_acl(name)
+	except Exception:
+		frappe.log_error(title="drop_group_field_acl")
 	frappe.db.commit()
 	return {"ok": True}
 
@@ -1569,6 +1575,19 @@ def _ensure_starter_staff_groups() -> dict:
 	if dirty:
 		_save_perm_store(store)
 		frappe.db.commit()
+	# Seed field ACL matrices for starters that have none yet (settings UI).
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.field_acl import ensure_starter_field_acls
+
+		ensure_starter_field_acls(
+			[
+				{"name": r["name"], "employee_group_name": r["employee_group_name"]}
+				for r in (created + attached + upgraded + skipped)
+				if r.get("name")
+			]
+		)
+	except Exception:
+		frappe.log_error(title="ensure_starter_field_acls")
 	return {"created": created, "attached": attached, "upgraded": upgraded, "skipped": skipped}
 
 

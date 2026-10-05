@@ -4953,6 +4953,12 @@ def create_guest_preorder(
 		frappe.flags.ignore_permissions = True
 		so = frappe.get_doc("Sales Order", so_name)
 		frappe.flags.ignore_permissions = False
+	else:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+			safe_touch_sales_order_last_editor,
+		)
+
+		safe_touch_sales_order_last_editor(so.name, commit=True)
 
 	payload = {
 		"preorder_name": so.name,
@@ -5167,6 +5173,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		_apply_tms_display_status(o)
 
 	_attach_factura_a_fields(filtered)
+	_attach_ecommerce_tags(filtered)
 	return {"preorders": filtered, "total_count": total_count}
 
 
@@ -5263,6 +5270,7 @@ def get_guest_preorder(preorder_name):
 		payload["delivery_note"] = lg.get("delivery_note")
 	_apply_tms_display_status(payload)
 	_attach_factura_a_fields([payload])
+	_attach_ecommerce_tags([payload])
 	return payload
 
 
@@ -5558,7 +5566,38 @@ def _erp_status_for_display(display_status):
 	}.get(display_status)
 
 
-@frappe.whitelist(allow_guest=True)
+def _stamp_and_get_guest_preorder(so_name, user=None):
+	"""Touch L_* last-editor tag then return guest-preorder detail."""
+	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+		safe_touch_sales_order_last_editor,
+	)
+
+	safe_touch_sales_order_last_editor(so_name, user=user, commit=True)
+	return get_guest_preorder(so_name)
+
+
+def _attach_ecommerce_tags(rows):
+	"""Attach Ecommerce Tag names onto guest-preorder list/detail rows as ``tags``."""
+	names = [cstr(r.get("name")).strip() for r in (rows or []) if r and r.get("name")]
+	names = [n for n in names if n]
+	if not names:
+		for r in rows or []:
+			if isinstance(r, dict):
+				r.setdefault("tags", [])
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
+
+		by_name = tags_map_for_docs("Sales Order", names)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "attach_ecommerce_tags")
+		by_name = {}
+	for r in rows or []:
+		if not isinstance(r, dict):
+			continue
+		r["tags"] = by_name.get(cstr(r.get("name")), []) or []
+
+
 def _attach_factura_a_fields(rows):
 	"""Attach Sales Order Factura A / delivery payment differential fields onto list/detail rows."""
 	names = [cstr(r.get("name")).strip() for r in (rows or []) if r.get("name")]
@@ -5663,6 +5702,17 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 		frappe.db.set_value("Sales Order", name, updates, update_modified=True)
 		frappe.db.commit()
 
+	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+		safe_sync_sales_order_service_tags,
+		safe_touch_sales_order_last_editor,
+	)
+
+	safe_touch_sales_order_last_editor(name, commit=False)
+	req = None
+	if "custom_requires_factura_a" in updates:
+		req = cint(updates.get("custom_requires_factura_a") or 0)
+	safe_sync_sales_order_service_tags(name, requires_factura_a=req, commit=True)
+
 	return get_guest_preorder(name)
 
 
@@ -5722,6 +5772,11 @@ def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_
 			_record_guest_preorder_status_audit(
 				preorder_name, current_base, "Consulta", source=pipeline_source
 			)
+			from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+				safe_touch_sales_order_last_editor,
+			)
+
+			safe_touch_sales_order_last_editor(preorder_name, commit=True)
 		return get_guest_preorder(preorder_name)
 
 	# Submit draft if needed for forward transitions
@@ -5771,6 +5826,11 @@ def set_guest_preorder_status(preorder_name, target_status, source=None, ensure_
 	_record_guest_preorder_status_audit(
 		preorder_name, current_base, new_base, source=pipeline_source
 	)
+	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+		safe_touch_sales_order_last_editor,
+	)
+
+	safe_touch_sales_order_last_editor(preorder_name, commit=True)
 	detail = get_guest_preorder(preorder_name)
 	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
 	if target_status in ("Orden", "Preparado") and cint(ensure_planner_remito):
@@ -6122,6 +6182,11 @@ def update_guest_preorder_details(preorder_name, data=None):
 		current_name = new_name
 
 	frappe.db.commit()
+	from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+		safe_touch_sales_order_last_editor,
+	)
+
+	safe_touch_sales_order_last_editor(current_name, commit=True)
 	return get_guest_preorder(current_name)
 
 
@@ -6155,18 +6220,53 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	if not items:
 		frappe.throw(_("Items list cannot be empty"))
 
+<<<<<<< Updated upstream
 	# Draft + submitted: edit in place. Keep operator rate/qty/uom (WEIGHT) —
 	# do not re-price from rules. Submitted needs update-after-submit bypass.
 	measured = _apply_item_changes(so, items, additional_discount_amount)
+=======
+	if so.docstatus == 1 and cstr(so.status) == "Consulta":
+		# Soft Consulta: edit in place — do not cancel/archive.
+		_apply_item_changes(so, items, additional_discount_amount)
+		so.flags.ignore_pricing_rule = True
+		so.flags.ignore_validate_update_after_submit = True
+		with _allow_weight_fractional_stock_qty(so):
+			so.save(ignore_permissions=True)
+		so.reload()
+		return _stamp_and_get_guest_preorder(preorder_name)
+
+	if so.docstatus == 1:
+		# Amend: cancel original, create amended copy with changes, submit
+		amended = frappe.copy_doc(so)
+		amended.amended_from = so.name
+		amended.docstatus = 0
+		so.flags.ignore_permissions = True
+		so.cancel()
+		_apply_item_changes(amended, items, additional_discount_amount)
+		amended.flags.ignore_pricing_rule = True
+		desired = _allocate_amend_name("Sales Order", so.name)
+		with _allow_weight_fractional_stock_qty(amended):
+			amended.insert(ignore_permissions=True, set_name=desired)
+			amended.submit()
+		amended.reload()
+		return _stamp_and_get_guest_preorder(amended.name)
+
+	# Draft: edit in place. Keep operator rate/qty/uom (WEIGHT) — do not re-price from rules.
+	_apply_item_changes(so, items, additional_discount_amount)
+>>>>>>> Stashed changes
 	so.flags.ignore_pricing_rule = True
 	if so.docstatus == 1:
 		so.flags.ignore_validate_update_after_submit = True
 	with _allow_weight_fractional_stock_qty(so):
 		so.save(ignore_permissions=True)
 	so.reload()
+<<<<<<< Updated upstream
 	# float_precision rounds weight_per_unit; restamp measured kg so 2kg stays 2.
 	_restamp_measured_line_weights(so, measured)
 	return get_guest_preorder(preorder_name)
+=======
+	return _stamp_and_get_guest_preorder(preorder_name)
+>>>>>>> Stashed changes
 
 
 def _restamp_measured_line_weights(so, measured_total_weight):
@@ -6294,7 +6394,7 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	with _allow_weight_fractional_stock_qty(so):
 		so.save(ignore_permissions=True)
 	so.reload()
-	return get_guest_preorder(preorder_name)
+	return _stamp_and_get_guest_preorder(preorder_name)
 
 
 @frappe.whitelist()
@@ -6380,7 +6480,7 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 		})
 	pe.insert(ignore_permissions=True)
 	pe.submit()
-	return get_guest_preorder(preorder_name)
+	return _stamp_and_get_guest_preorder(preorder_name)
 
 
 @frappe.whitelist()
@@ -7310,7 +7410,7 @@ def update_guest_preorder_logistics(
 			frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
 
 	frappe.db.commit()
-	return get_guest_preorder(name)
+	return _stamp_and_get_guest_preorder(name)
 
 
 def _preorder_address_line(so, *, allow_customer_primary=True) -> str:
