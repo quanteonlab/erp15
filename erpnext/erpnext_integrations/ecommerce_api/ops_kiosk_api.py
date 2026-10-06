@@ -72,14 +72,86 @@ def _require_admin_pin(pin: str | None) -> None:
 		frappe.throw(_("Incorrect admin PIN"), frappe.AuthenticationError)
 
 
+def _ops_identity_from_acting_user() -> dict | None:
+	"""Build an ops-operator identity from the shop session (no PIN).
+
+	Used when a logged-in staff user opens Armado / ops pages without re-entering PIN.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import is_desk_admin
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_acting_username,
+		get_user_app_permissions,
+	)
+
+	user = (_acting_username() or "").strip()
+	if not user or user.lower() in ("guest", "null", "none", "undefined"):
+		user = (frappe.session.user or "").strip()
+	if not user or user.lower() in ("guest", "null", "none", "undefined"):
+		return None
+
+	if is_desk_admin(user):
+		return {
+			"authorized": True,
+			"kind": "admin",
+			"employee": None,
+			"employee_name": None,
+			"user_id": user,
+			"permissions": ["*"],
+			"pin_configured": True,
+		}
+
+	info = None
+	try:
+		info = get_user_app_permissions(user)
+	except Exception:
+		info = None
+	perms = list((info or {}).get("permissions") or [])
+	source = (info or {}).get("source") or "roles"
+	if source == "admin" or "*" in perms:
+		return {
+			"authorized": True,
+			"kind": "admin",
+			"employee": None,
+			"employee_name": None,
+			"user_id": user,
+			"permissions": ["*"],
+			"pin_configured": True,
+		}
+
+	emp = frappe.db.get_value(
+		"Employee",
+		{"user_id": user},
+		["name", "employee_name", "status"],
+		as_dict=True,
+	)
+	if emp and (emp.status or "") != "Active":
+		emp = None
+	return {
+		"authorized": True,
+		"kind": "employee",
+		"employee": emp.name if emp else None,
+		"employee_name": (emp.employee_name if emp else None) or user,
+		"user_id": user,
+		"permissions": perms,
+		"pin_configured": True,
+	}
+
+
 def _require_ops_operator(pin: str | None) -> dict:
-	"""Require admin or employee 6-digit PIN; return resolve_ops_pin payload."""
+	"""Require admin/employee 6-digit PIN, or a logged-in acting user (empty pin)."""
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import resolve_ops_pin
 
-	res = resolve_ops_pin(pin)
-	if not (isinstance(res, dict) and res.get("authorized")):
-		frappe.throw(_("Incorrect PIN"), frappe.AuthenticationError)
-	return res
+	raw = str(pin or "").strip()
+	if raw:
+		res = resolve_ops_pin(raw)
+		if not (isinstance(res, dict) and res.get("authorized")):
+			frappe.throw(_("Incorrect PIN"), frappe.AuthenticationError)
+		return res
+
+	identity = _ops_identity_from_acting_user()
+	if identity and identity.get("authorized"):
+		return identity
+	frappe.throw(_("PIN required"), frappe.AuthenticationError)
 
 
 def _operator_label(identity: dict | None) -> str:

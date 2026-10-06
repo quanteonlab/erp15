@@ -1320,6 +1320,23 @@ def suite_5_11_pos_session():
         assert resolved.get("kind") == "employee"
         assert resolved.get("employee") == name
 
+    def check_ops_operator_empty_pin_uses_session():
+        """Logged-in desk user may open Armado without re-entering PIN."""
+        from erpnext.erpnext_integrations.ecommerce_api import ops_kiosk_api as oka
+
+        frappe.set_user("Administrator")
+        identity = oka._require_ops_operator(None)
+        assert isinstance(identity, dict) and identity.get("authorized"), identity
+        assert identity.get("kind") in ("admin", "employee"), identity
+        # Guest + empty pin must still fail
+        frappe.set_user("Guest")
+        try:
+            oka._require_ops_operator("")
+            raise AssertionError("empty pin as Guest must throw")
+        except Exception:
+            pass
+        frappe.set_user("Administrator")
+
     def check_pos_profiles():
         rows = cra.list_pos_profiles(minimal=1)
         assert rows is not None
@@ -1338,6 +1355,7 @@ def suite_5_11_pos_session():
     _run("5.11.4 validate_admin_pin shape", check_validate_admin_pin_wrong, "S3")
     _run("5.11.5 resolve_ops_pin shape", check_resolve_ops_pin_shape, "S3")
     _run("5.11.6 ensure_employee_ops_pins + resolve", check_ensure_ops_pin_roundtrip, "S2")
+    _run("5.11.6b ops operator empty pin uses session", check_ops_operator_empty_pin_uses_session, "S2")
     _run("5.11.7 list_pos_profiles", check_pos_profiles, "S3")
     _run("5.11.8 list_cash_register_sessions", check_cash_sessions, "S3")
     _run("5.11.9 list_pos_profile_meta", check_pos_profile_meta, "S3")

@@ -2539,10 +2539,12 @@ def list_trips_for_date(date=None, company=None, horizon_days=1, include_open_ba
 	``horizon_days=7`` → the 7 days ending on ``date`` (week view for fleet stats).
 	Each trip includes ``stop_count``, ``delivered_count``, ``pending_count``, ``vehicle_plate``.
 
-	When ``include_open_backlog`` is on (default), also include Draft / In Transit /
-	non-Completed trips whose departure is on or before ``date`` within the last
-	~120 days — so the planner left rail still shows unfinished routes when the
-	plan date moves forward (reduced bureaucracy).
+	When ``include_open_backlog`` is on (default), also include:
+	- Draft / In Transit / non-Completed trips whose departure is on or before
+	  ``date`` within the last ~120 days (unfinished routes when the plan day
+	  moves forward).
+	- Upcoming open Draft / Scheduled / In Transit trips up to ~90 days after
+	  ``date`` (Pedidos “new MAT” often schedules on the order delivery date).
 	"""
 	raw_date = date
 	if isinstance(raw_date, str):
@@ -2619,7 +2621,7 @@ def list_trips_for_date(date=None, company=None, horizon_days=1, include_open_ba
 	if include_backlog:
 		seen = {t.name for t in trips}
 		backlog_since = add_days(end, -120)
-		# Draft (docstatus 0) or submitted but not Completed
+		# Draft (docstatus 0) or submitted but not Completed — past open routes.
 		backlog = frappe.get_all(
 			"Delivery Trip",
 			filters={
@@ -2641,6 +2643,37 @@ def list_trips_for_date(date=None, company=None, horizon_days=1, include_open_ba
 				seen.add(t.name)
 			elif st != "Completed":
 				# e.g. custom statuses still open
+				trips.append(t)
+				seen.add(t.name)
+
+		# Upcoming open plans: Pedidos "new MAT" often uses the order delivery_date
+		# (days ahead). Without a forward window those Drafts never appear when
+		# as-of is "today".
+		upcoming_until = add_days(end, 90)
+		tomorrow = add_days(end, 1)
+		upcoming = frappe.get_all(
+			"Delivery Trip",
+			filters={
+				"docstatus": ["!=", 2],
+				"departure_time": [
+					"between",
+					[f"{tomorrow} 00:00:00", f"{upcoming_until} 23:59:59"],
+				],
+				**({"company": company_val} if company_val else {}),
+			},
+			fields=trip_fields,
+			order_by="departure_time asc",
+			ignore_permissions=True,
+		)
+		for t in upcoming:
+			if t.name in seen:
+				continue
+			st = str(t.status or "")
+			# Only still-open plans (not completed future trips).
+			if cint(t.docstatus) == 0 or st in ("Draft", "Scheduled", "In Transit", ""):
+				trips.append(t)
+				seen.add(t.name)
+			elif st != "Completed":
 				trips.append(t)
 				seen.add(t.name)
 		trips.sort(key=lambda r: str(r.departure_time or ""))

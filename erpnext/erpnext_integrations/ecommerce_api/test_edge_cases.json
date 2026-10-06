@@ -3308,6 +3308,19 @@
       "expect": "no_500"
     },
     {
+      "id": "tms_list_trips_includes_upcoming_open",
+      "source": "regression",
+      "bug": "list_trips_for_date(as-of today) with include_open_backlog must surface future Draft MATs created from Pedidos delivery_date",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_trips_for_date",
+      "args": {
+        "date": "2026-10-06",
+        "horizon_days": 14,
+        "include_open_backlog": 1,
+        "company": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_get_trip_delivery_summary_null",
       "source": "regression",
       "bug": "get_trip_delivery_summary with null trip_name is controlled ValidationError (dispatcher summary)",
@@ -3695,6 +3708,18 @@
         "pin": "000000"
       },
       "expect": "ok"
+    },
+    {
+      "id": "ops_require_operator_null_pin_guest",
+      "source": "regression",
+      "bug": "save_armado_notes with null pin as guest must controlled-fail AuthenticationError (logged-in session may omit pin)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.save_armado_notes",
+      "args": {
+        "preorder_name": null,
+        "notes": "",
+        "pin": null
+      },
+      "expect": "no_500"
     },
     {
       "id": "ops_ensure_employee_ops_pins_null",
