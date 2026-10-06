@@ -3924,6 +3924,173 @@ def _normalize_create_initial_status(initial_status) -> str:
 	return "Consulta"
 
 
+def _run_create_guest_preorder_side_effects(
+	so_name=None,
+	ensure_remito=0,
+	guest_name=None,
+	guest_phone=None,
+	guest_email=None,
+	seller_ref_user=None,
+	pin_allowed_countries=None,
+	send_client_pin=0,
+	client_access_pin=None,
+	phone_e164=None,
+):
+	"""Email / Twilio / Preventa / webhook / remito — after create returns to the UI.
+
+	Runs on the short queue (or inline when enqueue fails). Never raises to the
+	caller; each step is best-effort with its own error log.
+	"""
+	so_name = cstr(so_name or "").strip()
+	if not so_name or so_name.lower() in ("null", "undefined", "none"):
+		return {"ok": False, "reason": "missing_so"}
+	if not frappe.db.exists("Sales Order", so_name):
+		return {"ok": False, "reason": "missing_so"}
+
+	# Inquiry email (SMTP) — catalog consultas + Orden creates.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import (
+			send_consulta_notification,
+		)
+
+		send_consulta_notification(so_name, guest_name=guest_name, guest_phone=guest_phone)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Inquiry email failed for {so_name}")
+
+	# Twilio PIN send when mint already happened in the request (send=0 there).
+	client_access = None
+	pin = cstr(client_access_pin or "").strip()
+	e164 = cstr(phone_e164 or guest_phone or "").strip()
+	if cint(send_client_pin) and pin and e164:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				_portal_base_url,
+				_send_pin_message,
+			)
+
+			portal = f"{_portal_base_url()}/cliente"
+			send_result = _send_pin_message(e164, pin, portal)
+			client_access = {"pin": pin, "phone_e164": e164, "send": send_result}
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"Client access PIN send failed for {so_name}")
+	elif cstr(guest_phone or "").strip() and not pin:
+		# No PIN minted in-request (e.g. no phone path) — full issue+send.
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				issue_client_access_pin,
+			)
+
+			customer = frappe.db.get_value("Sales Order", so_name, "customer")
+			client_access = issue_client_access_pin(
+				guest_phone=guest_phone,
+				guest_name=guest_name,
+				guest_email=guest_email,
+				customer=customer,
+				allowed_countries=pin_allowed_countries,
+				send=cint(send_client_pin),
+			)
+			pin = cstr((client_access or {}).get("pin") or "").strip()
+			e164 = cstr((client_access or {}).get("phone_e164") or guest_phone or "").strip()
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so_name}")
+
+	# Preventa Lead bridge + stamp PIN onto Lead when we have one.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import (
+			sync_lead_from_guest_preorder,
+		)
+
+		sync_lead_from_guest_preorder(
+			so_name,
+			guest_name=guest_name,
+			guest_phone=guest_phone,
+			guest_email=guest_email,
+			seller_ref_user=seller_ref_user,
+		)
+		lead_name = frappe.db.get_value(
+			"Preventa Lead Consulta", {"sales_order": so_name}, "lead"
+		)
+		if lead_name and pin:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				_stamp_party,
+			)
+
+			_stamp_party("Lead", lead_name, pin, e164 or guest_phone)
+			frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so_name}")
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
+
+		row = (
+			frappe.db.get_value(
+				"Sales Order",
+				so_name,
+				["customer", "grand_total", "currency"],
+				as_dict=True,
+			)
+			or {}
+		)
+		emit_ecommerce_webhook(
+			"order_created",
+			{
+				"preorder_name": so_name,
+				"customer": row.get("customer"),
+				"grand_total": flt(row.get("grand_total")),
+				"currency": row.get("currency"),
+			},
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "webhook order_created")
+
+	# Orden / planner remito + soft geocode (was the main UI stall).
+	if cint(ensure_remito):
+		try:
+			frappe.flags.ignore_permissions = True
+			so = frappe.get_doc("Sales Order", so_name)
+			frappe.flags.ignore_permissions = False
+			if _is_guest_preorder_sales_order(so) and cint(so.docstatus) == 1:
+				_ensure_planner_delivery_note(so)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"deferred planner remito failed for {so_name}")
+
+	return {"ok": True, "so_name": so_name, "client_access": client_access}
+
+
+def _enqueue_create_guest_preorder_side_effects(**kwargs):
+	"""Queue post-create work; fall back to inline if Redis/workers unavailable."""
+	so_name = cstr(kwargs.get("so_name") or "").strip()
+	try:
+		enq = {
+			"queue": "short",
+			"timeout": 300,
+			"enqueue_after_commit": True,
+			**kwargs,
+		}
+		if so_name:
+			enq["job_id"] = f"guest_preorder_side:{so_name}"
+		frappe.enqueue(
+			"erpnext.erpnext_integrations.ecommerce_api.api._run_create_guest_preorder_side_effects",
+			**enq,
+		)
+		return {"queued": True}
+	except Exception:
+		frappe.log_error(
+			frappe.get_traceback(),
+			f"enqueue create side effects failed for {so_name or '?'}",
+		)
+		try:
+			_run_create_guest_preorder_side_effects(**kwargs)
+			return {"queued": False, "ran_inline": True}
+		except Exception:
+			frappe.log_error(
+				frappe.get_traceback(),
+				f"inline create side effects failed for {so_name or '?'}",
+			)
+			return {"queued": False, "ran_inline": False}
+
+
 def _sales_order_table_columns():
 	return set(frappe.db.get_table_columns("Sales Order") or [])
 
@@ -4383,27 +4550,142 @@ def _is_weight_sell_uom(uom):
 
 @contextmanager
 def _allow_weight_fractional_stock_qty(so):
-	"""Re-align stock_uom after set_missing resets it to Item Nos (whole-number check)."""
+	"""Re-align stock_uom after set_missing resets it to Item Nos (whole-number check).
+
+	Also rebills WEIGHT lines as $/kg × kg during calculate_taxes_and_totals so
+	Pedidos importe / grand_total match the UI (not qty × rate).
+	"""
+	from erpnext.controllers.taxes_and_totals import calculate_taxes_and_totals as _CTT
 	from erpnext.utilities import transaction_base as tb
 
-	orig = tb.validate_uom_is_integer
+	orig_uom = tb.validate_uom_is_integer
+	orig_civ = _CTT.calculate_item_values
 
-	def _patched(doc, uom_field, qty_fields, child_dt=None):
+	def _patched_uom(doc, uom_field, qty_fields, child_dt=None):
 		if doc is so:
 			for row in doc.get("items") or []:
 				if _is_weight_sell_uom(row.uom):
 					row.stock_uom = row.uom
 					row.conversion_factor = 1.0
 					row.stock_qty = flt(row.qty)
-		return orig(doc, uom_field, qty_fields, child_dt)
+		return orig_uom(doc, uom_field, qty_fields, child_dt)
 
-	tb.validate_uom_is_integer = _patched
+	def _patched_civ(self):
+		orig_civ(self)
+		if self.doc is not so and not getattr(getattr(self.doc, "flags", None), "ecommerce_weight_sell", False):
+			return
+		for item in self.doc.get("items") or []:
+			uom = cstr(getattr(item, "uom", None) or getattr(item, "stock_uom", None) or "")
+			if not _is_weight_sell_uom(uom):
+				continue
+			bill = _weight_billable_qty(item)
+			if bill <= 0:
+				continue
+			rate = _weight_sell_effective_rate(item)
+			new_amount = flt(rate * bill, item.precision("amount"))
+			if abs(flt(item.amount) - new_amount) < 1e-9:
+				continue
+			item.amount = new_amount
+			item.net_amount = new_amount
+			self._set_in_company_currency(item, ["amount", "net_amount"])
+
+	tb.validate_uom_is_integer = _patched_uom
+	_CTT.calculate_item_values = _patched_civ
 	so.flags.ecommerce_weight_sell = True
 	try:
 		yield
 	finally:
-		tb.validate_uom_is_integer = orig
+		tb.validate_uom_is_integer = orig_uom
+		_CTT.calculate_item_values = orig_civ
 		so.flags.ecommerce_weight_sell = False
+
+
+def _weight_billable_qty(row) -> float:
+	"""Kg (or qty) used to bill a WEIGHT line — mirrors frontend preorderLineBillableQty."""
+	uom = cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or "")
+	qty = flt(getattr(row, "qty", None) or 0)
+	if not _is_weight_sell_uom(uom):
+		return qty
+	tw = flt(getattr(row, "total_weight", None) or 0)
+	if tw > 0:
+		return tw
+	wpu = flt(getattr(row, "weight_per_unit", None) or 0)
+	if wpu > 0 and qty > 0:
+		return flt(qty * wpu)
+	return qty
+
+
+def _weight_sell_effective_rate(row) -> float:
+	"""$/kg used for WEIGHT importe.
+
+	ERPNext only applies ``discount_percentage`` when price_list_rate / margin is set.
+	Pedidos often has neither — apply disc here so importe matches the UI
+	(``rate × kg × (1 - disc%)``). When ERPNext already netted ``rate``,
+	``discount_amount`` is set and we must not double-discount.
+	"""
+	rate = flt(getattr(row, "rate", None) or 0)
+	disc = flt(getattr(row, "discount_percentage", None) or 0)
+	if disc <= 0 or disc >= 100:
+		return 0.0 if disc >= 100 else rate
+	already_net = flt(getattr(row, "discount_amount", None) or 0) > 0 or (
+		flt(getattr(row, "price_list_rate", None) or 0) > 0
+		and abs(flt(getattr(row, "price_list_rate")) - rate) > 1e-9
+	)
+	if already_net:
+		return rate
+	return flt(rate * (1.0 - disc / 100.0))
+
+
+def _guest_preorder_line_amount(row) -> float:
+	"""Line importe for Pedidos: WEIGHT → rate×kg; else rate×qty (or stored amount)."""
+	uom = cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or "")
+	if _is_weight_sell_uom(uom):
+		bill = _weight_billable_qty(row)
+		rate = _weight_sell_effective_rate(row)
+		if rate > 0 and bill > 0:
+			return flt(rate * bill)
+		return flt(getattr(row, "amount", None) or 0)
+	rate = flt(getattr(row, "rate", None) or 0)
+	qty = flt(getattr(row, "qty", None) or 0)
+	disc = flt(getattr(row, "discount_percentage", None) or 0)
+	if rate > 0 and qty > 0:
+		already_net = flt(getattr(row, "discount_amount", None) or 0) > 0
+		eff = rate if already_net or disc <= 0 else rate * (1.0 - disc / 100.0)
+		return flt(eff * qty)
+	return flt(getattr(row, "amount", None) or 0)
+
+
+def _guest_preorder_estimated_total(so) -> float:
+	total = sum(_guest_preorder_line_amount(d) for d in (so.items or []))
+	return max(flt(total) - flt(getattr(so, "additional_discount_amount", None) or 0), 0.0)
+
+
+def _calculate_guest_preorder_totals(so):
+	"""ERPNext qty×rate, then WEIGHT rebilled as $/kg × kg."""
+	with _allow_weight_fractional_stock_qty(so):
+		so.run_method("calculate_taxes_and_totals")
+
+
+def _repair_guest_preorder_weight_totals(so) -> bool:
+	"""Persist WEIGHT $/kg×kg totals when SO still has stale qty×rate money."""
+	est = _guest_preorder_estimated_total(so)
+	if abs(flt(so.grand_total) - est) < 0.01:
+		return False
+	has_weight = any(
+		_is_weight_sell_uom(cstr(getattr(d, "uom", None) or getattr(d, "stock_uom", None) or ""))
+		and _weight_billable_qty(d) > flt(getattr(d, "qty", None) or 0) + 1e-9
+		for d in (so.items or [])
+	)
+	if not has_weight:
+		return False
+	so.flags.ignore_pricing_rule = True
+	if cint(so.docstatus) == 1:
+		so.flags.ignore_validate_update_after_submit = True
+	_calculate_guest_preorder_totals(so)
+	_save_guest_preorder_so(so)
+	frappe.db.commit()
+	so.reload()
+	return True
 
 
 def _apply_so_line_uom(row, raw_uom):
@@ -4575,6 +4857,8 @@ def create_guest_preorder(
 		item_code = str(item.get("item_code") or "").strip()
 		qty = flt(item.get("qty", 1))
 		rate = flt(item.get("rate", 0))
+		wpu = item.get("weight_per_unit")
+		wpu_val = flt(wpu) if wpu not in (None, "") else None
 		if not item_code:
 			continue
 		if not frappe.db.exists("Item", item_code):
@@ -4584,7 +4868,14 @@ def create_guest_preorder(
 			else:
 				missing.append(item_code)
 				continue
-		resolved_rows.append({"item_code": item_code, "qty": qty, "rate": rate})
+		resolved_rows.append(
+			{
+				"item_code": item_code,
+				"qty": qty,
+				"rate": rate,
+				"weight_per_unit": wpu_val,
+			}
+		)
 
 	if missing:
 		frappe.throw(_("Item(s) not found: {0}").format(", ".join(missing)), frappe.ValidationError)
@@ -4716,12 +5007,21 @@ def create_guest_preorder(
 			})
 			rate = item_details.get("price_list_rate", 0)
 
-		so.append("items", {
+		line_kwargs = {
 			"item_code": item_code,
 			"qty": qty,
 			"rate": rate,
 			"delivery_date": so.delivery_date,
-		})
+		}
+		# Soft pack weight for mayorista WEIGHT estimates (importe before armado remide).
+		wpu = row.get("weight_per_unit")
+		if wpu is None and frappe.db.has_column("Item", "weight_per_unit"):
+			wpu = flt(frappe.db.get_value("Item", item_code, "weight_per_unit") or 0) or None
+		if wpu and flt(wpu) > 0:
+			line_kwargs["weight_per_unit"] = flt(wpu)
+			line_kwargs["total_weight"] = flt(wpu) * flt(qty)
+
+		so.append("items", line_kwargs)
 
 	# Calculate totals. Re-stamp so insert/validate cannot treat currency as None.
 	so.currency = company_currency
@@ -4729,7 +5029,7 @@ def create_guest_preorder(
 	so.price_list_currency = price_list_currency
 	so.plc_conversion_rate = 1
 	if resolved_rows:
-		so.run_method("calculate_taxes_and_totals")
+		_calculate_guest_preorder_totals(so)
 
 	# Save as Draft (Consulta). Stamp the acting cashier so Pedidos propios can match.
 	if acting and frappe.db.exists("User", acting):
@@ -4737,7 +5037,8 @@ def create_guest_preorder(
 	# Notes-only inquiries have no item rows — skip mandatory child-table / item checks.
 	if notes_only:
 		so.flags.ignore_validate = True
-	so.insert(ignore_permissions=True, ignore_mandatory=notes_only)
+	with _allow_weight_fractional_stock_qty(so):
+		so.insert(ignore_permissions=True, ignore_mandatory=notes_only)
 	if acting and frappe.db.exists("User", acting) and so.owner != acting:
 		so.db_set("owner", acting)
 
@@ -4760,12 +5061,8 @@ def create_guest_preorder(
 		cap = flt(so.grand_total)
 		so.db_set("advance_paid", min(paid, cap) if cap > 0 else paid)
 
-	from erpnext.erpnext_integrations.ecommerce_api.inquiry_email import send_consulta_notification
-
-	send_consulta_notification(so.name, guest_name=guest_name, guest_phone=guest_phone)
-
-	# Client access PIN (Twilio WhatsApp/SMS) — check "never seen" BEFORE lead sync
-	# so the brand-new Lead created below does not count as "already known".
+	# Mint PIN in-request (fast DB) so catalog can stash it locally; Twilio send
+	# + email + Preventa + remito run after the HTTP response (see side effects).
 	client_access = None
 	if cstr(guest_phone or "").strip():
 		try:
@@ -4779,62 +5076,18 @@ def create_guest_preorder(
 				guest_email=guest_email,
 				customer=so.customer,
 				allowed_countries=pin_allowed_countries,
-				send=cint(send_client_pin),
+				send=0,
 			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so.name}")
 
-	# Best-effort Pre-venta bridge: never let a Lead-sync problem affect the
-	# guest preorder response (see local_docs/proposals/i033_preventa_sales_kanban.md).
-	lead_name = None
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import sync_lead_from_guest_preorder
-
-		sync_lead_from_guest_preorder(
-			so.name,
-			guest_name=guest_name,
-			guest_phone=guest_phone,
-			guest_email=guest_email,
-			seller_ref_user=seller_ref_user,
-		)
-		lead_name = frappe.db.get_value(
-			"Preventa Lead Consulta", {"sales_order": so.name}, "lead"
-		)
-		if lead_name and client_access and client_access.get("pin"):
-			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
-				_stamp_party,
-			)
-
-			_stamp_party(
-				"Lead",
-				lead_name,
-				client_access.get("pin"),
-				client_access.get("phone_e164") or guest_phone,
-			)
-			frappe.db.commit()
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), f"Preventa lead sync failed for {so.name}")
-
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook
-
-		emit_ecommerce_webhook(
-			"order_created",
-			{
-				"preorder_name": so.name,
-				"customer": so.customer,
-				"grand_total": flt(so.grand_total),
-				"currency": so.currency,
-			},
-		)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "webhook order_created")
-
-	# Operaciones → Orden (and similar staff entry points): skip Inquiry / Consulta.
+	# Operaciones → Orden: submit now; remito/geocode deferred (was the long stall).
 	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
 	promoted = None
 	if want_orden and resolved_rows:
-		promoted = set_guest_preorder_status(so.name, "Orden")
+		promoted = set_guest_preorder_status(
+			so.name, "Orden", ensure_planner_remito=0
+		)
 		so_name = cstr((promoted or {}).get("name") or so.name)
 		frappe.flags.ignore_permissions = True
 		so = frappe.get_doc("Sales Order", so_name)
@@ -4846,12 +5099,14 @@ def create_guest_preorder(
 		"currency": so.currency,
 		"status": so.status,
 		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
+		"side_effects_queued": True,
 	}
 	if want_orden and resolved_rows:
 		payload["display_status"] = "Orden"
+		# Remito not ready yet — planner will pick it up after the background job.
+		payload["planner_ready"] = False
 		if isinstance(promoted, dict):
 			for key in (
-				"planner_ready",
 				"not_deliverable",
 				"delivery_warning",
 				"delivery_note",
@@ -4867,9 +5122,22 @@ def create_guest_preorder(
 			"phone_e164": client_access.get("phone_e164"),
 			"is_new_number": client_access.get("is_new_number"),
 			"portal_path": client_access.get("portal_path") or "/cliente",
-			"sent": (client_access.get("send") or {}).get("sent"),
-			"channel": (client_access.get("send") or {}).get("channel"),
+			"sent": False,
+			"channel": None,
 		}
+
+	_enqueue_create_guest_preorder_side_effects(
+		so_name=so.name,
+		ensure_remito=1 if (want_orden and resolved_rows) else 0,
+		guest_name=guest_name,
+		guest_phone=guest_phone,
+		guest_email=guest_email,
+		seller_ref_user=seller_ref_user,
+		pin_allowed_countries=pin_allowed_countries,
+		send_client_pin=cint(send_client_pin),
+		client_access_pin=(client_access or {}).get("pin") if client_access else None,
+		phone_e164=(client_access or {}).get("phone_e164") if client_access else None,
+	)
 	return payload
 
 
@@ -5071,6 +5339,7 @@ def get_guest_preorder(preorder_name):
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
 	_require_guest_preorder_visible(so)
+	_repair_guest_preorder_weight_totals(so)
 
 	tag_raw = getattr(so, "remarks", None) or getattr(so, "terms", None) or ""
 	tags = {}
@@ -5081,6 +5350,19 @@ def get_guest_preorder(preorder_name):
 			tags[key.strip()] = val.strip()
 
 	geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
+
+	# Soft list rates for lines with rate 0 (e.g. older consultas before $/Kg was kept).
+	selling_pl = getattr(so, "selling_price_list", None) or "Standard Selling"
+	zero_rate_codes = [d.item_code for d in (so.items or []) if flt(d.rate) <= 0 and d.item_code]
+	list_rate_by_code = {}
+	if zero_rate_codes:
+		try:
+			bulk = get_item_prices_bulk(zero_rate_codes, price_list=selling_pl) or {}
+			for code in zero_rate_codes:
+				list_rate_by_code[code] = flt(bulk.get(code) or 0)
+		except Exception:
+			for code in zero_rate_codes:
+				list_rate_by_code[code] = flt(get_item_price(code, selling_pl) or 0)
 
 	payload = {
 		"name": so.name,
@@ -5106,7 +5388,7 @@ def get_guest_preorder(preorder_name):
 		"status": so.status,
 		"display_status": _display_status(so),
 		"cashier_user": _cashier_from_guest_preorder(so),
-		"estimated_total": flt(so.grand_total),
+		"estimated_total": _guest_preorder_estimated_total(so),
 		"currency": so.currency,
 		"remarks": getattr(so, "remarks", None),
 		"terms": getattr(so, "terms", None),
@@ -5114,7 +5396,7 @@ def get_guest_preorder(preorder_name):
 		"advance_paid": flt(getattr(so, "advance_paid", 0)),
 		"amended_from": so.amended_from or None,
 		"delivery_note": _delivery_note_for_sales_order(preorder_name),
-		"payments": _payments_for_sales_order(preorder_name, flt(so.grand_total)),
+		"payments": _payments_for_sales_order(preorder_name, _guest_preorder_estimated_total(so)),
 		"external_status_change": _external_status_change_for(preorder_name),
 		"items": [
 			{
@@ -5122,7 +5404,12 @@ def get_guest_preorder(preorder_name):
 				"item_name": d.item_name,
 				"qty": flt(d.qty),
 				"rate": flt(d.rate),
-				"amount": flt(d.amount),
+				"amount": _guest_preorder_line_amount(d),
+				"price_list_rate": (
+					list_rate_by_code.get(d.item_code)
+					if flt(d.rate) <= 0
+					else None
+				),
 				"discount_percentage": flt(getattr(d, "discount_percentage", 0)),
 				**_item_line_weight_fields(
 					d.item_code,
@@ -5231,9 +5518,71 @@ def get_guest_preorder_history(preorder_name):
 
 WORKFLOW_STATUSES = ["Consulta", "Orden", "Preparado", "En Delivery", "Completado"]
 COMPLETED_UNPAID_LABEL = "Completado (no pagado)"
+# Written via db_set — not in stock Sales Order.status Select options.
+GUEST_PREORDER_CUSTOM_STATUSES = frozenset({"Consulta", "Preparado", "En Delivery"})
+_SO_STATUS_SELECT_BASE = (
+	"\nDraft\nOn Hold\nTo Deliver and Bill\nTo Bill\nTo Deliver\nCompleted\nCancelled\nClosed"
+)
 # Status transitions done outside the Órdenes table UI (armado / remito / TMS).
 EXTERNAL_PIPELINE_SOURCES = frozenset({"armado", "remito", "tms_claim", "tms_pod"})
 EXTERNAL_STATUS_KV_SCOPE = "pedidos.external_status"
+
+
+def ensure_guest_preorder_status_options():
+	"""Idempotent: extend Sales Order.status Select so Pedidos markers survive Document.save()."""
+	extras = ["Consulta", "Preparado", "En Delivery"]
+	meta = frappe.get_meta("Sales Order")
+	df = meta.get_field("status")
+	current = (df.options if df else "") or _SO_STATUS_SELECT_BASE
+	lines = current.split("\n")
+	changed = False
+	for extra in extras:
+		if extra not in lines:
+			lines.append(extra)
+			changed = True
+	if not changed:
+		return
+	options = "\n".join(lines)
+	existing = frappe.db.exists(
+		"Property Setter",
+		{"doc_type": "Sales Order", "field_name": "status", "property": "options"},
+	)
+	if existing:
+		frappe.db.set_value("Property Setter", existing, "value", options, update_modified=False)
+	else:
+		frappe.get_doc(
+			{
+				"doctype": "Property Setter",
+				"doctype_or_field": "DocField",
+				"doc_type": "Sales Order",
+				"field_name": "status",
+				"property": "options",
+				"property_type": "Text",
+				"value": options,
+			}
+		).insert(ignore_permissions=True)
+	frappe.clear_cache(doctype="Sales Order")
+
+
+def _save_guest_preorder_so(so):
+	"""
+	Save a guest-preorder Sales Order even when status is a custom pipeline marker.
+
+	Frappe Select validation rejects Consulta / Preparado / En Delivery unless the
+	Property Setter has run; stash a valid ERP status for save, then restore.
+	WEIGHT lines are rebilled as $/kg × kg inside the save validate path.
+	"""
+	ensure_guest_preorder_status_options()
+	custom = cstr(getattr(so, "status", None) or "").strip()
+	restore = custom if custom in GUEST_PREORDER_CUSTOM_STATUSES else None
+	if restore:
+		so.status = "To Deliver and Bill" if cint(so.docstatus) == 1 else "Draft"
+	if cint(so.docstatus) == 1:
+		so.flags.ignore_validate_update_after_submit = True
+	with _allow_weight_fractional_stock_qty(so):
+		so.save(ignore_permissions=True)
+	if restore:
+		so.db_set("status", restore, update_modified=False)
 
 
 def _normalize_pipeline_source(source):
@@ -5310,7 +5659,11 @@ def _external_status_change_map(so_names):
 
 
 def _so_is_fully_paid(so) -> bool:
-	total = flt(getattr(so, "grand_total", 0) or 0)
+	total = (
+		_guest_preorder_estimated_total(so)
+		if _is_guest_preorder_sales_order(so)
+		else flt(getattr(so, "grand_total", 0) or 0)
+	)
 	paid = flt(getattr(so, "advance_paid", 0) or 0)
 	return total > 0 and paid + 0.005 >= total
 
@@ -5623,7 +5976,7 @@ def set_guest_preorder_status(
 			if _resync_so_party_links(so):
 				so.flags.ignore_permissions = True
 				so.flags.ignore_mandatory = True
-				so.save(ignore_permissions=True)
+				_save_guest_preorder_so(so)
 				so.reload()
 			so.flags.ignore_permissions = True
 			so.submit()
@@ -5665,11 +6018,13 @@ def set_guest_preorder_status(
 	)
 	detail = get_guest_preorder(preorder_name)
 	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
-	# Armado confirm enqueues remito separately for a fast kiosk response.
+	# Armado confirm / create Orden enqueue remito separately for a fast response.
 	if target_status in ("Orden", "Preparado") and cint(ensure_planner_remito):
 		so.reload()
 		gate = _ensure_planner_delivery_note(so)
 		_attach_planner_gate_fields(detail, gate)
+	elif target_status in ("Orden", "Preparado"):
+		detail["planner_ready"] = False
 	return detail
 
 
@@ -5792,11 +6147,27 @@ def cancel_guest_preorder(preorder_name=None):
 	old_display = _display_status(so)
 	so.flags.ignore_permissions = True
 	if so.docstatus == 1:
-		so.cancel()
+		# Submitted → proper cancel (stock/GL hooks).
+		with _allow_weight_fractional_stock_qty(so):
+			so.cancel()
 	else:
-		so.docstatus = 2
-		so.save()
-	so.reload()
+		# Draft: Frappe forbids Document.save() transition 0 → 2
+		# (DocstatusTransitionError → HTTP 417). Archive via db.
+		frappe.db.set_value(
+			"Sales Order",
+			name,
+			{"docstatus": 2, "status": "Cancelled"},
+			update_modified=True,
+		)
+		frappe.db.sql(
+			"""
+			UPDATE `tabSales Order Item`
+			SET docstatus=2
+			WHERE parent=%s AND parenttype='Sales Order'
+			""",
+			(name,),
+		)
+	so = frappe.get_doc("Sales Order", name)
 	try:
 		_record_guest_preorder_status_audit(name, old_display, "Archivado", source=None)
 	except Exception:
@@ -5962,7 +6333,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 		# Consulta drafts may have no lines yet — Frappe "Data missing in table: Items"
 		# must not block header / tag updates from the Pedidos panel.
 		so.flags.ignore_mandatory = True
-		so.save(ignore_permissions=True)
+		_save_guest_preorder_so(so)
 	else:
 		# Submitted: persist allowed header fields without full amend
 		updates = {}
@@ -6062,7 +6433,7 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	if so.docstatus == 1:
 		so.flags.ignore_validate_update_after_submit = True
 	with _allow_weight_fractional_stock_qty(so):
-		so.save(ignore_permissions=True)
+		_save_guest_preorder_so(so)
 	so.reload()
 	return get_guest_preorder(preorder_name)
 
@@ -6141,7 +6512,7 @@ def _apply_item_changes(so, items, additional_discount_amount):
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
-	so.run_method("calculate_taxes_and_totals")
+	_calculate_guest_preorder_totals(so)
 
 
 @frappe.whitelist()
@@ -6177,12 +6548,62 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
-	so.run_method("calculate_taxes_and_totals")
+	_calculate_guest_preorder_totals(so)
 	so.flags.ignore_pricing_rule = True
 	with _allow_weight_fractional_stock_qty(so):
-		so.save(ignore_permissions=True)
+		_save_guest_preorder_so(so)
 	so.reload()
 	return get_guest_preorder(preorder_name)
+
+
+@frappe.whitelist()
+def reprice_guest_preorder_from_price_list(preorder_name, price_list=None):
+	"""
+	Refresh line rates from the selling price list without changing qty / weight.
+
+	WEIGHT lines keep list $/Kg (PRECIO POR 1 KG). Nos/CAJA get list $/unit.
+	Does not touch measured total_weight — only money columns.
+	"""
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	so = frappe.get_doc("Sales Order", preorder_name)
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+	if so.docstatus == 2:
+		frappe.throw(_("Cannot edit a cancelled order"))
+
+	pl = (
+		cstr(price_list or "").strip()
+		or cstr(getattr(so, "selling_price_list", None) or "").strip()
+		or "Standard Selling"
+	)
+	codes = [d.item_code for d in (so.items or []) if d.item_code]
+	rates = get_item_prices_bulk(codes, price_list=pl) or {}
+	changed = 0
+	for row in so.items or []:
+		new_rate = flt(rates.get(row.item_code) or 0)
+		if new_rate <= 0:
+			new_rate = flt(get_item_price(row.item_code, pl) or 0)
+		if new_rate <= 0:
+			continue
+		if abs(flt(row.rate) - new_rate) < 0.0001:
+			continue
+		row.rate = new_rate
+		changed += 1
+
+	if changed:
+		so.flags.ignore_pricing_rule = True
+		_calculate_guest_preorder_totals(so)
+		with _allow_weight_fractional_stock_qty(so):
+			_save_guest_preorder_so(so)
+		frappe.db.commit()
+		so.reload()
+
+	out = get_guest_preorder(preorder_name)
+	out["repriced_lines"] = changed
+	return out
 
 
 @frappe.whitelist()
@@ -6235,7 +6656,7 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 		company, mode_of_payment, so.customer
 	)
 
-	outstanding = flt(so.grand_total) - flt(getattr(so, "advance_paid", 0))
+	outstanding = _guest_preorder_estimated_total(so) - flt(getattr(so, "advance_paid", 0))
 	allocated = min(paid_amount, outstanding) if outstanding > 0 else paid_amount
 
 	pe = frappe.new_doc("Payment Entry")
@@ -6713,7 +7134,10 @@ def apply_coupon_to_order(order_name, coupon_code):
 	# Apply coupon
 	so.coupon_code = coupon_code
 	so.run_method("calculate_taxes_and_totals")
-	so.save(ignore_permissions=True)
+	if _is_guest_preorder_sales_order(so):
+		_save_guest_preorder_so(so)
+	else:
+		so.save(ignore_permissions=True)
 
 	return so.as_dict()
 

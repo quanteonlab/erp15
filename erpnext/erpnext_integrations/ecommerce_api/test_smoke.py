@@ -636,6 +636,63 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_weight_line_bills_rate_times_kg():
+        """WEIGHT + peso unitario: grand_total / payment outstanding = rate × kg (not qty×rate)."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 100, "weight_per_unit": 12}],
+                guest_notes="smoke weight bill",
+                guest_name="Smoke Weight Bill",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name
+            detail = api.update_guest_preorder_items(
+                so_name,
+                [
+                    {
+                        "item_code": item_code,
+                        "qty": 1,
+                        "rate": 100,
+                        "uom": "WEIGHT",
+                        "weight_per_unit": 12,
+                        "total_weight": 12,
+                    }
+                ],
+                0,
+            )
+            assert abs(flt(detail.get("estimated_total")) - 1200) < 0.01, detail
+            line = (detail.get("items") or [None])[0]
+            assert line and abs(flt(line.get("amount")) - 1200) < 0.01, line
+            assert abs(flt(frappe.db.get_value("Sales Order", so_name, "grand_total")) - 1200) < 0.01
+            # Pedidos disc% with no price_list_rate — still bills rate×kg×(1-disc)
+            detail2 = api.update_guest_preorder_items(
+                so_name,
+                [
+                    {
+                        "item_code": item_code,
+                        "qty": 1,
+                        "rate": 100,
+                        "uom": "WEIGHT",
+                        "weight_per_unit": 12,
+                        "total_weight": 12,
+                        "discount_percentage": 10,
+                    }
+                ],
+                0,
+            )
+            assert abs(flt(detail2.get("estimated_total")) - 1080) < 0.01, detail2
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_measured_total_weight_no_float_drift():
         """2 kg across 3 units must stay 2.000, not 2.001 after float_precision rounds wpu."""
         so_name = None
@@ -1052,6 +1109,7 @@ def suite_5_9_master_data():
     _run("5.9.12 consulta phone→customer match", check_consulta_phone_match, "S2")
     _run("5.9.13 empty-items Consulta header update", check_empty_items_consulta_update, "S2")
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
+    _run("5.9.14a WEIGHT bills rate×kg", check_weight_line_bills_rate_times_kg, "S2")
     _run("5.9.14b measured kg no float drift", check_measured_total_weight_no_float_drift, "S2")
     _run("5.9.14c create queues side effects", check_create_returns_before_side_effects, "S2")
     _run("5.9.15 Orden item edit in place (no amend)", check_orden_item_edit_inplace, "S2")

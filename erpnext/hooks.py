@@ -71,6 +71,7 @@ after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.price_list_rules.ensure_transferencia_auto_defaults",
 	"erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields.ensure_preferred_delivery_hours",
 	"erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields.ensure_argentina_iva_conditions",
+	"erpnext.erpnext_integrations.ecommerce_api.api.ensure_guest_preorder_status_options",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"

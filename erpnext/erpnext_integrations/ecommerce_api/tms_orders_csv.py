@@ -481,7 +481,11 @@ def _confirm_so_for_csv(so_name: str) -> None:
 
 def _append_logistics_tags_to_so(so_name: str, tag_parts: list) -> None:
 	"""Write ventana/op_type/csv_order_code… as sibling remark tags (not inside guest_notes)."""
-	from erpnext.erpnext_integrations.ecommerce_api.api import _update_guest_preorder_tag
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_is_guest_preorder_sales_order,
+		_save_guest_preorder_so,
+		_update_guest_preorder_tag,
+	)
 
 	if not so_name or not tag_parts:
 		return
@@ -496,7 +500,10 @@ def _append_logistics_tags_to_so(so_name: str, tag_parts: list) -> None:
 			key, val = part.split(":", 1)
 			_update_guest_preorder_tag(so, key.strip(), val.strip())
 		so.flags.ignore_permissions = True
-		so.save(ignore_permissions=True)
+		if _is_guest_preorder_sales_order(so):
+			_save_guest_preorder_so(so)
+		else:
+			so.save(ignore_permissions=True)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "tms_orders_csv._append_logistics_tags_to_so")
 

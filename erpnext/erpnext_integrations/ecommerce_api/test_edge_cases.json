@@ -2706,6 +2706,28 @@
       "expect": "no_500"
     },
     {
+      "id": "reprice_guest_preorder_from_price_list_dirty",
+      "source": "regression",
+      "bug": "reprice_guest_preorder_from_price_list with empty/null name and price_list must not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.reprice_guest_preorder_from_price_list",
+      "args": {
+        "preorder_name": "",
+        "price_list": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "update_guest_preorder_items_null_name",
+      "source": "regression",
+      "bug": "update_guest_preorder_items with null name is controlled (custom En Delivery status must not 417 on save paths)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_items",
+      "args": {
+        "preorder_name": null,
+        "items": [{"item_code": "X", "qty": 1, "rate": 1}]
+      },
+      "expect": "fail"
+    },
+    {
       "id": "create_guest_preorder_side_effects_null_so",
       "source": "regression",
       "bug": "deferred create side effects with null/empty so_name must not 500",
@@ -2735,6 +2757,16 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.cancel_guest_preorder",
       "args": {
         "preorder_name": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "preorder_cancel_empty_name",
+      "source": "regression",
+      "bug": "cancel_guest_preorder empty name is controlled ValidationError (never DocstatusTransitionError/417)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.cancel_guest_preorder",
+      "args": {
+        "preorder_name": ""
       },
       "expect": "fail"
     },
