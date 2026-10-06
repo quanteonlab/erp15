@@ -23,7 +23,14 @@ from frappe import _
 from frappe.utils import cint, get_datetime, now_datetime
 
 from erpnext.erpnext_integrations.ecommerce_api.company_context import acting_user as _acting_user
-from erpnext.erpnext_integrations.ecommerce_api.employee_api import _can_app, _require_app_permission
+from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+	_can_app,
+	_require_app_permission,
+	require_sales_commit_for_customer,
+	_set_customer_salesmen_users,
+	customer_salesmen,
+	_acting_username,
+)
 from erpnext.erpnext_integrations.ecommerce_api.tags_api import set_tags_for_doc, tags_map_for_docs
 from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
 
@@ -720,6 +727,10 @@ def move_lead(lead, to_stage, lost_reason=None, values=None, force=0):
 	if missing and force and not soft:
 		frappe.throw(_("Cannot force stage move while soft stage rules are off"))
 
+	if col.get("is_won"):
+		existing_customer = frappe.db.get_value("Customer", {"lead_name": doc.name}, "name")
+		require_sales_commit_for_customer(existing_customer)
+
 	old_stage = doc.custom_preventa_stage
 	doc.custom_preventa_stage = to_stage
 	doc.custom_preventa_stage_since = now_datetime()
@@ -1244,6 +1255,11 @@ def convert_lead_to_customer(
 		frappe.throw(_("Lead {0} not found").format(lead), frappe.DoesNotExistError)
 	_require_owner_or_crm(lead_owner)
 
+	# Sales commit scope: assigned-only users may convert only their clients
+	# (or new leads without a Customer yet).
+	existing_customer = frappe.db.get_value("Customer", {"lead_name": lead}, "name")
+	require_sales_commit_for_customer(existing_customer)
+
 	result = _do_convert_lead(
 		lead,
 		customer_group=customer_group,
@@ -1252,6 +1268,17 @@ def convert_lead_to_customer(
 		create_contact=cint(create_contact),
 		create_address=cint(create_address),
 	)
+	# Ensure converting salesman stays on the Customer salesmen list.
+	try:
+		cust = (result or {}).get("customer") or (result or {}).get("name")
+		uid = (_acting_username() or "").strip()
+		if cust and uid:
+			users = customer_salesmen(cust)
+			if uid not in users:
+				users.append(uid)
+				_set_customer_salesmen_users(cust, users)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Preventa assign salesman on convert failed")
 	result["ok"] = True
 	return result
 

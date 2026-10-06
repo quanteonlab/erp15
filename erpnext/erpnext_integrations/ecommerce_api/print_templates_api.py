@@ -615,7 +615,13 @@ def _default_warehouse_name(company=None) -> str:
 
 
 def _floor_sku_locations(floor_id=None, company=None):
-	"""Map item_code → {location, section_id} from ECommerce Floor Map racks."""
+	"""Map item_code → {location, location_path, section_id, sort_key} from floor map racks."""
+	from erpnext.erpnext_integrations.ecommerce_api.floor_map_containment import (
+		build_containment_index,
+		load_sections_json,
+		section_kind,
+	)
+
 	filters = {}
 	try:
 		if company and frappe.db.has_column("ECommerce Floor Map", "company"):
@@ -634,29 +640,11 @@ def _floor_sku_locations(floor_id=None, company=None):
 	)
 	sku_to_loc = {}
 	map_payload = None
+	index = None
 	for f in floors:
-		sections = []
-		try:
-			sections = json.loads(f.sections_data or "[]")
-		except Exception:
-			sections = []
-		highlighted = set()
-		for s in sections:
-			if not isinstance(s, dict):
-				continue
-			code = (s.get("code") or s.get("name") or "").strip()
-			skus = list(s.get("products") or [])
-			for row in s.get("productRows") or []:
-				if isinstance(row, dict) and row.get("sku"):
-					skus.append(row["sku"])
-			for sku in skus:
-				sku = (sku or "").strip()
-				if not sku:
-					continue
-				if sku not in sku_to_loc:
-					sku_to_loc[sku] = {"location": code, "section_id": s.get("id")}
-					if s.get("id"):
-						highlighted.add(s.get("id"))
+		sections = load_sections_json(f.sections_data)
+		index = build_containment_index(sections)
+		sku_to_loc = index["sku_locations"]()
 		if map_payload is None:
 			map_payload = {
 				"floor_id": f.name,
@@ -667,6 +655,7 @@ def _floor_sku_locations(floor_id=None, company=None):
 						"id": s.get("id"),
 						"code": s.get("code") or "",
 						"name": s.get("name") or "",
+						"kind": section_kind(s),
 						"x": s.get("x") or 0,
 						"y": s.get("y") or 0,
 						"width": s.get("width") or 0,
@@ -677,13 +666,30 @@ def _floor_sku_locations(floor_id=None, company=None):
 					for s in sections
 					if isinstance(s, dict)
 				],
+				"_index": index,
 			}
-			# highlight filled after we know which SKUs matter — caller updates
 			map_payload["_sku_to_loc"] = sku_to_loc
-		# Prefer first matching floor when floor_id set; otherwise first floor with sections
 		if floor_id or sections:
 			break
 	return sku_to_loc, map_payload
+
+
+def _item_provisional_paths(item_codes):
+	"""Batch-read custom_physical_section for provisional Zone/Fila paths."""
+	codes = [c for c in (item_codes or []) if c]
+	if not codes or not frappe.db.has_column("Item", "custom_physical_section"):
+		return {}
+	rows = frappe.get_all(
+		"Item",
+		filters={"name": ["in", codes]},
+		fields=["name", "custom_physical_section"],
+		ignore_permissions=True,
+	)
+	return {
+		r.name: (r.custom_physical_section or "").strip()
+		for r in rows
+		if (r.custom_physical_section or "").strip()
+	}
 
 
 def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=None):
@@ -766,10 +772,23 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 
 	rows = []
 	highlight_ids = set()
+	item_codes = [it.item_code for it in (so.items or []) if it.item_code]
+	provisional_by_sku = _item_provisional_paths(item_codes)
+	index = (map_payload or {}).get("_index") if map_payload else None
+
 	for it in so.items or []:
 		loc_info = sku_to_loc.get(it.item_code) or {}
-		loc = loc_info.get("location") or ""
+		loc = loc_info.get("location_path") or loc_info.get("location") or ""
 		sid = loc_info.get("section_id")
+		sort_key = loc_info.get("sort_key")
+		if not loc:
+			prov = provisional_by_sku.get(it.item_code) or ""
+			if prov:
+				loc = prov.replace("/", " › ")
+				if index:
+					sort_key = index["sort_key_for_provisional"](prov)
+		if not sort_key:
+			sort_key = (1e12, 1e12, 1e12, 1e12, 1e12, 1e12)
 		if sid:
 			highlight_ids.add(sid)
 		barcode = _item_barcode(it.item_code)
@@ -796,9 +815,15 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 				"barcode": barcode,
 				"confirm_uni": "",
 				"confirm_qty": "",
+				"_location_sort_key": sort_key,
 			}
 		)
 		rows.append(row)
+
+	# Walk order: Zone → Fila → Rack → x,y (stable within equal keys)
+	rows.sort(key=lambda r: (r.get("_location_sort_key") or (1e12,), r.get("item_code") or ""))
+	for r in rows:
+		r.pop("_location_sort_key", None)
 
 	map_out = None
 	if map_payload:

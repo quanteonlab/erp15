@@ -814,6 +814,14 @@ def ensure_product_manager_custom_fields() -> None:
                     "description": "Soft max weight per stock unit (Armado advisory). Same UOM as Weight UOM.",
                     "reqd": 0,
                 },
+                {
+                    "fieldname": "custom_physical_section",
+                    "fieldtype": "Data",
+                    "label": "Physical Section",
+                    "insert_after": "item_name",
+                    "description": "Provisional warehouse path (Z21/F23) until assigned to a rack.",
+                    "reqd": 0,
+                },
             ]
         },
         ignore_validate=True,
@@ -1155,6 +1163,11 @@ def get_product_rows(
         if frappe.db.has_column("Item", "has_batch_no")
         else "0 AS has_batch_no, 0 AS has_expiry_date"
     )
+    physical_select = (
+        "COALESCE(i.custom_physical_section, '') AS physical_section"
+        if frappe.db.has_column("Item", "custom_physical_section")
+        else "'' AS physical_section"
+    )
 
     sql = f"""
         SELECT
@@ -1174,6 +1187,7 @@ def get_product_rows(
             {wmax_select},
             {sell_by_select},
             {batch_select},
+            {physical_select},
             i.disabled               AS _disabled,
             COALESCE(i.custom_normalized_title, NULL)  AS _raw_norm,
             COALESCE(NULLIF(TRIM(i.custom_normalized_title), ''), i.item_name) AS normalized_title,
@@ -1405,6 +1419,7 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
 
     changes = dict(changes)
     stock_qty_target = changes.pop("stock_qty", None)
+    stock_qty_mode = changes.pop("stock_qty_mode", None)
     changes.pop("cost_from_buying", None)
 
     # Allow clearing pack qty/size/unit (DB Int columns are often NOT NULL by default).
@@ -1434,6 +1449,7 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             "unit_weight_min": "custom_unit_weight_min",
             "unit_weight_max": "custom_unit_weight_max",
             "sell_by_days": "shelf_life_in_days",
+            "physical_section": "custom_physical_section",
         }
         direct_field_map = {
             k: v for k, v in direct_field_map.items() if frappe.db.has_column("Item", v)
@@ -1558,13 +1574,31 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
                 frappe.throw(
                     _("Select a warehouse in Product Manager before saving quantity changes.")
                 )
-            old_qty = frappe.db.get_value(
-                "Bin",
-                {"item_code": item_code, "warehouse": warehouse},
-                "actual_qty",
+            # Dirty / null mode → absolute set (legacy Product Manager behaviour).
+            mode = cstr(stock_qty_mode or "set").strip().lower()
+            if mode in ("", "null", "undefined", "none"):
+                mode = "set"
+            old_qty = flt(
+                frappe.db.get_value(
+                    "Bin",
+                    {"item_code": item_code, "warehouse": warehouse},
+                    "actual_qty",
+                )
+                or 0
             )
-            _reconcile_item_stock_qty(item_code, warehouse, flt(stock_qty_target))
-            history.append(("stock_qty", flt(old_qty or 0), flt(stock_qty_target)))
+            if mode == "add":
+                from erpnext.erpnext_integrations.ecommerce_api.api import update_stock
+
+                delta = flt(stock_qty_target)
+                if abs(delta) < 1e-9:
+                    new_qty = old_qty
+                else:
+                    res = update_stock(item_code, warehouse, delta)
+                    new_qty = flt(res.get("new_qty") if isinstance(res, dict) else old_qty + delta)
+                history.append(("stock_qty", old_qty, new_qty))
+            else:
+                _reconcile_item_stock_qty(item_code, warehouse, flt(stock_qty_target))
+                history.append(("stock_qty", old_qty, flt(stock_qty_target)))
 
         if history:
             _log_item_field_history(item_code, history)
@@ -1820,8 +1854,22 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
             )
 
     if warehouse and changes.get("stock_qty") is not None:
-        _reconcile_item_stock_qty(candidate_code, warehouse, flt(changes["stock_qty"]))
-        create_history.append(("stock_qty", None, flt(changes["stock_qty"])))
+        mode = cstr(changes.get("stock_qty_mode") or "set").strip().lower()
+        if mode in ("", "null", "undefined", "none"):
+            mode = "set"
+        if mode == "add":
+            from erpnext.erpnext_integrations.ecommerce_api.api import update_stock
+
+            delta = flt(changes["stock_qty"])
+            if abs(delta) >= 1e-9:
+                res = update_stock(candidate_code, warehouse, delta)
+                new_qty = flt(res.get("new_qty") if isinstance(res, dict) else delta)
+            else:
+                new_qty = 0.0
+            create_history.append(("stock_qty", None, new_qty))
+        else:
+            _reconcile_item_stock_qty(candidate_code, warehouse, flt(changes["stock_qty"]))
+            create_history.append(("stock_qty", None, flt(changes["stock_qty"])))
 
     _log_item_field_history(candidate_code, create_history)
 
@@ -3431,16 +3479,47 @@ def get_section_details(section_id, company=None):
 
 
 @frappe.whitelist()
+def get_floor_containment(floor_id=None, company=None):
+    return _floor_map_api_module().get_floor_containment(floor_id=floor_id, company=company)
+
+
+@frappe.whitelist()
+def get_item_floor_location(item_code=None, floor_id=None, company=None):
+    return _floor_map_api_module().get_item_floor_location(
+        item_code=item_code, floor_id=floor_id, company=company
+    )
+
+
+@frappe.whitelist()
+def assign_item_floor_location(
+    item_code=None,
+    floor_id=None,
+    section_id=None,
+    provisional_path=None,
+    company=None,
+):
+    return _floor_map_api_module().assign_item_floor_location(
+        item_code=item_code,
+        floor_id=floor_id,
+        section_id=section_id,
+        provisional_path=provisional_path,
+        company=company,
+    )
+
+
+@frappe.whitelist()
 def save_floor_map(location_name, floor_name, sections_data=None, notes_data=None, canvas_width=1400, canvas_height=900, company=None):
     if isinstance(sections_data, list):
         sections_data = json.dumps(sections_data)
     if isinstance(notes_data, list):
         notes_data = json.dumps(notes_data)
+    # Pass None through so floor_map_api can keep existing sections/notes on update
+    # (do not coerce null → "[]", which wiped maps after smoke company renames).
     return _floor_map_api_module().save_floor_map(
         location_name,
         floor_name,
-        sections_data or "[]",
-        notes_data or "[]",
+        sections_data,
+        notes_data,
         canvas_width,
         canvas_height,
         company=company,
@@ -3728,6 +3807,120 @@ def resolve_ops_pin(pin=None):
     )
 
     return _impl(pin=pin)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_employee_sales(employee=None, user_id=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        get_employee_sales as _impl,
+    )
+
+    return _impl(employee=employee, user_id=user_id)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_customers(employee=None, user_id=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_employee_customers as _impl,
+    )
+
+    return _impl(employee=employee, user_id=user_id)
+
+
+@frappe.whitelist(allow_guest=True)
+def assign_employee_customer(employee=None, user_id=None, customer=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        assign_employee_customer as _impl,
+    )
+
+    return _impl(employee=employee, user_id=user_id, customer=customer)
+
+
+@frappe.whitelist(allow_guest=True)
+def unassign_employee_customer(employee=None, user_id=None, customer=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        unassign_employee_customer as _impl,
+    )
+
+    return _impl(employee=employee, user_id=user_id, customer=customer)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_orders(employee=None, user_id=None, start=0, page_length=50):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_employee_orders as _impl,
+    )
+
+    return _impl(employee=employee, user_id=user_id, start=start, page_length=page_length)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_invoices(employee=None, user_id=None, is_return=0, start=0, page_length=50):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_employee_invoices as _impl,
+    )
+
+    return _impl(
+        employee=employee,
+        user_id=user_id,
+        is_return=is_return,
+        start=start,
+        page_length=page_length,
+    )
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_payments(employee=None, user_id=None, start=0, page_length=50):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_employee_payments as _impl,
+    )
+
+    return _impl(employee=employee, user_id=user_id, start=start, page_length=page_length)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_products(employee=None, user_id=None, page_length=100):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_employee_products as _impl,
+    )
+
+    return _impl(employee=employee, user_id=user_id, page_length=page_length)
+
+
+@frappe.whitelist(allow_guest=True)
+def set_customer_salesmen(customer=None, user_ids=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        set_customer_salesmen as _impl,
+    )
+
+    return _impl(customer=customer, user_ids=user_ids)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_customer_salesmen(customer=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        get_customer_salesmen as _impl,
+    )
+
+    return _impl(customer=customer)
+
+
+@frappe.whitelist(allow_guest=True)
+def ensure_salesman(name=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        ensure_salesman as _impl,
+    )
+
+    return _impl(name=name)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_salesman_options(search=None, page_length=200):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        list_salesman_options as _impl,
+    )
+
+    return _impl(search=search, page_length=page_length)
 
 
 @frappe.whitelist(allow_guest=True)

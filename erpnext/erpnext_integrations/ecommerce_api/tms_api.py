@@ -588,16 +588,28 @@ def get_planner_context(company=None):
 	)
 
 	company = company or frappe.defaults.get_user_default("Company")
-	warehouses = []
-	default_warehouse = None
+	wh_filters = {"is_group": 0, "disabled": 0}
 	if company:
+		wh_filters["company"] = company
+	warehouses = frappe.get_all(
+		"Warehouse",
+		filters=wh_filters,
+		fields=["name", "warehouse_name"],
+		order_by="warehouse_name asc",
+		ignore_permissions=True,
+	)
+	# If company filter returned nothing (missing default / mismatch), fall back to all
+	# active leaf warehouses so Assign / pickers match the Pines list.
+	if not warehouses:
 		warehouses = frappe.get_all(
 			"Warehouse",
-			filters={"company": company, "is_group": 0, "disabled": 0},
+			filters={"is_group": 0, "disabled": 0},
 			fields=["name", "warehouse_name"],
 			order_by="warehouse_name asc",
 			ignore_permissions=True,
 		)
+	default_warehouse = None
+	if company:
 		default_warehouse = frappe.db.get_value("Company", company, "custom_default_warehouse")
 
 	return {
@@ -3229,15 +3241,37 @@ def reorder_trip_stops(trip_name, delivery_note_names=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def update_trip_assignment(trip_name, driver=None, vehicle=None, pickup_warehouse=None):
-	if not driver and not vehicle and not pickup_warehouse:
-		frappe.throw(_("Provide a driver, vehicle, or pickup warehouse to update."))
+def update_trip_assignment(
+	trip_name, driver=None, vehicle=None, pickup_warehouse=None, departure_time=None
+):
+	"""Update draft MAT assignment (driver / vehicle / warehouse) and/or departure time.
+
+	``departure_time`` accepts ``YYYY-MM-DD`` (defaults to 08:00) or a full datetime.
+	Driver / vehicle / warehouse changes remain Draft-only; departure can also be set
+	on Scheduled trips that have not started.
+	"""
+	has_assign = bool(cstr(driver or "").strip() or cstr(vehicle or "").strip() or cstr(pickup_warehouse or "").strip())
+	# departure_time=None → omit; "" → controlled error below
+	has_dep = departure_time is not None
+	if not has_assign and not has_dep:
+		frappe.throw(_("Provide a driver, vehicle, pickup warehouse, or departure time to update."))
 
 	frappe.flags.ignore_permissions = True
 	trip = frappe.get_doc("Delivery Trip", trip_name)
 	frappe.flags.ignore_permissions = False
-	if trip.docstatus != 0:
-		frappe.throw(_("Only a Draft trip can be reassigned. Cancel a published trip and create a new one instead."))
+
+	status = cstr(trip.status or "").strip()
+	if trip.docstatus == 2 or status == "Cancelled":
+		frappe.throw(_("Cannot edit a cancelled MAT."))
+	if status == "Completed":
+		frappe.throw(_("Cannot edit a completed MAT."))
+	if status == "In Transit" and has_assign:
+		frappe.throw(_("Cannot reassign driver/vehicle while the MAT is In Transit."))
+
+	if has_assign and trip.docstatus != 0:
+		frappe.throw(
+			_("Only a Draft trip can be reassigned. Cancel a published trip and create a new one instead.")
+		)
 
 	if driver or pickup_warehouse:
 		driver_doc = None
@@ -3258,8 +3292,19 @@ def update_trip_assignment(trip_name, driver=None, vehicle=None, pickup_warehous
 		if not frappe.db.exists("Vehicle", vehicle):
 			frappe.throw(_("Vehicle {0} not found").format(vehicle), frappe.DoesNotExistError)
 		trip.vehicle = vehicle
-	else:
+	elif has_assign and not vehicle and trip.docstatus == 0:
 		_ensure_trip_vehicle(trip)
+
+	if has_dep:
+		raw = cstr(departure_time or "").strip()
+		if not raw:
+			frappe.throw(_("Departure time is required."))
+		if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+			raw = f"{raw} 08:00:00"
+		try:
+			trip.departure_time = get_datetime(raw)
+		except Exception:
+			frappe.throw(_("Invalid departure time: {0}").format(departure_time))
 
 	_save_trip_doc(trip)
 
@@ -7375,9 +7420,112 @@ def _new_map_id(prefix="pin"):
 	return f"{prefix}-{frappe.generate_hash(length=10)}"
 
 
+def _warehouse_address_geo(warehouse_name):
+	"""Best-effort street + lat/lng for a Warehouse (linked Address or warehouse fields)."""
+	wh_name = cstr(warehouse_name or "").strip()
+	if not wh_name:
+		return "", 0.0, 0.0, None
+
+	addr_name = None
+	# Dynamic Link → Address
+	links = frappe.get_all(
+		"Dynamic Link",
+		filters={"link_doctype": "Warehouse", "link_name": wh_name, "parenttype": "Address"},
+		fields=["parent"],
+		ignore_permissions=True,
+		limit=5,
+	)
+	for link in links or []:
+		addr_name = cstr(link.parent or "").strip()
+		if addr_name:
+			break
+
+	line1 = ""
+	lat = 0.0
+	lng = 0.0
+	if addr_name and frappe.db.exists("Address", addr_name):
+		row = frappe.db.get_value(
+			"Address",
+			addr_name,
+			["address_line1", "address_line2", "city", "custom_latitude", "custom_longitude"],
+			as_dict=True,
+		) or {}
+		bits = [
+			cstr(row.get("address_line1") or "").strip(),
+			cstr(row.get("address_line2") or "").strip(),
+			cstr(row.get("city") or "").strip(),
+		]
+		line1 = ", ".join(b for b in bits if b)
+		lat = flt(row.get("custom_latitude"))
+		lng = flt(row.get("custom_longitude"))
+
+	if not line1 and frappe.db.has_column("Warehouse", "address_line_1"):
+		line1 = cstr(frappe.db.get_value("Warehouse", wh_name, "address_line_1") or "").strip()
+
+	return line1, lat, lng, addr_name or None
+
+
+def _ensure_warehouse_pins(pins):
+	"""Ensure every non-group Warehouse appears as a map pin (even without street/coords)."""
+	pins = list(pins or [])
+	existing_refs = {
+		cstr(p.get("ref_name"))
+		for p in pins
+		if isinstance(p, dict) and cstr(p.get("kind")) == "warehouse" and cstr(p.get("ref_name") or "").strip()
+	}
+	warehouses = frappe.get_all(
+		"Warehouse",
+		filters={"is_group": 0, "disabled": 0},
+		fields=["name", "warehouse_name"],
+		ignore_permissions=True,
+	)
+	changed = False
+	now = str(now_datetime())
+	for wh in warehouses or []:
+		ref = cstr(wh.name)
+		if ref in existing_refs:
+			continue
+		addr_line, lat, lng, addr_name = _warehouse_address_geo(ref)
+		label = cstr(wh.warehouse_name or wh.name).strip() or ref
+		pins.append(
+			{
+				"id": _new_map_id("wh"),
+				"kind": "warehouse",
+				"label": label,
+				"address": addr_line or "",
+				"lat": lat,
+				"lng": lng,
+				"ref_doctype": "Warehouse",
+				"ref_name": ref,
+				"address_name": addr_name,
+				"vehicles": [],
+				"coverage": dict(BA_COVERAGE_DEFAULT),
+				"ungeocoded": 0 if (lat or lng) else 1,
+				"created_at": now,
+				"updated_at": now,
+			}
+		)
+		changed = True
+	# Refresh ungeocoded flag on existing warehouse pins lacking coords.
+	for i, p in enumerate(pins):
+		if not isinstance(p, dict) or cstr(p.get("kind")) != "warehouse":
+			continue
+		lat = flt(p.get("lat"))
+		lng = flt(p.get("lng"))
+		flag = 0 if (lat or lng) else 1
+		if cint(p.get("ungeocoded")) != flag:
+			pins[i] = {**p, "ungeocoded": flag}
+			changed = True
+	return pins, changed
+
+
 @frappe.whitelist(allow_guest=True)
 def list_map_pins_and_plans():
-	"""Temp locations + named map plans for the Routes map."""
+	"""Temp locations + named map plans for the Routes map.
+
+	Also surfaces every Warehouse in the company as a pin — even when it has no
+	street address or coordinates yet (``ungeocoded=1``).
+	"""
 	store = _load_tms_map_store()
 	pins = list(store.get("pins") or [])
 	changed = False
@@ -7392,6 +7540,10 @@ def list_map_pins_and_plans():
 			row["vehicles"] = []
 			changed = True
 		pins[i] = row
+
+	pins, wh_changed = _ensure_warehouse_pins(pins)
+	changed = changed or wh_changed
+
 	# Single-depot convenience: if exactly one warehouse and no vehicles claimed yet,
 	# park every vehicle there.
 	wh_pins = [p for p in pins if isinstance(p, dict) and cstr(p.get("kind")) == "warehouse"]
@@ -7617,11 +7769,19 @@ def create_warehouse_at_location(
 
 
 @frappe.whitelist(allow_guest=True)
-def update_warehouse_depot(pin_id=None, vehicles=None, coverage=None):
+def update_warehouse_depot(
+	pin_id=None,
+	vehicles=None,
+	coverage=None,
+	label=None,
+	address=None,
+	lat=None,
+	lng=None,
+):
 	"""Assign vehicles + service coverage domain on a warehouse map pin.
 
-	``vehicles``: list of Vehicle names (for now typically one warehouse owns all).
-	``coverage``: {kind, name, south, west, north, east} bbox — default Buenos Aires.
+	Also accepts optional ``label`` / ``address`` / ``lat`` / ``lng`` so the
+	dispatcher can edit name and street from the Pines panel.
 	"""
 	pin_id = cstr(pin_id or "").strip()
 	if not pin_id or pin_id.lower() in ("null", "undefined", "none"):
@@ -7635,6 +7795,24 @@ def update_warehouse_depot(pin_id=None, vehicles=None, coverage=None):
 	pin = dict(pins[idx])
 	if cstr(pin.get("kind") or "") != "warehouse":
 		frappe.throw(_("Pin is not a warehouse."))
+
+	if label is not None:
+		lab = cstr(label or "").strip()
+		if lab:
+			pin["label"] = lab
+
+	if address is not None:
+		pin["address"] = cstr(address or "").strip()
+
+	if lat is not None or lng is not None:
+		try:
+			lat_f = flt(lat) if lat is not None else flt(pin.get("lat"))
+			lng_f = flt(lng) if lng is not None else flt(pin.get("lng"))
+		except Exception:
+			lat_f, lng_f = flt(pin.get("lat")), flt(pin.get("lng"))
+		pin["lat"] = lat_f
+		pin["lng"] = lng_f
+		pin["ungeocoded"] = 0 if (lat_f or lng_f) else 1
 
 	if vehicles is not None:
 		raw = vehicles
@@ -7692,7 +7870,117 @@ def update_warehouse_depot(pin_id=None, vehicles=None, coverage=None):
 	pins[idx] = pin
 	store["pins"] = pins
 	_save_tms_map_store(store)
+
+	# Keep Warehouse address_line_1 / Address geo in sync when street or coords change.
+	ref = cstr(pin.get("ref_name") or "").strip()
+	if ref and frappe.db.exists("Warehouse", ref):
+		addr_line = cstr(pin.get("address") or "").strip()
+		if addr_line and frappe.db.has_column("Warehouse", "address_line_1"):
+			frappe.db.set_value("Warehouse", ref, "address_line_1", addr_line, update_modified=False)
+		addr_name = cstr(pin.get("address_name") or "").strip()
+		if addr_name and frappe.db.exists("Address", addr_name):
+			updates = {}
+			if addr_line and frappe.db.has_column("Address", "address_line1"):
+				updates["address_line1"] = addr_line
+			if pin.get("lat") is not None and frappe.db.has_column("Address", "custom_latitude"):
+				updates["custom_latitude"] = flt(pin.get("lat"))
+			if pin.get("lng") is not None and frappe.db.has_column("Address", "custom_longitude"):
+				updates["custom_longitude"] = flt(pin.get("lng"))
+			if updates:
+				frappe.db.set_value("Address", addr_name, updates, update_modified=False)
+		frappe.db.commit()
+
 	return {"pin": pin, "pins": pins}
+
+
+@frappe.whitelist(allow_guest=True)
+def link_warehouse_at_location(
+	warehouse=None, address=None, lat=None, lng=None, label=None
+):
+	"""Move / set an existing Warehouse's map pin to the clicked location."""
+	wh_name = cstr(warehouse or "").strip()
+	if not wh_name or not frappe.db.exists("Warehouse", wh_name):
+		frappe.throw(_("Warehouse {0} not found").format(wh_name or "?"))
+	lat = flt(lat)
+	lng = flt(lng)
+	if not (lat or lng):
+		frappe.throw(_("Latitude and longitude are required."))
+	addr_line = cstr(address or "").strip() or cstr(label or "").strip() or wh_name
+	wh_label = (
+		cstr(label or "").strip()
+		or cstr(frappe.db.get_value("Warehouse", wh_name, "warehouse_name") or wh_name)
+	)
+
+	store = _load_tms_map_store()
+	pins = list(store.get("pins") or [])
+	idx = next(
+		(
+			i
+			for i, p in enumerate(pins)
+			if isinstance(p, dict)
+			and cstr(p.get("kind")) == "warehouse"
+			and cstr(p.get("ref_name")) == wh_name
+		),
+		None,
+	)
+
+	addr_name = None
+	if idx is not None:
+		addr_name = cstr(pins[idx].get("address_name") or "").strip() or None
+	if not addr_name:
+		_, _, _, addr_name = _warehouse_address_geo(wh_name)
+
+	if addr_name and frappe.db.exists("Address", addr_name):
+		updates = {
+			"address_line1": addr_line,
+			"custom_latitude": lat,
+			"custom_longitude": lng,
+		}
+		frappe.db.set_value("Address", addr_name, updates, update_modified=False)
+	else:
+		addr = _ensure_geo_address(
+			title=wh_label,
+			line1=addr_line,
+			lat=lat,
+			lng=lng,
+			link_doctype="Warehouse",
+			link_name=wh_name,
+			address_type="Warehouse",
+		)
+		addr_name = addr.name
+
+	if frappe.db.has_column("Warehouse", "address_line_1"):
+		frappe.db.set_value("Warehouse", wh_name, "address_line_1", addr_line, update_modified=False)
+
+	now = str(now_datetime())
+	pin = {
+		"id": pins[idx]["id"] if idx is not None else _new_map_id("wh"),
+		"kind": "warehouse",
+		"label": wh_label,
+		"address": addr_line,
+		"lat": lat,
+		"lng": lng,
+		"ref_doctype": "Warehouse",
+		"ref_name": wh_name,
+		"address_name": addr_name,
+		"vehicles": list(pins[idx].get("vehicles") or []) if idx is not None else [],
+		"coverage": dict(pins[idx].get("coverage") or BA_COVERAGE_DEFAULT)
+		if idx is not None
+		else dict(BA_COVERAGE_DEFAULT),
+		"ungeocoded": 0,
+		"updated_at": now,
+	}
+	if idx is not None:
+		pin["created_at"] = pins[idx].get("created_at") or now
+		pins[idx] = {**pins[idx], **pin}
+	else:
+		pin["created_at"] = now
+		pins.append(pin)
+
+	store["pins"] = pins
+	_save_tms_map_store(store)
+	frappe.db.commit()
+	return {"warehouse": wh_name, "address": addr_name, "pin": pin, "pins": pins}
 
 
 @frappe.whitelist(allow_guest=True)

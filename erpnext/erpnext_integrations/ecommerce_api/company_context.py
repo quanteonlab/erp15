@@ -89,29 +89,54 @@ def allowed_company_names(user: str | None = None) -> list[str]:
 	return out
 
 
+def _existing_company(name: str | None) -> str | None:
+	"""Return name only if a Company row exists (ignores stale session/default cache)."""
+	name = (name or "").strip()
+	if not name:
+		return None
+	try:
+		if frappe.db.exists("Company", name):
+			return name
+	except Exception:
+		return None
+	return None
+
+
 def resolve_company(company=None, user: str | None = None) -> str | None:
-	"""Company to stamp on writes. Ignores switcher/header when multi-company is off."""
+	"""Company to stamp on writes. Ignores switcher/header when multi-company is off.
+
+	Never returns a stale/ghost company name from session defaults after a rename
+	(e.g. smoke `__smoke_ren` leftovers) — validate against tabCompany.
+	"""
 	user = user or acting_user()
 	multi = is_multi_company_enabled()
 	if not multi:
-		default = frappe.defaults.get_user_default("Company", user)
-		if default:
-			return default
-		global_default = frappe.db.get_single_value("Global Defaults", "default_company")
-		if global_default:
-			return global_default
-		return frappe.db.get_value("Company", {}, "name")
+		for candidate in (
+			frappe.defaults.get_user_default("Company", user),
+			frappe.db.get_single_value("Global Defaults", "default_company"),
+			frappe.db.get_value("Company", {}, "name"),
+		):
+			found = _existing_company(candidate)
+			if found:
+				return found
+		return None
 
-	allowed = allowed_company_names(user)
-	requested = (company or _request_company() or "").strip()
+	allowed = [n for n in allowed_company_names(user) if _existing_company(n)]
+	requested = _existing_company(company or _request_company() or "")
+	if (company or _request_company() or "").strip() and not requested:
+		# Explicit request for a missing company — controlled error, not LinkValidationError later
+		frappe.throw(
+			_("Company {0} not found").format((company or _request_company() or "").strip()),
+			frappe.DoesNotExistError,
+		)
 	if requested:
-		if requested not in allowed:
+		if requested not in allowed and not _unrestricted(user):
 			frappe.throw(_("Company {0} is not allowed for this user").format(requested))
 		return requested
-	default = frappe.defaults.get_user_default("Company", user)
+	default = _existing_company(frappe.defaults.get_user_default("Company", user))
 	if default and default in allowed:
 		return default
-	global_default = frappe.db.get_single_value("Global Defaults", "default_company")
+	global_default = _existing_company(frappe.db.get_single_value("Global Defaults", "default_company"))
 	if global_default and global_default in allowed:
 		return global_default
 	return allowed[0] if allowed else None

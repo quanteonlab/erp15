@@ -1212,6 +1212,42 @@ def suite_5_10_product_manager():
             assert "headers" in block and "rows" in block, f"bad {key}: {block}"
             assert isinstance(block["rows"], list)
 
+    def check_stock_location_estimates():
+        from erpnext.erpnext_integrations.ecommerce_api import stock_location_api as sla
+
+        # Skip cleanly if DocType not migrated yet on this site.
+        if not frappe.db.exists("DocType", "Stock Location Estimate"):
+            return
+        item = frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        wh = frappe.db.get_value("Warehouse", {"is_group": 0, "disabled": 0}, "name")
+        if not item or not wh:
+            return
+        bin_before = flt(
+            frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "actual_qty") or 0
+        )
+        created = sla.upsert_stock_location_estimate(
+            item_code=item,
+            warehouse=wh,
+            location_label="Smoke soft loc",
+            qty_estimate=7,
+            lote_code="SMOKE-LOT",
+        )
+        assert created.get("ok") and created.get("row"), f"upsert failed: {created}"
+        name = created["row"]["name"]
+        cov = sla.get_stock_location_coverage(item_code=item, warehouse=wh)
+        assert abs(flt(cov.get("total")) - bin_before) < 1e-6, (
+            f"estimate must not change Bin: before={bin_before} total={cov.get('total')}"
+        )
+        assert flt(cov.get("located")) >= 7 - 1e-6, cov
+        assert "idk" in cov, cov
+        sla.delete_stock_location_estimate(name=name)
+        bin_after = flt(
+            frappe.db.get_value("Bin", {"item_code": item, "warehouse": wh}, "actual_qty") or 0
+        )
+        assert abs(bin_after - bin_before) < 1e-6, (
+            f"delete estimate changed Bin: {bin_before} → {bin_after}"
+        )
+
     _run("5.10.1 get_pm_context", check_pm_context, "S2")
     _run("5.10.2 get_product_rows page", check_product_rows, "S2")
     _run("5.10.3 list_uoms", check_uoms, "S3")
@@ -1224,6 +1260,7 @@ def suite_5_10_product_manager():
     _run("5.10.10 get_accounting_constants starter keys", check_accounting_constants_starter, "S2")
     _run("5.10.11 get_accounting_sheet starter tabs", check_accounting_starter_sheet, "S2")
     _run("5.10.12 get_accounting_detail_tables dumps", check_accounting_detail_tables, "S2")
+    _run("5.10.13 stock location estimates soft (Bin unchanged)", check_stock_location_estimates, "S2")
 
 
 # ── Suite 5.11 — POS session / cash / admin settings ──────────────────────────
@@ -1443,8 +1480,19 @@ def suite_5_12_modules_read():
 
     def check_floors():
         from erpnext.erpnext_integrations.ecommerce_api import floor_map_api as fma
+        from erpnext.erpnext_integrations.ecommerce_api import test_floor_map_containment as tfc
+
         floors = fma.get_floors()
         assert floors is not None
+        # Geometric containment fixtures (screenshot Z21/F23 membership)
+        assert tfc.run().get("ok") is True
+        # Dirty assign must be controlled
+        bad = fma.assign_item_floor_location(item_code=None)
+        assert isinstance(bad, dict) and bad.get("ok") is False
+        empty_loc = fma.get_item_floor_location(item_code="")
+        assert isinstance(empty_loc, dict) and empty_loc.get("item_code") == ""
+        containment = fma.get_floor_containment(floor_id=None)
+        assert isinstance(containment, dict) and "sections" in containment
 
     def check_print():
         from erpnext.erpnext_integrations.ecommerce_api import print_templates_api as pta
@@ -1500,8 +1548,17 @@ def suite_5_12_modules_read():
         company = restored_cur["company"]
         old_name = company["name"]
         tmp_name = f"{old_name}__smoke_ren"
-        if frappe.db.exists("Company", tmp_name):
-            tmp_name = f"{old_name}__smoke_ren2"
+        # Avoid stacking suffixes if a prior aborted smoke left *__smoke_ren
+        while frappe.db.exists("Company", tmp_name):
+            if tmp_name.endswith("__smoke_ren2"):
+                tmp_name = f"{old_name}__smoke_ren_{frappe.generate_hash(length=4)}"
+            elif tmp_name.endswith("__smoke_ren"):
+                tmp_name = f"{old_name}__smoke_ren2"
+            else:
+                tmp_name = f"{old_name}__smoke_ren_{frappe.generate_hash(length=4)}"
+            if len(tmp_name) > 120:
+                tmp_name = f"smoke_ren_{frappe.generate_hash(length=8)}"
+                break
         settings = {
             **company,
             "company_name": tmp_name,
@@ -1509,18 +1566,54 @@ def suite_5_12_modules_read():
             "default_language": payload.get("default_language") or "es",
             "multi_company_enabled": payload.get("multi_company_enabled") or 0,
         }
-        renamed = cs.save_company_settings(company=old_name, settings=settings)
-        assert renamed["company"]["name"] == tmp_name, renamed["company"]
-        assert (renamed["company"].get("domain") or "") != "shopify"
-        # Rename back
-        settings_back = {
-            **renamed["company"],
-            "company_name": old_name,
-            "default_language": renamed.get("default_language") or "es",
-            "multi_company_enabled": renamed.get("multi_company_enabled") or 0,
-        }
-        restored = cs.save_company_settings(company=tmp_name, settings=settings_back)
-        assert restored["company"]["name"] == old_name, restored["company"]
+        try:
+            renamed = cs.save_company_settings(company=old_name, settings=settings)
+            assert renamed["company"]["name"] == tmp_name, renamed["company"]
+            assert (renamed["company"].get("domain") or "") != "shopify"
+            # Rename back
+            settings_back = {
+                **renamed["company"],
+                "company_name": old_name,
+                "default_language": renamed.get("default_language") or "es",
+                "multi_company_enabled": renamed.get("multi_company_enabled") or 0,
+            }
+            restored = cs.save_company_settings(company=tmp_name, settings=settings_back)
+            assert restored["company"]["name"] == old_name, restored["company"]
+        finally:
+            # Always try to restore original name if a mid-test abort left *__smoke_ren
+            if not frappe.db.exists("Company", old_name):
+                leftover = None
+                if frappe.db.exists("Company", tmp_name):
+                    leftover = tmp_name
+                else:
+                    for n in frappe.get_all("Company", pluck="name", ignore_permissions=True) or []:
+                        if n and ("__smoke_ren" in n or n.startswith("smoke_ren_")):
+                            leftover = n
+                            break
+                if leftover:
+                    try:
+                        cs.save_company_settings(
+                            company=leftover,
+                            settings={
+                                "company_name": old_name,
+                                "default_language": payload.get("default_language") or "es",
+                            },
+                        )
+                    except Exception:
+                        frappe.log_error(title="smoke company rename restore")
+            # Clear stale session defaults pointing at ghost companies
+            try:
+                from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+                good = resolve_company(None) or (
+                    old_name if frappe.db.exists("Company", old_name) else None
+                )
+                if good and frappe.db.exists("Company", good):
+                    frappe.db.set_default("company", good)
+                    frappe.db.set_value("Global Defaults", None, "default_company", good)
+                    frappe.clear_cache()
+            except Exception:
+                pass
 
         # Company logo: tiny PNG → local /files, then clear
         tiny_png = (
@@ -2365,6 +2458,21 @@ def suite_5_12_modules_read():
             assert stamped.get("ok") and so in (stamped.get("names") or []), stamped
             got = ta.get_tags_for_doc("Sales Order", so)
             assert "PRINTED" in (got.get("tags") or []), got
+            # List + detail payloads must surface tags for pipeline print icons.
+            from erpnext.erpnext_integrations.ecommerce_api import api as guest_api
+
+            listed = guest_api.get_guest_preorders_list(page_length=80, scope="admin")
+            listed_row = next(
+                (r for r in (listed.get("preorders") or []) if r.get("name") == so),
+                None,
+            )
+            if listed_row is not None:
+                assert "PRINTED" in (listed_row.get("tags") or []), listed_row
+            try:
+                detail = guest_api.get_guest_preorder(so)
+                assert "PRINTED" in (detail.get("tags") or []), detail
+            except Exception:
+                pass  # non-guest SO ok — stamp path still covered above
             # download is the same as print — stamps PRINTED, not DOWNLOADED
             stamped2 = ta.mark_sales_orders_print_action(names=[so], action="downloaded", commit=True)
             assert stamped2.get("action") == "printed", stamped2

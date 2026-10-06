@@ -3009,8 +3009,27 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	)
 	# RM Zona = Address.custom_zone (committed Planificación de entregas codes), not Territory.
 	zone_by_customer = _customer_delivery_zone_map([r.name for r in rows])
-	return {
-		"customers": [
+
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_assigned_customer_names,
+		_acting_username,
+		customer_salesmen,
+		sales_visibility_scope,
+	)
+
+	scope = sales_visibility_scope()
+	allowed = None
+	if scope == "none":
+		rows = []
+	elif scope == "assigned":
+		uid = _acting_username() or ""
+		allowed = set(_assigned_customer_names(uid)) if uid else set()
+		rows = [r for r in rows if r.name in allowed]
+
+	out_customers = []
+	for r in rows:
+		salesmen = customer_salesmen(r.name)
+		out_customers.append(
 			{
 				"name": r.name,
 				"customer_name": r.customer_name,
@@ -3028,10 +3047,11 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"client_phone_e164": getattr(r, "custom_client_phone_e164", None),
 				"is_bucket": (r.customer_name or r.name or "")
 				in (CONSUMIDOR_FINAL_NAME, UNCATEGORIZED_CUSTOMER_NAME),
+				"salesmen": salesmen,
+				"account_manager": salesmen[0] if salesmen else None,
 			}
-			for r in rows
-		]
-	}
+		)
+	return {"customers": out_customers}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -5325,6 +5345,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		o["delivery_note"] = lg.get("delivery_note") or o.get("delivery_note")
 		o["trip_name"] = lg.get("trip_name")
 		o["trip_status"] = lg.get("trip_status")
+		o["stop_idx"] = lg.get("stop_idx")
 		o["vehicle"] = lg.get("vehicle")
 		o["vehicle_plate"] = lg.get("vehicle_plate")
 		o["driver"] = lg.get("driver")
@@ -5334,6 +5355,16 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		_apply_tms_display_status(o)
 
 	_attach_factura_a_fields(filtered)
+	# Ecommerce system tags (PRINTED, L_*, SRV-*) for pipeline icons.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
+
+		tag_map = tags_map_for_docs("Sales Order", [o["name"] for o in filtered])
+		for o in filtered:
+			o["tags"] = tag_map.get(o["name"]) or []
+	except Exception:
+		for o in filtered:
+			o.setdefault("tags", [])
 	return {"preorders": filtered, "total_count": total_count}
 
 
@@ -5439,6 +5470,7 @@ def get_guest_preorder(preorder_name):
 	payload["warehouse_defaulted"] = lg.get("warehouse_defaulted") if lg.get("warehouse") else (0 if tag_wh else 1)
 	payload["trip_name"] = lg.get("trip_name")
 	payload["trip_status"] = lg.get("trip_status")
+	payload["stop_idx"] = lg.get("stop_idx")
 	payload["vehicle"] = lg.get("vehicle")
 	payload["vehicle_plate"] = lg.get("vehicle_plate")
 	payload["driver"] = lg.get("driver")
@@ -5450,6 +5482,12 @@ def get_guest_preorder(preorder_name):
 		payload["delivery_note"] = lg.get("delivery_note")
 	_apply_tms_display_status(payload)
 	_attach_factura_a_fields([payload])
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
+
+		payload["tags"] = tags_map_for_docs("Sales Order", [preorder_name]).get(preorder_name) or []
+	except Exception:
+		payload["tags"] = []
 	return payload
 
 
@@ -7225,7 +7263,7 @@ def _tms_logistics_map_for_orders(order_names):
 	"""Batch-enrich Sales Orders with DN / MAT (Delivery Trip) / vehicle / PoD.
 
 	Returns ``{ so_name: { warehouse, delivery_note, trip_name, trip_status,
-	vehicle, vehicle_plate, driver, driver_name, delivery_at, pod } }``.
+	stop_idx, vehicle, vehicle_plate, driver, driver_name, delivery_at, pod } }``.
 	"""
 	names = [cstr(n).strip() for n in (order_names or []) if cstr(n).strip()]
 	out = {n: {} for n in names}
@@ -7285,6 +7323,7 @@ def _tms_logistics_map_for_orders(order_names):
 			SELECT
 				ds.delivery_note AS dn,
 				ds.parent AS trip_name,
+				ds.idx AS stop_idx,
 				ds.visited AS visited,
 				ds.estimated_arrival AS estimated_arrival,
 				ds.custom_pod_recipient_name AS recipient_name,
@@ -7365,6 +7404,7 @@ def _tms_logistics_map_for_orders(order_names):
 			trip_by_dn[dn] = {
 				"trip_name": r.trip_name,
 				"trip_status": r.trip_status,
+				"stop_idx": cint(r.stop_idx) or None,
 				"vehicle": veh,
 				"vehicle_plate": plate,
 				"driver": cstr(r.driver or "").strip() or None,
@@ -7402,6 +7442,7 @@ def _tms_logistics_map_for_orders(order_names):
 			"warehouse_defaulted": 0 if wh else 1,
 			"trip_name": (trip or {}).get("trip_name"),
 			"trip_status": (trip or {}).get("trip_status"),
+			"stop_idx": (trip or {}).get("stop_idx"),
 			"vehicle": (trip or {}).get("vehicle"),
 			"vehicle_plate": (trip or {}).get("vehicle_plate"),
 			"driver": (trip or {}).get("driver"),
@@ -7525,13 +7566,14 @@ def update_guest_preorder_logistics(
 	warehouse=None,
 	trip_name=None,
 	vehicle=None,
+	driver=None,
 	clear_trip=0,
 ):
-	"""Admin Pedidos logistics: warehouse, MAT (Delivery Trip), and car.
+	"""Admin Pedidos logistics: warehouse, MAT (Delivery Trip), car, and driver.
 
 	Creates a Delivery Note when assigning a MAT / warehouse if missing.
-	Vehicle options for the UI should come from the selected MAT's vehicle
-	(and planner context); changing vehicle updates the trip.
+	Vehicle / driver options for the UI should come from the selected MAT
+	(and planner context); changing them updates the trip assignment.
 	"""
 	name = cstr(preorder_name or "").strip()
 	if not name or not frappe.db.exists("Sales Order", name):
@@ -7547,6 +7589,7 @@ def update_guest_preorder_logistics(
 	wh_in = None if warehouse is None else cstr(warehouse).strip()
 	trip_in = None if trip_name is None else cstr(trip_name).strip()
 	veh_in = None if vehicle is None else cstr(vehicle).strip()
+	drv_in = None if driver is None else cstr(driver).strip()
 	do_clear = cint(clear_trip)
 
 	if wh_in:
@@ -7637,6 +7680,34 @@ def update_guest_preorder_logistics(
 				frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
 		else:
 			frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
+
+	if drv_in is not None and target_trip:
+		if drv_in and not frappe.db.exists("Driver", drv_in):
+			frappe.throw(_("Driver {0} not found").format(drv_in))
+		docstatus = cint(frappe.db.get_value("Delivery Trip", target_trip, "docstatus") or 0)
+		if docstatus == 0 and drv_in:
+			try:
+				tms_api.update_trip_assignment(target_trip, driver=drv_in)
+			except Exception:
+				driver_doc = (
+					frappe.db.get_value("Driver", drv_in, ["full_name"], as_dict=True) if drv_in else None
+				)
+				frappe.db.set_value("Delivery Trip", target_trip, "driver", drv_in or None)
+				if driver_doc:
+					frappe.db.set_value(
+						"Delivery Trip", target_trip, "driver_name", driver_doc.full_name
+					)
+		else:
+			driver_doc = (
+				frappe.db.get_value("Driver", drv_in, ["full_name"], as_dict=True) if drv_in else None
+			)
+			frappe.db.set_value("Delivery Trip", target_trip, "driver", drv_in or None)
+			if driver_doc:
+				frappe.db.set_value(
+					"Delivery Trip", target_trip, "driver_name", driver_doc.full_name
+				)
+			elif not drv_in:
+				frappe.db.set_value("Delivery Trip", target_trip, "driver_name", None)
 
 	frappe.db.commit()
 	return get_guest_preorder(name)

@@ -198,6 +198,46 @@ APP_PERMISSIONS = [
 		"desc_zh": "订单客户与收货供应商。",
 	},
 	{
+		"id": "sales.see_all",
+		"group": "ventas_scope",
+		"label_en": "See all clients",
+		"label_es": "Ver todos los clientes",
+		"label_zh": "查看全部客户",
+		"desc_en": "RM: view every customer.",
+		"desc_es": "RM: ver todos los clientes.",
+		"desc_zh": "关系管理：查看全部客户。",
+	},
+	{
+		"id": "sales.see_assigned",
+		"group": "ventas_scope",
+		"label_en": "See assigned clients",
+		"label_es": "Ver clientes asignados",
+		"label_zh": "查看已分配客户",
+		"desc_en": "RM: view only customers assigned to this salesman.",
+		"desc_es": "RM: ver solo clientes asignados a este vendedor.",
+		"desc_zh": "关系管理：仅查看分配给自己的客户。",
+	},
+	{
+		"id": "sales.commit_all",
+		"group": "ventas_scope",
+		"label_en": "Commit all sales",
+		"label_es": "Cerrar ventas de todos",
+		"label_zh": "提交全部销售",
+		"desc_en": "Preventa: win/convert for any client.",
+		"desc_es": "Preventa: ganar/convertir cualquier cliente.",
+		"desc_zh": "预售：可对任意客户成交/转化。",
+	},
+	{
+		"id": "sales.commit_assigned",
+		"group": "ventas_scope",
+		"label_en": "Commit assigned sales",
+		"label_es": "Cerrar ventas asignadas",
+		"label_zh": "提交已分配销售",
+		"desc_en": "Preventa: win/convert only assigned clients.",
+		"desc_es": "Preventa: ganar/convertir solo clientes asignados.",
+		"desc_zh": "预售：仅可对自己被分配的客户成交/转化。",
+	},
+	{
 		"id": "tables.compras",
 		"group": "tablas",
 		"label_en": "Purchases",
@@ -419,6 +459,10 @@ PERMISSION_TO_ROLES = {
 	"ops.receiving": ["Stock User", "Purchase User"],
 	"ops.delivery": ["Stock User"],
 	"ops.preventa": ["Sales User"],
+	"sales.see_all": ["Sales User"],
+	"sales.see_assigned": ["Sales User"],
+	"sales.commit_all": ["Sales User"],
+	"sales.commit_assigned": ["Sales User"],
 	"ops.buying": ["Purchase User", "Purchase Manager", "Stock User"],
 	"log.reports": ["Accounts User"],
 	"log.accounting": ["Accounts User"],
@@ -465,20 +509,42 @@ _STARTER_REPOSITOR = [
 	"tools.labels",
 	"tools.catalog_pdf",
 	"tools.sync",
+	"sales.see_all",
+	"sales.commit_assigned",
 ]
 _STARTER_CAJA = [
 	"ops.pos",
 	"ops.catalog",
 	"tools.labels",
+	"sales.see_all",
+	"sales.commit_assigned",
 ]
+# Default sales scope for every non-admin group: see all clients, commit only assigned.
+_DEFAULT_SALES_SCOPE = [
+	"sales.see_all",
+	"sales.commit_assigned",
+]
+_SALES_SCOPE_IDS = frozenset(
+	{
+		"sales.see_all",
+		"sales.see_assigned",
+		"sales.commit_all",
+		"sales.commit_assigned",
+	}
+)
 _STARTER_VENTAS = [
 	"ops.preventa",
 	"ops.catalog",
 	"tools.sync",
+	"tables.crm",
+	"sales.see_all",
+	"sales.commit_assigned",
 ]
 # Field driver / conductor app — assigned trips + PoD, not full route planning.
 _STARTER_DRIVER = [
 	"ops.delivery",
+	"sales.see_all",
+	"sales.commit_assigned",
 ]
 # Alias of ventas for EN-labeled sites / Vista previa “Sales”.
 _STARTER_SALES = list(_STARTER_VENTAS)
@@ -713,6 +779,10 @@ _COARSE_FLAG = {
 	"ops.pos": "pos",
 	"ops.catalog": "pos",
 	"ops.preventa": "pos",
+	"sales.see_all": "pos",
+	"sales.see_assigned": "pos",
+	"sales.commit_all": "pos",
+	"sales.commit_assigned": "pos",
 	"tables.orders": "pos",
 	"tables.orders.own": "pos",
 	"tables.orders.all": "pos",
@@ -873,6 +943,7 @@ def list_app_permissions():
 			{"id": "tablas", "label_en": "Tables", "label_es": "Tablas", "label_zh": "表格"},
 			{"id": "herramientas", "label_en": "Tools", "label_es": "Herramientas", "label_zh": "工具"},
 			{"id": "empleados", "label_en": "Staff", "label_es": "Personal", "label_zh": "员工管理"},
+			{"id": "ventas_scope", "label_en": "Sales scope", "label_es": "Alcance ventas", "label_zh": "销售范围"},
 		],
 	}
 
@@ -1113,6 +1184,10 @@ def save_employee(name=None, data=None):
 		_apply_group_roles_to_user(doc.user_id, doc.name)
 	elif "roles" in data and doc.user_id:
 		_set_user_roles(doc.user_id, data.get("roles") or [])
+
+	# New employees always get a random 6-digit ops PIN (armado/check/roleplay).
+	if is_new:
+		_issue_ops_pin_for_employee(doc.name)
 
 	frappe.db.commit()
 	return {"ok": True, "employee": _serialize_employee(doc.name)}
@@ -1371,11 +1446,22 @@ def save_employee_group(name=None, employee_group_name=None, members=None, permi
 
 	if permissions is not None:
 		store = _load_perm_store()
-		store[doc.name] = _normalize_permission_ids(permissions)
+		normalized = _normalize_permission_ids(permissions)
+		# New / empty permission lists get the default sales scope (except full *).
+		if not normalized:
+			normalized = list(_DEFAULT_SALES_SCOPE)
+		else:
+			normalized = _with_default_sales_scope(normalized)
+		store[doc.name] = normalized
 		_save_perm_store(store)
 		for m in doc.employee_list or []:
 			if m.user_id:
 				_apply_group_roles_to_user(m.user_id, m.employee)
+	elif not (name and frappe.db.exists("Employee Group", name)):
+		# Brand-new group with no permissions arg — seed sales scope defaults.
+		store = _load_perm_store()
+		store[doc.name] = list(_DEFAULT_SALES_SCOPE)
+		_save_perm_store(store)
 
 	frappe.db.commit()
 	return {
@@ -1530,6 +1616,52 @@ def _apply_caja_orders_split(store: dict) -> bool:
 	return True
 
 
+def _with_default_sales_scope(perms: list[str]) -> list[str]:
+	"""Ensure non-admin groups get see_all + commit_assigned when no sales.* set yet."""
+	ids = list(perms or [])
+	if "*" in ids:
+		return ids
+	if any(p in _SALES_SCOPE_IDS for p in ids):
+		return ids
+	return _normalize_permission_ids(ids + list(_DEFAULT_SALES_SCOPE))
+
+
+def _apply_default_sales_scope_to_store(store: dict) -> bool:
+	"""Backfill default sales scope onto every group that has none (admin → all four)."""
+	dirty = False
+	for name, raw in list(store.items()):
+		if name.startswith("_"):
+			continue
+		if not isinstance(raw, list):
+			continue
+		title = ""
+		try:
+			if frappe.db.exists("Employee Group", name):
+				title = frappe.db.get_value("Employee Group", name, "employee_group_name") or name
+		except Exception:
+			title = name
+		current = _normalize_permission_ids(raw)
+		if "*" in current or (title or "").strip().lower() == "admin":
+			# Admin / wildcard: ensure every sales.* flag is present for the matrix UI.
+			missing = [p for p in sorted(_SALES_SCOPE_IDS) if p not in current]
+			if missing:
+				store[name] = _normalize_permission_ids(current + missing)
+				dirty = True
+			continue
+		# Upgrade our previous ventas default (see_assigned+commit_assigned only) once.
+		scope_only = [p for p in current if p in _SALES_SCOPE_IDS]
+		if _perm_set(scope_only) == _perm_set(["sales.see_assigned", "sales.commit_assigned"]):
+			next_perms = [p for p in current if p not in _SALES_SCOPE_IDS] + list(_DEFAULT_SALES_SCOPE)
+			store[name] = _normalize_permission_ids(next_perms)
+			dirty = True
+			continue
+		next_perms = _with_default_sales_scope(current)
+		if _perm_set(next_perms) != _perm_set(current):
+			store[name] = next_perms
+			dirty = True
+	return dirty
+
+
 def _ensure_starter_staff_groups() -> dict:
 	"""Create repositor / caja / admin if missing. Do not overwrite customised lists.
 
@@ -1546,6 +1678,7 @@ def _ensure_starter_staff_groups() -> dict:
 	upgraded = []
 	skipped = []
 	dirty = _apply_caja_orders_split(store)
+	dirty = _apply_default_sales_scope_to_store(store) or dirty
 	for spec in STARTER_STAFF_GROUPS:
 		title = spec["employee_group_name"]
 		perms = _normalize_permission_ids(spec["permissions"])
@@ -1949,6 +2082,28 @@ def resolve_staff_login_barcode(code=None):
 	}
 
 
+def _issue_ops_pin_for_employee(employee: str, *, rotate: bool = False) -> str | None:
+	"""Allocate a unique 6-digit ops PIN for an employee (no permission check)."""
+	emp = str(employee or "").strip()
+	if not emp or not frappe.db.exists("Employee", emp):
+		return None
+	store = _load_ops_pin_store()
+	by_employee = dict(store.get("by_employee") or {})
+	by_pin = dict(store.get("by_pin") or {})
+	used = set(str(k) for k in by_pin.keys())
+	existing = by_employee.get(emp) if isinstance(by_employee.get(emp), dict) else None
+	pin = str((existing or {}).get("pin") or "").strip()
+	if rotate or not _normalize_ops_pin(pin):
+		if pin and pin in by_pin:
+			by_pin.pop(pin, None)
+			used.discard(pin)
+		pin = _gen_ops_pin(used)
+		by_employee[emp] = {"pin": pin}
+		by_pin[pin] = emp
+		_save_ops_pin_store({"by_employee": by_employee, "by_pin": by_pin})
+	return pin
+
+
 @frappe.whitelist()
 def ensure_employee_ops_pins(employees=None, rotate=0):
 	"""Issue (or rotate) unique 6-digit ops PINs for employees.
@@ -1968,34 +2123,14 @@ def ensure_employee_ops_pins(employees=None, rotate=0):
 		frappe.throw(_("employees is required"))
 
 	rotate = cint(rotate)
-	store = _load_ops_pin_store()
-	by_employee = dict(store.get("by_employee") or {})
-	by_pin = dict(store.get("by_pin") or {})
-	used = set(str(k) for k in by_pin.keys())
 	rows = []
-	changed = False
-
 	for emp_name in names:
 		if not frappe.db.exists("Employee", emp_name):
 			rows.append({"name": emp_name, "ok": False, "error": "not_found"})
 			continue
 		frappe.flags.ignore_permissions = True
 		emp = frappe.get_doc("Employee", emp_name)
-		existing = by_employee.get(emp.name) if isinstance(by_employee.get(emp.name), dict) else None
-		pin = str((existing or {}).get("pin") or "").strip()
-		if rotate or not _normalize_ops_pin(pin):
-			if pin and pin in by_pin:
-				by_pin.pop(pin, None)
-				used.discard(pin)
-			pin = _gen_ops_pin(used)
-			used.add(pin)
-			by_employee[emp.name] = {"pin": pin}
-			by_pin[pin] = emp.name
-			changed = True
-		else:
-			by_employee[emp.name] = {"pin": pin}
-			by_pin[pin] = emp.name
-
+		pin = _issue_ops_pin_for_employee(emp.name, rotate=bool(rotate))
 		rows.append(
 			{
 				"name": emp.name,
@@ -2005,9 +2140,6 @@ def ensure_employee_ops_pins(employees=None, rotate=0):
 				"ok": True,
 			}
 		)
-
-	if changed:
-		_save_ops_pin_store({"by_employee": by_employee, "by_pin": by_pin})
 
 	return {"rows": rows}
 
@@ -2100,3 +2232,989 @@ def resolve_ops_pin(pin=None):
 		"permissions": _permission_ids_for_employee(emp.name),
 		"pin_configured": True,
 	}
+
+
+
+# ---------------------------------------------------------------------------
+# Employee sales (multi salesman assignment + seller_ref orders)
+# ---------------------------------------------------------------------------
+
+CUSTOMER_SELLERS_SCOPE = "settings.customer_assigned_sellers"
+
+
+def _norm_optional_str(val) -> str:
+	if val is None:
+		return ""
+	s = str(val).strip()
+	if s.lower() in ("null", "undefined", "none", ""):
+		return ""
+	return s
+
+
+def _resolve_seller(employee=None, user_id=None) -> dict:
+	"""Resolve Employee + User for sales panels. Accepts either key."""
+	emp_name = _norm_optional_str(employee)
+	uid = _norm_optional_str(user_id)
+	frappe.flags.ignore_permissions = True
+
+	emp_doc = None
+	if emp_name and frappe.db.exists("Employee", emp_name):
+		emp_doc = frappe.get_doc("Employee", emp_name)
+		uid = (emp_doc.user_id or "").strip() or uid
+	elif uid:
+		found = frappe.db.get_value("Employee", {"user_id": uid}, "name")
+		if found:
+			emp_doc = frappe.get_doc("Employee", found)
+			emp_name = emp_doc.name
+			uid = (emp_doc.user_id or "").strip() or uid
+
+	if not emp_name and not uid:
+		frappe.throw(_("Employee or user_id required"))
+
+	employee_name = None
+	if emp_doc:
+		employee_name = emp_doc.employee_name
+	elif uid and frappe.db.exists("User", uid):
+		employee_name = frappe.db.get_value("User", uid, "full_name") or uid
+
+	return {
+		"employee": emp_name or None,
+		"user_id": uid or None,
+		"employee_name": employee_name or emp_name or uid,
+		"has_user": bool(uid),
+	}
+
+
+def _load_customer_sellers_store() -> dict:
+	if not frappe.db.exists("Table Extra Schema", CUSTOMER_SELLERS_SCOPE):
+		return {"by_customer": {}, "by_user": {}}
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Table Extra Schema", CUSTOMER_SELLERS_SCOPE)
+	data = _parse_json(doc.columns_json, {})
+	if not isinstance(data, dict):
+		return {"by_customer": {}, "by_user": {}}
+	by_customer = data.get("by_customer") if isinstance(data.get("by_customer"), dict) else {}
+	by_user = data.get("by_user") if isinstance(data.get("by_user"), dict) else {}
+	# normalize values to list[str]
+	by_customer = {
+		str(k): [str(x).strip() for x in (v or []) if str(x).strip()]
+		for k, v in by_customer.items()
+		if isinstance(v, (list, tuple))
+	}
+	by_user = {
+		str(k): [str(x).strip() for x in (v or []) if str(x).strip()]
+		for k, v in by_user.items()
+		if isinstance(v, (list, tuple))
+	}
+	return {"by_customer": by_customer, "by_user": by_user}
+
+
+def _save_customer_sellers_store(data: dict) -> None:
+	payload = json.dumps(
+		{
+			"by_customer": data.get("by_customer") or {},
+			"by_user": data.get("by_user") or {},
+		},
+		ensure_ascii=False,
+	)
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", CUSTOMER_SELLERS_SCOPE):
+		doc = frappe.get_doc("Table Extra Schema", CUSTOMER_SELLERS_SCOPE)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc(
+			{"doctype": "Table Extra Schema", "scope": CUSTOMER_SELLERS_SCOPE, "columns_json": payload}
+		)
+		doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def _sync_account_manager(customer: str, salesmen: list[str]) -> None:
+	"""Keep ERPNext Customer.account_manager = first salesman (desk compat)."""
+	if not frappe.db.has_column("Customer", "account_manager"):
+		return
+	primary = salesmen[0] if salesmen else None
+	frappe.db.set_value("Customer", customer, "account_manager", primary, update_modified=False)
+
+
+def _migrate_account_manager_into_store(store: dict, customer: str) -> list[str]:
+	"""If store empty for customer, seed from account_manager once."""
+	cur = list((store.get("by_customer") or {}).get(customer) or [])
+	if cur:
+		return cur
+	if not frappe.db.has_column("Customer", "account_manager"):
+		return []
+	am = frappe.db.get_value("Customer", customer, "account_manager") or ""
+	am = str(am).strip()
+	if not am:
+		return []
+	return [am]
+
+
+def customer_salesmen(customer: str) -> list[str]:
+	cust = _norm_optional_str(customer)
+	if not cust:
+		return []
+	store = _load_customer_sellers_store()
+	users = _migrate_account_manager_into_store(store, cust)
+	# Persist migration lazily
+	if users and cust not in (store.get("by_customer") or {}):
+		_set_customer_salesmen_users(cust, users, store=store)
+		store = _load_customer_sellers_store()
+		users = list((store.get("by_customer") or {}).get(cust) or [])
+	return list(users)
+
+
+def _rebuild_by_user(by_customer: dict) -> dict:
+	by_user: dict[str, list[str]] = {}
+	for cust, users in (by_customer or {}).items():
+		for u in users or []:
+			by_user.setdefault(u, [])
+			if cust not in by_user[u]:
+				by_user[u].append(cust)
+	return by_user
+
+
+def _sales_group_names() -> list[str]:
+	"""Prefer Sales / ventas starter groups when present."""
+	names: list[str] = []
+	for g in ("Sales", "ventas"):
+		if frappe.db.exists("Employee Group", g):
+			names.append(g)
+	return names
+
+
+def _add_employee_to_sales_groups(employee: str) -> None:
+	"""Append employee to Sales/ventas without removing other groups."""
+	emp = _norm_optional_str(employee)
+	if not emp or not frappe.db.exists("Employee", emp):
+		return
+	groups = _sales_group_names()
+	if not groups:
+		try:
+			_ensure_starter_staff_groups()
+		except Exception:
+			pass
+		groups = _sales_group_names()
+	if not groups:
+		return
+	emp_name = frappe.db.get_value("Employee", emp, "employee_name")
+	user_id = frappe.db.get_value("Employee", emp, "user_id")
+	frappe.flags.ignore_permissions = True
+	for g in groups:
+		already = frappe.db.exists(
+			"Employee Group Table", {"parent": g, "employee": emp}
+		)
+		if already:
+			continue
+		parent = frappe.get_doc("Employee Group", g)
+		parent.append(
+			"employee_list",
+			{"employee": emp, "employee_name": emp_name, "user_id": user_id},
+		)
+		parent.save(ignore_permissions=True)
+	if user_id and frappe.db.exists("User", user_id):
+		_apply_group_roles_to_user(user_id, emp)
+
+
+def _create_user_for_employee_sales(emp) -> str:
+	"""Create/link a User for an Employee (CRM salesman path; no create_user perm)."""
+	frappe.flags.ignore_permissions = True
+	if emp.user_id and frappe.db.exists("User", emp.user_id):
+		return emp.user_id
+
+	requested_email = (
+		emp.prefered_email or emp.company_email or emp.personal_email or ""
+	).strip()
+	linked_existing = False
+	user_name = None
+
+	if requested_email and frappe.db.exists("User", requested_email):
+		existing_roles = set(frappe.get_roles(requested_email))
+		other = frappe.db.get_value(
+			"Employee", {"user_id": requested_email, "name": ["!=", emp.name]}, "name"
+		)
+		if requested_email in ("Administrator", "Guest") or "Administrator" in existing_roles:
+			requested_email = ""
+		elif other:
+			requested_email = ""
+		else:
+			user_name = requested_email
+			linked_existing = True
+
+	login_email = (
+		requested_email
+		if linked_existing
+		else _unique_staff_email(requested_email, emp.employee_name or emp.name)
+	)
+	emp.prefered_contact_email = "Company Email"
+	emp.company_email = emp.company_email or login_email
+	emp.prefered_email = login_email
+	emp.save(ignore_permissions=True)
+
+	password = _rand_password()
+	parts = (emp.employee_name or emp.first_name or "User").split()
+	first = parts[0]
+	last = " ".join(parts[1:]) if len(parts) > 1 else first
+
+	if linked_existing:
+		user_name = login_email
+		user = frappe.get_doc("User", user_name)
+		user.flags.ignore_password_policy = True
+		user.flags.no_welcome_mail = True
+		user.enabled = 1
+		user.save(ignore_permissions=True)
+		_set_user_password(user_name, password)
+	else:
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": login_email,
+				"first_name": first,
+				"last_name": last,
+				"enabled": 1,
+				"send_welcome_email": 0,
+				"user_type": "System User",
+			}
+		)
+		user.flags.ignore_password_policy = True
+		user.flags.no_welcome_mail = True
+		# Attach roles before insert so Frappe does not warn "no roles enabled".
+		for role in ("Employee", "Sales User", "Desk User"):
+			if frappe.db.exists("Role", role):
+				user.append("roles", {"role": role})
+		user.insert(ignore_permissions=True)
+		user_name = user.name
+		_set_user_password(user_name, password)
+
+	_set_user_roles(user_name, ["Employee", "Sales User"])
+	emp.user_id = user_name
+	emp.create_user_permission = 0
+	emp.save(ignore_permissions=True)
+	log_field_changes("Employee", emp.name, [("user_id", None, user_name)])
+	return user_name
+
+
+def _find_employee_by_label(label: str):
+	"""Match Employee by user_id, name, or employee_name (case-insensitive)."""
+	q = _norm_optional_str(label)
+	if not q:
+		return None
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Employee", {"user_id": q}):
+		return frappe.get_doc("Employee", {"user_id": q})
+	if frappe.db.exists("Employee", q):
+		return frappe.get_doc("Employee", q)
+	# Exact employee_name (case-insensitive via SQL)
+	found = frappe.db.sql(
+		"""
+		SELECT name FROM `tabEmployee`
+		WHERE LOWER(TRIM(COALESCE(employee_name, ''))) = %(q)s
+		ORDER BY modified DESC
+		LIMIT 1
+		""",
+		{"q": q.lower()},
+	)
+	if found:
+		return frappe.get_doc("Employee", found[0][0])
+	# Partial name match only when unique
+	partial = frappe.db.sql(
+		"""
+		SELECT name FROM `tabEmployee`
+		WHERE LOWER(TRIM(COALESCE(employee_name, ''))) LIKE %(pat)s
+		ORDER BY modified DESC
+		LIMIT 2
+		""",
+		{"pat": f"%{q.lower()}%"},
+	)
+	if len(partial) == 1:
+		return frappe.get_doc("Employee", partial[0][0])
+	return None
+
+
+def _ensure_salesman_user_id(label: str) -> tuple[str, dict]:
+	"""
+	Resolve a typed CRM label to a User id.
+	If no Employee/User matches, create Employee + User and add to Sales/ventas.
+	Returns (user_id, meta).
+	"""
+	q = _norm_optional_str(label)
+	if not q:
+		frappe.throw(_("Salesman name required"))
+	frappe.flags.ignore_permissions = True
+	created = False
+
+	# Direct User id / email
+	if frappe.db.exists("User", q):
+		uid = q
+		emp = _find_employee_by_label(q)
+		if emp:
+			if not emp.user_id:
+				uid = _create_user_for_employee_sales(emp)
+				created = True
+			else:
+				uid = emp.user_id
+			_add_employee_to_sales_groups(emp.name)
+			return uid, {
+				"user_id": uid,
+				"employee": emp.name,
+				"label": (emp.employee_name or uid).strip() or uid,
+				"created": created,
+			}
+		# User without Employee: still assignable (legacy Administrator etc.)
+		full = frappe.db.get_value("User", uid, "full_name") or uid
+		return uid, {
+			"user_id": uid,
+			"employee": None,
+			"label": full,
+			"created": False,
+		}
+
+	emp = _find_employee_by_label(q)
+	if emp:
+		uid = (emp.user_id or "").strip()
+		if not uid or not frappe.db.exists("User", uid):
+			uid = _create_user_for_employee_sales(emp)
+			created = True
+		_add_employee_to_sales_groups(emp.name)
+		return uid, {
+			"user_id": uid,
+			"employee": emp.name,
+			"label": (emp.employee_name or uid).strip() or uid,
+			"created": created,
+		}
+
+	# Create Employee + User in Sales
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+	company = resolve_company() or frappe.db.get_value("Company", {}, "name")
+	parts = q.split()
+	first = parts[0]
+	last = " ".join(parts[1:]) if len(parts) > 1 else ""
+	doc = frappe.new_doc("Employee")
+	doc.company = company
+	doc.first_name = first
+	doc.last_name = last or None
+	doc.employee_name = q
+	doc.status = "Active"
+	doc.date_of_joining = today()
+	doc.gender = "Prefer not to say"
+	doc.date_of_birth = "1990-01-01"
+	doc.insert(ignore_permissions=True)
+	log_field_changes(
+		"Employee",
+		doc.name,
+		[("employee_name", None, doc.employee_name), ("status", None, doc.status)],
+	)
+	uid = _create_user_for_employee_sales(doc)
+	_add_employee_to_sales_groups(doc.name)
+	_issue_ops_pin_for_employee(doc.name)
+	frappe.db.commit()
+	return uid, {
+		"user_id": uid,
+		"employee": doc.name,
+		"label": q,
+		"created": True,
+	}
+
+
+def _salesman_label_for_user(uid: str) -> str:
+	uid = _norm_optional_str(uid)
+	if not uid:
+		return ""
+	emp_name = frappe.db.get_value("Employee", {"user_id": uid}, "employee_name")
+	if emp_name:
+		return emp_name
+	if frappe.db.exists("User", uid):
+		return frappe.db.get_value("User", uid, "full_name") or uid
+	return uid
+
+
+def _set_customer_salesmen_users(customer: str, user_ids, store=None) -> list[str]:
+	cust = _norm_optional_str(customer)
+	if not cust:
+		frappe.throw(_("Customer required"))
+	if not frappe.db.exists("Customer", cust):
+		frappe.throw(_("Customer {0} not found").format(cust))
+	if isinstance(user_ids, str):
+		try:
+			user_ids = json.loads(user_ids)
+		except Exception:
+			user_ids = [x.strip() for x in user_ids.split(",") if x.strip()]
+	cleaned = []
+	seen = set()
+	for u in user_ids or []:
+		raw = _norm_optional_str(u)
+		if not raw:
+			continue
+		uid, _meta = _ensure_salesman_user_id(raw)
+		if not uid or uid in seen:
+			continue
+		seen.add(uid)
+		cleaned.append(uid)
+	store = store or _load_customer_sellers_store()
+	by_customer = dict(store.get("by_customer") or {})
+	if cleaned:
+		by_customer[cust] = cleaned
+	else:
+		by_customer.pop(cust, None)
+	by_user = _rebuild_by_user(by_customer)
+	_save_customer_sellers_store({"by_customer": by_customer, "by_user": by_user})
+	_sync_account_manager(cust, cleaned)
+	return cleaned
+
+
+def _assigned_customer_names(user_id: str) -> list[str]:
+	uid = _norm_optional_str(user_id)
+	if not uid:
+		return []
+	store = _load_customer_sellers_store()
+	names = list((store.get("by_user") or {}).get(uid) or [])
+	# Also include account_manager legacy rows not yet migrated
+	if frappe.db.has_column("Customer", "account_manager"):
+		legacy = frappe.get_all(
+			"Customer",
+			filters={"account_manager": uid, "disabled": 0},
+			pluck="name",
+			ignore_permissions=True,
+		)
+		for n in legacy:
+			if n not in names:
+				names.append(n)
+	return names
+
+
+def _is_sales_admin() -> bool:
+	info = _acting_perm_info()
+	if not info:
+		return True
+	if info.get("source") == "admin" or "*" in (info.get("permissions") or []):
+		return True
+	return False
+
+
+def sales_visibility_scope(user_id=None) -> str:
+	"""Return 'all' | 'assigned' | 'none' for RM client list."""
+	if _is_sales_admin():
+		return "all"
+	if _can_app("sales.see_all"):
+		return "all"
+	if _can_app("sales.see_assigned"):
+		return "assigned"
+	# Legacy: tables.crm without explicit sales.* → all
+	if _can_app("tables.crm"):
+		return "all"
+	return "none"
+
+
+def sales_commit_scope(user_id=None) -> str:
+	"""Return 'all' | 'assigned' | 'none' for Preventa win/convert."""
+	if _is_sales_admin():
+		return "all"
+	if _can_app("sales.commit_all"):
+		return "all"
+	if _can_app("sales.commit_assigned"):
+		return "assigned"
+	# Legacy preventa without explicit commit flags → assigned (safer)
+	if _can_app("ops.preventa"):
+		return "assigned"
+	return "none"
+
+
+def can_see_customer(customer: str, user_id=None) -> bool:
+	scope = sales_visibility_scope()
+	if scope == "all":
+		return True
+	if scope == "none":
+		return False
+	uid = _norm_optional_str(user_id) or _acting_username() or ""
+	if not uid:
+		return False
+	return _norm_optional_str(customer) in set(_assigned_customer_names(uid))
+
+
+def can_commit_customer(customer: str | None, user_id=None) -> bool:
+	scope = sales_commit_scope()
+	if scope == "all":
+		return True
+	if scope == "none":
+		return False
+	uid = _norm_optional_str(user_id) or _acting_username() or ""
+	cust = _norm_optional_str(customer)
+	if not cust:
+		# New lead / no customer yet: allow own pipeline commit when assigned-scope
+		return bool(uid)
+	return cust in set(_assigned_customer_names(uid))
+
+
+def require_sales_commit_for_customer(customer: str | None = None) -> None:
+	if can_commit_customer(customer):
+		return
+	frappe.throw(_("Not permitted to commit sales for this client (sales.commit_*)"))
+
+
+def _customer_row(name: str) -> dict | None:
+	if not name or not frappe.db.exists("Customer", name):
+		return None
+	fields = ["name", "customer_name", "mobile_no", "email_id", "disabled"]
+	if frappe.db.has_column("Customer", "account_manager"):
+		fields.append("account_manager")
+	r = frappe.db.get_value("Customer", name, fields, as_dict=True)
+	if not r:
+		return None
+	salesmen = customer_salesmen(r.name)
+	return {
+		"name": r.name,
+		"customer_name": r.customer_name,
+		"phone": r.mobile_no,
+		"email": r.email_id,
+		"account_manager": getattr(r, "account_manager", None) or (salesmen[0] if salesmen else None),
+		"salesmen": salesmen,
+		"disabled": cint(r.disabled),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def set_customer_salesmen(customer=None, user_ids=None):
+	"""Replace the multi salesman list on a Customer (admin / CRM editors).
+
+	``user_ids`` may be User ids, emails, or employee display names. Unknown
+	labels create an Employee + User and attach them to Sales/ventas.
+	"""
+	if not (_can_app("tables.crm") or _can_app("employees.edit") or _is_sales_admin()):
+		_require_app_permission("tables.crm")
+	cust = _norm_optional_str(customer)
+	users = _set_customer_salesmen_users(cust, user_ids)
+	labels = [_salesman_label_for_user(u) for u in users]
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"customer": cust,
+		"salesmen": users,
+		"salesmen_labels": labels,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_customer_salesmen(customer=None):
+	cust = _norm_optional_str(customer)
+	if not cust:
+		frappe.throw(_("Customer required"))
+	users = customer_salesmen(cust)
+	return {
+		"ok": True,
+		"customer": cust,
+		"salesmen": users,
+		"salesmen_labels": [_salesman_label_for_user(u) for u in users],
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def ensure_salesman(name=None):
+	"""Resolve or create a salesman Employee+User for CRM vendedores pickers."""
+	if not (_can_app("tables.crm") or _can_app("employees.edit") or _is_sales_admin()):
+		_require_app_permission("tables.crm")
+	label = _norm_optional_str(name)
+	if not label:
+		frappe.throw(_("Salesman name required"))
+	uid, meta = _ensure_salesman_user_id(label)
+	frappe.db.commit()
+	return {"ok": True, **meta}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_salesman_options(search=None, page_length=200):
+	"""Employee/User options for the CRM Vendedores multi-select."""
+	if not (
+		_can_app("tables.crm")
+		or _can_app("tables.employees")
+		or _can_app("employees.edit")
+		or _is_sales_admin()
+	):
+		_require_app_permission("tables.crm")
+	q = _norm_optional_str(search)
+	limit = max(1, min(cint(page_length) or 200, 500))
+	frappe.flags.ignore_permissions = True
+	filters = {"status": "Active"}
+	rows = frappe.get_all(
+		"Employee",
+		filters=filters,
+		fields=["name", "employee_name", "user_id", "status"],
+		order_by="employee_name asc",
+		limit_page_length=limit * 2 if q else limit,
+		ignore_permissions=True,
+	)
+	out = []
+	seen_users = set()
+	for r in rows:
+		label = (r.employee_name or r.name or "").strip()
+		uid = (r.user_id or "").strip() or None
+		if q:
+			hay = f"{label} {uid or ''} {r.name}".lower()
+			if q.lower() not in hay:
+				continue
+		if uid:
+			seen_users.add(uid)
+		out.append(
+			{
+				"employee": r.name,
+				"user_id": uid,
+				"label": label or uid or r.name,
+				"has_user": bool(uid),
+			}
+		)
+		if len(out) >= limit:
+			break
+	return {"ok": True, "options": out}
+
+def _seller_ref_like(user_id: str) -> str:
+	return f"%seller_ref:{user_id}%"
+
+
+def _so_tag_field() -> str | None:
+	from erpnext.erpnext_integrations.ecommerce_api.api import _guest_preorder_tag_fieldname
+
+	return _guest_preorder_tag_fieldname()
+
+
+def _list_seller_ref_orders(uid: str, *, start=0, page_length=50) -> list[dict]:
+	"""Sales Orders tagged seller_ref:<uid> on remarks/terms."""
+	if not uid:
+		return []
+	tag_fn = _so_tag_field()
+	if not tag_fn:
+		return []
+	from erpnext.erpnext_integrations.ecommerce_api.api import _seller_ref_from_guest_preorder
+
+	fields = [
+		"name",
+		"customer",
+		"customer_name",
+		"transaction_date",
+		"delivery_date",
+		"grand_total",
+		"status",
+		"currency",
+		tag_fn,
+	]
+	raw = frappe.get_all(
+		"Sales Order",
+		filters={"docstatus": ["<", 2], tag_fn: ["like", _seller_ref_like(uid)]},
+		fields=fields,
+		order_by="transaction_date desc, creation desc",
+		limit_start=0,
+		limit_page_length=max(start + page_length + 80, 100),
+		ignore_permissions=True,
+	)
+	matched = []
+	for o in raw:
+		if (_seller_ref_from_guest_preorder(o) or "") != uid:
+			continue
+		matched.append(
+			{
+				"name": o.name,
+				"customer": o.customer,
+				"customer_name": o.customer_name,
+				"transaction_date": str(o.transaction_date) if o.transaction_date else None,
+				"delivery_date": str(o.delivery_date) if o.delivery_date else None,
+				"grand_total": flt(o.grand_total),
+				"status": o.status,
+				"currency": o.currency,
+			}
+		)
+	return matched[start : start + page_length]
+
+
+@frappe.whitelist(allow_guest=True)
+def get_employee_sales(employee=None, user_id=None):
+	"""Overview for Empleados/Pedidos Ventas tab: seller identity + clients + recent orders."""
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	customers = []
+	for n in _assigned_customer_names(uid):
+		row = _customer_row(n)
+		if row:
+			customers.append(row)
+
+	orders = _list_seller_ref_orders(uid, start=0, page_length=25) if uid else []
+
+	order_total = sum(flt(o.get("grand_total")) for o in orders)
+	return {
+		"ok": True,
+		"seller": seller,
+		"customers": customers,
+		"orders": orders,
+		"summary": {
+			"customers_count": len(customers),
+			"orders_count": len(orders),
+			"orders_total": order_total,
+		},
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_customers(employee=None, user_id=None):
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	rows = []
+	for n in _assigned_customer_names(uid):
+		row = _customer_row(n)
+		if row:
+			# Light order count attributed to this seller for the customer
+			cnt = 0
+			if uid:
+				tag_fn = _so_tag_field()
+				if tag_fn:
+					cnt = cint(
+						frappe.db.count(
+							"Sales Order",
+							{
+								"customer": n,
+								"docstatus": ["<", 2],
+								tag_fn: ["like", _seller_ref_like(uid)],
+							},
+						)
+					)
+			row["orders_count"] = cnt
+			rows.append(row)
+	return {"ok": True, "seller": seller, "customers": rows}
+
+
+@frappe.whitelist(allow_guest=True)
+def assign_employee_customer(employee=None, user_id=None, customer=None):
+	"""Add salesman to Customer multi-assignment list."""
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	cust = _norm_optional_str(customer)
+	if not uid:
+		frappe.throw(_("Employee has no login user — create a user first"))
+	if not cust:
+		frappe.throw(_("Customer required"))
+	users = customer_salesmen(cust)
+	if uid not in users:
+		users.append(uid)
+	_set_customer_salesmen_users(cust, users)
+	row = _customer_row(cust)
+	return {"ok": True, "seller": seller, "customer": row}
+
+
+@frappe.whitelist(allow_guest=True)
+def unassign_employee_customer(employee=None, user_id=None, customer=None):
+	"""Remove salesman from Customer multi-assignment list."""
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	cust = _norm_optional_str(customer)
+	if not cust:
+		frappe.throw(_("Customer required"))
+	users = [u for u in customer_salesmen(cust) if u != uid]
+	_set_customer_salesmen_users(cust, users)
+	row = _customer_row(cust)
+	return {"ok": True, "seller": seller, "customer": row}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_orders(employee=None, user_id=None, start=0, page_length=50):
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	start = max(0, cint(start) or 0)
+	page_length = max(1, min(200, cint(page_length) or 50))
+	if not uid:
+		return {"ok": True, "seller": seller, "total": 0, "rows": []}
+
+	# Fetch a bounded pool then slice for paging.
+	matched = _list_seller_ref_orders(uid, start=0, page_length=500)
+	total = len(matched)
+	rows = matched[start : start + page_length]
+	return {"ok": True, "seller": seller, "total": total, "rows": rows}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_invoices(
+	employee=None, user_id=None, is_return=0, start=0, page_length=50
+):
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	start = max(0, cint(start) or 0)
+	page_length = max(1, min(200, cint(page_length) or 50))
+	is_ret = 1 if cint(is_return) else 0
+	customers = _assigned_customer_names(uid)
+	if not customers:
+		return {"ok": True, "seller": seller, "total": 0, "rows": [], "is_return": is_ret}
+
+	filters = {
+		"customer": ["in", customers],
+		"docstatus": ["<", 2],
+		"is_return": is_ret,
+	}
+	rows = frappe.get_all(
+		"Sales Invoice",
+		filters=filters,
+		fields=[
+			"name",
+			"posting_date",
+			"due_date",
+			"grand_total",
+			"outstanding_amount",
+			"status",
+			"docstatus",
+			"is_return",
+			"return_against",
+			"currency",
+			"customer",
+			"customer_name",
+		],
+		order_by="posting_date desc, creation desc",
+		limit_start=start,
+		limit_page_length=page_length,
+		ignore_permissions=True,
+	)
+	total = frappe.db.count("Sales Invoice", filters)
+	out = []
+	for r in rows:
+		out.append(
+			{
+				"name": r.name,
+				"posting_date": str(r.posting_date) if r.posting_date else None,
+				"due_date": str(r.due_date) if r.due_date else None,
+				"grand_total": flt(r.grand_total),
+				"outstanding_amount": flt(r.outstanding_amount),
+				"status": r.status,
+				"docstatus": cint(r.docstatus),
+				"is_return": cint(r.is_return),
+				"return_against": r.return_against,
+				"currency": r.currency,
+				"customer": r.customer,
+				"customer_name": r.customer_name,
+			}
+		)
+	return {"ok": True, "seller": seller, "total": cint(total), "rows": out, "is_return": is_ret}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_payments(employee=None, user_id=None, start=0, page_length=50):
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	start = max(0, cint(start) or 0)
+	page_length = max(1, min(200, cint(page_length) or 50))
+	customers = _assigned_customer_names(uid)
+	if not customers:
+		return {"ok": True, "seller": seller, "total": 0, "rows": []}
+
+	filters = {
+		"party_type": "Customer",
+		"party": ["in", customers],
+		"docstatus": ["<", 2],
+	}
+	rows = frappe.get_all(
+		"Payment Entry",
+		filters=filters,
+		fields=[
+			"name",
+			"posting_date",
+			"payment_type",
+			"mode_of_payment",
+			"paid_amount",
+			"received_amount",
+			"status",
+			"docstatus",
+			"party",
+			"party_name",
+			"reference_no",
+			"reference_date",
+		],
+		order_by="posting_date desc, creation desc",
+		limit_start=start,
+		limit_page_length=page_length,
+		ignore_permissions=True,
+	)
+	total = frappe.db.count("Payment Entry", filters)
+	out = []
+	for r in rows:
+		amt = flt(r.received_amount) if r.payment_type == "Receive" else flt(r.paid_amount)
+		out.append(
+			{
+				"name": r.name,
+				"posting_date": str(r.posting_date) if r.posting_date else None,
+				"payment_type": r.payment_type,
+				"mode_of_payment": r.mode_of_payment,
+				"amount": amt,
+				"status": r.status,
+				"docstatus": cint(r.docstatus),
+				"party": r.party,
+				"party_name": r.party_name,
+				"reference_no": r.reference_no,
+				"reference_date": str(r.reference_date) if r.reference_date else None,
+			}
+		)
+	return {"ok": True, "seller": seller, "total": cint(total), "rows": out}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_employee_products(employee=None, user_id=None, page_length=100):
+	"""Aggregate SI items for assigned customers (same idea as CRM party products)."""
+	seller = _resolve_seller(employee=employee, user_id=user_id)
+	uid = seller.get("user_id") or ""
+	page_length = max(1, min(300, cint(page_length) or 100))
+	customers = _assigned_customer_names(uid)
+	if not customers:
+		return {"ok": True, "seller": seller, "products": []}
+
+	inv_names = frappe.get_all(
+		"Sales Invoice",
+		filters={"customer": ["in", customers], "docstatus": 1, "is_return": 0},
+		pluck="name",
+		ignore_permissions=True,
+	)
+	if not inv_names:
+		return {"ok": True, "seller": seller, "products": []}
+
+	items = frappe.get_all(
+		"Sales Invoice Item",
+		filters={"parent": ["in", inv_names]},
+		fields=["item_code", "item_name", "qty", "amount", "rate", "parent"],
+		ignore_permissions=True,
+	)
+	inv_dates = {
+		r.name: r.posting_date
+		for r in frappe.get_all(
+			"Sales Invoice",
+			filters={"name": ["in", inv_names]},
+			fields=["name", "posting_date"],
+			ignore_permissions=True,
+		)
+	}
+	agg: dict[str, dict] = {}
+	for it in items:
+		code = it.item_code or ""
+		if not code:
+			continue
+		slot = agg.setdefault(
+			code,
+			{
+				"id": code,
+				"item_code": code,
+				"item_name": it.item_name,
+				"qty_total": 0.0,
+				"amount_total": 0.0,
+				"invoice_count": 0,
+				"last_date": None,
+				"last_rate": 0.0,
+				"_parents": set(),
+			},
+		)
+		slot["qty_total"] += flt(it.qty)
+		slot["amount_total"] += flt(it.amount)
+		slot["_parents"].add(it.parent)
+		slot["last_rate"] = flt(it.rate)
+		d = inv_dates.get(it.parent)
+		if d and (not slot["last_date"] or str(d) > str(slot["last_date"])):
+			slot["last_date"] = str(d)
+
+	products = []
+	for slot in agg.values():
+		parents = slot.pop("_parents", set())
+		slot["invoice_count"] = len(parents)
+		products.append(slot)
+	products.sort(key=lambda p: (-flt(p["amount_total"]), p["item_code"]))
+	return {"ok": True, "seller": seller, "products": products[:page_length]}

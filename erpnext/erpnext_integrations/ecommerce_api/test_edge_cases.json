@@ -2764,7 +2764,13 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_items",
       "args": {
         "preorder_name": null,
-        "items": [{"item_code": "X", "qty": 1, "rate": 1}]
+        "items": [
+          {
+            "item_code": "X",
+            "qty": 1,
+            "rate": 1
+          }
+        ]
       },
       "expect": "fail"
     },
@@ -3166,6 +3172,80 @@
       "expect": "fail"
     },
     {
+      "id": "tms_link_warehouse_at_location_null",
+      "source": "regression",
+      "bug": "link_warehouse_at_location with null warehouse/lat/lng is controlled ValidationError, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.link_warehouse_at_location",
+      "args": {
+        "warehouse": null,
+        "address": null,
+        "lat": null,
+        "lng": null,
+        "label": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_link_warehouse_at_location_dirty",
+      "source": "regression",
+      "bug": "link_warehouse_at_location with empty/undefined dirty args is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.link_warehouse_at_location",
+      "args": {
+        "warehouse": "",
+        "address": "undefined",
+        "lat": "",
+        "lng": "null",
+        "label": "null"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "stock_location_list_null_item",
+      "source": "regression",
+      "bug": "list_stock_location_estimates with null item_code is controlled ValidationError, never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.stock_location_api.list_stock_location_estimates",
+      "args": {
+        "item_code": null,
+        "warehouse": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "stock_location_upsert_dirty",
+      "source": "regression",
+      "bug": "upsert_stock_location_estimate with empty/undefined dirty args is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.stock_location_api.upsert_stock_location_estimate",
+      "args": {
+        "name": null,
+        "item_code": "",
+        "warehouse": "undefined",
+        "location_label": "null",
+        "qty_estimate": "undefined"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "stock_location_delete_null",
+      "source": "regression",
+      "bug": "delete_stock_location_estimate with null name is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.stock_location_api.delete_stock_location_estimate",
+      "args": {
+        "name": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "stock_location_coverage_dirty",
+      "source": "regression",
+      "bug": "get_stock_location_coverage with dirty empty args returns controlled empty/bulk shape, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.stock_location_api.get_stock_location_coverage",
+      "args": {
+        "item_code": "",
+        "warehouse": "undefined"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_create_trip_null_vehicle_empty_dns",
       "source": "regression",
       "bug": "create_trip with null vehicle / empty delivery notes fails with controlled ValidationError (never MandatoryError Vehicle / 500)",
@@ -3194,15 +3274,38 @@
     {
       "id": "tms_update_trip_assignment_nulls",
       "source": "regression",
-      "bug": "update_trip_assignment with null trip/driver/vehicle is controlled ValidationError",
+      "bug": "update_trip_assignment with null trip/driver/vehicle/departure is controlled ValidationError",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_trip_assignment",
       "args": {
         "trip_name": null,
         "driver": null,
         "vehicle": null,
-        "pickup_warehouse": null
+        "pickup_warehouse": null,
+        "departure_time": null
       },
       "expect": "fail"
+    },
+    {
+      "id": "tms_update_trip_assignment_empty_departure",
+      "source": "regression",
+      "bug": "update_trip_assignment with empty departure_time and no other fields is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_trip_assignment",
+      "args": {
+        "trip_name": "",
+        "departure_time": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_trip_assignment_date_only",
+      "source": "regression",
+      "bug": "update_trip_assignment with YYYY-MM-DD departure_time (MatDetail date input) must not 500; expands to 08:00",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_trip_assignment",
+      "args": {
+        "trip_name": "MAT-DT-2026-00010",
+        "departure_time": "2026-10-20"
+      },
+      "expect": "no_500"
     },
     {
       "id": "tms_get_trip_delivery_summary_null",
@@ -3605,6 +3708,20 @@
       "expect": "fail"
     },
     {
+      "id": "save_employee_new_assigns_ops_pin",
+      "source": "regression",
+      "bug": "save_employee create must allocate ops_pin without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.save_employee",
+      "args": {
+        "name": null,
+        "data": {
+          "employee_name": "Edge Pin Auto Emp",
+          "status": "Active"
+        }
+      },
+      "expect": "ok"
+    },
+    {
       "id": "ops_ensure_employee_ops_pins_empty",
       "source": "regression",
       "bug": "ensure_employee_ops_pins with [] is controlled ValidationError",
@@ -3614,6 +3731,117 @@
         "rotate": 0
       },
       "expect": "fail"
+    },
+    {
+      "id": "get_employee_sales_null_keys",
+      "source": "regression",
+      "bug": "get_employee_sales with null employee/user_id must controlled error (not TypeError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.get_employee_sales",
+      "args": {
+        "employee": null,
+        "user_id": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "get_employee_sales_by_user",
+      "source": "regression",
+      "bug": "get_employee_sales by user_id returns ok bundle without crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.get_employee_sales",
+      "args": {
+        "employee": null,
+        "user_id": "Administrator"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "assign_employee_customer_null_customer",
+      "source": "regression",
+      "bug": "assign_employee_customer with null customer must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.assign_employee_customer",
+      "args": {
+        "user_id": "Administrator",
+        "customer": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "set_customer_salesmen_null",
+      "source": "regression",
+      "bug": "set_customer_salesmen with null customer/user_ids must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.set_customer_salesmen",
+      "args": {
+        "customer": null,
+        "user_ids": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "set_customer_salesmen_multi",
+      "source": "regression",
+      "bug": "set_customer_salesmen accepts multi user list without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.set_customer_salesmen",
+      "args": {
+        "customer": "Consumidor Final",
+        "user_ids": [
+          "Administrator"
+        ]
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "ensure_salesman_null",
+      "source": "regression",
+      "bug": "ensure_salesman with null name must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.ensure_salesman",
+      "args": {
+        "name": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "ensure_salesman_empty",
+      "source": "regression",
+      "bug": "ensure_salesman with empty name must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.ensure_salesman",
+      "args": {
+        "name": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "list_salesman_options_null",
+      "source": "regression",
+      "bug": "list_salesman_options null search/page_length must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.list_salesman_options",
+      "args": {
+        "search": null,
+        "page_length": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_customer_salesmen_null",
+      "source": "regression",
+      "bug": "get_customer_salesmen null customer controlled fail",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.get_customer_salesmen",
+      "args": {
+        "customer": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "list_employee_orders_empty_user",
+      "source": "regression",
+      "bug": "list_employee_orders with empty user_id after resolve must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.list_employee_orders",
+      "args": {
+        "employee": "",
+        "user_id": "Administrator",
+        "start": null,
+        "page_length": null
+      },
+      "expect": "ok"
     },
     {
       "id": "ops_save_armado_notes_missing_pin",
@@ -3784,14 +4012,28 @@
     {
       "id": "update_guest_preorder_logistics_null",
       "source": "regression",
-      "bug": "update_guest_preorder_logistics with null name is controlled error",
+      "bug": "update_guest_preorder_logistics with null name/driver/vehicle is controlled error (not TypeError)",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_logistics",
       "args": {
         "preorder_name": null,
         "warehouse": null,
         "trip_name": null,
         "vehicle": null,
+        "driver": null,
         "clear_trip": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "update_guest_preorder_logistics_driver_empty",
+      "source": "regression",
+      "bug": "update_guest_preorder_logistics with empty preorder_name + driver string must not AttributeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_logistics",
+      "args": {
+        "preorder_name": "",
+        "driver": "",
+        "vehicle": "",
+        "warehouse": ""
       },
       "expect": "no_500"
     },
@@ -4168,6 +4410,92 @@
       "expect": "controlled_error",
       "source": "regression",
       "bug": "list_tag_events(null refs) must not TypeError"
+    },
+    {
+      "id": "assign_item_floor_location_null_item",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.assign_item_floor_location",
+      "args": {
+        "item_code": null,
+        "floor_id": null,
+        "section_id": null,
+        "provisional_path": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "assign_item_floor_location(null item) must return ok=false dict, never TypeError"
+    },
+    {
+      "id": "assign_item_floor_location_empty_strings",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.assign_item_floor_location",
+      "args": {
+        "item_code": "",
+        "floor_id": "",
+        "section_id": "",
+        "provisional_path": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "empty-string args must not AttributeError"
+    },
+    {
+      "id": "get_item_floor_location_null_item",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_item_floor_location",
+      "args": {
+        "item_code": null,
+        "floor_id": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "get_item_floor_location(null) must return empty payload, never TypeError"
+    },
+    {
+      "id": "get_floor_containment_null_floor",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_floor_containment",
+      "args": {
+        "floor_id": null,
+        "company": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "get_floor_containment(null) must not TypeError"
+    },
+    {
+      "id": "save_floor_map_ghost_company",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.save_floor_map",
+      "args": {
+        "location_name": "Warehouse 1",
+        "floor_name": "Floor 1",
+        "sections_data": null,
+        "notes_data": null,
+        "company": "library__smoke_ren__smoke_ren"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "save_floor_map with stale smoke-renamed Company must not LinkValidationError; resolve_company must skip ghost defaults"
+    },
+    {
+      "id": "get_guest_preorders_list_includes_tags",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": 5,
+        "scope": "admin",
+        "status": null,
+        "start": 0
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "get_guest_preorders_list must attach ecommerce tags[] so PRINTED pipeline icons survive reload after bulk print"
+    },
+    {
+      "id": "mark_sales_orders_print_action_multi_null_safe",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.mark_sales_orders_print_action",
+      "args": {
+        "names": null,
+        "action": "printed"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "mark_sales_orders_print_action with null names must controlled-fail, never TypeError (bulk print stamp)"
     }
-]
+  ]
 }
