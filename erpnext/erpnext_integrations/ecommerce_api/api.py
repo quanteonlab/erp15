@@ -4874,12 +4874,14 @@ def create_guest_preorder(
 
 
 @frappe.whitelist()
-def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=None, scope="pos"):
+def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=None, scope="pos", include_archived=0):
 	"""
 	List Guest Preorders created by `create_guest_preorder`.
 
-	Cancelled orders that have been superseded by an amended version are excluded.
-	Only user-archived orders (no successor) and active orders are shown.
+	Cancelled / Archivado orders are hidden by default (``include_archived=0``).
+	Use ERPNext Desk / advanced search to find archived SOs; pass
+	``include_archived=1`` only when a UI explicitly needs them.
+	Superseded cancelled orders (replaced by an amendment) are always excluded.
 	"""
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -4901,6 +4903,13 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 	if page_length <= 0:
 		page_length = 20
 
+	try:
+		include_archived = cint(include_archived)
+	except Exception:
+		include_archived = 0
+	if isinstance(include_archived, str) and include_archived.strip().lower() in ("1", "true", "yes"):
+		include_archived = 1
+
 	scope = _order_visibility_scope()
 	if scope is not None and not scope.get("own") and not scope.get("tags"):
 		return {"preorders": [], "total_count": 0}
@@ -4912,8 +4921,14 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			filters["docstatus"] = 0
 		elif str(status).lower() in ("submitted", "confirmed"):
 			filters["docstatus"] = 1
+		elif str(status).lower() in ("archived", "cancelled", "archivado"):
+			filters["docstatus"] = 2
+			include_archived = 1
 		else:
 			filters["status"] = status
+	elif not include_archived:
+		# Active Pedidos table: drafts + submitted only (not Archivado).
+		filters["docstatus"] = ["<", 2]
 
 	orders = frappe.get_all(
 		"Sales Order",
@@ -4958,9 +4973,12 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 				superseded.add(a["amended_from"])
 
 	# Filter out superseded cancelled orders and orders outside this user's Pedidos scope.
+	# When include_archived is off, also drop any remaining docstatus=2 rows (belt & suspenders).
 	filtered = []
 	for o in orders:
 		if o.get("docstatus") == 2 and o["name"] in superseded:
+			continue
+		if not include_archived and cint(o.get("docstatus")) == 2:
 			continue
 		if not guest_preorder_matches_scope(o.get("owner"), o.get(tag_fn), scope):
 			continue
@@ -5755,12 +5773,15 @@ def unmark_prepared_guest_preorder(preorder_name):
 
 
 @frappe.whitelist()
-def cancel_guest_preorder(preorder_name):
+def cancel_guest_preorder(preorder_name=None):
 	"""Cancel (archive) a guest preorder. Works on both draft and submitted orders."""
-	if not frappe.db.exists("Sales Order", preorder_name):
-		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+	name = cstr(preorder_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Sales Order name is required"))
+	if not frappe.db.exists("Sales Order", name):
+		frappe.throw(_("Sales Order {0} not found").format(name))
 
-	so = frappe.get_doc("Sales Order", preorder_name)
+	so = frappe.get_doc("Sales Order", name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
 	_require_guest_preorder_visible(so)
@@ -5768,6 +5789,7 @@ def cancel_guest_preorder(preorder_name):
 	if so.docstatus == 2:
 		frappe.throw(_("Order is already cancelled"))
 
+	old_display = _display_status(so)
 	so.flags.ignore_permissions = True
 	if so.docstatus == 1:
 		so.cancel()
@@ -5775,7 +5797,12 @@ def cancel_guest_preorder(preorder_name):
 		so.docstatus = 2
 		so.save()
 	so.reload()
-	return {"ok": True, "name": preorder_name, "status": "Cancelled"}
+	try:
+		_record_guest_preorder_status_audit(name, old_display, "Archivado", source=None)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "guest preorder archive audit")
+	frappe.db.commit()
+	return {"ok": True, "name": name, "status": "Cancelled", "display_status": "Archivado"}
 
 
 @frappe.whitelist()

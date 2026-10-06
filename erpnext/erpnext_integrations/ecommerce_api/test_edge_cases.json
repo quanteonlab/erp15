@@ -2729,6 +2729,16 @@
       "expect": "fail"
     },
     {
+      "id": "preorder_cancel_null_name",
+      "source": "regression",
+      "bug": "cancel_guest_preorder (archive) with null name returns controlled error, not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.cancel_guest_preorder",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "fail"
+    },
+    {
       "id": "preorder_unarchive_null_name",
       "source": "regression",
       "bug": "unarchive_guest_preorder with null name returns controlled error, not TypeError/500",
