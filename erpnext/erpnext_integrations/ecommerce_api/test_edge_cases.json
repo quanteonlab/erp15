@@ -1479,6 +1479,31 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_seller_ref_user",
+      "source": "regression",
+      "bug": "create_guest_preorder stamps seller_ref from salesman link cookie (null/\"\"/user must not crash)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge seller_ref stamp",
+        "guest_name": "Edge Seller Ref",
+        "seller_ref_user": "Administrator"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "create_guest_preorder_seller_ref_null",
+      "source": "regression",
+      "bug": "create_guest_preorder seller_ref_user null must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge seller_ref null",
+        "seller_ref_user": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "create_guest_preorder_initial_status_null",
       "source": "regression",
       "bug": "create_guest_preorder initial_status null/\"\" must stay Consulta (no promote); dirty value must not TypeError",

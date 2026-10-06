@@ -4170,6 +4170,11 @@ def _cashier_from_guest_preorder(so_or_dict):
 	return _parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("cashier") or None
 
 
+def _seller_ref_from_guest_preorder(so_or_dict):
+	"""Salesman attributed via /s/{slug} cookie (seller_ref tag on the SO)."""
+	return _parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("seller_ref") or None
+
+
 def _delivery_date_forced_from_tags(so_or_dict) -> bool:
 	return (_parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("delivery_forced") or "") in (
 		"1",
@@ -4971,6 +4976,10 @@ def create_guest_preorder(
 	cashier = _resolve_order_cashier(cashier_id)
 	if cashier:
 		remarks_parts.append(f"cashier:{_sanitize_guest_tag(cashier)}")
+	# Salesman / referrer from the public /s/{slug} link cookie (catalog attribution).
+	seller_ref = cstr(seller_ref_user or "").strip()
+	if seller_ref and seller_ref.lower() not in ("null", "undefined", "none"):
+		remarks_parts.append(f"seller_ref:{_sanitize_guest_tag(seller_ref)}")
 	# Preferred salida warehouse (TMS depot) — default company/only warehouse.
 	default_wh = _default_company_warehouse(company)
 	if default_wh:
@@ -5282,6 +5291,7 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 	for o in filtered:
 		o["items_count"] = items_count_map.get(o["name"], 0)
 		o["cashier_user"] = _cashier_from_guest_preorder(o)
+		o["seller_ref_user"] = _seller_ref_from_guest_preorder(o)
 		o["display_status"] = _display_status_from_row(
 			o.get("docstatus", 0),
 			o.get("status", ""),
@@ -5388,6 +5398,7 @@ def get_guest_preorder(preorder_name):
 		"status": so.status,
 		"display_status": _display_status(so),
 		"cashier_user": _cashier_from_guest_preorder(so),
+		"seller_ref_user": _seller_ref_from_guest_preorder(so),
 		"estimated_total": _guest_preorder_estimated_total(so),
 		"currency": so.currency,
 		"remarks": getattr(so, "remarks", None),
@@ -6329,6 +6340,11 @@ def update_guest_preorder_details(preorder_name, data=None):
 			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
 		_update_guest_preorder_tag(so, "cashier", str(data.get("cashier_user") or "").strip())
 
+	if data.get("seller_ref_user") is not None:
+		if not _can_view_all_guest_preorders():
+			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
+		_update_guest_preorder_tag(so, "seller_ref", str(data.get("seller_ref_user") or "").strip())
+
 	if so.docstatus == 0:
 		# Consulta drafts may have no lines yet — Frappe "Data missing in table: Items"
 		# must not block header / tag updates from the Pedidos panel.
@@ -6347,6 +6363,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 		if tag_fn and (
 			data.get("customer")
 			or data.get("cashier_user") is not None
+			or data.get("seller_ref_user") is not None
 			or guest_tags_touched
 			or so.customer
 			or force_flag is not None
