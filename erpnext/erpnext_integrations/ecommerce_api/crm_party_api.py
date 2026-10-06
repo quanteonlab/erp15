@@ -775,6 +775,8 @@ def _interaction_row(
 	amount: float,
 	paid: float,
 	status: str = "",
+	display_status: str | None = None,
+	docstatus: int | None = None,
 	currency: str | None = None,
 ) -> dict:
 	amt = flt(amount)
@@ -789,6 +791,8 @@ def _interaction_row(
 		"paid": pd,
 		"outstanding": max(0.0, amt - pd) if doctype != "Payment Entry" else 0.0,
 		"status": status or "",
+		"display_status": display_status or status or "",
+		"docstatus": cint(docstatus) if docstatus is not None else None,
 		"currency": currency,
 	}
 
@@ -823,6 +827,8 @@ def list_party_interactions(party_type=None, party=None, start=0, page_length=10
 	rows: list[dict] = []
 
 	if ptype == "Customer":
+		from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
+
 		for r in frappe.get_all(
 			"Sales Order",
 			filters={"customer": party, "docstatus": ["<", 2]},
@@ -832,21 +838,28 @@ def list_party_interactions(party_type=None, party=None, start=0, page_length=10
 				"grand_total",
 				"advance_paid",
 				"status",
+				"docstatus",
 				"currency",
 			],
 			order_by="transaction_date desc",
 			limit_page_length=300,
 			ignore_permissions=True,
 		):
+			gt = flt(r.grand_total)
+			paid = flt(r.advance_paid)
 			rows.append(
 				_interaction_row(
 					doctype="Sales Order",
 					name=r.name,
 					date=r.transaction_date,
 					doc_kind="sale",
-					amount=flt(r.grand_total),
-					paid=flt(r.advance_paid),
+					amount=gt,
+					paid=paid,
 					status=r.status,
+					display_status=_display_status_from_row(
+						r.docstatus, r.status, gt, paid
+					),
+					docstatus=cint(r.docstatus),
 					currency=r.currency,
 				)
 			)

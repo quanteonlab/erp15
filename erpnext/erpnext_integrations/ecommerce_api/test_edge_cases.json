@@ -973,6 +973,22 @@
       "expect": "no_500"
     },
     {
+      "id": "list_party_interactions_so_display_status",
+      "source": "regression",
+      "bug": "customer MOVIMIENTOS rows include Pedidos display_status for Sales Orders",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_party_api.list_party_interactions",
+      "args": {
+        "party_type": "Customer",
+        "party": "Consumidor Final",
+        "page_length": 20
+      },
+      "expect": "ok",
+      "assert": {
+        "path": "ok",
+        "equals": true
+      }
+    },
+    {
       "id": "list_party_payments_empty_party_type",
       "source": "regression",
       "bug": "list_party_payments with empty party_type must controlled error",
