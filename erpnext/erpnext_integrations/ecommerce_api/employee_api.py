@@ -43,10 +43,11 @@ APP_PERMISSIONS = [
 		"label_en": "Catalog",
 		"label_es": "Catálogo",
 		"label_zh": "目录",
-		"desc_en": "Browse the public/internal catalog.",
-		"desc_es": "Ver el catálogo interno/público.",
-		"desc_zh": "浏览商品目录。",
+		"desc_en": "Show Catalog in navbar / home. The /catalog page stays reachable without this.",
+		"desc_es": "Mostrar Catálogo en la barra y en Inicio. /catalog sigue accesible sin este permiso.",
+		"desc_zh": "在导航/首页显示目录。无此权限仍可打开 /catalog。",
 	},
+
 	{
 		"id": "ops.receiving",
 		"group": "operaciones",
@@ -66,6 +67,26 @@ APP_PERMISSIONS = [
 		"desc_en": "See assigned delivery routes and record proof of delivery.",
 		"desc_es": "Ver las rutas de entrega asignadas y registrar la prueba de entrega.",
 		"desc_zh": "查看已分配的配送路线并记录送达凭证。",
+	},
+	{
+		"id": "ops.check",
+		"group": "operaciones",
+		"label_en": "Check",
+		"label_es": "Check",
+		"label_zh": "复核",
+		"desc_en": "Show Check in navbar / home. /check stays reachable (PIN gate) without this.",
+		"desc_es": "Mostrar Check en la barra y en Inicio. /check sigue accesible (PIN) sin este permiso.",
+		"desc_zh": "在导航/首页显示复核。无此权限仍可打开 /check（PIN）。",
+	},
+	{
+		"id": "ops.armado",
+		"group": "operaciones",
+		"label_en": "Assembly",
+		"label_es": "Armado",
+		"label_zh": "配货",
+		"desc_en": "Show Armado in navbar / home. /armado stays reachable (PIN gate) without this.",
+		"desc_es": "Mostrar Armado en la barra y en Inicio. /armado sigue accesible (PIN) sin este permiso.",
+		"desc_zh": "在导航/首页显示配货。无此权限仍可打开 /armado（PIN）。",
 	},
 	{
 		"id": "ops.preventa",
@@ -458,6 +479,8 @@ PERMISSION_TO_ROLES = {
 	"ops.catalog": ["Sales User"],
 	"ops.receiving": ["Stock User", "Purchase User"],
 	"ops.delivery": ["Stock User"],
+	"ops.check": ["Stock User"],
+	"ops.armado": ["Stock User"],
 	"ops.preventa": ["Sales User"],
 	"sales.see_all": ["Sales User"],
 	"sales.see_assigned": ["Sales User"],
@@ -506,6 +529,8 @@ _STARTER_REPOSITOR = [
 	"ops.receiving",
 	"ops.catalog",
 	"ops.buying",
+	"ops.check",
+	"ops.armado",
 	"tools.labels",
 	"tools.catalog_pdf",
 	"tools.sync",
@@ -532,11 +557,17 @@ _SALES_SCOPE_IDS = frozenset(
 		"sales.commit_assigned",
 	}
 )
-_STARTER_VENTAS = [
+# Official sales floor role title is ``Sales`` (EN). Legacy sites may still have ``ventas``.
+# No Entregas / Check / Armado — those are opt-in via group permissions.
+# Catalog PDF is a normal seller tool (share price lists); still toggleable in Groups.
+_STARTER_SALES = [
 	"ops.preventa",
 	"ops.catalog",
 	"tools.sync",
+	"tools.catalog_pdf",
 	"tables.crm",
+	# Own Pedidos so Operaciones → Orden (create + confirm) works without full tables.orders.
+	"tables.orders.own",
 	"sales.see_all",
 	"sales.commit_assigned",
 ]
@@ -546,11 +577,12 @@ _STARTER_DRIVER = [
 	"sales.see_all",
 	"sales.commit_assigned",
 ]
-# Alias of ventas for EN-labeled sites / Vista previa “Sales”.
-_STARTER_SALES = list(_STARTER_VENTAS)
+# Floor ops that Sales must not keep if they were inherited from older broad gates.
+_SALES_STRIP_OPS = frozenset({"ops.delivery", "ops.check", "ops.armado"})
 
 # Prior starter lists (pre ops-only defaults). Matching groups are upgraded in place
 # so unmodified floor roles lose log.*/tables.* without touching customised groups.
+# ``ventas`` stays here so existing sites still get the ops-only upgrade; it is not seeded.
 _FLOOR_STARTER_TITLES = frozenset({"repositor", "caja", "ventas", "Sales", "Driver"})
 _LEGACY_STARTER_BY_TITLE = {
 	"repositor": [
@@ -624,7 +656,6 @@ def _floor_starter_needs_ops_only_upgrade(title: str, current: list[str]) -> boo
 STARTER_STAFF_GROUPS = [
 	{"employee_group_name": "repositor", "permissions": list(_STARTER_REPOSITOR)},
 	{"employee_group_name": "caja", "permissions": list(_STARTER_CAJA)},
-	{"employee_group_name": "ventas", "permissions": list(_STARTER_VENTAS)},
 	{"employee_group_name": "Sales", "permissions": list(_STARTER_SALES)},
 	{"employee_group_name": "Driver", "permissions": list(_STARTER_DRIVER)},
 	{
@@ -662,6 +693,18 @@ def _rand_password(length: int = 16) -> str:
 
 def _set_user_password(user_name: str, password: str) -> None:
 	_update_password(user=user_name, pwd=password, logout_all_sessions=False)
+
+
+def _optional_staff_password(password) -> str | None:
+	"""Return stripped password or None (caller should mint random). Rejects too-short values."""
+	if password is None:
+		return None
+	pwd = str(password).strip()
+	if not pwd:
+		return None
+	if len(pwd) < 6:
+		frappe.throw(_("Password must be at least 6 characters"))
+	return pwd
 
 
 def _load_perm_store() -> dict:
@@ -779,6 +822,9 @@ _COARSE_FLAG = {
 	"ops.pos": "pos",
 	"ops.catalog": "pos",
 	"ops.preventa": "pos",
+	"ops.check": "receiving",
+	"ops.armado": "receiving",
+	"ops.delivery": "receiving",
 	"sales.see_all": "pos",
 	"sales.see_assigned": "pos",
 	"sales.commit_all": "pos",
@@ -884,9 +930,11 @@ def _serialize_employee(name: str) -> dict:
 	)
 	roles: list[str] = []
 	user_enabled = None
+	login_username = None
 	if emp.user_id and frappe.db.exists("User", emp.user_id):
 		roles = [r for r in frappe.get_roles(emp.user_id) if r not in ("All", "Guest", "Desk User")]
 		user_enabled = cint(frappe.db.get_value("User", emp.user_id, "enabled"))
+		login_username = frappe.db.get_value("User", emp.user_id, "username") or None
 	login_barcode = None
 	store = _load_staff_login_store()
 	entry = (store.get("by_employee") or {}).get(emp.name)
@@ -915,6 +963,7 @@ def _serialize_employee(name: str) -> dict:
 		"salary_currency": emp.salary_currency,
 		"bio": emp.bio,
 		"user_id": emp.user_id,
+		"username": login_username,
 		"has_user": bool(emp.user_id),
 		"user_enabled": user_enabled,
 		"roles": roles,
@@ -1122,8 +1171,9 @@ def save_employee(name=None, data=None):
 				doc.set(key, data[key])
 		if "ctc" in data:
 			doc.ctc = flt(data.get("ctc"))
-		if data.get("company_email") or data.get("prefered_email"):
-			doc.prefered_contact_email = "Company Email"
+		email_in = (data.get("prefered_email") or data.get("company_email") or "").strip()
+		if email_in:
+			_sync_employee_login_email(doc, email_in)
 		doc.insert(ignore_permissions=True)
 		log_field_changes(
 			"Employee",
@@ -1135,8 +1185,21 @@ def save_employee(name=None, data=None):
 			frappe.throw(_("Employee {0} not found").format(name))
 		doc = frappe.get_doc("Employee", name)
 		changes = []
+		email_keys = {"company_email", "prefered_email"}
+		email_in = None
+		if "prefered_email" in data or "company_email" in data:
+			email_in = (
+				data.get("prefered_email")
+				if data.get("prefered_email") not in (None, "")
+				else data.get("company_email")
+			)
+			if email_in not in (None, ""):
+				changes.extend(_sync_employee_login_email(doc, str(email_in)))
 		for key in tracked:
 			if key not in data:
+				continue
+			if key in email_keys:
+				# Handled by _sync_employee_login_email (also renames User).
 				continue
 			new_val = data[key]
 			if key == "ctc":
@@ -1156,8 +1219,6 @@ def save_employee(name=None, data=None):
 				doc.first_name = first
 			if last is not None:
 				doc.last_name = last or None
-		if data.get("company_email") or data.get("prefered_email"):
-			doc.prefered_contact_email = "Company Email"
 		try:
 			doc.save(ignore_permissions=True)
 		except (frappe.ValidationError, frappe.DuplicateEntryError):
@@ -1165,10 +1226,22 @@ def save_employee(name=None, data=None):
 			# blocked by unrelated pre-existing data (e.g. two employees sharing a
 			# login user) — common for offline-replayed edits. Write just the
 			# changed scalar fields; anything else re-raises.
-			simple = {"employee_name", "first_name", "last_name", "status", "branch", "ctc", "bio", "cell_number"}
+			simple = {
+				"employee_name",
+				"first_name",
+				"last_name",
+				"status",
+				"branch",
+				"ctc",
+				"bio",
+				"cell_number",
+				"company_email",
+				"prefered_email",
+				"user_id",
+			}
 			patch = {k: doc.get(k) for k, _o, _n in changes}
-			for k in ("first_name", "last_name", "employee_name"):
-				if k in data:
+			for k in ("first_name", "last_name", "employee_name", "company_email", "prefered_email", "user_id"):
+				if k in data or k in {c[0] for c in changes}:
 					patch[k] = doc.get(k)
 			if not set(patch).issubset(simple):
 				raise
@@ -1176,6 +1249,17 @@ def save_employee(name=None, data=None):
 				frappe.db.set_value("Employee", doc.name, patch, update_modified=True)
 		if changes:
 			log_field_changes("Employee", doc.name, changes)
+
+		# Custom login handle (User.username). Blank → clear so login is email only.
+		if "username" in data and doc.user_id and frappe.db.exists("User", doc.user_id):
+			prev_u = frappe.db.get_value("User", doc.user_id, "username") or ""
+			next_u = _set_user_login_username(doc.user_id, data.get("username"))
+			if str(prev_u or "") != str(next_u or ""):
+				log_field_changes(
+					"Employee",
+					doc.name,
+					[("username", prev_u or None, next_u)],
+				)
 
 	if "groups" in data:
 		_set_employee_groups(doc.name, data.get("groups") or [])
@@ -1188,6 +1272,31 @@ def save_employee(name=None, data=None):
 	# New employees always get a random 6-digit ops PIN (armado/check/roleplay).
 	if is_new:
 		_issue_ops_pin_for_employee(doc.name)
+
+	# Optional: create User in the same save (Nuevo empleado + checkbox).
+	credentials = None
+	if is_new and cint(data.get("create_user")):
+		_require_app_permission("employees.create_user")
+		# create_employee_user commits; return its credential payload for the one-time flash.
+		created = create_employee_user(
+			doc.name,
+			email=data.get("prefered_email") or data.get("company_email"),
+			password=data.get("password"),
+			username=data.get("username"),
+		)
+		credentials = {
+			"user_id": created.get("user_id"),
+			"email": created.get("email"),
+			"username": created.get("username"),
+			"password": created.get("password"),
+			"password_was_set": created.get("password_was_set"),
+			"linked_existing": created.get("linked_existing"),
+		}
+		return {
+			"ok": True,
+			"employee": created.get("employee") or _serialize_employee(doc.name),
+			"credentials": credentials,
+		}
 
 	frappe.db.commit()
 	return {"ok": True, "employee": _serialize_employee(doc.name)}
@@ -1250,26 +1359,146 @@ def _email_local_slug(text: str, max_len: int = 18) -> str:
 	return slug or "staff"
 
 
+def _ensure_username_login_enabled() -> None:
+	"""Frappe only resolves User.username at login when this System Setting is on."""
+	if cint(frappe.db.get_single_value("System Settings", "allow_login_using_user_name")):
+		return
+	frappe.flags.ignore_permissions = True
+	frappe.db.set_single_value("System Settings", "allow_login_using_user_name", 1)
+
+
+def _normalize_login_username(raw) -> str:
+	"""Custom login handle (employee code / username). Blank → login via email only."""
+	import re
+
+	s = str(raw or "").strip().strip("@")
+	s = re.sub(r"\s+", "", s)
+	if not s:
+		return ""
+	if "@" in s:
+		frappe.throw(_("Username cannot be an email — leave blank to use the email as login"))
+	if not re.match(r"^[A-Za-z0-9._-]{2,64}$", s):
+		frappe.throw(
+			_("Username may only contain letters, numbers, dots, underscores and hyphens (2–64 chars)")
+		)
+	return s
+
+
+def _set_user_login_username(user_name: str, username) -> str | None:
+	"""Set or clear ``User.username``. Returns the stored username (or None)."""
+	_ensure_username_login_enabled()
+	wanted = _normalize_login_username(username)
+	frappe.flags.ignore_permissions = True
+	if not wanted:
+		frappe.db.set_value("User", user_name, "username", None, update_modified=False)
+		return None
+	other = frappe.db.get_value(
+		"User", {"username": wanted, "name": ["!=", user_name]}, "name"
+	)
+	if other:
+		frappe.throw(_("Username {0} is already taken").format(wanted))
+	# Avoid colliding with another account's email/login id.
+	if frappe.db.exists("User", wanted) and wanted != user_name:
+		frappe.throw(_("Username {0} conflicts with an existing login email").format(wanted))
+	frappe.db.set_value("User", user_name, "username", wanted, update_modified=False)
+	return wanted
+
+
 def _unique_staff_email(base_email: str, employee_name: str) -> str:
+	"""Return a free login email.
+
+	If ``base_email`` is valid and unused, keep it. Otherwise mint
+	``{local}{random5}@{domain}`` so auto-created users never collide with
+	existing User names (e.g. two "Bruno" salespeople).
+	"""
 	from frappe.utils import validate_email_address
 
 	email = (base_email or "").strip().lower()
 	if email and validate_email_address(email) and not frappe.db.exists("User", email):
 		return email
-	slug = _email_local_slug(employee_name or "staff")
-	for i in range(0, 40):
-		candidate = f"{slug}{i or ''}@employees.local"
+
+	if email and "@" in email and validate_email_address(email):
+		local, _, domain = email.rpartition("@")
+		local = _email_local_slug(local, max_len=24) or _email_local_slug(employee_name or "staff")
+		domain = (domain or "employees.local").strip() or "employees.local"
+	else:
+		local = _email_local_slug(employee_name or "staff")
+		domain = "employees.local"
+
+	for _ in range(48):
+		suffix = secrets.randbelow(90000) + 10000  # 10000–99999
+		candidate = f"{local}{suffix}@{domain}"
 		if not frappe.db.exists("User", candidate):
 			return candidate
-	return f"{slug}{secrets.token_hex(3)}@employees.local"
+	return f"{local}{secrets.token_hex(4)}@{domain}"
+
+
+def _sync_employee_login_email(doc, new_email: str) -> list[tuple]:
+	"""Set company/prefered email; rename linked User.name (Frappe requires name=email).
+
+	Custom login handles live on ``User.username`` and are preserved across rename.
+	Returns a list of (field, old, new) change tuples for logging.
+	"""
+	from frappe.utils import validate_email_address
+
+	changes: list[tuple] = []
+	wanted = (new_email or "").strip().lower()
+	if not wanted:
+		return changes
+	if not validate_email_address(wanted):
+		frappe.throw(_("Invalid email: {0}").format(wanted))
+
+	old_company = doc.company_email
+	old_prefered = doc.prefered_email
+	if str(old_company or "") != wanted:
+		changes.append(("company_email", old_company, wanted))
+	if str(old_prefered or "") != wanted:
+		changes.append(("prefered_email", old_prefered, wanted))
+	doc.company_email = wanted
+	doc.prefered_email = wanted
+	doc.prefered_contact_email = "Company Email"
+
+	old_uid = (doc.user_id or "").strip()
+	if not old_uid or not frappe.db.exists("User", old_uid):
+		return changes
+	prev_username = frappe.db.get_value("User", old_uid, "username")
+	if old_uid.lower() == wanted:
+		# Keep User.email aligned even if name already matches.
+		frappe.db.set_value("User", old_uid, "email", wanted, update_modified=False)
+		return changes
+	if old_uid in ("Administrator", "Guest"):
+		frappe.throw(_("Cannot rename system user {0}").format(old_uid))
+	if frappe.db.exists("User", wanted):
+		frappe.throw(_("User {0} already exists").format(wanted))
+	other = frappe.db.get_value(
+		"Employee", {"user_id": wanted, "name": ["!=", doc.name]}, "name"
+	)
+	if other:
+		frappe.throw(_("User {0} is already linked to employee {1}").format(wanted, other))
+
+	frappe.flags.ignore_permissions = True
+	frappe.rename_doc("User", old_uid, wanted, force=True, merge=False)
+	frappe.db.set_value("User", wanted, "email", wanted, update_modified=False)
+	if prev_username:
+		_set_user_login_username(wanted, prev_username)
+	changes.append(("user_id", old_uid, wanted))
+	doc.user_id = wanted
+	return changes
 
 
 @frappe.whitelist()
-def create_employee_user(employee, email=None, roles=None):
-	"""Create or link a User for the employee and return a one-time random password."""
+def create_employee_user(employee, email=None, roles=None, password=None, username=None):
+	"""Create or link a User for the employee.
+
+	``password`` optional — when omitted a random one-time password is minted.
+	``username`` optional custom login handle (employee code). Blank → login with email only.
+	Frappe User.name is always the email; custom handles live on User.username.
+	"""
 	_require_app_permission("employees.create_user")
 	if isinstance(roles, str):
 		roles = frappe.parse_json(roles)
+	chosen = _optional_staff_password(password)
+	wanted_username = _normalize_login_username(username)
 
 	frappe.flags.ignore_permissions = True
 	if not frappe.db.exists("Employee", employee):
@@ -1303,7 +1532,7 @@ def create_employee_user(employee, email=None, roles=None):
 	emp.prefered_email = login_email
 	emp.save(ignore_permissions=True)
 
-	password = _rand_password()
+	password = chosen if chosen is not None else _rand_password()
 	parts = (emp.employee_name or emp.first_name or "User").split()
 	first = parts[0]
 	last = " ".join(parts[1:]) if len(parts) > 1 else first
@@ -1334,6 +1563,9 @@ def create_employee_user(employee, email=None, roles=None):
 		user_name = user.name
 		_set_user_password(user_name, password)
 
+	# Clear Frappe's auto first_name scrub username unless a custom handle was requested.
+	stored_username = _set_user_login_username(user_name, wanted_username or None)
+
 	group_roles = _roles_from_permission_ids(_permission_ids_for_employee(emp.name))
 	if not group_roles or group_roles == ["Employee"]:
 		fallback = list(roles) if roles else ["Employee", "Sales User"]
@@ -1351,28 +1583,65 @@ def create_employee_user(employee, email=None, roles=None):
 		"ok": True,
 		"user_id": user_name,
 		"email": login_email,
+		"username": stored_username,
 		"password": password,
+		"password_was_set": chosen is not None,
 		"linked_existing": linked_existing,
 		"employee": _serialize_employee(emp.name),
 	}
 
 
 @frappe.whitelist()
-def reset_employee_user_password(employee):
-	"""Generate a new random password for the linked user (returned once)."""
+def reset_employee_user_password(employee, password=None):
+	"""Set a specific password or mint a new random one for the linked user (returned once)."""
 	_require_app_permission("employees.reset_password")
+	chosen = _optional_staff_password(password)
 	frappe.flags.ignore_permissions = True
 	emp = frappe.get_doc("Employee", employee)
 	if not emp.user_id or not frappe.db.exists("User", emp.user_id):
 		frappe.throw(_("Employee has no user"))
-	password = _rand_password()
+	password = chosen if chosen is not None else _rand_password()
 	user = frappe.get_doc("User", emp.user_id)
 	user.flags.ignore_password_policy = True
 	user.flags.no_welcome_mail = True
 	user.save(ignore_permissions=True)
 	_set_user_password(user.name, password)
 	frappe.db.commit()
-	return {"ok": True, "user_id": user.name, "email": user.email, "password": password}
+	return {
+		"ok": True,
+		"user_id": user.name,
+		"email": user.email,
+		"password": password,
+		"password_was_set": chosen is not None,
+	}
+
+
+@frappe.whitelist()
+def change_own_password(current_password=None, new_password=None):
+	"""Signed-in staff changes their own login password (Profile settings)."""
+	from frappe.utils.password import check_password
+
+	user = _acting_username()
+	if not user or user in ("Guest",) or not frappe.db.exists("User", user):
+		frappe.throw(_("Not signed in"))
+	cur = (current_password or "").strip() if current_password is not None else ""
+	new = _optional_staff_password(new_password)
+	if not cur:
+		frappe.throw(_("Current password is required"))
+	if not new:
+		frappe.throw(_("New password is required"))
+	if cur == new:
+		frappe.throw(_("New password must be different from the current password"))
+	try:
+		check_password(user, cur)
+	except frappe.AuthenticationError:
+		frappe.throw(_("Current password is incorrect"))
+	except Exception:
+		frappe.throw(_("Current password is incorrect"))
+	frappe.flags.ignore_permissions = True
+	_set_user_password(user, new)
+	frappe.db.commit()
+	return {"ok": True}
 
 
 @frappe.whitelist()
@@ -1564,13 +1833,14 @@ def _order_visibility_scope() -> dict | None:
 def guest_preorder_matches_scope(owner: str, tag_text: str, scope: dict | None) -> bool:
 	if scope is None:
 		return True
+	user = str(scope.get("user") or "").strip()
+	tokens = {part.strip() for part in str(tag_text or "").split("|") if part.strip()}
+	# Creator can always follow their own guest pedido (Orden submit, edits) even
+	# without tables.orders.own — Sales has catalog/preventa but not Pedidos table.
+	if user and (str(owner or "").strip() == user or f"order_owner:{user}" in tokens):
+		return True
 	if not scope.get("own") and not scope.get("tags"):
 		return False
-	tokens = {part.strip() for part in str(tag_text or "").split("|") if part.strip()}
-	if scope.get("own"):
-		user = str(scope.get("user") or "").strip()
-		if user and (str(owner or "").strip() == user or f"order_owner:{user}" in tokens):
-			return True
 	for tag in scope.get("tags") or []:
 		if f"order_tag:{tag}" in tokens:
 			return True
@@ -1662,6 +1932,70 @@ def _apply_default_sales_scope_to_store(store: dict) -> bool:
 	return dirty
 
 
+def _strip_sales_floor_ops_extras(store: dict) -> bool:
+	"""Sales/ventas must not keep Entregas / Check / Armado from older broad gates."""
+	dirty = False
+	for name, raw in list(store.items()):
+		if name.startswith("_") or not isinstance(raw, list):
+			continue
+		title = ""
+		try:
+			if frappe.db.exists("Employee Group", name):
+				title = frappe.db.get_value("Employee Group", name, "employee_group_name") or name
+		except Exception:
+			title = name
+		title_l = (title or "").strip().lower()
+		if title_l not in ("sales", "ventas"):
+			continue
+		current = _normalize_permission_ids(raw)
+		if "*" in current:
+			continue
+		next_perms = [p for p in current if p not in _SALES_STRIP_OPS]
+		if _perm_set(next_perms) != _perm_set(current):
+			store[name] = next_perms
+			dirty = True
+	return dirty
+
+
+def _backfill_floor_fulfillment_perms(store: dict) -> bool:
+	"""Attach new ops.check / ops.armado onto repositor + admin; catalog PDF onto Sales."""
+	dirty = False
+	for name, raw in list(store.items()):
+		if name.startswith("_") or not isinstance(raw, list):
+			continue
+		title = ""
+		try:
+			if frappe.db.exists("Employee Group", name):
+				title = frappe.db.get_value("Employee Group", name, "employee_group_name") or name
+		except Exception:
+			title = name
+		title_l = (title or "").strip().lower()
+		current = _normalize_permission_ids(raw)
+		if "*" in current:
+			continue
+		if title_l == "admin":
+			missing = sorted(KNOWN_PERMISSION_IDS - set(current))
+			if missing:
+				store[name] = _normalize_permission_ids(current + missing)
+				dirty = True
+			continue
+		if title_l == "repositor":
+			need = ["ops.check", "ops.armado"]
+			missing = [p for p in need if p not in current]
+			if missing:
+				store[name] = _normalize_permission_ids(current + missing)
+				dirty = True
+			continue
+		if title_l in ("sales", "ventas"):
+			# Soft-add catalog PDF + own Pedidos when missing; never re-add stripped floor ops.
+			need = ["tools.catalog_pdf", "tables.orders.own"]
+			missing = [p for p in need if p not in current]
+			if missing:
+				store[name] = _normalize_permission_ids(current + missing)
+				dirty = True
+	return dirty
+
+
 def _ensure_starter_staff_groups() -> dict:
 	"""Create repositor / caja / admin if missing. Do not overwrite customised lists.
 
@@ -1679,6 +2013,8 @@ def _ensure_starter_staff_groups() -> dict:
 	skipped = []
 	dirty = _apply_caja_orders_split(store)
 	dirty = _apply_default_sales_scope_to_store(store) or dirty
+	dirty = _strip_sales_floor_ops_extras(store) or dirty
+	dirty = _backfill_floor_fulfillment_perms(store) or dirty
 	for spec in STARTER_STAFF_GROUPS:
 		title = spec["employee_group_name"]
 		perms = _normalize_permission_ids(spec["permissions"])
@@ -2377,16 +2713,23 @@ def _rebuild_by_user(by_customer: dict) -> dict:
 
 
 def _sales_group_names() -> list[str]:
-	"""Prefer Sales / ventas starter groups when present."""
-	names: list[str] = []
-	for g in ("Sales", "ventas"):
-		if frappe.db.exists("Employee Group", g):
-			names.append(g)
-	return names
+	"""Official ``Sales`` group only; fall back to legacy ``ventas`` if Sales missing."""
+	if frappe.db.exists("Employee Group", "Sales"):
+		return ["Sales"]
+	found = _find_employee_group_by_title("Sales")
+	if found:
+		return [found]
+	# Legacy ES title from older seeds — do not dual-attach once Sales exists.
+	if frappe.db.exists("Employee Group", "ventas"):
+		return ["ventas"]
+	found_legacy = _find_employee_group_by_title("ventas")
+	if found_legacy:
+		return [found_legacy]
+	return []
 
 
 def _add_employee_to_sales_groups(employee: str) -> None:
-	"""Append employee to Sales/ventas without removing other groups."""
+	"""Append employee to the official Sales group (legacy ventas only if Sales absent)."""
 	emp = _norm_optional_str(employee)
 	if not emp or not frappe.db.exists("Employee", emp):
 		return
@@ -2536,7 +2879,7 @@ def _find_employee_by_label(label: str):
 def _ensure_salesman_user_id(label: str) -> tuple[str, dict]:
 	"""
 	Resolve a typed CRM label to a User id.
-	If no Employee/User matches, create Employee + User and add to Sales/ventas.
+	If no Employee/User matches, create Employee + User and add to Sales.
 	Returns (user_id, meta).
 	"""
 	q = _norm_optional_str(label)
@@ -2792,9 +3135,36 @@ def set_customer_salesmen(customer=None, user_ids=None):
 	"""Replace the multi salesman list on a Customer (admin / CRM editors).
 
 	``user_ids`` may be User ids, emails, or employee display names. Unknown
-	labels create an Employee + User and attach them to Sales/ventas.
+	labels create an Employee + User and attach them to Sales.
+
+	Sales floor may self-assign only (so they can own temporal clients they create).
 	"""
-	if not (_can_app("tables.crm") or _can_app("employees.edit") or _is_sales_admin()):
+	acting = _acting_username() or ""
+	raw_ids = user_ids
+	if isinstance(raw_ids, str):
+		try:
+			raw_ids = json.loads(raw_ids)
+		except Exception:
+			raw_ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
+	normalized = [_norm_optional_str(u) for u in (raw_ids or [])]
+	normalized = [u for u in normalized if u]
+	self_only = (
+		bool(acting)
+		and len(normalized) == 1
+		and normalized[0].lower() == acting.lower()
+		and (
+			_can_app("sales.commit_assigned")
+			or _can_app("sales.commit_all")
+			or _can_app("ops.catalog")
+			or _can_app("ops.preventa")
+		)
+	)
+	if not (
+		_can_app("tables.crm")
+		or _can_app("employees.edit")
+		or _is_sales_admin()
+		or self_only
+	):
 		_require_app_permission("tables.crm")
 	cust = _norm_optional_str(customer)
 	users = _set_customer_salesmen_users(cust, user_ids)

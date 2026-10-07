@@ -1535,6 +1535,50 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_duplicate_sku_lines",
+      "source": "regression",
+      "bug": "two cart lines of the same SKU (add twice) must not HTTP 417 Item Price added/duplicate on Standard Selling",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [
+          {
+            "item_code": "F0025",
+            "qty": 1,
+            "rate": 100
+          },
+          {
+            "item_code": "F0025",
+            "qty": 1,
+            "rate": 100
+          }
+        ],
+        "guest_name": "Agustin",
+        "guest_notes": "edge duplicate sku lines",
+        "price_list": "Standard Selling",
+        "customer": "Consumidor Final"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "create_guest_preorder_same_sku_twice",
+      "source": "regression",
+      "bug": "second create_guest_preorder for same SKU must not 417 Item Price added when Stock Settings auto-insert is on",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [
+          {
+            "item_code": "F0025",
+            "qty": 2,
+            "rate": 100
+          }
+        ],
+        "guest_name": "Agustin",
+        "guest_notes": "edge same sku second order",
+        "price_list": "Standard Selling"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "match_customers_for_consulta_null_empty",
       "source": "regression",
       "bug": "match_customers_for_consulta with null/empty phone and local must not match empty Customer phones; controlled empty list",
@@ -4585,6 +4629,87 @@
       "expect": "ok",
       "source": "regression",
       "bug": "seller_scope=orden_here powers Operaciones→Orden floating orders FAB"
+    },
+    {
+      "id": "save_employee_email_empty_string_ok",
+      "source": "regression",
+      "bug": "save_employee with empty email strings must not TypeError (login sync path)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.save_employee",
+      "args": {
+        "name": null,
+        "data": {
+          "employee_name": "Edge Email Empty Emp",
+          "status": "Active",
+          "prefered_email": "",
+          "company_email": ""
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "save_employee_create_user_flag_null_ok",
+      "source": "regression",
+      "bug": "save_employee create_user null/0 must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.save_employee",
+      "args": {
+        "name": null,
+        "data": {
+          "employee_name": "Edge Create User Flag Emp",
+          "status": "Active",
+          "create_user": null,
+          "password": null
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "create_employee_user_null_employee_fail",
+      "source": "regression",
+      "bug": "create_employee_user with null employee must controlled fail (not TypeError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.create_employee_user",
+      "args": {
+        "employee": null,
+        "email": null,
+        "password": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "change_own_password_nulls_fail",
+      "source": "regression",
+      "bug": "change_own_password with null passwords must controlled fail (not TypeError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.change_own_password",
+      "args": {
+        "current_password": null,
+        "new_password": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "create_employee_user_short_password_fail",
+      "source": "regression",
+      "bug": "create_employee_user rejects passwords shorter than 6 chars",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.create_employee_user",
+      "args": {
+        "employee": "nonexistent-emp-edge",
+        "email": null,
+        "password": "ab",
+        "username": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "create_employee_user_username_as_email_fail",
+      "source": "regression",
+      "bug": "create_employee_user rejects username that looks like an email",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.create_employee_user",
+      "args": {
+        "employee": "nonexistent-emp-edge",
+        "email": null,
+        "password": null,
+        "username": "someone@company.com"
+      },
+      "expect": "fail"
     }
   ]
 }

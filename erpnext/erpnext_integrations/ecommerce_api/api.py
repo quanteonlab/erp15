@@ -2763,12 +2763,46 @@ def create_customer(
 	if zone_val:
 		_set_customer_zone_and_address(customer.name, zone=zone_val)
 
+	# Floor sales / Orden: attach the acting salesman so sales.commit_assigned
+	# can place pedidos for this new (often temporal / Pending-review) client.
+	acting = ""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+			_acting_username,
+			_can_app,
+			_is_sales_admin,
+			_set_customer_salesmen_users,
+		)
+
+		acting = cstr(_acting_username() or "").strip()
+		if acting and acting not in ("Guest", "Administrator"):
+			may_own = (
+				_is_sales_admin()
+				or _can_app("tables.crm")
+				or _can_app("ops.catalog")
+				or _can_app("ops.preventa")
+				or _can_app("ops.pos")
+				or _can_app("sales.commit_assigned")
+				or _can_app("sales.commit_all")
+				or _can_app("sales.see_assigned")
+				or _can_app("sales.see_all")
+			)
+			if may_own:
+				_set_customer_salesmen_users(customer.name, [acting])
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "create_customer auto-assign salesman")
+
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
 			maybe_mark_creation_review_pending,
 		)
 
-		maybe_mark_creation_review_pending("Customer", customer.name)
+		# Non-admin salesman → Pending so it appears in Tables → Revisar.
+		maybe_mark_creation_review_pending(
+			"Customer",
+			customer.name,
+			actor=acting or None,
+		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "creation_review mark customer")
 
@@ -4163,7 +4197,12 @@ def _require_guest_preorder_visible(so) -> None:
 	scope = _order_visibility_scope()
 	if guest_preorder_matches_scope(getattr(so, "owner", ""), _guest_preorder_tag_text(so), scope):
 		return
-	frappe.throw(_("Not permitted (tables.orders)"))
+	frappe.throw(
+		_(
+			"No permission to open or confirm this order (tables.orders). "
+			"Ask an admin for «Pedidos propios», or copy the selection and send it instead."
+		)
+	)
 
 
 def _is_guest_preorder_sales_order(so):
@@ -5158,8 +5197,18 @@ def create_guest_preorder(
 	# Notes-only inquiries have no item rows — skip mandatory child-table / item checks.
 	if notes_only:
 		so.flags.ignore_validate = True
-	with _allow_weight_fractional_stock_qty(so):
-		so.insert(ignore_permissions=True, ignore_mandatory=notes_only)
+	# Catalog already sent line rates. Stock Settings auto-insert Item Price on
+	# validate otherwise msgprints / duplicates → HTTP 417 "Item Price added…".
+	prev_skip_price = frappe.flags.get("skip_auto_insert_item_price")
+	prev_mute = frappe.flags.get("mute_messages")
+	frappe.flags.skip_auto_insert_item_price = True
+	frappe.flags.mute_messages = True
+	try:
+		with _allow_weight_fractional_stock_qty(so):
+			so.insert(ignore_permissions=True, ignore_mandatory=notes_only)
+	finally:
+		frappe.flags.skip_auto_insert_item_price = prev_skip_price
+		frappe.flags.mute_messages = prev_mute
 	if acting and frappe.db.exists("User", acting) and so.owner != acting:
 		so.db_set("owner", acting)
 
@@ -6604,12 +6653,22 @@ def update_guest_preorder_details(preorder_name, data=None):
 
 	if data.get("cashier_user") is not None:
 		if not _can_view_all_guest_preorders():
-			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
+			frappe.throw(
+				_(
+					"No permission to reassign cashier (tables.orders). "
+					"Ask an admin for full Pedidos access, or copy the selection instead."
+				)
+			)
 		_update_guest_preorder_tag(so, "cashier", str(data.get("cashier_user") or "").strip())
 
 	if data.get("seller_ref_user") is not None:
 		if not _can_view_all_guest_preorders():
-			frappe.throw(_("Not permitted ({0})").format("tables.orders"))
+			frappe.throw(
+				_(
+					"No permission to reassign seller (tables.orders). "
+					"Ask an admin for full Pedidos access, or copy the selection instead."
+				)
+			)
 		_update_guest_preorder_tag(so, "seller_ref", str(data.get("seller_ref_user") or "").strip())
 
 	if so.docstatus == 0:

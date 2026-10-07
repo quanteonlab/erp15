@@ -949,6 +949,9 @@ def insert_item_price(args):
 		or not args.rate
 		or args.get("is_internal_supplier")
 		or args.get("is_internal_customer")
+		# Catalog / guest preorder already sends line rates — skip auto Item Price
+		# writes (duplicate UOM/currency lookups 417 with "Item Price added…").
+		or frappe.flags.get("skip_auto_insert_item_price")
 	):
 		return
 
@@ -972,6 +975,15 @@ def insert_item_price(args):
 		["name", "price_list_rate"],
 		as_dict=1,
 	)
+	# Soft fallback: existing row with different/blank UOM still counts — avoid
+	# a second insert that throws ItemPriceDuplicateItem (HTTP 417).
+	if not item_price:
+		item_price = frappe.db.get_value(
+			"Item Price",
+			{"item_code": args.item_code, "price_list": args.price_list},
+			["name", "price_list_rate"],
+			as_dict=1,
+		)
 
 	update_based_on_price_list_rate = stock_settings.update_price_list_based_on == "Price List Rate"
 
@@ -998,17 +1010,25 @@ def insert_item_price(args):
 		)
 		price_list_rate = _get_stock_uom_rate(rate_to_consider, args)
 
-		item_price = frappe.get_doc(
-			{
-				"doctype": "Item Price",
-				"price_list": args.price_list,
-				"item_code": args.item_code,
-				"currency": args.currency,
-				"price_list_rate": price_list_rate,
-				"uom": args.stock_uom,
-			}
-		)
-		item_price.insert()
+		try:
+			item_price = frappe.get_doc(
+				{
+					"doctype": "Item Price",
+					"price_list": args.price_list,
+					"item_code": args.item_code,
+					"currency": args.currency,
+					"price_list_rate": price_list_rate,
+					"uom": args.stock_uom,
+				}
+			)
+			item_price.insert()
+		except frappe.DuplicateEntryError:
+			return
+		except frappe.ValidationError as e:
+			# ItemPriceDuplicateItem and cousins — price already there; ignore.
+			if "Item Price" in cstr(e) or "appears multiple times" in cstr(e):
+				return
+			raise
 		frappe.msgprint(
 			_("Item Price added for {0} in Price List {1}").format(args.item_code, args.price_list),
 			alert=True,

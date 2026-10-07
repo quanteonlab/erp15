@@ -3678,21 +3678,30 @@ def save_employee(name=None, data=None):
 
 
 @frappe.whitelist()
-def create_employee_user(employee, email=None, roles=None):
+def create_employee_user(employee, email=None, roles=None, password=None, username=None):
     from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
         create_employee_user as _impl,
     )
 
-    return _impl(employee, email=email, roles=roles)
+    return _impl(employee, email=email, roles=roles, password=password, username=username)
 
 
 @frappe.whitelist()
-def reset_employee_user_password(employee):
+def reset_employee_user_password(employee, password=None):
     from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
         reset_employee_user_password as _impl,
     )
 
-    return _impl(employee)
+    return _impl(employee, password=password)
+
+
+@frappe.whitelist()
+def change_own_password(current_password=None, new_password=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        change_own_password as _impl,
+    )
+
+    return _impl(current_password=current_password, new_password=new_password)
 
 
 @frappe.whitelist()
