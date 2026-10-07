@@ -10,7 +10,9 @@ document. Writes are two-step: ``confirm=0`` returns a preview/diff with
 ``requires_confirm: true`` and persists nothing; ``confirm=1`` applies.
 
 Everything is written to the ``mcp.audit`` store (who / which key / which
-fields / ok / error). Per-token rate limits apply (reads 240/min, writes
+fields / ok / error). Applies are bound to a prior preview: confirm=1 needs the
+single-use ``preview_id`` returned by the preview, and the payload must be
+identical to what was previewed (15 min TTL). Per-token rate limits apply (reads 240/min, writes
 60/min). Never expose seed/delete/import/snippet methods here.
 """
 
@@ -226,14 +228,55 @@ def _rate_limit(key_id: str, limit: int) -> None:
 		pass
 
 
+PREVIEW_TTL_SEC = 15 * 60
+
+
+def _preview_key(ctx: dict, preview_id: str) -> str:
+	return f"mcp-preview:{ctx['key_id']}:{preview_id}"
+
+
+def _payload_digest(payload) -> str:
+	raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+	return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _remember_preview(ctx: dict, payload) -> str:
+	"""Store the digest of a previewed write; apply must present the returned id."""
+	preview_id = secrets.token_hex(8)
+	frappe.cache().set_value(_preview_key(ctx, preview_id), _payload_digest(payload), expires_in_sec=PREVIEW_TTL_SEC)
+	return preview_id
+
+
+def _consume_preview(ctx: dict, payload, preview_id) -> None:
+	"""Single-use: the apply payload must be byte-identical to what was previewed."""
+	preview_id = str(preview_id or "").strip()
+	if not preview_id:
+		frappe.throw(
+			_("Missing preview_id — call the preview first, show the user the diff, then apply with its preview_id"),
+			frappe.ValidationError,
+		)
+	key = _preview_key(ctx, preview_id)
+	stored = frappe.cache().get_value(key)
+	if not stored:
+		frappe.throw(_("preview_id {0} is unknown, expired or already used — preview again").format(preview_id))
+	if stored != _payload_digest(payload):
+		frappe.throw(_("Payload differs from the previewed one — preview the new values and show them to the user"))
+	frappe.cache().delete_value(key)
+
+
 def _bind_acting_user(user: str) -> None:
-	"""Force the staff-permission layer to see the key's bound user."""
-	try:
-		req = getattr(frappe.local, "request", None)
-		if req is not None and getattr(req, "headers", None) is not None:
-			req.headers["X-ERP-Acting-User"] = user
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "mcp_bind_acting_user_failed")
+	"""Force the staff-permission layer to see the key's bound user.
+
+	Werkzeug request headers are immutable views over the WSGI environ, so the
+	environ key is rewritten instead; the cached perm lookup is dropped so
+	``_require_app_permission`` re-resolves against the bound user.
+	"""
+	req = getattr(frappe.local, "request", None)
+	environ = getattr(req, "environ", None) if req is not None else None
+	if environ is not None:
+		environ["HTTP_X_ERP_ACTING_USER"] = user or ""
+	if hasattr(frappe.local, "_staff_acting_perm_info"):
+		del frappe.local._staff_acting_perm_info
 
 
 def _ctx(mcp_token, *, write=False):
@@ -247,11 +290,17 @@ def _ctx(mcp_token, *, write=False):
 	ctx = {"store": store, "key_id": key_id, "actor": actor, "write": write}
 	frappe.local._mcp_ctx = ctx
 	_rate_limit(key_id, WRITE_LIMIT_PER_MIN if write else READ_LIMIT_PER_MIN)
-	if actor and frappe.db.exists("User", actor):
-		enabled = frappe.db.get_value("User", actor, "enabled")
-		if enabled is not None and int(enabled) == 0:
-			_audit(tool="auth", actor=actor, key_id=key_id, ok=False, error="actor disabled")
-			frappe.throw(_("MCP acting user {0} is disabled").format(actor), frappe.AuthenticationError)
+	# Without a bound user the staff-permission layer would allow everything,
+	# so an unbound / deleted / disabled actor is a hard auth failure.
+	enabled = frappe.db.get_value("User", actor, "enabled") if actor else None
+	if enabled is None or int(enabled) == 0:
+		_audit(tool="auth", actor=actor or None, key_id=key_id, ok=False, error="actor missing or disabled")
+		frappe.throw(
+			_("MCP acting user {0} is missing or disabled — rebind it in Settings → Apps & devices").format(
+				actor or "(none)"
+			),
+			frappe.AuthenticationError,
+		)
 	_bind_acting_user(actor)
 	return ctx
 
@@ -620,9 +669,10 @@ def _load_doc_for_edit(doctype: str, name: str):
 
 
 @frappe.whitelist()
-def mcp_update_record(mcp_token=None, doctype=None, name=None, fields=None, confirm=0):
-	"""Patch a document. ``confirm=0`` returns the diff (writes nothing);
-	``confirm=1`` applies it. Blocked/unknown fields are rejected loudly."""
+def mcp_update_record(mcp_token=None, doctype=None, name=None, fields=None, confirm=0, preview_id=None):
+	"""Patch a document. ``confirm=0`` returns the diff + ``preview_id`` (writes
+	nothing); ``confirm=1`` applies it and requires that ``preview_id`` with the
+	identical fields. Blocked/unknown fields are rejected loudly."""
 
 	@_guard(
 		"update",
@@ -630,7 +680,7 @@ def mcp_update_record(mcp_token=None, doctype=None, name=None, fields=None, conf
 		name=lambda: name,
 		payload=lambda: {"doctype": doctype, "name": name, "fields": fields, "confirm": confirm},
 	)
-	def _impl(mcp_token, doctype, name, fields, confirm):
+	def _impl(mcp_token, doctype, name, fields, confirm, preview_id):
 		ctx = _ctx(mcp_token, write=True)
 		frappe.local._mcp_ctx = ctx
 		doctype = str(doctype or "").strip()
@@ -643,6 +693,7 @@ def mcp_update_record(mcp_token=None, doctype=None, name=None, fields=None, conf
 		diff = [
 			_diff_entry(doctype, fieldname, doc.get(fieldname), value) for fieldname, value in changes.items()
 		]
+		signed = {"op": "update", "doctype": doctype, "name": name, "fields": changes}
 		if not cint_confirm(confirm):
 			return {
 				"doctype": doctype,
@@ -650,7 +701,10 @@ def mcp_update_record(mcp_token=None, doctype=None, name=None, fields=None, conf
 				"preview": diff,
 				"requires_confirm": True,
 				"applied": False,
+				"preview_id": _remember_preview(ctx, signed),
+				"expires_in_sec": PREVIEW_TTL_SEC,
 			}
+		_consume_preview(ctx, signed, preview_id)
 		for fieldname, value in changes.items():
 			doc.set(fieldname, value)
 		doc.save(ignore_permissions=True)
@@ -663,20 +717,20 @@ def mcp_update_record(mcp_token=None, doctype=None, name=None, fields=None, conf
 			"doc": _sanitize_output(_json_safe(doc.as_dict())),
 		}
 
-	return _impl(mcp_token, doctype, name, fields, confirm)
+	return _impl(mcp_token, doctype, name, fields, confirm, preview_id)
 
 
 @frappe.whitelist()
-def mcp_create_record(mcp_token=None, doctype=None, fields=None, confirm=0):
+def mcp_create_record(mcp_token=None, doctype=None, fields=None, confirm=0, preview_id=None):
 	"""Create a document (matrix edit = write+create). ``confirm=0`` echoes the
-	validated payload back for review; ``confirm=1`` inserts."""
+	validated payload + ``preview_id``; ``confirm=1`` inserts and requires it."""
 
 	@_guard(
 		"create",
 		doctype=lambda: doctype,
 		payload=lambda: {"doctype": doctype, "fields": fields, "confirm": confirm},
 	)
-	def _impl(mcp_token, doctype, fields, confirm):
+	def _impl(mcp_token, doctype, fields, confirm, preview_id):
 		ctx = _ctx(mcp_token, write=True)
 		frappe.local._mcp_ctx = ctx
 		doctype = str(doctype or "").strip()
@@ -684,13 +738,17 @@ def mcp_create_record(mcp_token=None, doctype=None, fields=None, confirm=0):
 			frappe.throw(_("doctype is required"))
 		_can_edit(_matrix(), doctype)
 		changes = _validate_fields(doctype, _parse_json(fields, fields), for_create=True)
+		signed = {"op": "create", "doctype": doctype, "fields": changes}
 		if not cint_confirm(confirm):
 			return {
 				"doctype": doctype,
-				"preview": changes,
+				"preview": _sanitize_output(_json_safe(changes)),
 				"requires_confirm": True,
 				"applied": False,
+				"preview_id": _remember_preview(ctx, signed),
+				"expires_in_sec": PREVIEW_TTL_SEC,
 			}
+		_consume_preview(ctx, signed, preview_id)
 		doc = frappe.get_doc({"doctype": doctype, **changes})
 		doc.insert(ignore_permissions=True)
 		frappe.db.commit()
@@ -701,7 +759,7 @@ def mcp_create_record(mcp_token=None, doctype=None, fields=None, confirm=0):
 			"doc": _sanitize_output(_json_safe(doc.as_dict())),
 		}
 
-	return _impl(mcp_token, doctype, fields, confirm)
+	return _impl(mcp_token, doctype, fields, confirm, preview_id)
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +922,7 @@ def mcp_list_workflows(mcp_token=None):
 
 
 @frappe.whitelist()
-def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0):
+def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0, preview_id=None):
 	"""Run a named domain workflow. ``confirm=1`` is required — the assistant
 	should first fetch the target record (mcp_get_record) and show the user
 	what will change, then call with confirm=1."""
@@ -873,7 +931,7 @@ def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0):
 		"run_workflow",
 		payload=lambda: {"workflow": workflow, "args": args, "confirm": confirm},
 	)
-	def _impl(mcp_token, workflow, args, confirm):
+	def _impl(mcp_token, workflow, args, confirm, preview_id):
 		ctx = _ctx(mcp_token, write=True)
 		frappe.local._mcp_ctx = ctx
 		workflow = str(workflow or "").strip()
@@ -888,15 +946,19 @@ def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0):
 		missing = [k for k in entry["args_schema"].get("required", []) if args.get(k) in (None, "")]
 		if missing:
 			frappe.throw(_("Missing required args: {0}").format(", ".join(missing)))
+		signed = {"op": "workflow", "workflow": workflow, "args": args}
 		if not cint_confirm(confirm):
 			return {
 				"workflow": workflow,
 				"args": _sanitize_output(_json_safe(args)),
 				"requires_confirm": True,
 				"applied": False,
-				"hint": "Show the user the target record and these args, then re-call with confirm=1.",
+				"preview_id": _remember_preview(ctx, signed),
+				"expires_in_sec": PREVIEW_TTL_SEC,
+				"hint": "Show the user the target record and these args, then re-call with confirm=1 and this preview_id.",
 			}
+		_consume_preview(ctx, signed, preview_id)
 		result = _run_workflow(workflow, args)
 		return {"workflow": workflow, "applied": True, "result": _sanitize_output(_json_safe(result))}
 
-	return _impl(mcp_token, workflow, args, confirm)
+	return _impl(mcp_token, workflow, args, confirm, preview_id)

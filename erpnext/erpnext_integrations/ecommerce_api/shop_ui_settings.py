@@ -185,6 +185,20 @@ def _normalize_catalog_template(val) -> str:
 	return "classic"
 
 
+def _normalize_pedidos_default_seller_scope(val) -> str:
+	"""Default Pedidos table toggle: assigned clients | seller link | all.
+
+	Unset / unknown → ``assigned`` (salesman's clients). Explicit ``all`` / ``todos`` → ``""``.
+	"""
+	s = str(val or "").strip().lower()
+	if s in ("all", "todos"):
+		return ""
+	if s in ("mine", "my", "seller_ref", "mi_enlace", "link"):
+		return "mine"
+	# assigned (default) — also treat empty/null as assigned so new tenants show clients.
+	return "assigned"
+
+
 def _normalize_catalog_display(raw) -> dict:
 	src = raw if isinstance(raw, dict) else {}
 	return {
@@ -199,6 +213,12 @@ def _normalize_catalog_display(raw) -> dict:
 		# Commerce catalog: qty-gated Oferta/BOGO badges vs unit red/strike.
 		"showQtyPromoBadges": _as_bool(src.get("showQtyPromoBadges"), True),
 		"showUnitPromoStrike": _as_bool(src.get("showUnitPromoStrike"), True),
+		# Pedidos table + Orden FAB: lookback days for assigned clients (default 30).
+		"ordenPedidosDays": _as_int(src.get("ordenPedidosDays"), 30, 1, 365),
+		# Tablas → Pedidos default toggle for salesmen: assigned | mine | all ("").
+		"pedidosDefaultSellerScope": _normalize_pedidos_default_seller_scope(
+			src.get("pedidosDefaultSellerScope")
+		),
 		"headerPreset": _normalize_header_preset(src.get("headerPreset")),
 		"headerSearchBackgroundColor": _as_hex(src.get("headerSearchBackgroundColor"), ""),
 		"headerSearchTextColor": _as_hex(src.get("headerSearchTextColor"), ""),

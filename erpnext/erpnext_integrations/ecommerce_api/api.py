@@ -4230,7 +4230,12 @@ def _require_guest_preorder_visible(so) -> None:
 	)
 
 	scope = _order_visibility_scope()
-	if guest_preorder_matches_scope(getattr(so, "owner", ""), _guest_preorder_tag_text(so), scope):
+	if guest_preorder_matches_scope(
+		getattr(so, "owner", ""),
+		_guest_preorder_tag_text(so),
+		scope,
+		customer=getattr(so, "customer", None),
+	):
 		return
 	frappe.throw(
 		_(
@@ -5298,6 +5303,26 @@ def create_guest_preorder(
 		so = frappe.get_doc("Sales Order", so_name)
 		frappe.flags.ignore_permissions = False
 
+	# Link the customer to the acting seller so Orden → Pedidos (assigned clients) lists it.
+	if (want_orden or tag_slug == "orden") and so.customer:
+		assign_uid = cstr(acting or seller_ref or "").strip()
+		if assign_uid and assign_uid not in ("Guest", "Administrator"):
+			try:
+				from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+					_set_customer_salesmen_users,
+					customer_salesmen,
+				)
+
+				users = list(customer_salesmen(so.customer) or [])
+				if assign_uid not in users:
+					users.append(assign_uid)
+					_set_customer_salesmen_users(so.customer, users)
+			except Exception:
+				frappe.log_error(
+					frappe.get_traceback(),
+					f"orden assign salesman for {so.customer}",
+				)
+
 	payload = {
 		"preorder_name": so.name,
 		"estimated_total": flt(so.grand_total),
@@ -5347,15 +5372,49 @@ def create_guest_preorder(
 
 
 def _normalize_seller_scope(raw) -> str:
-	"""'' | mine | orden_here — seller-attributed / Orden-screen filters."""
+	"""'' | mine | assigned | orden_here — Pedidos table / Orden FAB filters."""
 	val = cstr(raw or "").strip().lower()
-	if val in ("", "all", "null", "undefined", "none", "*", "0"):
+	if val in ("", "all", "null", "undefined", "none", "*", "0", "todos"):
 		return ""
 	if val in ("mine", "my", "seller", "seller_ref", "mi_enlace", "link"):
 		return "mine"
-	if val in ("orden_here", "orden", "here", "ordered_here", "ops_orden"):
+	if val in (
+		"assigned",
+		"clients",
+		"clientes",
+		"mis_clientes",
+		"my_clients",
+		"salesman_clients",
+	):
+		return "assigned"
+	if val in ("orden_here", "orden", "here", "ordered_here", "ops_orden", "pedidos"):
 		return "orden_here"
 	return ""
+
+
+def _is_assigned_client_seller_scope(seller_scope: str) -> bool:
+	"""True for scopes that list SOs for the acting seller's assigned clients."""
+	return seller_scope in ("assigned", "orden_here")
+
+
+def _orden_pedidos_window_days() -> int:
+	"""Admin-configurable lookback for Pedidos table + Orden FAB (default 30)."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import get_shop_ui_settings
+
+		bundle = get_shop_ui_settings() or {}
+		settings = bundle.get("settings") if isinstance(bundle, dict) else None
+		if not isinstance(settings, dict):
+			settings = bundle if isinstance(bundle, dict) else {}
+		catalog = settings.get("catalogDisplay") if isinstance(settings, dict) else {}
+		if not isinstance(catalog, dict):
+			catalog = {}
+		days = cint(catalog.get("ordenPedidosDays"))
+		if days <= 0:
+			return 30
+		return max(1, min(365, days))
+	except Exception:
+		return 30
 
 
 def _attach_creation_review_fields(rows: list) -> None:
@@ -5407,8 +5466,15 @@ def _requeue_seller_amend_review(preorder_name: str, reason: str = "seller_amend
 		return False
 
 
-def _guest_preorder_matches_seller_scope(order: dict, seller_scope: str, uid: str) -> bool:
-	"""Filter guest preorders by seller_ref / order_tag for Pedidos + Orden FAB."""
+def _guest_preorder_matches_seller_scope(
+	order: dict,
+	seller_scope: str,
+	uid: str,
+	*,
+	assigned_customers: set | None = None,
+	cutoff_date=None,
+) -> bool:
+	"""Filter guest preorders by seller_ref / assigned clients for Pedidos + Orden FAB."""
 	if not seller_scope:
 		return True
 	uid = cstr(uid or "").strip()
@@ -5416,16 +5482,21 @@ def _guest_preorder_matches_seller_scope(order: dict, seller_scope: str, uid: st
 		return False
 	tags = _parse_remarks_tags(_guest_preorder_tag_text(order))
 	seller = cstr(tags.get("seller_ref") or "").strip()
-	cashier = cstr(tags.get("cashier") or "").strip()
-	order_tag = cstr(tags.get("order_tag") or "").strip().lower()
-	owner = cstr(order.get("owner") or "").strip()
 	if seller_scope == "mine":
 		return seller == uid
-	if seller_scope == "orden_here":
-		if order_tag != "orden":
+	if _is_assigned_client_seller_scope(seller_scope):
+		# Pedidos table / Orden FAB: guest preorders for assigned clients in window.
+		cust = cstr(order.get("customer") or "").strip()
+		if not cust or not assigned_customers or cust not in assigned_customers:
 			return False
-		# Ordered on Operaciones → Orden by / for this seller.
-		return seller == uid or cashier == uid or owner == uid
+		if cutoff_date is not None:
+			try:
+				tx = order.get("transaction_date")
+				if tx and getdate(tx) < getdate(cutoff_date):
+					return False
+			except Exception:
+				return False
+		return True
 	return True
 
 
@@ -5449,20 +5520,31 @@ def get_guest_preorders_list(
 
 	``seller_scope``:
 	  - ``mine`` — only SOs tagged ``seller_ref:<acting user>`` (seller link)
-	  - ``orden_here`` — ``order_tag:orden`` for this seller/cashier/owner
+	  - ``assigned`` / ``orden_here`` — Pedidos for this seller's assigned clients
+	    in the admin lookback window (``catalogDisplay.ordenPedidosDays``, default 30)
 	"""
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
-		return {"preorders": [], "total_count": 0}
+		return {"preorders": [], "total_count": 0, "window_days": 30}
 
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 		_acting_username,
+		_assigned_customer_names,
 		_order_visibility_scope,
 		guest_preorder_matches_scope,
 	)
 
 	seller_scope = _normalize_seller_scope(seller_scope)
 	acting_uid = cstr(_acting_username() or "").strip()
+	window_days = (
+		_orden_pedidos_window_days() if _is_assigned_client_seller_scope(seller_scope) else None
+	)
+	cutoff_date = add_days(getdate(nowdate()), -window_days) if window_days else None
+	assigned_customers: set[str] = set()
+	if _is_assigned_client_seller_scope(seller_scope) and acting_uid:
+		assigned_customers = {
+			cstr(n).strip() for n in (_assigned_customer_names(acting_uid) or []) if cstr(n).strip()
+		}
 
 	try:
 		start = max(0, cint(start))
@@ -5484,14 +5566,23 @@ def get_guest_preorders_list(
 
 	scope = _order_visibility_scope()
 	if scope is not None and not scope.get("own") and not scope.get("tags"):
-		return {"preorders": [], "total_count": 0}
+		out = {"preorders": [], "total_count": 0}
+		if window_days is not None:
+			out["window_days"] = window_days
+		return out
+
+	# No assigned clients → empty Pedidos list (still report the window).
+	if _is_assigned_client_seller_scope(seller_scope) and not assigned_customers:
+		return {"preorders": [], "total_count": 0, "window_days": window_days or 30}
 
 	filters = {tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]}
 	if seller_scope == "mine" and acting_uid:
 		# Prefer rows that also carry this seller_ref (tag order is not guaranteed).
 		filters[tag_fn] = ["like", f"%seller_ref:{acting_uid}%"]
-	elif seller_scope == "orden_here":
-		filters[tag_fn] = ["like", "%order_tag:orden%"]
+	elif _is_assigned_client_seller_scope(seller_scope):
+		filters["customer"] = ["in", list(assigned_customers)]
+		if cutoff_date is not None:
+			filters["transaction_date"] = [">=", str(cutoff_date)]
 
 	if status:
 		if str(status).lower() == "draft":
@@ -5565,9 +5656,21 @@ def get_guest_preorders_list(
 		tag_raw_check = str(o.get(tag_fn) or "")
 		if GUEST_PREORDER_REMARKS_TAG not in tag_raw_check:
 			continue
-		if not guest_preorder_matches_scope(o.get("owner"), o.get(tag_fn), scope):
+		if not guest_preorder_matches_scope(
+			o.get("owner"),
+			o.get(tag_fn),
+			scope,
+			customer=o.get("customer"),
+			assigned_customers=assigned_customers or None,
+		):
 			continue
-		if not _guest_preorder_matches_seller_scope(o, seller_scope, acting_uid):
+		if not _guest_preorder_matches_seller_scope(
+			o,
+			seller_scope,
+			acting_uid,
+			assigned_customers=assigned_customers,
+			cutoff_date=cutoff_date,
+		):
 			continue
 		tag_raw = str(o.get(tag_fn) or "")
 		order_tag = ""
@@ -5668,7 +5771,10 @@ def get_guest_preorders_list(
 	_attach_creation_review_fields(filtered)
 	for o in filtered:
 		o.pop("_tag_raw", None)
-	return {"preorders": filtered, "total_count": total_count}
+	out = {"preorders": filtered, "total_count": total_count}
+	if window_days is not None:
+		out["window_days"] = window_days
+	return out
 
 
 @frappe.whitelist()
@@ -6951,6 +7057,7 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	with _allow_weight_fractional_stock_qty(so):
 		_save_guest_preorder_so(so)
 	so.reload()
+	_requeue_seller_amend_review(so.name, reason="seller_amend_prices")
 	return get_guest_preorder(preorder_name)
 
 

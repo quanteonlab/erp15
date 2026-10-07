@@ -4685,8 +4685,45 @@
       },
       "expect": "ok",
       "source": "regression",
-      "bug": "seller_scope=orden_here powers Operaciones→Orden floating orders FAB"
+      "bug": "seller_scope=orden_here lists Pedidos for seller assigned clients in catalogDisplay.ordenPedidosDays window (default 30)"
     },
+    {
+      "id": "get_guest_preorders_list_seller_scope_pedidos_alias",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": "",
+        "scope": "admin",
+        "seller_scope": "pedidos"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "seller_scope=pedidos alias + empty page_length must not 500; same Pedidos FAB window as orden_here"
+    },
+    {
+      "id": "get_guest_preorders_list_seller_scope_assigned",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": 20,
+        "scope": "admin",
+        "seller_scope": "assigned"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "seller_scope=assigned lists Pedidos for salesman assigned clients in window (Tablas→Pedidos Mis clientes)"
+    },
+    {
+      "id": "get_guest_preorders_list_seller_scope_mis_clientes_alias",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": null,
+        "scope": "admin",
+        "seller_scope": "mis_clientes"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "seller_scope=mis_clientes alias + null page_length must not 500; same as assigned"
+    },
+
     {
       "id": "save_employee_email_empty_string_ok",
       "source": "regression",
@@ -4767,6 +4804,79 @@
         "username": "someone@company.com"
       },
       "expect": "fail"
+    },
+    {
+      "id": "mcp_save_matrix_empty_rows",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_keys_api.save_mcp_matrix",
+      "args": {
+        "rows": []
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "rows=[] (dirty sweep / bad client) silently reset every MCP matrix override to defaults; now a controlled ValidationError"
+    },
+    {
+      "id": "mcp_save_matrix_unknown_doctype",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_keys_api.save_mcp_matrix",
+      "args": {
+        "rows": [
+          {
+            "doctype": "GL Entry",
+            "view": 1,
+            "edit": 1
+          }
+        ]
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Non-allowlisted DocType must never enter the MCP matrix"
+    },
+    {
+      "id": "mcp_set_acting_user_blank",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_keys_api.set_mcp_acting_user",
+      "args": {
+        "user": ""
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Blank acting user would make the gateway run without staff permission checks"
+    },
+    {
+      "id": "mcp_whoami_null_token",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_whoami",
+      "args": {
+        "mcp_token": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Null MCP token must be a controlled AuthenticationError"
+    },
+    {
+      "id": "mcp_update_record_dirty_bad_token",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_update_record",
+      "args": {
+        "mcp_token": "mcp_x_y",
+        "doctype": "",
+        "name": "",
+        "fields": "",
+        "confirm": ""
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Auth is checked before parsing dirty fields; bad token never reaches json/doc code"
+    },
+    {
+      "id": "mcp_run_workflow_dirty_args",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_run_workflow",
+      "args": {
+        "mcp_token": "",
+        "workflow": null,
+        "args": "not-json",
+        "confirm": "1"
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Dirty workflow args with empty token → controlled auth failure, no TypeError"
     }
   ]
 }

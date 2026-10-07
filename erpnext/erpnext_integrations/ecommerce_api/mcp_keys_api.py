@@ -153,16 +153,28 @@ def _parse_token(raw) -> tuple[str, str] | None:
 	return key_id, secret
 
 
+def _requesting_user() -> str:
+	"""The staff user behind this request: Next forwards it as X-ERP-Acting-User
+	(the session user is the tenant API-key user in that case)."""
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _acting_username
+
+	user = _acting_username()
+	if user and frappe.db.exists("User", user):
+		return user
+	return frappe.session.user if frappe.session.user != "Guest" else "Administrator"
+
+
 def _new_token_store(acting_user: str | None = None) -> dict:
 	key_id = secrets.token_hex(8)
 	secret = secrets.token_hex(16)
+	creator = _requesting_user()
 	return {
 		"key_id": key_id,
 		"secret_hash": _hash_secret(secret),
 		"secret_enc": encrypt(secret),
 		"created_at": _now_iso(),
-		"created_by": frappe.session.user if frappe.session.user != "Guest" else "Administrator",
-		"acting_user": acting_user or (frappe.session.user if frappe.session.user != "Guest" else "Administrator"),
+		"created_by": creator,
+		"acting_user": acting_user or creator,
 		"_plain_secret": secret,
 	}
 
@@ -323,8 +335,10 @@ def save_mcp_matrix(rows=None):
 	_require_mcp_admin()
 	if isinstance(rows, str):
 		rows = _parse_json(rows, None)
-	if not isinstance(rows, list):
-		frappe.throw(_("rows must be a list of {doctype, view, edit}"))
+	# An empty grid would silently reset every override — the UI always sends
+	# the full matrix, so treat [] as a dirty client payload.
+	if not isinstance(rows, list) or not rows:
+		frappe.throw(_("rows must be a non-empty list of {doctype, view, edit}"))
 	clean: dict[str, dict] = {}
 	for item in rows:
 		if not isinstance(item, dict):

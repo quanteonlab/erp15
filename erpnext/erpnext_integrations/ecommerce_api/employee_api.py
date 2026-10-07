@@ -527,6 +527,7 @@ PERMISSION_TO_ROLES = {
 	"employees.edit": ["HR User"],
 	"settings.manage_groups": ["HR Manager"],
 	"settings.view_link_key": ["System Manager"],
+	"settings.manage_mcp": ["System Manager"],
 }
 
 PROTECTED_ROLES = {"All", "Guest", "Administrator"}
@@ -1857,7 +1858,13 @@ def _order_visibility_scope() -> dict | None:
 	}
 
 
-def guest_preorder_matches_scope(owner: str, tag_text: str, scope: dict | None) -> bool:
+def guest_preorder_matches_scope(
+	owner: str,
+	tag_text: str,
+	scope: dict | None,
+	customer=None,
+	assigned_customers=None,
+) -> bool:
 	if scope is None:
 		return True
 	user = str(scope.get("user") or "").strip()
@@ -1866,6 +1873,18 @@ def guest_preorder_matches_scope(owner: str, tag_text: str, scope: dict | None) 
 	# without tables.orders.own — Sales has catalog/preventa but not Pedidos table.
 	if user and (str(owner or "").strip() == user or f"order_owner:{user}" in tokens):
 		return True
+	# Assigned-client Pedidos: salesman can list/open SOs for customers linked to them
+	# (not only orders they personally created). Used by Tablas → Pedidos Mis clientes.
+	cust = cstr(customer or "").strip()
+	if cust:
+		assigned = assigned_customers
+		if assigned is None and user:
+			try:
+				assigned = set(_assigned_customer_names(user))
+			except Exception:
+				assigned = set()
+		if assigned and cust in assigned:
+			return True
 	if not scope.get("own") and not scope.get("tags"):
 		return False
 	for tag in scope.get("tags") or []:

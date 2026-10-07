@@ -1120,8 +1120,12 @@ def suite_5_9_master_data():
 
         mine = api.get_guest_preorders_list(page_length=5, scope="admin", seller_scope="mine")
         here = api.get_guest_preorders_list(page_length=5, scope="admin", seller_scope="orden_here")
+        assigned = api.get_guest_preorders_list(page_length=5, scope="admin", seller_scope="assigned")
         assert isinstance(mine.get("preorders"), list), mine
         assert isinstance(here.get("preorders"), list), here
+        assert isinstance(assigned.get("preorders"), list), assigned
+        assert cint(here.get("window_days") or 0) >= 1, here
+        assert cint(assigned.get("window_days") or 0) >= 1, assigned
 
         item_code = frappe.db.get_value("Item", {"disabled": 0, "is_sales_item": 1}, "name")
         if not item_code:
@@ -3041,6 +3045,19 @@ def suite_5_14_ops_requirements():
     _run("5.14.1 every queued write accepts the minimal offline payload (auto-fill)", check_probe_clean, "S1")
 
 
+# ── Suite 5.17 — MCP gateway (tenant admin MCP) ──────────────────────────────
+
+def suite_5_17_mcp_gateway():
+    print("\n▸ 5.17 MCP gateway — key, matrix gates, preview→confirm")
+    from erpnext.erpnext_integrations.ecommerce_api import test_mcp_gateway as probe
+
+    def check_probe_clean():
+        bad = probe.run()
+        assert not bad, "; ".join(f"{label}: {detail}" for label, _status, detail in bad[:6])
+
+    _run("5.17.1 MCP gateway probe (auth, matrix, field allowlist, confirm gate)", check_probe_clean, "S1")
+
+
 # ── Suite 5.15 — Creation review (Revisión Pedidos / Clientes) ────────────────
 
 def _ensure_smoke_creation_review_staff():
@@ -3269,6 +3286,7 @@ def run(do_cleanup="1"):
     suite_5_14_ops_requirements()
     suite_5_15_creation_review()
     suite_5_16_presentation_demo()
+    suite_5_17_mcp_gateway()
 
     passed = _print_summary()
 
