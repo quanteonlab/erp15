@@ -1777,6 +1777,32 @@ def suite_5_12_modules_read():
             and e.get("staticText") == "DOCUMENT NOT VALID AS INVOICE"
             for e in sienw
         ), sienw
+        # Official EN + ES + CH seeded names (gift_core / ensure_starter).
+        starter_names = {
+            s.get("template_name")
+            for s in (pta._STARTER_TEMPLATES or [])
+            if isinstance(s, dict)
+        }
+        assert "Invoice (no valid.) with weights" in starter_names, starter_names
+        assert "Factura No valid. Con pesos" in starter_names, starter_names
+        assert "CH - Invoice (no valid.) with weights" in starter_names, starter_names
+        es_sienw = next(
+            s
+            for s in pta._STARTER_TEMPLATES
+            if isinstance(s, dict) and s.get("template_name") == "Factura No valid. Con pesos"
+        )
+        es_items = next(
+            (e for e in (es_sienw.get("elements") or []) if isinstance(e, dict) and e.get("kind") == "line-items"),
+            None,
+        )
+        assert es_items, es_sienw
+        es_labels = [c.get("label") for c in (es_items.get("columns") or [])]
+        assert es_labels == ["Detalle", "Unid", "Peso", "UM", "Precio", "Dto", "Total"], es_labels
+        assert any(
+            isinstance(e, dict)
+            and e.get("staticText") == "DOCUMENTO NO VALIDO COMO FACTURA"
+            for e in (es_sienw.get("elements") or [])
+        ), es_sienw
         # DN remito keeps line amount for Importe even when WEIGHT + no measured kg yet.
         dn_amt = pta._enrich_print_line_item(
             {"item_code": "SMOKE-WT", "qty": 1, "uom": "WEIGHT", "total_weight": 0, "amount": 7900},

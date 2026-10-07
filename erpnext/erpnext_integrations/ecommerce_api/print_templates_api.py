@@ -3252,7 +3252,7 @@ _STARTER_TEMPLATES = [
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _en_sales_invoice_commercial_a4_elements(id_prefix="starter-sien"),
 	},
-	# ── Sales Invoice · non-fiscal with Unid/Peso/UM (ES name later) ────
+	# ── Sales Invoice · non-fiscal with Unid/Peso/UM (EN + ES + CH) ────
 	{
 		"template_name": "Invoice (no valid.) with weights",
 		"source_doctype": "Sales Invoice",
@@ -3261,8 +3261,11 @@ _STARTER_TEMPLATES = [
 		"gift": True,
 		"resync": True,
 		"resync_if_missing_id": "starter-sienw-items-v1",
-		# English first — Spanish "Factura No valid. Con pesos" on request.
-		"skip_locale_expand": True,
+		# Official locale names (seeded via gift_core / ensure_starter).
+		"locale_names": {
+			"es": "Factura No valid. Con pesos",
+			"zh": "CH - Invoice (no valid.) with weights",
+		},
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _en_sales_invoice_with_weights_a4_elements(id_prefix="starter-sienw"),
 	},
@@ -4144,10 +4147,11 @@ def _localize_elements(elements, locale: str):
 
 
 def _expand_locale_starter_templates(base_starters):
-	"""Duplicate every starter as ES - … and CH - … localized copies.
+	"""Duplicate every starter as ES / CH localized copies.
 
-	Starters with ``skip_locale_expand: True`` stay English-only until locales
-	are explicitly enabled (e.g. new Sales Invoice commercial form).
+	Default names are ``ES - {name}`` / ``CH - {name}``. Optional
+	``locale_names: {es: …, zh: …}`` overrides those (e.g. official Spanish
+	title). Starters with ``skip_locale_expand: True`` stay English-only.
 	"""
 	import copy
 
@@ -4156,11 +4160,17 @@ def _expand_locale_starter_templates(base_starters):
 		name = starter.get("template_name") or ""
 		if name.startswith("ES - ") or name.startswith("CH - "):
 			continue
+		# Official locale titles (e.g. Factura No valid. Con pesos) — skip prefix.
+		locale_names = starter.get("locale_names") or {}
+		if name in set(locale_names.values()):
+			continue
 		if starter.get("skip_locale_expand"):
 			continue
 		for locale, prefix in (("es", "ES"), ("zh", "CH")):
 			clone = copy.deepcopy(starter)
-			clone["template_name"] = f"{prefix} - {name}"
+			clone.pop("locale_names", None)
+			clone.pop("skip_locale_expand", None)
+			clone["template_name"] = locale_names.get(locale) or f"{prefix} - {name}"
 			clone["is_default"] = False
 			# Keep resync markers so localized copies pick up layout fixes
 			# (element ids are not locale-specific).
