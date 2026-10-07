@@ -453,7 +453,7 @@ def _submit_remito_for_so(so_name: str) -> str | None:
 	with _temporarily_allow_negative_stock():
 		dn.submit()
 	try:
-		frappe.db.set_value("Sales Order", so_name, "status", "En Delivery")
+		frappe.db.set_value("Sales Order", so_name, "status", "Delivery")
 	except Exception:
 		pass
 	try:

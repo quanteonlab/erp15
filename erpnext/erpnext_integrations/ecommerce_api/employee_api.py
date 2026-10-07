@@ -22,8 +22,10 @@ STAFF_LOGIN_SCOPE = "settings.staff_login_barcodes"
 STAFF_LOGIN_PREFIX = "99"
 STAFF_LOGIN_LEN = 12
 # Employee -> 6-digit ops PIN (armado/check/roleplay). Plaintext, unique vs admin PIN.
+# First digit must be > 3 (4–9) so client PINs (first digit < 5) stay distinguishable.
 STAFF_OPS_PIN_SCOPE = "settings.staff_ops_pins"
 STAFF_OPS_PIN_LEN = 6
+STAFF_OPS_PIN_FIRST_DIGITS = "456789"
 
 # App permissions that match the current Next.js UI (not ERPNext desk roles).
 APP_PERMISSIONS = [
@@ -2246,12 +2248,19 @@ def _rebuild_ops_pin_index(by_employee: dict) -> dict:
 
 
 def _client_access_pin_owner(pin: str) -> str | None:
-	"""Return Customer name when ``pin`` is a CRM client-access PIN (not staff ops)."""
+	"""Return Customer or Lead name when ``pin`` is a CRM client-access PIN (not staff ops)."""
 	raw = cstr(pin or "").strip()
-	if not raw or not frappe.db.has_column("Customer", "custom_client_access_pin"):
+	if not raw:
 		return None
-	# db.get_value bypasses DocType permissions
-	return frappe.db.get_value("Customer", {"custom_client_access_pin": raw}, "name")
+	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		cust = frappe.db.get_value("Customer", {"custom_client_access_pin": raw}, "name")
+		if cust:
+			return cust
+	if frappe.db.has_column("Lead", "custom_client_access_pin"):
+		lead = frappe.db.get_value("Lead", {"custom_client_access_pin": raw}, "name")
+		if lead:
+			return lead
+	return None
 
 
 def _unauthorized_ops_pin(*, reason: str, pin_configured: bool = True) -> dict:
@@ -2312,11 +2321,17 @@ def _admin_pin_matches(pin: str) -> bool:
 
 
 def _gen_ops_pin(used: set[str]) -> str:
+	"""Mint a staff ops PIN: 6 digits, first digit in 4–9 (above 3)."""
 	for _ in range(120):
-		candidate = "".join(secrets.choice(string.digits) for _ in range(STAFF_OPS_PIN_LEN))
+		first = secrets.choice(STAFF_OPS_PIN_FIRST_DIGITS)
+		rest = "".join(secrets.choice(string.digits) for _ in range(STAFF_OPS_PIN_LEN - 1))
+		candidate = f"{first}{rest}"
 		if candidate in used:
 			continue
 		if _admin_pin_matches(candidate):
+			continue
+		# Avoid colliding with CRM client-access PINs (first digit may overlap on 4).
+		if _client_access_pin_owner(candidate):
 			continue
 		return candidate
 	frappe.throw(_("Could not allocate a unique employee PIN"))

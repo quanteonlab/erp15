@@ -1018,6 +1018,87 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_delivery_mat_gate_and_outcome_tags():
+        """Delivery requires MAT; PoD tags #parcial/#devolucion; facets from logistics."""
+        from erpnext.erpnext_integrations.ecommerce_api import tms_api
+        from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+            TAG_DEVOLUCION,
+            TAG_PARCIAL,
+            get_tags_list,
+        )
+
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1},
+            "name",
+        )
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 18}],
+                guest_notes="smoke delivery mat gate",
+                guest_name="Smoke Delivery Gate",
+                guest_address="Quintino Bocayuca 141",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            api.set_guest_preorder_status(so_name, "Orden")
+            api.set_guest_preorder_status(so_name, "Preparado")
+            # Manual Delivery without MAT must fail controlled.
+            blocked = False
+            try:
+                api.set_guest_preorder_status(so_name, "Delivery")
+            except Exception as e:
+                blocked = True
+                msg = str(e)
+                assert "MAT" in msg or "mat" in msg.lower(), msg
+            assert blocked, "expected MAT gate on Delivery"
+            # PoD path (source=tms_pod) may set Delivery without trip check.
+            pod = api.set_guest_preorder_status(so_name, "Delivery", source="tms_pod")
+            assert api._pipeline_base_status(pod.get("display_status")) == "Delivery", pod
+            # Outcome tags
+            tms_api._stamp_delivery_outcome_tags(so_name, "Partial", has_returns=True)
+            tags = [cstr(t) for t in (get_tags_list("Sales Order", so_name) or [])]
+            assert TAG_PARCIAL in tags, tags
+            assert TAG_DEVOLUCION in tags, tags
+            # Facets
+            assert api._delivery_facet(None, "Delivered") == "Delivery (done)"
+            assert api._delivery_facet(None, "Partial") == "Delivery (partial)"
+            assert api._delivery_facet("In Transit", None) == "Delivery (on)"
+            assert api._delivery_facet(None, None) == "Delivery (plan)"
+            # Remito alone must not force Delivery / MAT error
+            remito = api.create_delivery_note_for_preorder(so_name)
+            assert remito.get("delivery_note") or remito.get("planner_ready") is not None, remito
+            assert api._pipeline_base_status(
+                remito.get("display_status") or frappe.db.get_value("Sales Order", so_name, "status")
+            ) in ("Delivery", "Preparado", "Orden"), remito
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                dn = frappe.db.get_value(
+                    "Delivery Note Item",
+                    {"against_sales_order": so_name},
+                    "parent",
+                )
+                if dn and frappe.db.exists("Delivery Note", dn):
+                    try:
+                        dn_doc = frappe.get_doc("Delivery Note", dn)
+                        if cint(dn_doc.docstatus) == 1:
+                            dn_doc.flags.ignore_permissions = True
+                            dn_doc.cancel()
+                        frappe.delete_doc("Delivery Note", dn, ignore_permissions=True, force=True)
+                    except Exception:
+                        pass
+                docstatus = frappe.db.get_value("Sales Order", so_name, "docstatus")
+                if cint(docstatus) == 1:
+                    try:
+                        so = frappe.get_doc("Sales Order", so_name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    except Exception:
+                        pass
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_orden_planner_remito_and_address_gate():
         """Orden with address → remito for planner; Orden without → not_deliverable warning."""
         so_ok = so_bad = None
@@ -1192,6 +1273,7 @@ def suite_5_9_master_data():
     _run("5.9.15 Orden item edit in place (no amend)", check_orden_item_edit_inplace, "S2")
     _run("5.9.16 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
     _run("5.9.17 external pipeline status audit", check_external_pipeline_status_audit, "S2")
+    _run("5.9.17b Delivery MAT gate + #parcial/#devolucion", check_delivery_mat_gate_and_outcome_tags, "S2")
     _run("5.9.18 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
     _run("5.9.18b preorder list customer_stage", check_preorder_list_customer_stage, "S3")
     _run("5.9.18c seller_scope + amend → Revisar", check_seller_scope_list_and_amend_review, "S2")
@@ -1388,16 +1470,35 @@ def suite_5_11_pos_session():
         if not emp:
             return
         name = emp[0]
-        issued = ea.ensure_employee_ops_pins(employees=[name], rotate=0)
+        # rotate=1 so first-digit rule (>3 → 4–9) is exercised on a fresh mint
+        issued = ea.ensure_employee_ops_pins(employees=[name], rotate=1)
         assert isinstance(issued, dict) and issued.get("rows")
         row = issued["rows"][0]
         assert row.get("ok"), row
         pin = str(row.get("ops_pin") or "")
         assert len(pin) == 6 and pin.isdigit(), pin
+        assert pin[0] in "456789", f"staff ops PIN first digit must be >3: {pin}"
         resolved = ea.resolve_ops_pin(pin=pin)
         assert resolved.get("authorized") is True
         assert resolved.get("kind") == "employee"
         assert resolved.get("employee") == name
+        # Staff PIN must not authenticate as a client on the login page
+        from erpnext.erpnext_integrations.ecommerce_api import client_access_api as caa
+
+        client_res = caa.resolve_client_access_pin(pin=pin)
+        assert client_res.get("ok") is False
+        assert client_res.get("reason") == "staff_pin"
+
+    def check_client_pin_first_digit_and_resolve():
+        from erpnext.erpnext_integrations.ecommerce_api import client_access_api as caa
+
+        pin = caa._new_pin()
+        assert len(pin) == 6 and pin.isdigit(), pin
+        assert pin[0] in "01234", f"client PIN first digit must be <5: {pin}"
+        # Unknown mint (not stamped on a party) → not_found
+        res = caa.resolve_client_access_pin(pin=pin)
+        assert res.get("ok") is False
+        assert res.get("reason") in ("not_found", "invalid")
 
     def check_ops_operator_empty_pin_uses_session():
         """Logged-in desk user may open Armado without re-entering PIN."""
@@ -1434,6 +1535,7 @@ def suite_5_11_pos_session():
     _run("5.11.4 validate_admin_pin shape", check_validate_admin_pin_wrong, "S3")
     _run("5.11.5 resolve_ops_pin shape", check_resolve_ops_pin_shape, "S3")
     _run("5.11.6 ensure_employee_ops_pins + resolve", check_ensure_ops_pin_roundtrip, "S2")
+    _run("5.11.6a client PIN first digit + resolve", check_client_pin_first_digit_and_resolve, "S2")
     _run("5.11.6b ops operator empty pin uses session", check_ops_operator_empty_pin_uses_session, "S2")
     _run("5.11.7 list_pos_profiles", check_pos_profiles, "S3")
     _run("5.11.8 list_cash_register_sessions", check_cash_sessions, "S3")
@@ -1619,16 +1721,62 @@ def suite_5_12_modules_read():
         )
         assert abs(flt(weighed.get("weight")) - 13.43) < 1e-9, weighed
         assert abs(flt(weighed.get("total_weight")) - 13.43) < 1e-9, weighed
+        assert weighed.get("units_qty") == "4", weighed
+        assert weighed.get("um_display") == "Kil", weighed
+        assert weighed.get("peso_display") == "13.43", weighed
         # Catalog WEIGHT without measured kg → blank (do not print unit count as kg).
         units_only = pta._enrich_print_line_item(
             {"item_code": "SMOKE-WT", "qty": 4, "uom": "WEIGHT", "total_weight": 0, "amount": 1}
         )
         assert units_only.get("weight") in ("", None, 0, "0"), units_only
-        # Real mass UOM: qty is the weight.
+        assert units_only.get("peso_display") == "-", units_only
+        assert units_only.get("units_qty") == "4", units_only
+        # Real mass UOM: qty is the weight; Unid from weight_per_unit when known.
         mass = pta._enrich_print_line_item(
-            {"item_code": "SMOKE-KG", "qty": 2.5, "uom": "Kg", "total_weight": 0}
+            {
+                "item_code": "SMOKE-KG",
+                "qty": 2.04,
+                "uom": "Kg",
+                "total_weight": 0,
+                "weight_per_unit": 0.102,
+            }
         )
-        assert abs(flt(mass.get("weight")) - 2.5) < 1e-9, mass
+        assert abs(flt(mass.get("weight")) - 2.04) < 1e-9, mass
+        assert mass.get("um_display") == "Kil", mass
+        assert mass.get("peso_display") == "2.04", mass
+        assert mass.get("units_qty") == "20", mass
+        # Nos / Uni lines: Peso is '-', UM is Uni (never NOS).
+        nos = pta._enrich_print_line_item(
+            {"item_code": "SMOKE-NOS", "qty": 1, "uom": "Nos", "total_weight": 0.01, "amount": 10}
+        )
+        assert nos.get("um_display") == "Uni", nos
+        assert nos.get("peso_display") == "-", nos
+        assert nos.get("units_qty") == "1", nos
+        # Starter: Invoice (no valid.) with weights — Unid/Peso/UM columns.
+        sienw = pta._en_sales_invoice_with_weights_a4_elements()
+        sienw_items = next(
+            (e for e in sienw if isinstance(e, dict) and e.get("kind") == "line-items"),
+            None,
+        )
+        assert sienw_items, sienw
+        sienw_paths = [c.get("fieldPath") for c in (sienw_items.get("columns") or [])]
+        assert sienw_paths == [
+            "item_name",
+            "units_qty",
+            "peso_display",
+            "um_display",
+            "rate",
+            "discount_percentage",
+            "amount",
+        ], sienw_paths
+        assert any(
+            isinstance(e, dict) and e.get("label") == "UM" for e in (sienw_items.get("columns") or [])
+        ), sienw_items
+        assert any(
+            isinstance(e, dict)
+            and e.get("staticText") == "DOCUMENT NOT VALID AS INVOICE"
+            for e in sienw
+        ), sienw
         # DN remito keeps line amount for Importe even when WEIGHT + no measured kg yet.
         dn_amt = pta._enrich_print_line_item(
             {"item_code": "SMOKE-WT", "qty": 1, "uom": "WEIGHT", "total_weight": 0, "amount": 7900},
@@ -1660,6 +1808,54 @@ def suite_5_12_modules_read():
         assert any(
             isinstance(e, dict) and e.get("fieldPath") == "grand_total" for e in remito_els
         ), remito_els
+        # Badge = MAT trip (mat_ref), not remito DN name; Pedido is wide full SO.
+        badge = next(
+            (e for e in remito_els if isinstance(e, dict) and e.get("id", "").endswith("-ped")),
+            None,
+        )
+        assert badge and badge.get("fieldPath") == "mat_ref", badge
+        wide_pedido = next(
+            (e for e in remito_els if isinstance(e, dict) and e.get("id", "").endswith("-wide")),
+            None,
+        )
+        assert wide_pedido and wide_pedido.get("fieldPath") == "pedido_ref", wide_pedido
+        assert flt(wide_pedido.get("width") or 0) >= 50, wide_pedido
+        # Live DN: mat_ref empty when unassigned; trip name (MAT-DT) when assigned.
+        bare_dn = frappe.db.sql(
+            """
+            SELECT dn.name FROM `tabDelivery Note` dn
+            WHERE dn.docstatus = 1
+              AND NOT EXISTS (
+                SELECT 1 FROM `tabDelivery Stop` ds
+                INNER JOIN `tabDelivery Trip` dt ON dt.name = ds.parent
+                WHERE ds.delivery_note = dn.name AND dt.docstatus < 2
+              )
+            LIMIT 1
+            """
+        )
+        if bare_dn:
+            bare = pta.get_print_data("Delivery Note", bare_dn[0][0])
+            bare_doc = (bare or {}).get("doc") or bare or {}
+            assert not cstr(bare_doc.get("mat_ref") or "").strip(), bare_doc.get("mat_ref")
+        linked = frappe.db.sql(
+            """
+            SELECT ds.delivery_note, dt.name
+            FROM `tabDelivery Stop` ds
+            INNER JOIN `tabDelivery Trip` dt ON dt.name = ds.parent
+            WHERE ds.delivery_note IS NOT NULL AND ds.delivery_note != ''
+              AND dt.docstatus < 2
+            LIMIT 1
+            """
+        )
+        if linked:
+            dn_name, trip_name = linked[0]
+            linked_data = pta.get_print_data("Delivery Note", dn_name)
+            linked_doc = (linked_data or {}).get("doc") or linked_data or {}
+            assert cstr(linked_doc.get("mat_ref") or "") == cstr(trip_name), linked_doc.get("mat_ref")
+            assert linked_doc.get("mat_ref") != linked_doc.get("name"), linked_doc
+            pref = cstr(linked_doc.get("pedido_ref") or "")
+            if pref.startswith("SAL-ORD-"):
+                assert not pref.endswith("-"), pref
 
     def check_company_settings():
         from erpnext.erpnext_integrations.ecommerce_api import company_settings as cs

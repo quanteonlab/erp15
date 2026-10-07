@@ -1037,7 +1037,7 @@ def _rutas_order_display_status(dn_status=None, so_status=None, previous_attempt
 		return "prepared"
 	if so in ("Orden", "To Deliver and Bill", "To Deliver"):
 		return "pending"
-	if so in ("En Delivery",):
+	if so in ("En Delivery", "Delivery") or str(so).startswith("Delivery"):
 		return "in_delivery"
 	if so in ("Completado", "Completed", "Closed"):
 		return "completed"
@@ -1480,7 +1480,9 @@ def _list_claimable_preorders(company=None):
 			continue
 		# Skip already-in-delivery / completed display statuses
 		display = str(o.status or "")
-		if display in ("En Delivery", "Completado", "Closed", "Completed"):
+		if display in ("Delivery", "En Delivery", "Completado", "Closed", "Completed") or str(
+			display
+		).startswith("Delivery"):
 			continue
 		address_name = o.shipping_address_name or o.customer_address
 		# Fallback: guest_address tag (consultas often lack shipping_address_name).
@@ -1652,7 +1654,7 @@ def claim_orders_to_trip(
 		try:
 			from erpnext.erpnext_integrations.ecommerce_api.api import set_guest_preorder_status
 
-			set_guest_preorder_status(so_name, "En Delivery", source="tms_claim")
+			set_guest_preorder_status(so_name, "Delivery", source="tms_claim")
 			frappe.db.commit()
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "claim_orders_to_trip status")
@@ -9632,27 +9634,75 @@ def _record_so_receive_payment(so_name: str, paid_amount, mode_of_payment=None) 
 	return pe.name
 
 
-def _mark_so_completado(so_name: str):
-	"""Move SO to Completado workflow (display Completado / Completado no pagado via advance_paid)."""
+def _stamp_delivery_outcome_tags(so_name: str, outcome: str, *, has_returns: bool = False) -> None:
+	"""Tag Pedidos for partial delivery / returns (#parcial, #devolucion)."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import add_tags_for_doc
+
+		tags = []
+		out = cstr(outcome or "").strip()
+		if out == "Partial":
+			tags.append("#parcial")
+		if has_returns or out == "Refused":
+			tags.append("#devolucion")
+		if tags:
+			add_tags_for_doc("Sales Order", so_name, tags=tags, commit=False)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "stamp delivery outcome tags")
+
+
+def _mark_so_after_pod(so_name: str, outcome: str | None = None, *, has_returns: bool = False):
+	"""After PoD: stay on Delivery (facets via logistics); Completado only if opt-in + paid."""
 	so_name = cstr(so_name or "").strip()
 	if not so_name or not frappe.db.exists("Sales Order", so_name):
 		return
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		_is_guest_preorder_sales_order,
+		_orders_auto_complete_on_full_payment,
+		_so_is_fully_paid,
 		set_guest_preorder_status,
 	)
 
+	outcome = cstr(outcome or "").strip() or "Delivered"
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", so_name)
 	frappe.flags.ignore_permissions = False
 	try:
 		if _is_guest_preorder_sales_order(so):
-			set_guest_preorder_status(so_name, "Completado", source="tms_pod")
+			from erpnext.erpnext_integrations.ecommerce_api.api import (
+				_display_status,
+				_pipeline_base_status,
+			)
+
+			_stamp_delivery_outcome_tags(so_name, outcome, has_returns=has_returns)
+			# Don't regress Completado → Delivery on a second PoD/tag pass.
+			if _pipeline_base_status(_display_status(so)) == "Completado":
+				return
+			# PoD no longer jumps to Completado — Delivery (done|partial) facets.
+			if outcome in ("Delivered", "Partial"):
+				set_guest_preorder_status(so_name, "Delivery", source="tms_pod")
+			so.reload()
+			if (
+				_orders_auto_complete_on_full_payment()
+				and outcome in ("Delivered", "Partial")
+				and _so_is_fully_paid(so)
+			):
+				set_guest_preorder_status(so_name, "Completado", source="tms_pod")
 		else:
 			if cint(so.docstatus) == 1 and cstr(so.status) not in ("Completed", "Closed"):
-				so.db_set("status", "Completed", update_modified=True)
+				# Non-guest: keep legacy Completed only when auto-complete setting is on.
+				if _orders_auto_complete_on_full_payment() and _so_is_fully_paid(so):
+					so.db_set("status", "Completed", update_modified=True)
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "delivery mark Completado")
+		frappe.log_error(frappe.get_traceback(), "delivery mark after PoD")
+
+
+def _mark_so_completado(so_name: str):
+	"""Legacy name — prefer Delivery after PoD; Completado only via opt-in payment rule."""
+	_mark_so_after_pod(so_name, outcome="Delivered")
 
 
 def _sync_stop_collection_to_sales_orders(
@@ -9667,8 +9717,10 @@ def _sync_stop_collection_to_sales_orders(
 	requires_factura_a: bool = False,
 	surcharge_amount: float = 0.0,
 	payment_summary: str | None = None,
+	pod_outcome: str | None = None,
+	has_returns: bool = False,
 ):
-	"""Book PE for cash taken + optionally Completado on linked SOs."""
+	"""Book PE for cash taken + move linked SOs to Delivery (Completado only if opt-in)."""
 	settings = settings or _load_tms_settings()
 	if settings.get("sync_delivery_payment_to_so") is False:
 		return
@@ -9713,7 +9765,8 @@ def _sync_stop_collection_to_sales_orders(
 		if ledger_note:
 			_append_so_payment_note(so_name, ledger_note)
 		if complete:
-			_mark_so_completado(so_name)
+			outcome = cstr(pod_outcome or getattr(stop, "custom_outcome", None) or "Delivered").strip()
+			_mark_so_after_pod(so_name, outcome=outcome, has_returns=has_returns)
 
 
 def _apply_collection_and_penalty(
@@ -10063,12 +10116,26 @@ def _record_stop_outcome_impl(
 		tracking_code = _ensure_tracking_code(stop.delivery_note)
 
 	credit_note = None
+	has_returns = False
 	if outcome == "Partial":
 		raw_items = frappe.parse_json(credit_items) if isinstance(credit_items, str) else (credit_items or [])
 		if isinstance(raw_items, list) and raw_items:
 			credit_note = _process_partial_credit_note(
 				stop, verify_shortfall_items=raw_items, notes=notes, settings=settings
 			)
+			has_returns = True
+	elif outcome == "Refused":
+		has_returns = True
+
+	dn = cstr(getattr(stop, "delivery_note", None) or "").strip()
+	so_names = _sales_orders_for_dn(dn) if dn else []
+	if outcome in ("Delivered", "Partial"):
+		# Collection sync may have already moved to Delivery; re-stamp tags (returns) + opt-in Completado.
+		for so_name in so_names:
+			_mark_so_after_pod(so_name, outcome=outcome, has_returns=has_returns)
+	elif outcome == "Refused":
+		for so_name in so_names:
+			_stamp_delivery_outcome_tags(so_name, outcome, has_returns=True)
 
 	frappe.db.commit()
 

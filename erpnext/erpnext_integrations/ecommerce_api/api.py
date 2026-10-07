@@ -5585,13 +5585,20 @@ def get_guest_preorders_list(
 			filters["transaction_date"] = [">=", str(cutoff_date)]
 
 	if status:
-		if str(status).lower() == "draft":
+		st = cstr(status).strip()
+		st_l = st.lower()
+		if st_l == "draft":
 			filters["docstatus"] = 0
-		elif str(status).lower() in ("submitted", "confirmed"):
+		elif st_l in ("submitted", "confirmed"):
 			filters["docstatus"] = 1
-		elif str(status).lower() in ("archived", "cancelled", "archivado"):
+		elif st_l in ("archived", "cancelled", "archivado"):
 			filters["docstatus"] = 2
 			include_archived = 1
+		elif st in ("Delivery", "En Delivery") or st.startswith("Delivery"):
+			# Facets are display-only; ERP status is Delivery (legacy En Delivery).
+			filters["status"] = ["in", ["Delivery", "En Delivery"]]
+		elif st.startswith("Completado") or st_l == "completed":
+			filters["status"] = "Completed"
 		else:
 			filters["status"] = status
 	elif not include_archived:
@@ -5736,7 +5743,7 @@ def get_guest_preorders_list(
 			tags = _parse_remarks_tags(_guest_preorder_tag_text(o))
 			o["address"] = tags.get("guest_address") or None
 
-	# TMS logistics: warehouse / MAT / car / PoD (+ transit → En Delivery).
+	# TMS logistics: warehouse / MAT / car / PoD (+ Delivery facets).
 	logistics = _tms_logistics_map_for_orders([o["name"] for o in filtered])
 	for o in filtered:
 		lg = logistics.get(o["name"]) or {}
@@ -5974,19 +5981,27 @@ def get_guest_preorder_history(preorder_name):
 
 
 # ── Custom workflow status helpers ────────────────────────────────────────────
-# Display statuses: Consulta → Orden → Preparado → En Delivery → Completado
+# Display statuses: Consulta → Orden → Preparado → Delivery → Completado
 # Mapping to SilkOS:
 #   Consulta   = docstatus 0 (Draft)
 #   Orden      = docstatus 1, status "To Deliver and Bill"
 #   Preparado  = docstatus 1, status "Preparado"   (custom via db_set)
-#   En Delivery= docstatus 1, status "En Delivery"  (custom via db_set)
+#   Delivery   = docstatus 1, status "Delivery"    (custom via db_set; legacy "En Delivery")
 #   Completado = docstatus 1, status "Completed"
 #   Archivado  = docstatus 2 (Cancelled)
+#
+# Delivery / Completado expose payment & logistics *facets* in display_status only:
+#   Delivery (plan|on|partial|done), Completado (pago|no pagado).
 
-WORKFLOW_STATUSES = ["Consulta", "Orden", "Preparado", "En Delivery", "Completado"]
+WORKFLOW_STATUSES = ["Consulta", "Orden", "Preparado", "Delivery", "Completado"]
+COMPLETED_PAID_LABEL = "Completado (pago)"
 COMPLETED_UNPAID_LABEL = "Completado (no pagado)"
+DELIVERY_PEND_LABEL = "Delivery (plan)"
+DELIVERY_ON_LABEL = "Delivery (on)"
+DELIVERY_PARTIAL_LABEL = "Delivery (partial)"
+DELIVERY_DONE_LABEL = "Delivery (done)"
 # Written via db_set — not in stock Sales Order.status Select options.
-GUEST_PREORDER_CUSTOM_STATUSES = frozenset({"Consulta", "Preparado", "En Delivery"})
+GUEST_PREORDER_CUSTOM_STATUSES = frozenset({"Consulta", "Preparado", "Delivery", "En Delivery"})
 _SO_STATUS_SELECT_BASE = (
 	"\nDraft\nOn Hold\nTo Deliver and Bill\nTo Bill\nTo Deliver\nCompleted\nCancelled\nClosed"
 )
@@ -5997,7 +6012,7 @@ EXTERNAL_STATUS_KV_SCOPE = "pedidos.external_status"
 
 def ensure_guest_preorder_status_options():
 	"""Idempotent: extend Sales Order.status Select so Pedidos markers survive Document.save()."""
-	extras = ["Consulta", "Preparado", "En Delivery"]
+	extras = ["Consulta", "Preparado", "Delivery", "En Delivery"]
 	meta = frappe.get_meta("Sales Order")
 	df = meta.get_field("status")
 	current = (df.options if df else "") or _SO_STATUS_SELECT_BASE
@@ -6035,7 +6050,7 @@ def _save_guest_preorder_so(so):
 	"""
 	Save a guest-preorder Sales Order even when status is a custom pipeline marker.
 
-	Frappe Select validation rejects Consulta / Preparado / En Delivery unless the
+	Frappe Select validation rejects Consulta / Preparado / Delivery unless the
 	Property Setter has run; stash a valid ERP status for save, then restore.
 	WEIGHT lines are rebilled as $/kg × kg inside the save validate path.
 	"""
@@ -6189,6 +6204,64 @@ def _payments_for_sales_order(so_name: str, grand_total=None) -> list:
 	return out
 
 
+def _pipeline_base_status(status_or_display) -> str:
+	"""Collapse facets / legacy aliases to the canonical WORKFLOW_STATUSES id."""
+	s = cstr(status_or_display or "").strip()
+	if not s:
+		return s
+	if s.startswith("Completado"):
+		return "Completado"
+	if s.startswith("Delivery") or s == "En Delivery":
+		return "Delivery"
+	return s
+
+
+def _normalize_target_pipeline_status(target_status) -> str:
+	"""Accept legacy En Delivery and Completado facets as set_guest_preorder_status targets."""
+	raw = cstr(target_status or "").strip()
+	base = _pipeline_base_status(raw)
+	if base in WORKFLOW_STATUSES:
+		return base
+	return raw
+
+
+def _completado_facet(fully_paid: bool) -> str:
+	return COMPLETED_PAID_LABEL if fully_paid else COMPLETED_UNPAID_LABEL
+
+
+def _delivery_facet(trip_status=None, pod_outcome=None) -> str:
+	"""Logistics facet for the Delivery pipeline step."""
+	outcome = cstr(pod_outcome or "").strip()
+	if outcome == "Delivered":
+		return DELIVERY_DONE_LABEL
+	if outcome == "Partial":
+		return DELIVERY_PARTIAL_LABEL
+	trip_st = cstr(trip_status or "").strip()
+	if trip_st == "In Transit":
+		return DELIVERY_ON_LABEL
+	return DELIVERY_PEND_LABEL
+
+
+def _orders_auto_complete_on_full_payment() -> bool:
+	"""Shop UI setting — default False (PoD stays on Delivery until ops closes)."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import get_shop_ui_settings
+
+		res = get_shop_ui_settings() or {}
+		cat = (res.get("settings") or {}).get("catalogDisplay") or {}
+		return bool(cat.get("autoCompleteOnFullPayment"))
+	except Exception:
+		return False
+
+
+def _so_has_mat_trip(so_name: str) -> bool:
+	so_name = cstr(so_name or "").strip()
+	if not so_name:
+		return False
+	lg = (_tms_logistics_map_for_orders([so_name]) or {}).get(so_name) or {}
+	return bool(cstr(lg.get("trip_name") or "").strip())
+
+
 def _display_status(so):
 	"""Return the user-facing workflow status for a Sales Order."""
 	if so.docstatus == 0:
@@ -6199,10 +6272,13 @@ def _display_status(so):
 	s = so.status
 	if s == "Consulta":
 		return "Consulta"
-	if s in ("Preparado", "En Delivery"):
-		return s
+	if s == "Preparado":
+		return "Preparado"
+	if s in ("Delivery", "En Delivery"):
+		# Facet filled later by _apply_tms_display_status when logistics are attached.
+		return "Delivery"
 	if s == "Completed":
-		return "Completado" if _so_is_fully_paid(so) else COMPLETED_UNPAID_LABEL
+		return _completado_facet(_so_is_fully_paid(so))
 	# "To Deliver and Bill", "To Deliver", "To Bill", etc.
 	return "Orden"
 
@@ -6215,14 +6291,15 @@ def _display_status_from_row(docstatus, status, grand_total=0, advance_paid=0):
 		return "Archivado"
 	if status == "Consulta":
 		return "Consulta"
-	if status in ("Preparado", "En Delivery"):
-		return status
+	if status == "Preparado":
+		return "Preparado"
+	if status in ("Delivery", "En Delivery"):
+		return "Delivery"
 	if status == "Completed":
 		total = flt(grand_total or 0)
 		paid = flt(advance_paid or 0)
-		if total > 0 and paid + 0.005 >= total:
-			return "Completado"
-		return COMPLETED_UNPAID_LABEL
+		fully = total > 0 and paid + 0.005 >= total
+		return _completado_facet(fully)
 	return "Orden"
 
 
@@ -6258,13 +6335,13 @@ def _latest_amend_successor(order_name):
 
 def _erp_status_for_display(display_status):
 	"""Map display status → SilkOS status string."""
+	base = _normalize_target_pipeline_status(display_status)
 	return {
 		"Orden": "To Deliver and Bill",
 		"Preparado": "Preparado",
-		"En Delivery": "En Delivery",
+		"Delivery": "Delivery",
 		"Completado": "Completed",
-		COMPLETED_UNPAID_LABEL: "Completed",
-	}.get(display_status)
+	}.get(base)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -6382,7 +6459,8 @@ def set_guest_preorder_status(
 	"""
 	Unified status transition for the custom workflow.
 
-	Accepts target_status as one of: Consulta, Orden, Preparado, En Delivery, Completado.
+	Accepts target_status as one of: Consulta, Orden, Preparado, Delivery, Completado
+	(legacy ``En Delivery`` is normalized to Delivery).
 	Consulta on a submitted order is a soft marker (db_set status) — it does **not**
 	cancel/archive. Explicit archive uses ``cancel_guest_preorder``.
 	 Backward moves among submitted custom statuses use db_set so SilkOS
@@ -6394,6 +6472,7 @@ def set_guest_preorder_status(
 	``ensure_planner_remito``: when 0, skip inline remito/geocode (caller may
 	enqueue it — e.g. armado kiosk confirm for a fast response).
 	"""
+	target_status = _normalize_target_pipeline_status(target_status)
 	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
 
@@ -6424,7 +6503,7 @@ def set_guest_preorder_status(
 		)
 
 	current = _display_status(so)
-	current_base = "Completado" if str(current).startswith("Completado") else current
+	current_base = _pipeline_base_status(current)
 
 	# Soft Consulta — never cancel/archive just to go back.
 	if target_status == "Consulta":
@@ -6455,13 +6534,22 @@ def set_guest_preorder_status(
 				)
 			)
 
+	# Delivery requires a linked MAT (same pattern as Consulta → real client).
+	# tms_claim / tms_pod already sit on a trip stop.
+	if target_status == "Delivery" and pipeline_source not in ("tms_claim", "tms_pod"):
+		if not _so_has_mat_trip(preorder_name):
+			frappe.throw(
+				_("Assign a MAT before moving to Delivery."),
+				title=_("MAT required"),
+			)
+
 	erp_status = _erp_status_for_display(target_status)
 	if not erp_status:
 		frappe.throw(_("Invalid target status"))
 
-	# Completado / Preparado / En Delivery: always db_set (custom workflow markers).
+	# Completado / Preparado / Delivery: always db_set (custom workflow markers).
 	# Orden ("To Deliver and Bill"): try update_status first; on failure fall back to
-	# db_set so going back from Preparado/En Delivery/Completado works.
+	# db_set so going back from Preparado/Delivery/Completado works.
 	try:
 		if erp_status == "To Deliver and Bill":
 			try:
@@ -6479,10 +6567,17 @@ def set_guest_preorder_status(
 
 	so.reload()
 	new_display = _display_status(so)
-	new_base = "Completado" if str(new_display).startswith("Completado") else new_display
+	new_base = _pipeline_base_status(new_display)
 	_record_guest_preorder_status_audit(
 		preorder_name, current_base, new_base, source=pipeline_source
 	)
+	# Pipeline moves clear print-output tags (PRINTED).
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tags_api import clear_sales_order_print_tags
+
+		clear_sales_order_print_tags(preorder_name, commit=False)
+	except Exception:
+		pass
 	detail = get_guest_preorder(preorder_name)
 	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
 	# Armado confirm / create Orden enqueue remito separately for a fast response.
@@ -7906,18 +8001,25 @@ def _tms_logistics_map_for_orders(order_names):
 
 
 def _apply_tms_display_status(row):
-	"""When the linked MAT trip is In Transit, surface pipeline as En Delivery."""
+	"""Overlay Delivery facets from MAT trip status + PoD outcome."""
 	if not row:
 		return row
-	trip_st = cstr(row.get("trip_status") or "").strip()
 	disp = cstr(row.get("display_status") or row.get("status") or "")
-	if trip_st == "In Transit" and disp not in (
-		"Completado",
-		"Completado (no pagado)",
-		"Cancelled",
-		"Closed",
-	):
-		row["display_status"] = "En Delivery"
+	base = _pipeline_base_status(disp)
+	if base == "Completado" or disp in ("Cancelled", "Closed", "Archivado"):
+		return row
+	trip_st = cstr(row.get("trip_status") or "").strip()
+	erp = cstr(row.get("status") or "").strip()
+	pod = row.get("pod") if isinstance(row.get("pod"), dict) else {}
+	outcome = cstr((pod or {}).get("outcome") or "").strip()
+	on_delivery = (
+		base == "Delivery"
+		or erp in ("Delivery", "En Delivery")
+		or trip_st == "In Transit"
+	)
+	if not on_delivery:
+		return row
+	row["display_status"] = _delivery_facet(trip_st, outcome)
 	return row
 
 
@@ -8103,7 +8205,7 @@ def update_guest_preorder_logistics(
 			tms_api.add_stops_to_trip(trip_in, [dn_name], allow_steal=1)
 		except TypeError:
 			tms_api.add_stops_to_trip(trip_in, [dn_name])
-		set_guest_preorder_status(name, "En Delivery", source="tms_claim")
+		set_guest_preorder_status(name, "Delivery", source="tms_claim")
 		current_trip = frappe._dict(trip_name=trip_in, docstatus=frappe.db.get_value("Delivery Trip", trip_in, "docstatus"), status=frappe.db.get_value("Delivery Trip", trip_in, "status"))
 
 	target_trip = trip_in or (current_trip.trip_name if current_trip else None)
@@ -8565,9 +8667,11 @@ def sync_orden_planner_remitos(company=None):
 def create_delivery_note_for_preorder(preorder_name):
 	"""Create + submit a real Delivery Note from a confirmed guest preorder,
 	so it becomes visible in the TMS dispatcher (get_pending_deliveries only
-	lists submitted Delivery Notes) - and advances the preorder's display
-	status to "En Delivery". Idempotent: reuses an existing linked DN
-	instead of creating a duplicate.
+	lists submitted Delivery Notes).
+
+	Does **not** move the pipeline to Delivery — that requires a MAT
+	(``update_guest_preorder_logistics`` / PoD claim). Idempotent: reuses an
+	existing linked DN instead of creating a duplicate.
 
 	Insufficient warehouse qty does **not** block submit — stock may go
 	negative (Pedidos remitos are operational; shortfalls are warned only).
@@ -8591,8 +8695,9 @@ def create_delivery_note_for_preorder(preorder_name):
 			or _("Could not create Delivery Note for {0}").format(preorder_name)
 		)
 
-	updated = set_guest_preorder_status(preorder_name, "En Delivery", source="remito")
-	return _attach_planner_gate_fields(updated, gate)
+	# Remito alone stays on Orden/Preparado; MAT assignment advances to Delivery.
+	detail = get_guest_preorder(preorder_name)
+	return _attach_planner_gate_fields(detail, gate)
 
 
 def _delivery_note_stock_shortages(dn):

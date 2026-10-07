@@ -129,6 +129,14 @@ def run():
 
 		check("whoami returns bound actor + matrix counts", whoami_ok)
 
+		def reads_do_not_eat_write_budget():
+			for _ in range(mcp_api.WRITE_LIMIT_PER_MIN + 5):
+				mcp_api.mcp_search(token, "Brand", "a", 1)
+			out = mcp_api.mcp_create_record(token, "Brand", {"brand": "rate-probe"}, 0)
+			assert out["requires_confirm"], out
+
+		check("reads beyond the write limit do not block writes", reads_do_not_eat_write_budget)
+
 		def actor_bound_on_request():
 			from erpnext.erpnext_integrations.ecommerce_api.employee_api import _acting_username
 

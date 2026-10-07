@@ -219,6 +219,9 @@ def _normalize_catalog_display(raw) -> dict:
 		"pedidosDefaultSellerScope": _normalize_pedidos_default_seller_scope(
 			src.get("pedidosDefaultSellerScope")
 		),
+		# When True, PoD/payment that fully settles a Delivery order auto-moves to Completado.
+		# Default False — ops closes Completado manually (or jumps with UI warning).
+		"autoCompleteOnFullPayment": _as_bool(src.get("autoCompleteOnFullPayment"), False),
 		"headerPreset": _normalize_header_preset(src.get("headerPreset")),
 		"headerSearchBackgroundColor": _as_hex(src.get("headerSearchBackgroundColor"), ""),
 		"headerSearchTextColor": _as_hex(src.get("headerSearchTextColor"), ""),

@@ -127,8 +127,47 @@ def _phone_seen_before(e164: str) -> bool:
 	return False
 
 
+# Client PIN: 6 digits, first digit < 5 (0–4). Staff ops PINs use first digit > 3 (4–9).
+CLIENT_ACCESS_PIN_LEN = 6
+CLIENT_ACCESS_PIN_FIRST_DIGITS = "01234"
+
+
+def _client_pin_in_use(pin: str) -> bool:
+	raw = cstr(pin or "").strip()
+	if not raw:
+		return False
+	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		if frappe.db.exists("Customer", {"custom_client_access_pin": raw}):
+			return True
+	if frappe.db.has_column("Lead", "custom_client_access_pin"):
+		if frappe.db.exists("Lead", {"custom_client_access_pin": raw}):
+			return True
+	return False
+
+
 def _new_pin() -> str:
-	return f"{secrets.randbelow(1_000_000):06d}"
+	"""Mint a client-access PIN: 6 digits, first digit in 0–4 (below 5)."""
+	ensure_client_access_custom_fields()
+	for _ in range(120):
+		first = secrets.choice(CLIENT_ACCESS_PIN_FIRST_DIGITS)
+		rest = f"{secrets.randbelow(100_000):05d}"
+		candidate = f"{first}{rest}"
+		if _client_pin_in_use(candidate):
+			continue
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+				employee_ops_pin_taken,
+			)
+			from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+				_verify_pin_value,
+			)
+
+			if employee_ops_pin_taken(candidate) or _verify_pin_value(candidate):
+				continue
+		except Exception:
+			pass
+		return candidate
+	frappe.throw(_("Could not allocate a unique client PIN"))
 
 
 def _portal_base_url() -> str:
@@ -307,6 +346,91 @@ def issue_client_access_pin(
 		"portal_path": "/cliente",
 		"portal_url": portal,
 		"send": send_result,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def resolve_client_access_pin(pin=None):
+	"""Resolve a 6-digit CRM client PIN for login / roleplay (no ERP User).
+
+	Employee ops PINs and the admin PIN are rejected — staff must not sign in
+	via PIN; only clients may.
+	"""
+	ensure_client_access_custom_fields()
+	raw = cstr(pin or "").strip()
+	if not raw.isdigit() or len(raw) != CLIENT_ACCESS_PIN_LEN:
+		return {"ok": False, "reason": "invalid", "kind": None}
+
+	# Staff / admin PINs must never authenticate as a client.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+			employee_ops_pin_taken,
+		)
+		from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+			_verify_pin_value,
+		)
+
+		if _verify_pin_value(raw) or employee_ops_pin_taken(raw):
+			return {"ok": False, "reason": "staff_pin", "kind": "staff"}
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "resolve_client_access_pin staff check")
+
+	customer = None
+	customer_name = None
+	phone_e164 = None
+	lead = None
+	lead_name = None
+
+	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		row = frappe.db.get_value(
+			"Customer",
+			{"custom_client_access_pin": raw, "disabled": 0},
+			["name", "customer_name", "mobile_no", "custom_client_phone_e164"],
+			as_dict=True,
+		)
+		if row:
+			customer = row.name
+			customer_name = cstr(row.customer_name or row.name).strip() or row.name
+			phone_e164 = _normalize_e164(
+				cstr(getattr(row, "custom_client_phone_e164", None) or row.mobile_no or "")
+			) or None
+
+	if not customer and frappe.db.has_column("Lead", "custom_client_access_pin"):
+		fields = ["name", "lead_name", "mobile_no", "whatsapp_no", "phone"]
+		if frappe.db.has_column("Lead", "custom_client_phone_e164"):
+			fields.append("custom_client_phone_e164")
+		row = frappe.db.get_value(
+			"Lead",
+			{"custom_client_access_pin": raw},
+			fields,
+			as_dict=True,
+		)
+		if row:
+			lead = row.name
+			lead_name = cstr(row.lead_name or row.name).strip() or row.name
+			phone_e164 = _normalize_e164(
+				cstr(
+					getattr(row, "custom_client_phone_e164", None)
+					or row.whatsapp_no
+					or row.mobile_no
+					or row.phone
+					or ""
+				)
+			) or None
+
+	if not customer and not lead:
+		return {"ok": False, "reason": "not_found", "kind": None}
+
+	return {
+		"ok": True,
+		"kind": "client",
+		"reason": None,
+		"customer": customer,
+		"customer_name": customer_name or lead_name,
+		"lead": lead,
+		"phone_e164": phone_e164,
+		"pin": raw,
+		"portal_path": "/cliente",
 	}
 
 

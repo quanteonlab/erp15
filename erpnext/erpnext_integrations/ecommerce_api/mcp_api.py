@@ -212,9 +212,10 @@ def _prune_audit():
 		frappe.log_error(frappe.get_traceback(), "mcp_audit_prune_failed")
 
 
-def _rate_limit(key_id: str, limit: int) -> None:
+def _rate_limit(key_id: str, limit: int, kind: str) -> None:
 	try:
-		bucket = f"mcp-rl:{key_id}:{int(time.time() // 60)}"
+		# Separate read/write buckets: browsing must not eat the write budget.
+		bucket = f"mcp-rl:{kind}:{key_id}:{int(time.time() // 60)}"
 		cache = frappe.cache()
 		current = cache.incr(bucket)
 		if current == 1:
@@ -289,7 +290,7 @@ def _ctx(mcp_token, *, write=False):
 		frappe.throw(_("Invalid or revoked MCP token"), frappe.AuthenticationError)
 	ctx = {"store": store, "key_id": key_id, "actor": actor, "write": write}
 	frappe.local._mcp_ctx = ctx
-	_rate_limit(key_id, WRITE_LIMIT_PER_MIN if write else READ_LIMIT_PER_MIN)
+	_rate_limit(key_id, WRITE_LIMIT_PER_MIN if write else READ_LIMIT_PER_MIN, "w" if write else "r")
 	# Without a bound user the staff-permission layer would allow everything,
 	# so an unbound / deleted / disabled actor is a hard auth failure.
 	enabled = frappe.db.get_value("User", actor, "enabled") if actor else None
@@ -776,7 +777,7 @@ def cint_confirm(value) -> bool:
 		return False
 
 
-_PREORDER_STATUSES = ["Consulta", "Orden", "Preparado", "En Delivery", "Completado"]
+_PREORDER_STATUSES = ["Consulta", "Orden", "Preparado", "Delivery", "Completado", "En Delivery"]
 
 
 def _workflow_catalog() -> list[dict]:
@@ -802,7 +803,11 @@ def _workflow_catalog() -> list[dict]:
 		{
 			"name": "convert_lead",
 			"doctype": "Lead",
-			"description": "Convert a Preventa Lead into a Customer (wraps convert_lead_to_customer).",
+			"description": (
+				"Convert a Preventa Lead into a Customer (wraps convert_lead_to_customer). The site's "
+				"conversion checklist may require customer_type / tax_id / customer_group — the preview "
+				"lists anything missing under 'issues'."
+			),
 			"args_schema": {
 				"type": "object",
 				"properties": {
@@ -850,6 +855,27 @@ def _workflow_catalog() -> list[dict]:
 			},
 		},
 	]
+
+
+def _workflow_preview_issues(name: str, args: dict) -> list[str]:
+	"""Problems the apply would hit, surfaced at preview time so the agent can
+	ask the user for them before requesting approval."""
+	if name != "convert_lead":
+		return []
+	from erpnext.erpnext_integrations.ecommerce_api.preventa_api import LEAD_FIELD_MAP, _load_preventa_settings
+
+	lead = args.get("lead")
+	if not frappe.db.exists("Lead", lead):
+		return [f"Lead {lead} not found"]
+	provided = {k: args.get(k) for k in ("customer_type", "tax_id", "customer_group")}
+	missing = []
+	for fid in _load_preventa_settings().get("conversion_checklist") or []:
+		if fid in provided:
+			if not provided[fid]:
+				missing.append(fid)
+		elif not frappe.db.get_value("Lead", lead, LEAD_FIELD_MAP.get(fid, fid)):
+			missing.append(fid)
+	return [f"Missing required field(s) to convert: {', '.join(missing)}"] if missing else []
 
 
 def _run_workflow(name: str, args: dict):
@@ -947,6 +973,16 @@ def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0, previe
 		if missing:
 			frappe.throw(_("Missing required args: {0}").format(", ".join(missing)))
 		signed = {"op": "workflow", "workflow": workflow, "args": args}
+		issues = [] if cint_confirm(confirm) else _workflow_preview_issues(workflow, args)
+		if not cint_confirm(confirm) and issues:
+			return {
+				"workflow": workflow,
+				"args": _sanitize_output(_json_safe(args)),
+				"requires_confirm": False,
+				"applied": False,
+				"issues": issues,
+				"hint": "Fix these first (ask the user for the missing values), then preview again.",
+			}
 		if not cint_confirm(confirm):
 			return {
 				"workflow": workflow,

@@ -1638,6 +1638,36 @@
       "expect": "no_500"
     },
     {
+      "id": "resolve_client_access_pin_null",
+      "source": "regression",
+      "bug": "resolve_client_access_pin with null/empty pin returns ok:false reason=invalid, not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.resolve_client_access_pin",
+      "args": {
+        "pin": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "resolve_client_access_pin_empty_string",
+      "source": "regression",
+      "bug": "resolve_client_access_pin with '' returns ok:false, never 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.resolve_client_access_pin",
+      "args": {
+        "pin": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "resolve_client_access_pin_garbage",
+      "source": "regression",
+      "bug": "resolve_client_access_pin with non-digit / wrong length is controlled ok:false",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.resolve_client_access_pin",
+      "args": {
+        "pin": "______"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "update_guest_preorder_details_guest_fields_null",
       "source": "regression",
       "bug": "update_guest_preorder_details with null guest_* fields must not TypeError",
@@ -4877,6 +4907,49 @@
       "expect": "fail",
       "source": "regression",
       "bug": "Dirty workflow args with empty token → controlled auth failure, no TypeError"
+    },
+    {
+      "id": "set_guest_preorder_status_delivery_null_name_mat_gate",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": null,
+        "target_status": "Delivery"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Delivery MAT gate with null preorder_name is controlled (no AttributeError)"
+    },
+    {
+      "id": "set_guest_preorder_status_en_delivery_legacy_alias",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "En Delivery"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Legacy En Delivery target normalizes to Delivery without 500"
+    },
+    {
+      "id": "create_delivery_note_for_preorder_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_delivery_note_for_preorder",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Remito create with null name is controlled; must not auto-jump Delivery via MAT gate"
+    },
+    {
+      "id": "get_print_data_dn_empty_docname_mat_ref",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_print_data",
+      "args": {
+        "source_doctype": "Delivery Note",
+        "docname": ""
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "DN print enrich for mat_ref/pedido_ref with empty docname is controlled, not AttributeError"
     }
   ]
 }

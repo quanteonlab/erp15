@@ -68,6 +68,7 @@ _DELIVERY_CHECKLIST_FIELDS = [
 	{"fieldname": "transaction_date", "label": "Order Date", "fieldtype": "Date"},
 	{"fieldname": "warehouse_name", "label": "Almacen", "fieldtype": "Data"},
 	{"fieldname": "total_weight", "label": "Peso total", "fieldtype": "Float"},
+	{"fieldname": "grand_total", "label": "Importe total", "fieldtype": "Currency"},
 	{"fieldname": "company", "label": "Company", "fieldtype": "Data"},
 	{"fieldname": "order_ean13", "label": "Armado EAN-13", "fieldtype": "Data"},
 	{"fieldname": "_map", "label": "Warehouse Map", "fieldtype": "JSON"},
@@ -196,27 +197,99 @@ def _positive_float(raw):
 	return v if v > 0 else None
 
 
-def _so_line_total_weight(so_name, so_detail=None, item_code=None):
-	"""Measured kg on the source Sales Order Item (DN often drops / zeroes it)."""
+def _so_line_row(so_name, so_detail=None, item_code=None):
+	"""First matching Sales Order Item row (qty/uom/weight) for print Unid/Peso."""
 	so = cstr(so_name or "").strip()
 	if not so or not frappe.db.exists("Sales Order", so):
 		return None
 	detail = cstr(so_detail or "").strip()
+	fields = ["qty", "uom", "stock_uom", "weight_per_unit", "total_weight"]
 	if detail and frappe.db.exists("Sales Order Item", detail):
-		return _positive_float(frappe.db.get_value("Sales Order Item", detail, "total_weight"))
+		return frappe.db.get_value("Sales Order Item", detail, fields, as_dict=True)
 	code = cstr(item_code or "").strip()
 	if not code:
 		return None
 	rows = frappe.get_all(
 		"Sales Order Item",
 		filters={"parent": so, "item_code": code},
-		fields=["total_weight"],
+		fields=fields,
 		limit_page_length=1,
 		ignore_permissions=True,
 	)
-	if not rows:
+	return rows[0] if rows else None
+
+
+def _so_line_total_weight(so_name, so_detail=None, item_code=None):
+	"""Measured kg on the source Sales Order Item (DN often drops / zeroes it)."""
+	row = _so_line_row(so_name, so_detail=so_detail, item_code=item_code)
+	if not row:
 		return None
-	return _positive_float(rows[0].get("total_weight"))
+	return _positive_float(row.get("total_weight"))
+
+
+def _um_display(uom) -> str:
+	"""3-letter UM for remito/factura: Kil (weight) or Uni (countable). Never NOS."""
+	if _is_mass_uom(uom) or _is_catalog_weight_uom(uom):
+		return "Kil"
+	return "Uni"
+
+
+def _format_units_qty(raw) -> str:
+	"""Whole packs as integers; keep decimals when needed."""
+	if raw in (None, ""):
+		return ""
+	try:
+		v = float(raw)
+	except (TypeError, ValueError):
+		return ""
+	if not (v > 0) or not (v < 1e9):
+		return ""
+	if abs(v - round(v)) < 1e-6:
+		return str(int(round(v)))
+	return f"{v:.3f}".rstrip("0").rstrip(".")
+
+
+def _format_peso_display(total_w, *, tx_uom) -> str:
+	"""Peso column: measured/est. kg, or '-' when the line is not sold by weight."""
+	# Countable UM (Nos/Uni/CAJA) → always dash, even if Item.weight_uom is Kg.
+	if not (_is_mass_uom(tx_uom) or _is_catalog_weight_uom(tx_uom)):
+		return "-"
+	tw = _positive_float(total_w)
+	if tw is None:
+		return "-"
+	text = f"{tw:.3f}".rstrip("0").rstrip(".")
+	return text or "-"
+
+
+def _line_units_requested(row: dict, *, line_wpu: float, total_w) -> str:
+	"""Unid = packs/units requested (not kg). Prefer SO pack qty when SI bills in Kg."""
+	tx_uom = row.get("uom") or row.get("stock_uom") or ""
+	qty = flt(row.get("qty"))
+
+	# Catalog WEIGHT / Nos / CAJA: qty is the unit count.
+	if not _is_mass_uom(tx_uom):
+		return _format_units_qty(qty)
+
+	# Mass UOM on SI/DN: qty is kg — recover packs from SO or weight_per_unit.
+	so = _so_line_row(
+		row.get("against_sales_order") or row.get("sales_order"),
+		so_detail=row.get("so_detail") or row.get("against_sales_order_item"),
+		item_code=row.get("item_code"),
+	)
+	if so:
+		so_uom = so.get("uom") or so.get("stock_uom") or ""
+		so_qty = flt(so.get("qty"))
+		if so_qty > 0 and not _is_mass_uom(so_uom):
+			return _format_units_qty(so_qty)
+		so_wpu = _positive_float(so.get("weight_per_unit")) or line_wpu
+		so_tw = _positive_float(so.get("total_weight")) or _positive_float(total_w)
+		if so_wpu and so_tw:
+			return _format_units_qty(float(so_tw) / float(so_wpu))
+
+	tw = _positive_float(total_w)
+	if line_wpu and tw:
+		return _format_units_qty(float(tw) / float(line_wpu))
+	return ""
 
 
 def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) -> dict:
@@ -250,11 +323,12 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 	tx_uom = out.get("uom") or stock_uom or line_wuom
 	if existing_tw is not None:
 		total_w = existing_tw
-	elif line_wpu and qty:
-		total_w = line_wpu * qty
 	elif weight_based and qty and _is_mass_uom(tx_uom):
-		# Real mass UOM (kg/g): qty itself is the weight.
+		# Real mass UOM (kg/g): qty itself is the weight (wpu is only for Unid).
 		total_w = qty
+	elif line_wpu and qty:
+		# Catalog WEIGHT / Nos packs: estimate kg from pack count × wpu.
+		total_w = line_wpu * qty
 	else:
 		# Catalog WEIGHT / Nos without measured kg or pack weight → blank.
 		total_w = None
@@ -268,6 +342,10 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 	aw = _positive_float(out.get("actual_weight"))
 	out["actual_weight"] = aw if aw is not None else ""
 	out["is_weight_based"] = 1 if weight_based else 0
+	# Factura-con-pesos columns: Unid / Peso / UM (3-letter Uni|Kil).
+	out["um_display"] = _um_display(tx_uom)
+	out["units_qty"] = _line_units_requested(out, line_wpu=line_wpu, total_w=total_w)
+	out["peso_display"] = _format_peso_display(total_w, tx_uom=tx_uom)
 	# Armado sheets: hide $ until weighed. Remito/SI keep billed amount for Importe.
 	if (
 		blank_unknown_weight_amount
@@ -830,23 +908,14 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 	)
 
 	vendedor = getattr(so, "sales_person", None) or so.owner or ""
-	# Delivery trip / driver if linked
-	fletero = ""
-	try:
-		trip = frappe.db.sql(
-			"""
-			SELECT dt.driver_name, dt.name
-			FROM `tabDelivery Trip` dt
-			INNER JOIN `tabDelivery Stop` ds ON ds.parent = dt.name
-			WHERE ds.customer = %s AND dt.docstatus < 2
-			ORDER BY dt.modified DESC LIMIT 1
-			""",
-			(so.customer,),
-		)
-		if trip:
-			fletero = trip[0][0] or trip[0][1] or ""
-	except Exception:
-		fletero = ""
+	# MAT / fletero from the remito's Delivery Trip (empty when not on a MAT).
+	dn_name = frappe.db.get_value(
+		"Delivery Note Item",
+		{"against_sales_order": sales_order_name, "docstatus": ["!=", 2]},
+		"parent",
+	)
+	mat_ref = _mat_ref_for_delivery_note(dn_name) if dn_name else ""
+	fletero = _fletero_for_delivery_note(dn_name) if dn_name else ""
 
 	cargado = ""
 	if so.modified:
@@ -937,6 +1006,7 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"vendedor": vendedor,
 		"zona": zona,
 		"horario": horario,
+		"mat_ref": mat_ref,
 		"fletero": fletero,
 		"cargado": cargado,
 		"armado_flag": "SI" if has_dn else "NO",
@@ -1022,6 +1092,13 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 				data[k] = v
 		if not data.get("vendedor"):
 			data["vendedor"] = data.get("sales_person") or data.get("owner") or ""
+		# SI/DN often store HTML address_display; customer_address is the print field.
+		if not data.get("customer_address"):
+			data["customer_address"] = (
+				data.get("address_display")
+				or data.get("customer_address_display")
+				or ""
+			)
 	elif source_doctype == "Purchase Receipt":
 		meta = _party_print_meta("Supplier", data.get("supplier"))
 		for k, v in meta.items():
@@ -1046,8 +1123,27 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 				break
 		data["pedido_ref"] = ref or data.get("against_sales_order") or ""
 
+	# MAT = Delivery Trip (MAT-DT-…), not the remito (MAT-DN-…). Empty if unassigned.
+	dn_for_mat = None
+	if source_doctype == "Delivery Note":
+		dn_for_mat = data.get("name")
+	elif source_doctype == "Sales Invoice":
+		so_ref = data.get("pedido_ref")
+		if so_ref:
+			dn_for_mat = frappe.db.get_value(
+				"Delivery Note Item",
+				{"against_sales_order": so_ref, "docstatus": ["!=", 2]},
+				"parent",
+			)
+	if not data.get("mat_ref"):
+		data["mat_ref"] = _mat_ref_for_delivery_note(dn_for_mat) if dn_for_mat else ""
 	if not data.get("fletero"):
-		data["fletero"] = ""
+		fletero = ""
+		if source_doctype == "Delivery Note":
+			fletero = _fletero_for_delivery_note(data.get("name"))
+		elif source_doctype == "Sales Invoice" and dn_for_mat:
+			fletero = _fletero_for_delivery_note(dn_for_mat)
+		data["fletero"] = fletero or ""
 	if not data.get("set_warehouse") and rows:
 		wh = next(
 			(r.get("warehouse") for r in rows if isinstance(r, dict) and r.get("warehouse")),
@@ -1055,6 +1151,46 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 		)
 		if wh:
 			data["set_warehouse"] = wh
+
+
+def _trip_row_for_delivery_note(dn_name):
+	"""Active Delivery Trip (MAT) for a remito — None when not assigned."""
+	dn_name = cstr(dn_name or "").strip()
+	if not dn_name:
+		return None
+	try:
+		rows = frappe.db.sql(
+			"""
+			SELECT dt.name AS trip_name,
+				COALESCE(NULLIF(dt.driver_name, ''), dt.driver, '') AS fletero
+			FROM `tabDelivery Trip` dt
+			INNER JOIN `tabDelivery Stop` ds ON ds.parent = dt.name
+			WHERE ds.delivery_note = %s AND dt.docstatus < 2
+			ORDER BY dt.modified DESC
+			LIMIT 1
+			""",
+			(dn_name,),
+			as_dict=True,
+		)
+		return rows[0] if rows else None
+	except Exception:
+		return None
+
+
+def _fletero_for_delivery_note(dn_name) -> str:
+	"""Driver name from the active Delivery Trip stop that carries this remito."""
+	row = _trip_row_for_delivery_note(dn_name)
+	if not row:
+		return ""
+	return cstr(row.get("fletero") or "").strip()
+
+
+def _mat_ref_for_delivery_note(dn_name) -> str:
+	"""MAT / Delivery Trip name — empty when the remito is not on a trip."""
+	row = _trip_row_for_delivery_note(dn_name)
+	if not row:
+		return ""
+	return cstr(row.get("trip_name") or "").strip()
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1597,12 +1733,20 @@ def _compact_party_doc_header_elements(
 	doc_badge_label: str = "Pedido:",
 	doc_badge_field: str = "name",
 	meta_rows: list | None = None,
+	wide_meta: tuple | None = None,
 	font: int = 10,
 	y0: int = 10,
+	show_party_totals: bool = False,
+	importe_field: str = "grand_total",
+	peso_field: str = "total_weight",
 ) -> list:
 	"""Compressed two-column header (Armado style): party box + doc badge + meta grid.
 
-	Keeps vertical space ~44mm so line-items start early on A4.
+	When ``show_party_totals``, Total Importe / Total Peso sit under Cond. IVA inside
+	the client box (frees the page footer for the tear-off strip).
+
+	``wide_meta`` = (label, fieldPath) renders a full-width row under the badge
+	(used for long Sales Order names that do not fit the 2-col meta cells).
 	"""
 	fs = font
 	fs_sm = max(8, font - 1)
@@ -1612,6 +1756,8 @@ def _compact_party_doc_header_elements(
 		("Cargado:", "cargado", "Armado:", "armado_flag"),
 		("Facturado:", "facturado_flag", "CUIT:", "tax_id"),
 	]
+	# Taller party box when totals live under Cond. IVA.
+	box_h = 40 if show_party_totals else 28
 	els = []
 	# Left: party box
 	els.extend(
@@ -1622,7 +1768,7 @@ def _compact_party_doc_header_elements(
 				"x": 10,
 				"y": y0,
 				"width": 105,
-				"height": 28,
+				"height": box_h,
 				"shapeType": "rect",
 				"color": "#94a3b8",
 				"filled": False,
@@ -1694,6 +1840,65 @@ def _compact_party_doc_header_elements(
 			},
 		]
 	)
+	if show_party_totals:
+		els.extend(
+			[
+				{
+					"id": f"{p}-imp-label",
+					"kind": "text",
+					"x": 12,
+					"y": y0 + 25,
+					"width": 28,
+					"height": 5,
+					"staticText": "Total Importe:",
+					"fontSize": fs_sm,
+					"bold": True,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-imp",
+					"kind": "field",
+					"x": 40,
+					"y": y0 + 25,
+					"width": 32,
+					"height": 5,
+					"fieldPath": importe_field,
+					"label": "Total Importe",
+					"fontSize": fs_sm,
+					"bold": True,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-tw-label",
+					"kind": "text",
+					"x": 74,
+					"y": y0 + 25,
+					"width": 22,
+					"height": 5,
+					"staticText": "Total Peso:",
+					"fontSize": fs_sm,
+					"bold": True,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-tw",
+					"kind": "field",
+					"x": 96,
+					"y": y0 + 25,
+					"width": 16,
+					"height": 5,
+					"fieldPath": peso_field,
+					"label": "Total Peso",
+					"fontSize": fs_sm,
+					"bold": True,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+			]
+		)
 	# Right: document number badge + meta grid
 	els.extend(
 		[
@@ -1739,7 +1944,41 @@ def _compact_party_doc_header_elements(
 		]
 	)
 	meta_y = y0 + 12
-	for i, (l1, f1, l2, f2) in enumerate(rows[:4]):
+	# Full-width row for long refs (e.g. SAL-ORD-2026-00363) — 2-col cells clip them.
+	if wide_meta and len(wide_meta) >= 2:
+		wlabel, wfield = wide_meta[0], wide_meta[1]
+		els.extend(
+			[
+				{
+					"id": f"{p}-wide-l",
+					"kind": "text",
+					"x": 120,
+					"y": meta_y,
+					"width": 18,
+					"height": 5,
+					"staticText": wlabel,
+					"fontSize": fs_sm,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-wide",
+					"kind": "field",
+					"x": 138,
+					"y": meta_y,
+					"width": 62,
+					"height": 5,
+					"fieldPath": wfield,
+					"label": wlabel,
+					"fontSize": fs_sm,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+			]
+		)
+		meta_y += 6
+	max_rows = 3 if wide_meta else 4
+	for i, (l1, f1, l2, f2) in enumerate(rows[:max_rows]):
 		yy = meta_y + i * 6
 		els.extend(
 			[
@@ -1798,9 +2037,94 @@ def _compact_party_doc_header_elements(
 	return els
 
 
-def _armado_meta_header_elements(p: str, *, font: int = 10, y0: int = 10) -> list:
+def _armado_meta_header_elements(p: str, *, font: int = 10, y0: int = 10, show_party_totals: bool = False) -> list:
 	"""Compressed header (screenshot-style): meta grid + cliente + pedido — no ENTREGAS title."""
-	return _compact_party_doc_header_elements(p, font=font, y0=y0)
+	return _compact_party_doc_header_elements(
+		p, font=font, y0=y0, show_party_totals=show_party_totals
+	)
+
+
+def _tear_off_strip_elements(
+	p: str,
+	*,
+	y: float,
+	doc_field: str = "name",
+	fletero_field: str = "fletero",
+	date_field: str = "posting_date",
+	copies: int = 5,
+	marker_id: str | None = None,
+) -> list:
+	"""Bottom cut-off strip: remito/pedido + fletero + fecha repeated for scissors.
+
+	Includes a solid cut bar + "cortar" cues so the tear edge is obvious on paper.
+	"""
+	els = []
+	# Solid cut bar (filled rect — more reliable in print than a 1px line)
+	els.append(
+		{
+			"id": marker_id or f"{p}-tear-cutbar-v5",
+			"kind": "shape",
+			"x": 10,
+			"y": y,
+			"width": 190,
+			"height": 1.2,
+			"shapeType": "rect",
+			"color": "#0f172a",
+			"filled": True,
+			"bgColor": "#0f172a",
+		}
+	)
+	n = max(1, int(copies))
+	col_w = 190 / n
+	inner_w = col_w - 2
+	for i in range(n):
+		x = 10 + i * col_w + 1
+		yy = y + 3
+		els.extend(
+			[
+				{
+					"id": f"{p}-tear{i}-doc",
+					"kind": "field",
+					"x": x,
+					"y": yy,
+					"width": inner_w,
+					"height": 5,
+					"fieldPath": doc_field,
+					"label": "Pedido",
+					"fontSize": 7,
+					"bold": True,
+					"align": "center",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-tear{i}-fletero",
+					"kind": "field",
+					"x": x,
+					"y": yy + 5,
+					"width": inner_w,
+					"height": 5,
+					"fieldPath": fletero_field,
+					"label": "Fletero",
+					"fontSize": 7,
+					"align": "center",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-tear{i}-fecha",
+					"kind": "field",
+					"x": x,
+					"y": yy + 10,
+					"width": inner_w,
+					"height": 5,
+					"fieldPath": date_field,
+					"label": "Fecha",
+					"fontSize": 7,
+					"align": "center",
+					"textColor": "#334155",
+				},
+			]
+		)
+	return els
 
 
 def _compact_commercial_a4_elements(
@@ -1815,14 +2139,30 @@ def _compact_commercial_a4_elements(
 	disclaimer: str | None = None,
 	address_field: str = "customer_address",
 	items_id_suffix: str = "v1",
+	layout: str = "classic",
+	doc_badge_field: str = "name",
+	wide_meta: tuple | None = None,
 ):
-	"""Armado-style A4: compact header + multi-column line items + signature footer."""
+	"""Armado-style A4: compact header + multi-column line items + footer.
+
+	``layout="classic"`` — totals/firma in the page footer (original starters).
+	``layout="tearoff"`` — totals in the client box + cut-line stub strip (variants).
+	"""
 	p = id_prefix
 	font = 11
-	header_h = 44
+	use_tear = layout == "tearoff" and footer_kind in ("remito", "invoice")
+	# Extra row when Pedido is full-width under the badge.
+	extra = 6 if wide_meta else 0
+	header_h = (52 if use_tear else 44) + extra
 	table_y = header_h + (8 if disclaimer else 4)
 	table_w = 190
-	items_h = 158 if footer_kind == "remito" else (165 if not disclaimer else 160)
+	if use_tear:
+		# Leave room for cut bar + label + 3-line stubs (~24mm).
+		items_h = (178 if not disclaimer else 172) - extra
+	elif footer_kind == "remito":
+		items_h = 158 - extra
+	else:
+		items_h = (165 if not disclaimer else 160) - extra
 
 	elements = _compact_party_doc_header_elements(
 		p,
@@ -1830,9 +2170,11 @@ def _compact_commercial_a4_elements(
 		party_field=party_field,
 		address_field=address_field,
 		doc_badge_label=doc_badge_label,
-		doc_badge_field="name",
+		doc_badge_field=doc_badge_field,
 		meta_rows=meta_rows,
+		wide_meta=wide_meta,
 		font=font,
+		show_party_totals=use_tear,
 	)
 	if disclaimer:
 		elements.append(
@@ -1865,7 +2207,19 @@ def _compact_commercial_a4_elements(
 		}
 	)
 	footer_y = table_y + items_h + 4
-	if footer_kind == "remito":
+	if use_tear:
+		elements.extend(
+			_tear_off_strip_elements(
+				p,
+				y=footer_y,
+				doc_field="name",
+				fletero_field="fletero",
+				date_field="posting_date",
+				copies=5,
+				marker_id=f"{p}-tear-cutbar-v5",
+			)
+		)
+	elif footer_kind == "remito":
 		elements.extend(
 			[
 				{
@@ -2033,15 +2387,22 @@ def _compact_commercial_a4_elements(
 	return elements
 
 
-def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem"):
-	"""Delivery Note remito — compact Armado header + shipped qty/importe columns."""
+def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem", *, layout: str = "classic"):
+	"""Delivery Note remito — compact Armado header + shipped qty/importe columns.
+
+	Badge shows MAT (Delivery Trip); empty when the remito is not on a trip.
+	Remito number stays in the meta grid; Pedido uses a full-width row so SO
+	names like SAL-ORD-2026-00363 are not clipped.
+	"""
 	return _compact_commercial_a4_elements(
 		id_prefix=id_prefix,
 		party_label="CLIENTE:",
 		party_field="customer_name",
-		doc_badge_label="Remito:",
+		doc_badge_label="MAT:",
+		doc_badge_field="mat_ref",
+		wide_meta=("Pedido:", "pedido_ref"),
 		meta_rows=[
-			("Fecha:", "posting_date", "Pedido:", "pedido_ref"),
+			("Fecha:", "posting_date", "Remito:", "name"),
 			("Vend:", "vendedor", "Zona:", "zona"),
 			("Almacen:", "set_warehouse", "Fletero:", "fletero"),
 			("CUIT:", "tax_id", "Horario:", "horario"),
@@ -2057,6 +2418,7 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem"):
 		],
 		footer_kind="remito",
 		items_id_suffix="v2",
+		layout=layout,
 	)
 
 
@@ -2087,19 +2449,519 @@ def _pr_remito_a4_elements(id_prefix: str = "starter-prrem", *, disclaimer: str 
 	)
 
 
-def _si_compact_a4_elements(id_prefix: str = "starter-sicomp", *, disclaimer: str | None = None):
+def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
+	"""English A4 Sales Invoice matching the commercial paper form.
+
+	Layout (top → bottom):
+	- Title / invoice # / date (top-right)
+	- Customer box: Customer, Address, Tax status, Tax ID
+	- Line table: Code, Description, Units, Quantity, UOM, Price, Disc., Total
+	- Observations (Vendedor / Zone / Schedule / Order) + signature + totals
+	"""
+	p = id_prefix
+	return [
+		# ── Header (top-right) ──────────────────────────────────────────
+		{
+			"id": f"{p}-title",
+			"kind": "text",
+			"x": 100,
+			"y": 10,
+			"width": 95,
+			"height": 10,
+			"staticText": "SALES INVOICE",
+			"fontSize": 14,
+			"bold": True,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-nro-label",
+			"kind": "text",
+			"x": 128,
+			"y": 22,
+			"width": 18,
+			"height": 6,
+			"staticText": "No.",
+			"fontSize": 9,
+			"bold": True,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-nro",
+			"kind": "field",
+			"x": 146,
+			"y": 22,
+			"width": 49,
+			"height": 6,
+			"fieldPath": "name",
+			"label": "Invoice No.",
+			"fontSize": 9,
+			"bold": True,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-fecha-label",
+			"kind": "text",
+			"x": 128,
+			"y": 30,
+			"width": 18,
+			"height": 6,
+			"staticText": "Date:",
+			"fontSize": 9,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-fecha",
+			"kind": "field",
+			"x": 146,
+			"y": 30,
+			"width": 49,
+			"height": 6,
+			"fieldPath": "posting_date",
+			"label": "Date",
+			"fontSize": 9,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		# ── Customer box ────────────────────────────────────────────────
+		{
+			"id": f"{p}-cli-box",
+			"kind": "shape",
+			"x": 12,
+			"y": 40,
+			"width": 186,
+			"height": 28,
+			"shapeType": "rect",
+			"color": "#334155",
+			"filled": False,
+		},
+		{
+			"id": f"{p}-cli-label",
+			"kind": "text",
+			"x": 14,
+			"y": 42,
+			"width": 24,
+			"height": 5,
+			"staticText": "Customer:",
+			"fontSize": 9,
+			"bold": True,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-cli",
+			"kind": "field",
+			"x": 38,
+			"y": 42,
+			"width": 156,
+			"height": 5,
+			"fieldPath": "customer_name",
+			"label": "Customer",
+			"fontSize": 10,
+			"bold": True,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-addr-label",
+			"kind": "text",
+			"x": 14,
+			"y": 49,
+			"width": 24,
+			"height": 5,
+			"staticText": "Address:",
+			"fontSize": 9,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-addr",
+			"kind": "field",
+			"x": 38,
+			"y": 49,
+			"width": 156,
+			"height": 6,
+			"fieldPath": "customer_address",
+			"label": "Address",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-taxst-label",
+			"kind": "text",
+			"x": 14,
+			"y": 58,
+			"width": 28,
+			"height": 5,
+			"staticText": "Tax status:",
+			"fontSize": 9,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-taxst",
+			"kind": "field",
+			"x": 42,
+			"y": 58,
+			"width": 70,
+			"height": 5,
+			"fieldPath": "tax_category",
+			"label": "Tax status",
+			"fontSize": 9,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-taxid-label",
+			"kind": "text",
+			"x": 118,
+			"y": 58,
+			"width": 18,
+			"height": 5,
+			"staticText": "Tax ID:",
+			"fontSize": 9,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-taxid",
+			"kind": "field",
+			"x": 136,
+			"y": 58,
+			"width": 58,
+			"height": 5,
+			"fieldPath": "tax_id",
+			"label": "Tax ID",
+			"fontSize": 9,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		# ── Line items (photo columns) ──────────────────────────────────
+		{
+			"id": f"{p}-items-v1",
+			"kind": "line-items",
+			"x": 12,
+			"y": 74,
+			"width": 186,
+			"height": 130,
+			"childTableFieldname": "items",
+			"headerBg": "#64748b",
+			"headerColor": "#ffffff",
+			"columns": [
+				{"fieldPath": "item_code", "label": "Code", "width": 22},
+				{"fieldPath": "item_name", "label": "Description", "width": 52},
+				{"fieldPath": "stock_qty", "label": "Units", "width": 14},
+				{"fieldPath": "qty", "label": "Quantity", "width": 20},
+				{"fieldPath": "uom", "label": "UOM", "width": 14},
+				{"fieldPath": "rate", "label": "Price", "width": 22},
+				{"fieldPath": "discount_percentage", "label": "Disc.", "width": 14},
+				{"fieldPath": "amount", "label": "Total", "width": 22},
+			],
+		},
+		# ── Observations (bottom-left) ──────────────────────────────────
+		{
+			"id": f"{p}-obs-box",
+			"kind": "shape",
+			"x": 12,
+			"y": 210,
+			"width": 100,
+			"height": 42,
+			"shapeType": "rect",
+			"color": "#334155",
+			"filled": False,
+		},
+		{
+			"id": f"{p}-obs-title",
+			"kind": "text",
+			"x": 14,
+			"y": 212,
+			"width": 40,
+			"height": 5,
+			"staticText": "Observations",
+			"fontSize": 9,
+			"bold": True,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-vend-label",
+			"kind": "text",
+			"x": 14,
+			"y": 220,
+			"width": 24,
+			"height": 5,
+			"staticText": "Salesperson:",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-vend",
+			"kind": "field",
+			"x": 38,
+			"y": 220,
+			"width": 70,
+			"height": 5,
+			"fieldPath": "vendedor",
+			"label": "Salesperson",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-zona-label",
+			"kind": "text",
+			"x": 14,
+			"y": 227,
+			"width": 24,
+			"height": 5,
+			"staticText": "Zone:",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-zona",
+			"kind": "field",
+			"x": 38,
+			"y": 227,
+			"width": 70,
+			"height": 5,
+			"fieldPath": "zona",
+			"label": "Zone",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-hor-label",
+			"kind": "text",
+			"x": 14,
+			"y": 234,
+			"width": 24,
+			"height": 5,
+			"staticText": "Schedule:",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-hor",
+			"kind": "field",
+			"x": 38,
+			"y": 234,
+			"width": 70,
+			"height": 5,
+			"fieldPath": "horario",
+			"label": "Schedule",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-ped-label",
+			"kind": "text",
+			"x": 14,
+			"y": 241,
+			"width": 24,
+			"height": 5,
+			"staticText": "Order:",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-ped",
+			"kind": "field",
+			"x": 38,
+			"y": 241,
+			"width": 70,
+			"height": 5,
+			"fieldPath": "pedido_ref",
+			"label": "Order",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		# ── Totals (bottom-right, shaded) ───────────────────────────────
+		{
+			"id": f"{p}-tot-box",
+			"kind": "shape",
+			"x": 120,
+			"y": 210,
+			"width": 78,
+			"height": 28,
+			"shapeType": "rect",
+			"color": "#cbd5e1",
+			"filled": True,
+			"bgColor": "#e2e8f0",
+		},
+		{
+			"id": f"{p}-sub-label",
+			"kind": "text",
+			"x": 124,
+			"y": 214,
+			"width": 30,
+			"height": 6,
+			"staticText": "Subtotal",
+			"fontSize": 10,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-sub",
+			"kind": "field",
+			"x": 154,
+			"y": 214,
+			"width": 40,
+			"height": 6,
+			"fieldPath": "net_total",
+			"label": "Subtotal",
+			"fontSize": 10,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-total-label",
+			"kind": "text",
+			"x": 124,
+			"y": 226,
+			"width": 30,
+			"height": 8,
+			"staticText": "TOTAL $",
+			"fontSize": 12,
+			"bold": True,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-total",
+			"kind": "field",
+			"x": 154,
+			"y": 226,
+			"width": 40,
+			"height": 8,
+			"fieldPath": "grand_total",
+			"label": "TOTAL",
+			"fontSize": 13,
+			"bold": True,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		# ── Signature ───────────────────────────────────────────────────
+		{
+			"id": f"{p}-firma-label",
+			"kind": "text",
+			"x": 12,
+			"y": 260,
+			"width": 120,
+			"height": 6,
+			"staticText": "Received in Good Order (Signature and Print Name):",
+			"fontSize": 8,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-firma-line",
+			"kind": "shape",
+			"x": 12,
+			"y": 274,
+			"width": 100,
+			"height": 1,
+			"shapeType": "line",
+			"color": "#0f172a",
+		},
+	]
+
+
+def _en_sales_invoice_with_weights_a4_elements(id_prefix: str = "starter-sienw"):
+	"""English non-fiscal Sales Invoice with Unid / Peso / UM (Uni|Kil).
+
+	Photo form columns: Description, Units, Weight, UM, Price, Disc., Total.
+	Peso shows measured kg or '-' when the line is not sold by weight.
+	UM is always 3 letters (Uni / Kil) — never NOS.
+	"""
+	import copy
+
+	elements = copy.deepcopy(_en_sales_invoice_commercial_a4_elements(id_prefix=id_prefix))
+	# Non-fiscal banner (Spanish name later: Factura No valid. Con pesos).
+	elements.insert(
+		1,
+		{
+			"id": f"{id_prefix}-novalid",
+			"kind": "text",
+			"x": 100,
+			"y": 20,
+			"width": 95,
+			"height": 5,
+			"staticText": "DOCUMENT NOT VALID AS INVOICE",
+			"fontSize": 7,
+			"bold": True,
+			"align": "right",
+			"textColor": "#b91c1c",
+		},
+	)
+	# Nudge invoice # / date down so they clear the banner.
+	for el in elements:
+		if not isinstance(el, dict):
+			continue
+		eid = el.get("id") or ""
+		if eid in (
+			f"{id_prefix}-nro-label",
+			f"{id_prefix}-nro",
+			f"{id_prefix}-fecha-label",
+			f"{id_prefix}-fecha",
+		):
+			el["y"] = float(el.get("y") or 0) + 4
+
+	for el in elements:
+		if not isinstance(el, dict) or el.get("kind") != "line-items":
+			continue
+		el["id"] = f"{id_prefix}-items-v1"
+		el["columns"] = [
+			{"fieldPath": "item_name", "label": "Description", "width": 58},
+			{"fieldPath": "units_qty", "label": "Units", "width": 14},
+			{"fieldPath": "peso_display", "label": "Weight", "width": 18},
+			{"fieldPath": "um_display", "label": "UM", "width": 12},
+			{"fieldPath": "rate", "label": "Price", "width": 22},
+			{"fieldPath": "discount_percentage", "label": "Disc.", "width": 14},
+			{"fieldPath": "amount", "label": "Total", "width": 22},
+		]
+		break
+	return elements
+
+
+def _si_compact_a4_elements(
+	id_prefix: str = "starter-sicomp",
+	*,
+	disclaimer: str | None = None,
+	layout: str = "classic",
+):
 	"""Sales Invoice / non-fiscal compact — Armado header + money columns."""
+	meta = [
+		("Fecha:", "posting_date", "Pedido:", "pedido_ref"),
+		("Vend:", "vendedor", "Zona:", "zona"),
+		("CUIT:", "tax_id", "Cond. IVA:", "tax_category"),
+		("Pago:", "mode_of_payment", "Horario:", "horario"),
+	]
+	if layout == "tearoff":
+		# Tear strip needs fletero visible in the header meta too.
+		meta = [
+			("Fecha:", "posting_date", "Pedido:", "pedido_ref"),
+			("Vend:", "vendedor", "Zona:", "zona"),
+			("CUIT:", "tax_id", "Fletero:", "fletero"),
+			("Pago:", "mode_of_payment", "Horario:", "horario"),
+		]
 	return _compact_commercial_a4_elements(
 		id_prefix=id_prefix,
 		party_label="CLIENTE:",
 		party_field="customer_name",
 		doc_badge_label="Doc:",
-		meta_rows=[
-			("Fecha:", "posting_date", "Pedido:", "pedido_ref"),
-			("Vend:", "vendedor", "Zona:", "zona"),
-			("CUIT:", "tax_id", "Cond. IVA:", "tax_category"),
-			("Pago:", "mode_of_payment", "Horario:", "horario"),
-		],
+		meta_rows=meta,
 		columns=[
 			{"fieldPath": "code_display", "label": "Codigo", "width": 32},
 			{"fieldPath": "item_name", "label": "Detalle", "width": 52},
@@ -2110,6 +2972,7 @@ def _si_compact_a4_elements(id_prefix: str = "starter-sicomp", *, disclaimer: st
 		],
 		footer_kind="invoice",
 		disclaimer=disclaimer,
+		layout=layout,
 	)
 
 
@@ -2119,6 +2982,7 @@ def _ar_entregas_checklist_a4_elements(
 	with_location: bool = False,
 	with_map: bool = False,
 	mode: str = "almacen",
+	layout: str = "classic",
 ):
 	"""A4 armado layouts.
 
@@ -2126,13 +2990,16 @@ def _ar_entregas_checklist_a4_elements(
 	mode=almacen — warehouse/location focused + ARMADO confirmation columns.
 	PEDIDO + ARMADO share one line-items table so row heights stay aligned.
 	Compressed header; larger type; no ENTREGAS title block.
+
+	``layout="tearoff"`` — totals in client box + cut-line stub strip (variant starters).
 	"""
 	p = id_prefix
 	font = 12
 	# Leave top strip for scannable EAN (left) so it does not cover Pedido meta.
 	barcode_h = 16
 	header_y0 = 3 + barcode_h + 3  # 22
-	header_h = header_y0 + 34  # ~56 — party box 28 + meta rows
+	use_tear = layout == "tearoff"
+	header_h = header_y0 + (42 if use_tear else 34)
 	table_y = header_h + 4
 
 	if mode == "peso_indefinido":
@@ -2171,9 +3038,14 @@ def _ar_entregas_checklist_a4_elements(
 		armado_label_x = 10 + pedido_label_w
 		armado_label_w = 34
 
-	items_h = 95 if with_map else 175
+	if use_tear:
+		items_h = 80 if with_map else 178
+	else:
+		items_h = 95 if with_map else 175
 
-	elements = _armado_meta_header_elements(p, font=font, y0=header_y0)
+	elements = _armado_meta_header_elements(
+		p, font=font, y0=header_y0, show_party_totals=use_tear
+	)
 	# Scannable armado EAN-13 (prefix 290…) — top-left so Pedido meta stays readable
 	elements.append(
 		{
@@ -2234,8 +3106,9 @@ def _ar_entregas_checklist_a4_elements(
 		}
 	)
 
-	footer_y = table_y + items_h + 6
+	footer_y = table_y + items_h + (4 if use_tear else 6)
 	if with_map:
+		map_h = 40 if use_tear else 45
 		elements.append(
 			{
 				"id": f"{p}-map",
@@ -2243,64 +3116,78 @@ def _ar_entregas_checklist_a4_elements(
 				"x": 10,
 				"y": footer_y,
 				"width": 190,
-				"height": 45,
+				"height": map_h,
 				"fieldPath": "_map",
 			}
 		)
-		footer_y += 50
+		footer_y += map_h + (4 if use_tear else 5)
 
-	elements.extend(
-		[
-			{
-				"id": f"{p}-tw-label",
-				"kind": "text",
-				"x": 10,
-				"y": footer_y,
-				"width": 28,
-				"height": 6,
-				"staticText": "Peso tot:",
-				"fontSize": 10,
-				"align": "left",
-				"textColor": "#0f172a",
-			},
-			{
-				"id": f"{p}-tw",
-				"kind": "field",
-				"x": 38,
-				"y": footer_y,
-				"width": 36,
-				"height": 6,
-				"fieldPath": "total_weight",
-				"label": "Peso total",
-				"fontSize": 11,
-				"align": "left",
-				"textColor": "#0f172a",
-			},
-			{
-				"id": f"{p}-firma-label",
-				"kind": "text",
-				"x": 110,
-				"y": footer_y,
-				"width": 90,
-				"height": 6,
-				"staticText": "Recibi Conforme (Firma y Aclaración):",
-				"fontSize": 9,
-				"align": "left",
-				"textColor": "#0f172a",
-			},
-			{
-				"id": f"{p}-firma-line",
-				"kind": "shape",
-				"x": 110,
-				"y": footer_y + 12,
-				"width": 90,
-				"height": 1,
-				"shapeType": "line",
-				"color": "#0f172a",
-			},
-		]
-	)
+	if use_tear:
+		elements.extend(
+			_tear_off_strip_elements(
+				p,
+				y=footer_y,
+				doc_field="name",
+				fletero_field="fletero",
+				date_field="posting_date",
+				copies=5,
+				marker_id=f"{p}-tear-cutbar-v5",
+			)
+		)
+	else:
+		elements.extend(
+			[
+				{
+					"id": f"{p}-tw-label",
+					"kind": "text",
+					"x": 10,
+					"y": footer_y,
+					"width": 28,
+					"height": 6,
+					"staticText": "Peso tot:",
+					"fontSize": 10,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-tw",
+					"kind": "field",
+					"x": 38,
+					"y": footer_y,
+					"width": 36,
+					"height": 6,
+					"fieldPath": "total_weight",
+					"label": "Peso total",
+					"fontSize": 11,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-firma-label",
+					"kind": "text",
+					"x": 110,
+					"y": footer_y,
+					"width": 90,
+					"height": 6,
+					"staticText": "Recibi Conforme (Firma y Aclaración):",
+					"fontSize": 9,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-firma-line",
+					"kind": "shape",
+					"x": 110,
+					"y": footer_y + 12,
+					"width": 90,
+					"height": 1,
+					"shapeType": "line",
+					"color": "#0f172a",
+				},
+			]
+		)
 	return elements
+
 
 
 
@@ -2313,12 +3200,71 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-siad-items-v1",
+		# Restore classic footer totals after accidental tearoff overwrite.
+		"resync_if_missing_id": "starter-siad-classic-v4",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _si_compact_a4_elements(
 			id_prefix="starter-siad",
 			disclaimer="DOCUMENTO NO VALIDO COMO FACTURA",
+			layout="classic",
+		)
+		+ [
+			{
+				"id": "starter-siad-classic-v4",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
+	},
+	# Variant: totals in client box + cut-line stub strip (does not replace classic).
+	{
+		"template_name": "Documento no válido como factura · tira (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-siadtear-tear-cutbar-v5",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _si_compact_a4_elements(
+			id_prefix="starter-siadtear",
+			disclaimer="DOCUMENTO NO VALIDO COMO FACTURA",
+			layout="tearoff",
 		),
+	},
+	# ── Sales Invoice · English commercial A4 (photo form; locales on request) ─
+	{
+		"template_name": "Sales Invoice (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-sien-items-v1",
+		# English first — do not auto-clone ES/CH until explicitly approved.
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _en_sales_invoice_commercial_a4_elements(id_prefix="starter-sien"),
+	},
+	# ── Sales Invoice · non-fiscal with Unid/Peso/UM (ES name later) ────
+	{
+		"template_name": "Invoice (no valid.) with weights",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-sienw-items-v1",
+		# English first — Spanish "Factura No valid. Con pesos" on request.
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _en_sales_invoice_with_weights_a4_elements(id_prefix="starter-sienw"),
 	},
 	# ── Sales Invoice ──────────────────────────────────────────────────
 	{
@@ -2774,14 +3720,29 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-peso-order-ean13-left",
+		# Restore classic footer after accidental tearoff overwrite.
+		"resync_if_missing_id": "starter-peso-classic-v4",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-peso",
 			with_location=False,
 			with_map=False,
 			mode="peso_indefinido",
-		),
+			layout="classic",
+		)
+		+ [
+			{
+				"id": "starter-peso-classic-v4",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	{
 		"template_name": "Armado Almacen (A4)",
@@ -2790,14 +3751,28 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-alm-order-ean13-left",
+		"resync_if_missing_id": "starter-alm-classic-v4",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-alm",
 			with_location=True,
 			with_map=False,
 			mode="almacen",
-		),
+			layout="classic",
+		)
+		+ [
+			{
+				"id": "starter-alm-classic-v4",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	{
 		"template_name": "Armado Almacen + Mapa (A4)",
@@ -2806,13 +3781,45 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-almmap-order-ean13-left",
+		"resync_if_missing_id": "starter-almmap-classic-v4",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-almmap",
 			with_location=True,
 			with_map=True,
 			mode="almacen",
+			layout="classic",
+		)
+		+ [
+			{
+				"id": "starter-almmap-classic-v4",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
+	},
+	# Variant: armado with client-box totals + cut-line stub strip.
+	{
+		"template_name": "Armado · tira recortable (A4)",
+		"source_doctype": "Delivery Checklist",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-pesotear-tear-cutbar-v5",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_entregas_checklist_a4_elements(
+			id_prefix="starter-pesotear",
+			with_location=False,
+			with_map=False,
+			mode="peso_indefinido",
+			layout="tearoff",
 		),
 	},
 	# ── Delivery Note · A4 remito (compact Armado header) ───────────────
@@ -2823,10 +3830,48 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		# v2: Importe column + Importe tot footer (was qty/peso-only v1).
-		"resync_if_missing_id": "starter-dnrem-items-v2",
+		# MAT badge + full-width Pedido (was classic-v4 / DN-as-badge).
+		"resync_if_missing_id": "starter-dnrem-mat-v6",
 		"margin_mm": [8, 8, 8, 8],
-		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem"),
+		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem", layout="classic")
+		+ [
+			{
+				"id": "starter-dnrem-mat-v6",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
+	},
+	# Variant: totals in client box + cut-line stub strip (does not replace classic).
+	{
+		"template_name": "Remito · tira recortable (A4)",
+		"source_doctype": "Delivery Note",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-dnremtear-mat-v6",
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _dn_remito_a4_elements(id_prefix="starter-dnremtear", layout="tearoff")
+		+ [
+			{
+				"id": "starter-dnremtear-mat-v6",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	# ── TMS delivery tickets (Delivery Note · Thermal 80mm) ─────────────
 	{
@@ -2946,6 +3991,10 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Peso medido": ("Peso medido", "实称重量"),
 		"Peso total": ("Peso total", "总重量"),
 		"Peso total:": ("Peso total:", "总重量："),
+		"Total Importe:": ("Total Importe:", "总金额："),
+		"Total Importe": ("Total Importe", "总金额"),
+		"Total Peso:": ("Total Peso:", "总重量："),
+		"Total Peso": ("Total Peso", "总重量"),
 		"P.tot": ("P.tot", "总重"),
 		"Desde": ("Desde", "库位"),
 		"Ubicación": ("Ubicación", "位置"),
@@ -2956,7 +4005,48 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"ENTREGAS": ("ENTREGAS", "发货单"),
 		"PEDIDO": ("PEDIDO", "订单"),
 		"Remito:": ("Remito:", "出库单："),
+		"MAT:": ("MAT:", "MAT："),
 		"Doc:": ("Doc:", "单据："),
+		# English Sales Invoice commercial A4 (locale expand when approved)
+		"SALES INVOICE": ("FACTURA DE VENTA", "销售发票"),
+		"No.": ("N°", "编号"),
+		"Invoice No.": ("N° Factura", "发票号"),
+		"Date:": ("Fecha:", "日期："),
+		"Customer:": ("Cliente:", "客户："),
+		"Address:": ("Dirección:", "地址："),
+		"Tax status:": ("Cond. IVA:", "IVA条件："),
+		"Tax status": ("Cond. IVA", "IVA条件"),
+		"Tax ID:": ("CUIT:", "税号："),
+		"Tax ID": ("CUIT", "税号"),
+		"Code": ("Codigo", "编码"),
+		"Description": ("Detalle", "明细"),
+		"Units": ("Unid", "件数"),
+		"Quantity": ("Cantidad", "数量"),
+		"Weight": ("Peso", "重量"),
+		"UOM": ("UM", "单位"),
+		"UM": ("UM", "单位"),
+		"Price": ("Precio", "单价"),
+		"Disc.": ("Dto", "折扣"),
+		"Total": ("Total", "合计"),
+		"DOCUMENT NOT VALID AS INVOICE": (
+			"DOCUMENTO NO VALIDO COMO FACTURA",
+			"非正式发票单据",
+		),
+		"Observations": ("Observaciones", "备注"),
+		"Salesperson:": ("Vendedor:", "销售："),
+		"Salesperson": ("Vendedor", "销售"),
+		"Zone:": ("Zona:", "区域："),
+		"Zone": ("Zona", "区域"),
+		"Schedule:": ("Horario:", "时段："),
+		"Schedule": ("Horario", "时段"),
+		"Order:": ("Pedido:", "订单："),
+		"Order": ("Pedido", "订单"),
+		"Subtotal": ("Subtotal", "小计"),
+		"TOTAL $": ("TOTAL $", "合计 $"),
+		"Received in Good Order (Signature and Print Name):": (
+			"Recibi Conforme (Firma y Aclaración):",
+			"收货确认（签名）：",
+		),
 		"PROVEEDOR:": ("PROVEEDOR:", "供应商："),
 		"Almacen:": ("Almacen:", "仓库："),
 		"PO:": ("PO:", "采购单："),
@@ -3054,13 +4144,19 @@ def _localize_elements(elements, locale: str):
 
 
 def _expand_locale_starter_templates(base_starters):
-	"""Duplicate every starter as ES - … and CH - … localized copies."""
+	"""Duplicate every starter as ES - … and CH - … localized copies.
+
+	Starters with ``skip_locale_expand: True`` stay English-only until locales
+	are explicitly enabled (e.g. new Sales Invoice commercial form).
+	"""
 	import copy
 
 	out = list(base_starters)
 	for starter in base_starters:
 		name = starter.get("template_name") or ""
 		if name.startswith("ES - ") or name.startswith("CH - "):
+			continue
+		if starter.get("skip_locale_expand"):
 			continue
 		for locale, prefix in (("es", "ES"), ("zh", "CH")):
 			clone = copy.deepcopy(starter)
