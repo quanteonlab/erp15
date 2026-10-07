@@ -1667,6 +1667,29 @@ def suite_5_12_modules_read():
         assert rows is not None
         groups = ea.list_employee_groups()
         assert groups is not None
+        # Detaching ops.catalog from Sales must stick — ensure_starter must not
+        # rewrite the group just because tables.crm / tables.orders.own remain.
+        sales = next(
+            (
+                g
+                for g in (groups.get("groups") or [])
+                if (g.get("employee_group_name") or "").strip().lower() in ("sales", "ventas")
+            ),
+            None,
+        )
+        if sales and "ops.catalog" in (sales.get("permissions") or []):
+            original = list(sales.get("permissions") or [])
+            without = [p for p in original if p != "ops.catalog"]
+            ea.save_employee_group_permissions(sales["name"], without)
+            try:
+                if getattr(frappe.local, "_staff_starter_ensured", False):
+                    frappe.local._staff_starter_ensured = False
+                ea.ensure_starter_staff_groups()
+                again = ea.list_employee_groups()
+                sales2 = next(g for g in (again.get("groups") or []) if g.get("name") == sales["name"])
+                assert "ops.catalog" not in (sales2.get("permissions") or []), sales2.get("permissions")
+            finally:
+                ea.save_employee_group_permissions(sales["name"], original)
 
     def check_devices():
         from erpnext.erpnext_integrations.ecommerce_api import device_link_api as dla

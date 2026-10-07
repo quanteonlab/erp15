@@ -4836,6 +4836,17 @@
       "expect": "fail"
     },
     {
+      "id": "save_employee_group_permissions_missing_group_fail",
+      "source": "regression",
+      "bug": "save_employee_group_permissions with null/missing group must controlled fail (detaching ops.catalog uses this path; must not TypeError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.save_employee_group_permissions",
+      "args": {
+        "name": null,
+        "permissions": ["ops.preventa", "tools.catalog_pdf"]
+      },
+      "expect": "fail"
+    },
+    {
       "id": "mcp_save_matrix_empty_rows",
       "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_keys_api.save_mcp_matrix",
       "args": {

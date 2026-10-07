@@ -659,11 +659,39 @@ def _is_legacy_starter_perms(title: str, current: list[str]) -> bool:
 	return False
 
 
+def _starter_perms_for_title(title: str) -> frozenset | None:
+	"""Current starter permission set for a floor title (ventas → Sales)."""
+	wanted = (title or "").strip()
+	if not wanted:
+		return None
+	if wanted.lower() == "ventas":
+		return _perm_set(_STARTER_SALES)
+	for spec in STARTER_STAFF_GROUPS:
+		if spec.get("employee_group_name") == wanted:
+			return _perm_set(spec.get("permissions") or [])
+	return None
+
+
 def _floor_starter_needs_ops_only_upgrade(title: str, current: list[str]) -> bool:
-	"""True when a named floor starter still carries tables.* / log.* access."""
+	"""True when a floor starter still carries *legacy* tables.*/log.* extras.
+
+	Current Sales/caja starters intentionally include some tables.* (e.g.
+	tables.crm, tables.orders.own). Those must NOT force a full reset — otherwise
+	detaching ops.catalog (or any other optional starter perm) is undone on the
+	next list_employee_groups / ensure_starter call.
+	"""
 	if title not in _FLOOR_STARTER_TITLES:
 		return False
-	return any(p.startswith("tables.") or p.startswith("log.") for p in current)
+	starter = _starter_perms_for_title(title)
+	if starter is None:
+		return False
+	cur = _perm_set(current)
+	extras = {
+		p
+		for p in cur
+		if (p.startswith("tables.") or p.startswith("log.")) and p not in starter
+	}
+	return bool(extras)
 
 
 STARTER_STAFF_GROUPS = [
