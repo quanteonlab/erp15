@@ -2671,6 +2671,32 @@ def create_customer(
 	except Exception:
 		pass
 
+	# Coerce multi-salesman payload early (Flutter may send null / "null" / CSV).
+	import json as _json
+
+	raw_salesmen = kwargs.get("salesmen")
+	if raw_salesmen is None:
+		raw_salesmen = kwargs.get("user_ids")
+	explicit_salesmen = raw_salesmen is not None
+	salesmen_list: list = []
+	if explicit_salesmen:
+		if isinstance(raw_salesmen, str):
+			s = raw_salesmen.strip()
+			if not s or s.lower() in ("null", "undefined", "none"):
+				salesmen_list = []
+			else:
+				try:
+					parsed = _json.loads(s)
+					salesmen_list = list(parsed) if isinstance(parsed, (list, tuple)) else [s]
+				except Exception:
+					salesmen_list = [x.strip() for x in s.split(",") if x.strip()]
+		elif isinstance(raw_salesmen, (list, tuple)):
+			salesmen_list = list(raw_salesmen)
+		elif raw_salesmen:
+			salesmen_list = [raw_salesmen]
+		else:
+			salesmen_list = []
+
 	label = cstr(customer_name or "").strip()
 	if not label:
 		frappe.throw(_("Customer name is required"))
@@ -2763,19 +2789,24 @@ def create_customer(
 	if zone_val:
 		_set_customer_zone_and_address(customer.name, zone=zone_val)
 
-	# Floor sales / Orden: attach the acting salesman so sales.commit_assigned
-	# can place pedidos for this new (often temporal / Pending-review) client.
+	# CRM table create may pass one/many salesmen (user ids or display labels).
+	# When omitted → auto-assign acting salesman (floor / Orden temporal clients).
+	# Explicit empty list clears assignment (no auto-assign).
 	acting = ""
+	assigned_salesmen: list[str] = []
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 			_acting_username,
 			_can_app,
 			_is_sales_admin,
 			_set_customer_salesmen_users,
+			customer_salesmen,
 		)
 
 		acting = cstr(_acting_username() or "").strip()
-		if acting and acting not in ("Guest", "Administrator"):
+		if explicit_salesmen:
+			assigned_salesmen = _set_customer_salesmen_users(customer.name, salesmen_list)
+		elif acting and acting not in ("Guest", "Administrator"):
 			may_own = (
 				_is_sales_admin()
 				or _can_app("tables.crm")
@@ -2788,7 +2819,9 @@ def create_customer(
 				or _can_app("sales.see_all")
 			)
 			if may_own:
-				_set_customer_salesmen_users(customer.name, [acting])
+				assigned_salesmen = _set_customer_salesmen_users(customer.name, [acting])
+		if not assigned_salesmen:
+			assigned_salesmen = customer_salesmen(customer.name)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "create_customer auto-assign salesman")
 
@@ -2837,6 +2870,8 @@ def create_customer(
 
 	out = customer.as_dict()
 	out["zone"] = _customer_delivery_zone_map([customer.name]).get(customer.name)
+	out["salesmen"] = assigned_salesmen
+	out["account_manager"] = assigned_salesmen[0] if assigned_salesmen else None
 	return out
 
 

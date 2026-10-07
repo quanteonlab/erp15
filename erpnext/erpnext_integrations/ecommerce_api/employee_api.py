@@ -10,7 +10,7 @@ import unicodedata
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, today
+from frappe.utils import cint, cstr, flt, today
 from frappe.utils.password import update_password as _update_password
 
 from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
@@ -1096,6 +1096,22 @@ def list_employees(search=None, status=None, page=1, page_length=100, company=No
 		limit_page_length=page_length,
 		ignore_permissions=True,
 	)
+	# Lazy-issue missing ops PINs for Active rows on this page so roleplay /
+	# Armado always have a working PIN without a separate "generate" click.
+	store = _load_ops_pin_store()
+	by_employee = store.get("by_employee") or {}
+	missing = []
+	for n in names:
+		status = frappe.db.get_value("Employee", n, "status")
+		if (status or "") != "Active":
+			continue
+		entry = by_employee.get(n)
+		pin = str((entry or {}).get("pin") or "").strip() if isinstance(entry, dict) else ""
+		if not _normalize_ops_pin(pin):
+			missing.append(n)
+	for n in missing:
+		_issue_ops_pin_for_employee(n, rotate=False)
+
 	total = frappe.db.count("Employee", filters=filters)
 	return {"rows": [_serialize_employee(n) for n in names], "total": total}
 
@@ -2157,6 +2173,38 @@ def _load_ops_pin_store() -> dict:
 	return {"by_employee": by_employee, "by_pin": by_pin}
 
 
+def _rebuild_ops_pin_index(by_employee: dict) -> dict:
+	"""Rebuild by_pin from by_employee (source of truth) when the reverse index drifts."""
+	by_pin = {}
+	for emp, meta in (by_employee or {}).items():
+		pin = _normalize_ops_pin((meta or {}).get("pin") if isinstance(meta, dict) else None)
+		if pin:
+			by_pin[pin] = emp
+	return by_pin
+
+
+def _client_access_pin_owner(pin: str) -> str | None:
+	"""Return Customer name when ``pin`` is a CRM client-access PIN (not staff ops)."""
+	raw = cstr(pin or "").strip()
+	if not raw or not frappe.db.has_column("Customer", "custom_client_access_pin"):
+		return None
+	# db.get_value bypasses DocType permissions
+	return frappe.db.get_value("Customer", {"custom_client_access_pin": raw}, "name")
+
+
+def _unauthorized_ops_pin(*, reason: str, pin_configured: bool = True) -> dict:
+	return {
+		"authorized": False,
+		"kind": None,
+		"employee": None,
+		"employee_name": None,
+		"user_id": None,
+		"permissions": [],
+		"pin_configured": pin_configured,
+		"reason": reason,
+	}
+
+
 def _save_ops_pin_store(data: dict) -> None:
 	payload = json.dumps(
 		{
@@ -2482,18 +2530,14 @@ def ensure_employee_ops_pins(employees=None, rotate=0):
 
 @frappe.whitelist(allow_guest=True)
 def resolve_ops_pin(pin=None):
-	"""Resolve a 6-digit PIN to admin or employee identity (kiosk / roleplay)."""
+	"""Resolve a 6-digit PIN to admin or employee identity (kiosk / roleplay).
+
+	CRM ``custom_client_access_pin`` values are NOT valid here — roleplay uses
+	the employee ops PIN from Empleados (settings.staff_ops_pins).
+	"""
 	raw = _normalize_ops_pin(pin)
 	if not raw:
-		return {
-			"authorized": False,
-			"kind": None,
-			"employee": None,
-			"employee_name": None,
-			"user_id": None,
-			"permissions": [],
-			"pin_configured": False,
-		}
+		return _unauthorized_ops_pin(reason="invalid", pin_configured=False)
 
 	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
 		_pin_configured,
@@ -2509,54 +2553,43 @@ def resolve_ops_pin(pin=None):
 			"user_id": None,
 			"permissions": ["*"],
 			"pin_configured": _pin_configured(),
+			"reason": None,
 		}
 
 	store = _load_ops_pin_store()
-	emp_name = (store.get("by_pin") or {}).get(raw)
+	by_employee = store.get("by_employee") or {}
+	by_pin = store.get("by_pin") or {}
+	emp_name = by_pin.get(raw)
+
+	# Repair drifted reverse index (by_employee is source of truth).
 	if not emp_name:
-		return {
-			"authorized": False,
-			"kind": None,
-			"employee": None,
-			"employee_name": None,
-			"user_id": None,
-			"permissions": [],
-			"pin_configured": _pin_configured() or bool(store.get("by_pin")),
-		}
+		rebuilt = _rebuild_ops_pin_index(by_employee)
+		emp_name = rebuilt.get(raw)
+		if emp_name and rebuilt != by_pin:
+			_save_ops_pin_store({"by_employee": by_employee, "by_pin": rebuilt})
+			by_pin = rebuilt
+
+	if not emp_name:
+		# Common confusion: CRM client PIN (ZONA/PIN table) ≠ employee ops PIN.
+		if _client_access_pin_owner(raw):
+			return _unauthorized_ops_pin(
+				reason="client_pin",
+				pin_configured=_pin_configured() or bool(by_pin),
+			)
+		return _unauthorized_ops_pin(
+			reason="not_found",
+			pin_configured=_pin_configured() or bool(by_pin),
+		)
 
 	frappe.flags.ignore_permissions = True
 	if not frappe.db.exists("Employee", emp_name):
-		return {
-			"authorized": False,
-			"kind": None,
-			"employee": None,
-			"employee_name": None,
-			"user_id": None,
-			"permissions": [],
-			"pin_configured": True,
-		}
+		return _unauthorized_ops_pin(reason="missing_employee")
 	emp = frappe.get_doc("Employee", emp_name)
 	if (emp.status or "") != "Active":
-		return {
-			"authorized": False,
-			"kind": None,
-			"employee": None,
-			"employee_name": None,
-			"user_id": None,
-			"permissions": [],
-			"pin_configured": True,
-		}
-	entry = (store.get("by_employee") or {}).get(emp.name)
+		return _unauthorized_ops_pin(reason="inactive")
+	entry = by_employee.get(emp.name)
 	if isinstance(entry, dict) and str(entry.get("pin") or "") != raw:
-		return {
-			"authorized": False,
-			"kind": None,
-			"employee": None,
-			"employee_name": None,
-			"user_id": None,
-			"permissions": [],
-			"pin_configured": True,
-		}
+		return _unauthorized_ops_pin(reason="stale")
 
 	user_id = (emp.user_id or "").strip() or None
 	return {
@@ -2567,6 +2600,7 @@ def resolve_ops_pin(pin=None):
 		"user_id": user_id,
 		"permissions": _permission_ids_for_employee(emp.name),
 		"pin_configured": True,
+		"reason": None,
 	}
 
 

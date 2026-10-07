@@ -3095,6 +3095,29 @@
       "expect": "error"
     },
     {
+      "id": "create_customer_null_salesmen",
+      "source": "regression",
+      "bug": "create_customer with null/empty salesmen must not TypeError when coercing multi-salesman assignment",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_customer",
+      "args": {
+        "customer_name": "",
+        "salesmen": null,
+        "user_ids": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "create_customer_salesmen_dirty_string",
+      "source": "regression",
+      "bug": "create_customer salesmen as 'null'/empty string must not TypeError before name validation",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_customer",
+      "args": {
+        "customer_name": "",
+        "salesmen": "null"
+      },
+      "expect": "error"
+    },
+    {
       "id": "get_accounting_constants_null_date",
       "source": "regression",
       "bug": "get_accounting_constants(as_of_date=null) must return starter-pack keys (sales_net, po_ordered, ar_aging) without TypeError",
@@ -3752,6 +3775,16 @@
         "pin": "000000"
       },
       "expect": "ok"
+    },
+    {
+      "id": "ops_resolve_ops_pin_client_pin_reason",
+      "source": "regression",
+      "bug": "CRM client_access_pin must not authorize roleplay; reason=client_pin when pin matches a Customer",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.resolve_ops_pin",
+      "args": {
+        "pin": null
+      },
+      "expect": "no_500"
     },
     {
       "id": "ops_require_operator_null_pin_guest",
