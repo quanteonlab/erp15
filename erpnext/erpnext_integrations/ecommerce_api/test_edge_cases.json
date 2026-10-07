@@ -4521,6 +4521,70 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "mark_sales_orders_print_action with null names must controlled-fail, never TypeError (bulk print stamp)"
+    },
+    {
+      "id": "search_customers_null_term_returns_stage_keys",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
+      "args": {
+        "search_term": null,
+        "page_length": null,
+        "ensure_buckets": 0
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_customers with null search_term/page_length must return customers with assigned+stage keys (seller-assigned clients in preorder picker)"
+    },
+    {
+      "id": "search_customers_string_null_term",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
+      "args": {
+        "search_term": "null",
+        "page_length": "12",
+        "ensure_buckets": 0
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Flutter may send search_term as literal 'null'; treat as empty typeahead for assigned-client list"
+    },
+    {
+      "id": "get_guest_preorders_list_seller_scope_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": 5,
+        "scope": "admin",
+        "seller_scope": null,
+        "status": null,
+        "start": 0
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "seller_scope null must not 500; Pedidos Todos | Mi enlace toggle"
+    },
+    {
+      "id": "get_guest_preorders_list_seller_scope_mine",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": "20",
+        "scope": "admin",
+        "seller_scope": "mine",
+        "status": "",
+        "start": "0"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "seller_scope=mine (dirty string page_length/start) lists seller_ref orders for Pedidos toggle"
+    },
+    {
+      "id": "get_guest_preorders_list_seller_scope_orden_here",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": 20,
+        "scope": "admin",
+        "seller_scope": "orden_here"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "seller_scope=orden_here powers Operaciones→Orden floating orders FAB"
     }
   ]
 }

@@ -2764,6 +2764,16 @@ def _customer_row(name: str) -> dict | None:
 	if not r:
 		return None
 	salesmen = customer_salesmen(r.name)
+	stage = None
+	stage_label = None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _customer_preventa_stage_map
+
+		st = (_customer_preventa_stage_map([r.name]).get(r.name) or {})
+		stage = st.get("stage")
+		stage_label = st.get("stage_label")
+	except Exception:
+		pass
 	return {
 		"name": r.name,
 		"customer_name": r.customer_name,
@@ -2772,6 +2782,8 @@ def _customer_row(name: str) -> dict | None:
 		"account_manager": getattr(r, "account_manager", None) or (salesmen[0] if salesmen else None),
 		"salesmen": salesmen,
 		"disabled": cint(r.disabled),
+		"stage": stage,
+		"stage_label": stage_label,
 	}
 
 

@@ -1094,6 +1094,79 @@ def suite_5_9_master_data():
         assert isinstance(rows, list), listed
         if rows:
             assert "zone" in rows[0], f"search_customers must include zone key: {list(rows[0].keys())}"
+            assert "assigned" in rows[0], f"search_customers must include assigned: {list(rows[0].keys())}"
+            assert "stage" in rows[0], f"search_customers must include stage (client state): {list(rows[0].keys())}"
+            assert "stage_label" in rows[0], f"search_customers must include stage_label: {list(rows[0].keys())}"
+
+    def check_preorder_list_customer_stage():
+        """Pedidos list exposes customer_stage so assigned clients show Preventa state."""
+        listed = api.get_guest_preorders_list(page_length=5, scope="admin")
+        rows = listed.get("preorders") or []
+        assert isinstance(rows, list), listed
+        if rows:
+            assert "customer_stage" in rows[0], (
+                f"get_guest_preorders_list must include customer_stage: {list(rows[0].keys())}"
+            )
+            assert "customer_stage_label" in rows[0], (
+                f"get_guest_preorders_list must include customer_stage_label: {list(rows[0].keys())}"
+            )
+            assert "creation_review" in rows[0], (
+                f"get_guest_preorders_list must include creation_review: {list(rows[0].keys())}"
+            )
+
+    def check_seller_scope_list_and_amend_review():
+        """seller_scope mine/orden_here + seller item amend re-queues Revisar."""
+        from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+        mine = api.get_guest_preorders_list(page_length=5, scope="admin", seller_scope="mine")
+        here = api.get_guest_preorders_list(page_length=5, scope="admin", seller_scope="orden_here")
+        assert isinstance(mine.get("preorders"), list), mine
+        assert isinstance(here.get("preorders"), list), here
+
+        item_code = frappe.db.get_value("Item", {"disabled": 0, "is_sales_item": 1}, "name")
+        if not item_code:
+            raise AssertionError("no sales Item for seller-amend smoke")
+
+        staff = _ensure_smoke_creation_review_staff()
+        so_name = None
+        prev = frappe.session.user
+        try:
+            frappe.set_user(staff)
+            created = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 10}],
+                guest_name="Smoke Seller Amend",
+                guest_phone="+5491100008899",
+                order_tag="orden",
+                seller_ref_user=staff,
+            )
+            so_name = created.get("preorder_name")
+            assert so_name, created
+            frappe.set_user(prev)
+            api.confirm_creation_review(kind="order", name=so_name)
+            assert (
+                frappe.db.get_value("Sales Order", so_name, cr.FIELDNAME) == cr.STATUS_CONFIRMED
+            ), so_name
+            frappe.set_user(staff)
+            detail = api.get_guest_preorder(so_name)
+            items = detail.get("items") or []
+            assert items, detail
+            items[0]["qty"] = flt(items[0].get("qty") or 1) + 1
+            api.update_guest_preorder_items(so_name, items)
+            frappe.set_user(prev)
+            assert (
+                frappe.db.get_value("Sales Order", so_name, cr.FIELDNAME) == cr.STATUS_PENDING
+            ), so_name
+            listed = api.list_creation_reviews(kind="order", status="Pending", limit=50)
+            names = {r.get("name") for r in (listed or [])}
+            assert so_name in names, (so_name, names)
+        finally:
+            frappe.set_user(prev)
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                try:
+                    api.cancel_guest_preorder(so_name)
+                except Exception:
+                    frappe.db.set_value("Sales Order", so_name, "docstatus", 2)
+                frappe.db.commit()
 
     _run("5.9.1 get_item_groups", check_item_groups, "S3")
     _run("5.9.2 get_price_lists", check_price_lists, "S3")
@@ -1116,6 +1189,8 @@ def suite_5_9_master_data():
     _run("5.9.16 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
     _run("5.9.17 external pipeline status audit", check_external_pipeline_status_audit, "S2")
     _run("5.9.18 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
+    _run("5.9.18b preorder list customer_stage", check_preorder_list_customer_stage, "S3")
+    _run("5.9.18c seller_scope + amend → Revisar", check_seller_scope_list_and_amend_review, "S2")
     _run("5.9.19 Orden→planner remito + no-address warn", check_orden_planner_remito_and_address_gate, "S2")
 
 

@@ -2968,9 +2968,10 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	except Exception:
 		pass
 
-	term = (search_term or "").strip()
+	term = cstr(search_term or "").strip()
+	if term.lower() in ("null", "undefined", "none"):
+		term = ""
 	limit = max(1, min(cint(page_length) or 20, 200))
-	filters = {"disabled": 0}
 	or_filters = None
 	if term:
 		like = f"%{term}%"
@@ -2998,18 +2999,6 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	if frappe.db.has_column("Customer", "custom_preferred_hours"):
 		base_fields.append("custom_preferred_hours")
 
-	rows = frappe.get_all(
-		"Customer",
-		filters=filters,
-		or_filters=or_filters,
-		fields=base_fields,
-		order_by="customer_name asc",
-		limit_page_length=limit,
-		ignore_permissions=True,
-	)
-	# RM Zona = Address.custom_zone (committed Planificación de entregas codes), not Territory.
-	zone_by_customer = _customer_delivery_zone_map([r.name for r in rows])
-
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 		_assigned_customer_names,
 		_acting_username,
@@ -3018,17 +3007,50 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	)
 
 	scope = sales_visibility_scope()
-	allowed = None
+	uid = _acting_username() or ""
+	assigned_names = list(_assigned_customer_names(uid)) if uid else []
+	assigned_set = set(assigned_names)
+
+	def _fetch(extra_filters=None, page_len=None):
+		flt = {"disabled": 0}
+		if extra_filters:
+			flt.update(extra_filters)
+		return frappe.get_all(
+			"Customer",
+			filters=flt,
+			or_filters=or_filters,
+			fields=base_fields,
+			order_by="customer_name asc",
+			limit_page_length=page_len if page_len is not None else limit,
+			ignore_permissions=True,
+		)
+
+	# Query inside the assigned set (do not filter after a global page limit —
+	# otherwise seller-assigned clients outside the alphabetical first page never appear).
 	if scope == "none":
 		rows = []
 	elif scope == "assigned":
-		uid = _acting_username() or ""
-		allowed = set(_assigned_customer_names(uid)) if uid else set()
-		rows = [r for r in rows if r.name in allowed]
+		rows = _fetch({"name": ["in", assigned_names]}) if assigned_names else []
+	elif not term and assigned_names:
+		# Prefer the acting seller's assigned clients at the top of an empty typeahead.
+		assigned_rows = _fetch({"name": ["in", assigned_names]})
+		remaining = max(0, limit - len(assigned_rows))
+		other_rows = (
+			_fetch({"name": ["not in", assigned_names]}, page_len=remaining) if remaining else []
+		)
+		rows = list(assigned_rows) + list(other_rows)
+	else:
+		rows = _fetch()
+
+	# RM Zona = Address.custom_zone (committed Planificación de entregas codes), not Territory.
+	cust_names = [r.name for r in rows]
+	zone_by_customer = _customer_delivery_zone_map(cust_names)
+	stage_by_customer = _customer_preventa_stage_map(cust_names)
 
 	out_customers = []
 	for r in rows:
 		salesmen = customer_salesmen(r.name)
+		st = stage_by_customer.get(r.name) or {}
 		out_customers.append(
 			{
 				"name": r.name,
@@ -3049,6 +3071,9 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				in (CONSUMIDOR_FINAL_NAME, UNCATEGORIZED_CUSTOMER_NAME),
 				"salesmen": salesmen,
 				"account_manager": salesmen[0] if salesmen else None,
+				"assigned": r.name in assigned_set,
+				"stage": st.get("stage"),
+				"stage_label": st.get("stage_label"),
 			}
 		)
 	return {"customers": out_customers}
@@ -4174,8 +4199,10 @@ def _parse_remarks_tags(raw) -> dict:
 
 def _guest_preorder_tag_text(so_or_dict):
 	if isinstance(so_or_dict, dict):
+		if so_or_dict.get("_tag_raw"):
+			return str(so_or_dict.get("_tag_raw") or "")
 		tag_fn = _guest_preorder_tag_fieldname()
-		if tag_fn:
+		if tag_fn and so_or_dict.get(tag_fn):
 			return so_or_dict.get(tag_fn) or ""
 		return so_or_dict.get("remarks") or so_or_dict.get("terms") or ""
 	for fn in ("remarks", "terms"):
@@ -4316,6 +4343,71 @@ def _customer_delivery_zone_map(customer_names):
 		out[c.name] = addr_zone.get(c.customer_primary_address) if c.customer_primary_address else None
 	for n in names:
 		out.setdefault(n, None)
+	return out
+
+
+def _preventa_stage_label_map(owner_user=None) -> dict:
+	"""Preventa column key → display label (board template or per-seller columns)."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import (
+			_load_board_columns,
+			_load_preventa_settings,
+		)
+
+		cols = []
+		if owner_user:
+			try:
+				cols = _load_board_columns(owner_user) or []
+			except Exception:
+				cols = []
+		if not cols:
+			cols = list((_load_preventa_settings() or {}).get("default_columns_template") or [])
+		out = {}
+		for col in cols:
+			if not isinstance(col, dict):
+				continue
+			key = cstr(col.get("key") or "").strip()
+			if not key:
+				continue
+			out[key] = cstr(col.get("label") or key).strip() or key
+		return out
+	except Exception:
+		return {}
+
+
+def _customer_preventa_stage_map(customer_names) -> dict:
+	"""customer → {stage, stage_label} from linked Lead.custom_preventa_stage."""
+	out = {}
+	names = list({cstr(c).strip() for c in (customer_names or []) if cstr(c).strip()})
+	if not names:
+		return out
+	if not frappe.db.has_column("Customer", "lead_name"):
+		return {n: {"stage": None, "stage_label": None} for n in names}
+	customers = frappe.get_all(
+		"Customer",
+		filters={"name": ["in", names]},
+		fields=["name", "lead_name"],
+		ignore_permissions=True,
+	)
+	lead_ids = [c.lead_name for c in customers if c.lead_name]
+	stage_by_lead = {}
+	if lead_ids and frappe.db.has_column("Lead", "custom_preventa_stage"):
+		for row in frappe.get_all(
+			"Lead",
+			filters={"name": ["in", lead_ids]},
+			fields=["name", "custom_preventa_stage"],
+			ignore_permissions=True,
+		):
+			stage_by_lead[row.name] = cstr(row.custom_preventa_stage or "").strip() or None
+	labels = _preventa_stage_label_map()
+	for c in customers:
+		stage = stage_by_lead.get(c.lead_name) if c.lead_name else None
+		out[c.name] = {
+			"stage": stage,
+			"stage_label": (labels.get(stage) if stage else None) or stage,
+		}
+	for n in names:
+		out.setdefault(n, {"stage": None, "stage_label": None})
 	return out
 
 
@@ -5170,8 +5262,99 @@ def create_guest_preorder(
 	return payload
 
 
+def _normalize_seller_scope(raw) -> str:
+	"""'' | mine | orden_here — seller-attributed / Orden-screen filters."""
+	val = cstr(raw or "").strip().lower()
+	if val in ("", "all", "null", "undefined", "none", "*", "0"):
+		return ""
+	if val in ("mine", "my", "seller", "seller_ref", "mi_enlace", "link"):
+		return "mine"
+	if val in ("orden_here", "orden", "here", "ordered_here", "ops_orden"):
+		return "orden_here"
+	return ""
+
+
+def _attach_creation_review_fields(rows: list) -> None:
+	"""Attach creation_review (+ review_reason from tags) onto list/detail rows."""
+	from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import FIELDNAME
+
+	names = [cstr(r.get("name") or "").strip() for r in (rows or []) if r.get("name")]
+	names = [n for n in names if n]
+	if not names or not frappe.db.has_column("Sales Order", FIELDNAME):
+		for r in rows or []:
+			r.setdefault("creation_review", None)
+			r.setdefault("review_reason", None)
+		return
+	status_map = {
+		r.name: getattr(r, FIELDNAME, None)
+		for r in frappe.get_all(
+			"Sales Order",
+			filters={"name": ["in", names]},
+			fields=["name", FIELDNAME],
+			ignore_permissions=True,
+		)
+	}
+	for r in rows or []:
+		name = cstr(r.get("name") or "").strip()
+		r["creation_review"] = status_map.get(name) or None
+		if r.get("review_reason") is None:
+			tags = _parse_remarks_tags(_guest_preorder_tag_text(r))
+			r["review_reason"] = tags.get("review_reason") or None
+
+
+def _requeue_seller_amend_review(preorder_name: str, reason: str = "seller_amend") -> bool:
+	"""Park SO in admin Revisar after a non-admin seller material amend/edit."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			mark_seller_amend_for_review,
+		)
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import _acting_username
+
+		actor = cstr(_acting_username() or "").strip() or cstr(frappe.session.user or "").strip()
+		return bool(
+			mark_seller_amend_for_review(
+				preorder_name,
+				actor=actor,
+				reason=reason,
+			)
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"requeue seller amend review {preorder_name}")
+		return False
+
+
+def _guest_preorder_matches_seller_scope(order: dict, seller_scope: str, uid: str) -> bool:
+	"""Filter guest preorders by seller_ref / order_tag for Pedidos + Orden FAB."""
+	if not seller_scope:
+		return True
+	uid = cstr(uid or "").strip()
+	if not uid:
+		return False
+	tags = _parse_remarks_tags(_guest_preorder_tag_text(order))
+	seller = cstr(tags.get("seller_ref") or "").strip()
+	cashier = cstr(tags.get("cashier") or "").strip()
+	order_tag = cstr(tags.get("order_tag") or "").strip().lower()
+	owner = cstr(order.get("owner") or "").strip()
+	if seller_scope == "mine":
+		return seller == uid
+	if seller_scope == "orden_here":
+		if order_tag != "orden":
+			return False
+		# Ordered on Operaciones → Orden by / for this seller.
+		return seller == uid or cashier == uid or owner == uid
+	return True
+
+
 @frappe.whitelist()
-def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=None, scope="pos", include_archived=0):
+def get_guest_preorders_list(
+	status=None,
+	start=0,
+	page_length=20,
+	cashier_id=None,
+	scope="pos",
+	include_archived=0,
+	seller_scope=None,
+):
 	"""
 	List Guest Preorders created by `create_guest_preorder`.
 
@@ -5179,15 +5362,23 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 	Use ERPNext Desk / advanced search to find archived SOs; pass
 	``include_archived=1`` only when a UI explicitly needs them.
 	Superseded cancelled orders (replaced by an amendment) are always excluded.
+
+	``seller_scope``:
+	  - ``mine`` — only SOs tagged ``seller_ref:<acting user>`` (seller link)
+	  - ``orden_here`` — ``order_tag:orden`` for this seller/cashier/owner
 	"""
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
 		return {"preorders": [], "total_count": 0}
 
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_acting_username,
 		_order_visibility_scope,
 		guest_preorder_matches_scope,
 	)
+
+	seller_scope = _normalize_seller_scope(seller_scope)
+	acting_uid = cstr(_acting_username() or "").strip()
 
 	try:
 		start = max(0, cint(start))
@@ -5212,6 +5403,11 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		return {"preorders": [], "total_count": 0}
 
 	filters = {tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]}
+	if seller_scope == "mine" and acting_uid:
+		# Prefer rows that also carry this seller_ref (tag order is not guaranteed).
+		filters[tag_fn] = ["like", f"%seller_ref:{acting_uid}%"]
+	elif seller_scope == "orden_here":
+		filters[tag_fn] = ["like", "%order_tag:orden%"]
 
 	if status:
 		if str(status).lower() == "draft":
@@ -5245,8 +5441,12 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			"amended_from",
 			tag_fn,
 		],
-		start=start,
-		limit_page_length=page_length + (200 if scope else 50),  # fetch extra to account for filtering
+		start=0 if seller_scope else start,
+		limit_page_length=(
+			max(page_length + 200, 400)
+			if seller_scope
+			else page_length + (200 if scope else 50)
+		),  # fetch extra to account for filtering
 		order_by="transaction_date desc, creation desc",
 		ignore_permissions=True,
 	)
@@ -5277,7 +5477,13 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 			continue
 		if not include_archived and cint(o.get("docstatus")) == 2:
 			continue
+		# Seller-scope lists still require the guest_preorder marker.
+		tag_raw_check = str(o.get(tag_fn) or "")
+		if GUEST_PREORDER_REMARKS_TAG not in tag_raw_check:
+			continue
 		if not guest_preorder_matches_scope(o.get("owner"), o.get(tag_fn), scope):
+			continue
+		if not _guest_preorder_matches_seller_scope(o, seller_scope, acting_uid):
 			continue
 		tag_raw = str(o.get(tag_fn) or "")
 		order_tag = ""
@@ -5287,8 +5493,12 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 				order_tag = part.split(":", 1)[1].strip()
 				break
 		o["order_tag"] = order_tag or None
+		# Keep raw tags under a stable key so seller_ref / review_reason survive pop.
+		o["_tag_raw"] = tag_raw
 		o.pop(tag_fn, None)
 		filtered.append(o)
+	if seller_scope and start:
+		filtered = filtered[start:]
 	total_count = len(filtered)
 	filtered = filtered[:page_length]
 
@@ -5325,11 +5535,15 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 		o["external_status_change"] = ext_map.get(o["name"]) or None
 
 	geo = _customer_address_zone_map([o.get("customer") for o in filtered])
+	stage_map = _customer_preventa_stage_map([o.get("customer") for o in filtered])
 	for o in filtered:
 		info = geo.get(o.get("customer")) or {}
 		o["address"] = info.get("address")
 		o["territory"] = info.get("territory")
 		o["zone"] = info.get("zone")
+		st = stage_map.get(o.get("customer")) or {}
+		o["customer_stage"] = st.get("stage")
+		o["customer_stage_label"] = st.get("stage_label")
 		# Fallback: guest_address tag when customer has no street yet.
 		if not o.get("address"):
 			tags = _parse_remarks_tags(_guest_preorder_tag_text(o))
@@ -5365,6 +5579,11 @@ def get_guest_preorders_list(status=None, start=0, page_length=20, cashier_id=No
 	except Exception:
 		for o in filtered:
 			o.setdefault("tags", [])
+
+	# Creation-review (Revisar) status for seller-amend badges.
+	_attach_creation_review_fields(filtered)
+	for o in filtered:
+		o.pop("_tag_raw", None)
 	return {"preorders": filtered, "total_count": total_count}
 
 
@@ -5391,6 +5610,7 @@ def get_guest_preorder(preorder_name):
 			tags[key.strip()] = val.strip()
 
 	geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
+	client_state = (_customer_preventa_stage_map([so.customer]).get(so.customer) or {})
 
 	# Soft list rates for lines with rate 0 (e.g. older consultas before $/Kg was kept).
 	selling_pl = getattr(so, "selling_price_list", None) or "Standard Selling"
@@ -5410,6 +5630,14 @@ def get_guest_preorder(preorder_name):
 		"order_type": so.order_type,
 		"customer": so.customer,
 		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
+		"customer_stage": client_state.get("stage"),
+		"customer_stage_label": client_state.get("stage_label"),
+		"creation_review": (
+			frappe.db.get_value("Sales Order", so.name, "custom_creation_review")
+			if frappe.db.has_column("Sales Order", "custom_creation_review")
+			else None
+		),
+		"review_reason": tags.get("review_reason") or None,
 		"guest_name": tags.get("guest_name") or None,
 		"guest_phone": tags.get("guest_phone") or None,
 		"guest_email": tags.get("guest_email") or None,
@@ -6166,6 +6394,7 @@ def unarchive_guest_preorder(preorder_name=None):
 		new_so.status = "Draft"
 	desired = _allocate_amend_name("Sales Order", so.name)
 	new_so.insert(ignore_permissions=True, set_name=desired)
+	_requeue_seller_amend_review(new_so.name, reason="seller_unarchive_amend")
 	frappe.db.commit()
 	return get_guest_preorder(new_so.name)
 
@@ -6447,6 +6676,24 @@ def update_guest_preorder_details(preorder_name, data=None):
 		frappe.rename_doc("Sales Order", current_name, new_name, force=True, merge=False)
 		current_name = new_name
 
+	# Material header edits by non-admins re-enter Revisar (not soft pipeline moves).
+	material_keys = (
+		"customer",
+		"customer_name",
+		"paid_amount",
+		"guest_name",
+		"guest_phone",
+		"guest_address",
+		"guest_notes",
+		"address_line1",
+		"address",
+		"zone",
+		"territory",
+		"delivery_date",
+	)
+	if any(k in data for k in material_keys):
+		_requeue_seller_amend_review(current_name, reason="seller_amend_details")
+
 	frappe.db.commit()
 	return get_guest_preorder(current_name)
 
@@ -6490,6 +6737,8 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	with _allow_weight_fractional_stock_qty(so):
 		_save_guest_preorder_so(so)
 	so.reload()
+	_requeue_seller_amend_review(so.name, reason="seller_amend_items")
+	frappe.db.commit()
 	return get_guest_preorder(preorder_name)
 
 

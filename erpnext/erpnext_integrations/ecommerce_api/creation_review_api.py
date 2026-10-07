@@ -121,6 +121,37 @@ def maybe_mark_creation_review_pending(doctype: str, name: str, actor=None) -> b
 	return True
 
 
+def mark_seller_amend_for_review(name: str, actor=None, reason: str = "seller_amend") -> bool:
+	"""Re-queue a guest preorder in Revisar after a non-admin seller amend/edit.
+
+	Sets ``custom_creation_review=Pending`` and stamps ``review_reason:<reason>``
+	on the guest-preorder tag field so admin Revisar can show why it returned.
+	"""
+	name = cstr(name or "").strip()
+	if not name:
+		return False
+	if not maybe_mark_creation_review_pending("Sales Order", name, actor=actor):
+		return False
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import (
+			_guest_preorder_tag_fieldname,
+			_sanitize_guest_tag,
+			_update_guest_preorder_tag,
+		)
+
+		tag_fn = _guest_preorder_tag_fieldname()
+		if not tag_fn or not frappe.db.exists("Sales Order", name):
+			return True
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", name)
+		frappe.flags.ignore_permissions = False
+		_update_guest_preorder_tag(so, "review_reason", _sanitize_guest_tag(reason) or "seller_amend")
+		frappe.db.set_value("Sales Order", name, tag_fn, getattr(so, tag_fn, None), update_modified=False)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"mark_seller_amend_for_review tag {name}")
+	return True
+
+
 def _owner_full_name(owner: str) -> str:
 	owner = cstr(owner or "").strip()
 	if not owner:
@@ -306,6 +337,8 @@ def list_creation_reviews(kind="customer", status="Pending", limit=100, start=0)
 				"creation": str(r.creation) if r.creation else None,
 				"modified": str(r.modified) if r.modified else None,
 				"review_status": getattr(r, FIELDNAME, None) or status_filter,
+				"review_reason": tags.get("review_reason") or None,
+				"seller_ref_user": tags.get("seller_ref") or None,
 			}
 		)
 	return out
