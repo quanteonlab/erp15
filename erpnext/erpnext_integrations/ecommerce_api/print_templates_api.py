@@ -948,8 +948,9 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"set_warehouse": wh,
 		"total_weight": _sum_line_total_weight(rows) or getattr(so, "total_weight", None) or "",
 		# SI / remito print tabs reuse this checklist when no linked doc exists.
-		"grand_total": flt(getattr(so, "grand_total", None) or 0) or "",
-		"net_total": flt(getattr(so, "net_total", None) or 0) or "",
+		# Always numeric (never "") so Standard Invoice Total binds.
+		"grand_total": flt(getattr(so, "grand_total", None) or 0),
+		"net_total": flt(getattr(so, "net_total", None) or 0),
 		"currency": getattr(so, "currency", None) or "",
 		"company": company,
 		"order_ean13": _armado_order_ean13(so.name),
