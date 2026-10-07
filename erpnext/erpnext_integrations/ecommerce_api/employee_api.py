@@ -438,6 +438,16 @@ APP_PERMISSIONS = [
 		"desc_es": "Ver la clave permanente de la API y todos los dispositivos móviles/escritorio conectados.",
 		"desc_zh": "查看永久 API 连接密钥以及已连接的手机/电脑设备。",
 	},
+	{
+		"id": "settings.manage_mcp",
+		"group": "empleados",
+		"label_en": "Manage MCP agent key",
+		"label_es": "Administrar clave de agentes MCP",
+		"label_zh": "管理 MCP 智能体密钥",
+		"desc_en": "Create/rotate the MCP key for AI assistants and set its DocType view/edit matrix (Settings → Apps & devices).",
+		"desc_es": "Crear/rotar la clave MCP para asistentes de IA y definir su matriz de DocTypes (Ajustes → Apps y dispositivos).",
+		"desc_zh": "创建/轮换 MCP 密钥并为 AI 助手设置 DocType 查看/编辑矩阵。",
+	},
 ]
 
 KNOWN_PERMISSION_IDS = {p["id"] for p in APP_PERMISSIONS}
@@ -534,19 +544,19 @@ _STARTER_REPOSITOR = [
 	"tools.labels",
 	"tools.catalog_pdf",
 	"tools.sync",
-	"sales.see_all",
+	"sales.see_assigned",
 	"sales.commit_assigned",
 ]
 _STARTER_CAJA = [
 	"ops.pos",
 	"ops.catalog",
 	"tools.labels",
-	"sales.see_all",
+	"sales.see_assigned",
 	"sales.commit_assigned",
 ]
-# Default sales scope for every non-admin group: see all clients, commit only assigned.
+# Default sales scope: RM shows only assigned clients; Preventa commits only assigned.
 _DEFAULT_SALES_SCOPE = [
-	"sales.see_all",
+	"sales.see_assigned",
 	"sales.commit_assigned",
 ]
 _SALES_SCOPE_IDS = frozenset(
@@ -568,13 +578,13 @@ _STARTER_SALES = [
 	"tables.crm",
 	# Own Pedidos so Operaciones → Orden (create + confirm) works without full tables.orders.
 	"tables.orders.own",
-	"sales.see_all",
+	"sales.see_assigned",
 	"sales.commit_assigned",
 ]
 # Field driver / conductor app — assigned trips + PoD, not full route planning.
 _STARTER_DRIVER = [
 	"ops.delivery",
-	"sales.see_all",
+	"sales.see_assigned",
 	"sales.commit_assigned",
 ]
 # Floor ops that Sales must not keep if they were inherited from older broad gates.
@@ -859,6 +869,7 @@ _COARSE_FLAG = {
 	"employees.view_salary": "receiving",
 	"employees.edit": "receiving",
 	"settings.manage_groups": "receiving",
+	"settings.manage_mcp": "receiving",
 	"tools.sync": "sync",
 }
 
@@ -1903,7 +1914,7 @@ def _apply_caja_orders_split(store: dict) -> bool:
 
 
 def _with_default_sales_scope(perms: list[str]) -> list[str]:
-	"""Ensure non-admin groups get see_all + commit_assigned when no sales.* set yet."""
+	"""Ensure non-admin groups get see_assigned + commit_assigned when no sales.* set yet."""
 	ids = list(perms or [])
 	if "*" in ids:
 		return ids
@@ -1934,18 +1945,49 @@ def _apply_default_sales_scope_to_store(store: dict) -> bool:
 				store[name] = _normalize_permission_ids(current + missing)
 				dirty = True
 			continue
-		# Upgrade our previous ventas default (see_assigned+commit_assigned only) once.
-		scope_only = [p for p in current if p in _SALES_SCOPE_IDS]
-		if _perm_set(scope_only) == _perm_set(["sales.see_assigned", "sales.commit_assigned"]):
-			next_perms = [p for p in current if p not in _SALES_SCOPE_IDS] + list(_DEFAULT_SALES_SCOPE)
-			store[name] = _normalize_permission_ids(next_perms)
-			dirty = True
-			continue
 		next_perms = _with_default_sales_scope(current)
 		if _perm_set(next_perms) != _perm_set(current):
 			store[name] = next_perms
 			dirty = True
 	return dirty
+
+
+def _migrate_sales_see_assigned_default(store: dict) -> bool:
+	"""One-shot: Sales/ventas starter default see_all → see_assigned (RM own clients only).
+
+	Only flips groups still on the exact previous default (see_all + commit_assigned).
+	Custom see_all + commit_all (or other combos) are left alone.
+	"""
+	meta = store.get("_migrations")
+	if not isinstance(meta, dict):
+		meta = {}
+	if meta.get("sales_see_assigned_v1"):
+		return False
+	dirty = False
+	for name, raw in list(store.items()):
+		if name.startswith("_") or not isinstance(raw, list):
+			continue
+		title = ""
+		try:
+			if frappe.db.exists("Employee Group", name):
+				title = frappe.db.get_value("Employee Group", name, "employee_group_name") or name
+		except Exception:
+			title = name
+		title_l = (title or "").strip().lower()
+		if title_l not in ("sales", "ventas"):
+			continue
+		current = _normalize_permission_ids(raw)
+		if "*" in current:
+			continue
+		scope_only = [p for p in current if p in _SALES_SCOPE_IDS]
+		if _perm_set(scope_only) != _perm_set(["sales.see_all", "sales.commit_assigned"]):
+			continue
+		next_perms = [p for p in current if p not in _SALES_SCOPE_IDS] + list(_DEFAULT_SALES_SCOPE)
+		store[name] = _normalize_permission_ids(next_perms)
+		dirty = True
+	meta["sales_see_assigned_v1"] = True
+	store["_migrations"] = meta
+	return True
 
 
 def _strip_sales_floor_ops_extras(store: dict) -> bool:
@@ -2029,6 +2071,7 @@ def _ensure_starter_staff_groups() -> dict:
 	skipped = []
 	dirty = _apply_caja_orders_split(store)
 	dirty = _apply_default_sales_scope_to_store(store) or dirty
+	dirty = _migrate_sales_see_assigned_default(store) or dirty
 	dirty = _strip_sales_floor_ops_extras(store) or dirty
 	dirty = _backfill_floor_fulfillment_perms(store) or dirty
 	for spec in STARTER_STAFF_GROUPS:

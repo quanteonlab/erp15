@@ -2,7 +2,7 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import flt, nowdate
+from frappe.utils import cstr, flt, nowdate
 
 # Fields exposed per source doctype, plus the child-table (line items) fieldname
 # used by the 'line-items' element kind in the template designer.
@@ -125,6 +125,19 @@ def _is_weight_uom(uom) -> bool:
 	return _norm_uom(uom) in _WEIGHT_UOMS
 
 
+# Catalog mayorista token: qty is pack/unit count, kg lives in total_weight after armado.
+_CATALOG_WEIGHT_TOKENS = frozenset({"weight", "por peso", "porpeso"})
+
+
+def _is_catalog_weight_uom(uom) -> bool:
+	return _norm_uom(uom) in _CATALOG_WEIGHT_TOKENS
+
+
+def _is_mass_uom(uom) -> bool:
+	"""True kg/g/lb — not the catalog WEIGHT sell-by-weight token."""
+	return _is_weight_uom(uom) and not _is_catalog_weight_uom(uom)
+
+
 def _item_weight_meta(item_code):
 	"""Return (stock_uom, weight_per_unit, weight_uom) for an Item."""
 	if not item_code:
@@ -173,31 +186,103 @@ def _is_weight_based_line(row: dict, stock_uom: str = "", weight_uom: str = "") 
 	return False
 
 
-def _enrich_print_line_item(row) -> dict:
-	"""Add weight fields; blank amount for weight-based lines when client may not know weight."""
+def _positive_float(raw):
+	if raw in (None, ""):
+		return None
+	try:
+		v = float(raw)
+	except (TypeError, ValueError):
+		return None
+	return v if v > 0 else None
+
+
+def _so_line_total_weight(so_name, so_detail=None, item_code=None):
+	"""Measured kg on the source Sales Order Item (DN often drops / zeroes it)."""
+	so = cstr(so_name or "").strip()
+	if not so or not frappe.db.exists("Sales Order", so):
+		return None
+	detail = cstr(so_detail or "").strip()
+	if detail and frappe.db.exists("Sales Order Item", detail):
+		return _positive_float(frappe.db.get_value("Sales Order Item", detail, "total_weight"))
+	code = cstr(item_code or "").strip()
+	if not code:
+		return None
+	rows = frappe.get_all(
+		"Sales Order Item",
+		filters={"parent": so, "item_code": code},
+		fields=["total_weight"],
+		limit_page_length=1,
+		ignore_permissions=True,
+	)
+	if not rows:
+		return None
+	return _positive_float(rows[0].get("total_weight"))
+
+
+def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) -> dict:
+	"""Add weight fields; optionally blank amount for unweighed weight-based lines.
+
+	Remito ``Peso`` maps to ``weight`` and must show measured/estimated line kg
+	(same as Pedidos PESO), never mayorista unit count.
+
+	``blank_unknown_weight_amount``: True for armado/picking sheets; False for
+	Delivery Note / Sales Invoice remitos that must show Importe.
+	"""
 	out = dict(row) if isinstance(row, dict) else {}
 	item_code = out.get("item_code") or ""
 	stock_uom, wpu, wuom = _item_weight_meta(item_code)
-	line_wpu = float(out.get("weight_per_unit") or 0) or wpu
+	line_wpu = _positive_float(out.get("weight_per_unit")) or wpu or 0.0
 	line_wuom = out.get("weight_uom") or wuom
 	qty = float(out.get("qty") or 0)
 	weight_based = _is_weight_based_line(out, stock_uom=stock_uom, weight_uom=line_wuom)
 
-	weight_val = line_wpu if line_wpu else (qty if weight_based else None)
-	total_w = None
-	if line_wpu and qty:
+	# Prefer measured line kg (SO/DN total_weight, armado actual_weight).
+	existing_tw = _positive_float(out.get("total_weight"))
+	if existing_tw is None:
+		existing_tw = _positive_float(out.get("actual_weight"))
+	if existing_tw is None:
+		existing_tw = _so_line_total_weight(
+			out.get("against_sales_order") or out.get("sales_order"),
+			so_detail=out.get("so_detail") or out.get("against_sales_order_item"),
+			item_code=item_code,
+		)
+
+	tx_uom = out.get("uom") or stock_uom or line_wuom
+	if existing_tw is not None:
+		total_w = existing_tw
+	elif line_wpu and qty:
 		total_w = line_wpu * qty
-	elif weight_based and qty:
+	elif weight_based and qty and _is_mass_uom(tx_uom):
+		# Real mass UOM (kg/g): qty itself is the weight.
 		total_w = qty
+	else:
+		# Catalog WEIGHT / Nos without measured kg or pack weight → blank.
+		total_w = None
+
+	# Remito "Peso" = line kg (matches Pedidos PESO), not unit count.
+	weight_val = total_w
 
 	out["weight"] = weight_val if weight_val not in (None, 0) else ""
 	out["weight_uom"] = line_wuom or (stock_uom if weight_based else "") or ""
 	out["total_weight"] = total_w if total_w not in (None, 0) else ""
-	out["actual_weight"] = out.get("actual_weight") if out.get("actual_weight") not in (None, "") else ""
+	aw = _positive_float(out.get("actual_weight"))
+	out["actual_weight"] = aw if aw is not None else ""
 	out["is_weight_based"] = 1 if weight_based else 0
-	# Default: client does not know weight → leave amount blank for weight-based lines.
-	if weight_based and not _order_print_client_knows_weight():
+	# Armado sheets: hide $ until weighed. Remito/SI keep billed amount for Importe.
+	if (
+		blank_unknown_weight_amount
+		and weight_based
+		and not _order_print_client_knows_weight()
+		and total_w is None
+	):
 		out["amount"] = ""
+	elif not _positive_float(out.get("amount")):
+		# Fill Amount when rate × kg/qty is known (WEIGHT lines often store qty as packs).
+		rate = flt(out.get("rate"))
+		if rate > 0 and total_w is not None and weight_based:
+			out["amount"] = round(rate * float(total_w), 2)
+		elif rate > 0 and qty > 0 and not weight_based:
+			out["amount"] = round(rate * qty, 2)
 	return out
 
 
@@ -804,19 +889,24 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 				"item_name": it.item_name,
 				"qty": qty,
 				"uom": uom,
+				"stock_uom": getattr(it, "stock_uom", None) or "",
 				"qty_display": qty_display,
 				"code_display": code_display,
 				"rate": it.rate,
 				"amount": it.amount,
 				"weight_per_unit": getattr(it, "weight_per_unit", None),
 				"weight_uom": getattr(it, "weight_uom", None),
+				"total_weight": getattr(it, "total_weight", None),
 				"warehouse": it.warehouse or wh,
 				"location": loc,
 				"barcode": barcode,
 				"confirm_uni": "",
 				"confirm_qty": "",
 				"_location_sort_key": sort_key,
-			}
+			},
+			# Armado sheet has no Importe column, but SI/DN print tabs fall back to
+			# this checklist when the linked doc is missing — keep money fields.
+			blank_unknown_weight_amount=False,
 		)
 		rows.append(row)
 
@@ -853,8 +943,14 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"facturado_flag": "SI" if has_si else "NO",
 		"delivery_date": so.delivery_date,
 		"transaction_date": so.transaction_date,
+		"posting_date": so.transaction_date or so.delivery_date,
 		"warehouse_name": wh,
+		"set_warehouse": wh,
 		"total_weight": _sum_line_total_weight(rows) or getattr(so, "total_weight", None) or "",
+		# SI / remito print tabs reuse this checklist when no linked doc exists.
+		"grand_total": flt(getattr(so, "grand_total", None) or 0) or "",
+		"net_total": flt(getattr(so, "net_total", None) or 0) or "",
+		"currency": getattr(so, "currency", None) or "",
 		"company": company,
 		"order_ean13": _armado_order_ean13(so.name),
 		"_map": map_out,
@@ -980,7 +1076,12 @@ def get_print_data(source_doctype, docname, warehouse=None, floor_id=None):
 	rows = []
 	if child_table_fieldname:
 		# doc.as_dict() already recursively converts child table rows to plain dicts.
-		rows = [_enrich_print_line_item(r) for r in (data.get(child_table_fieldname) or [])]
+		# DN / SI remitos must keep line amounts for the Importe column.
+		keep_amount = source_doctype in ("Delivery Note", "Sales Invoice", "Purchase Receipt")
+		rows = [
+			_enrich_print_line_item(r, blank_unknown_weight_amount=not keep_amount)
+			for r in (data.get(child_table_fieldname) or [])
+		]
 		data[child_table_fieldname] = rows
 		if not data.get("total_weight"):
 			tw = _sum_line_total_weight(rows)
@@ -1712,6 +1813,7 @@ def _compact_commercial_a4_elements(
 	footer_kind: str = "remito",
 	disclaimer: str | None = None,
 	address_field: str = "customer_address",
+	items_id_suffix: str = "v1",
 ):
 	"""Armado-style A4: compact header + multi-column line items + signature footer."""
 	p = id_prefix
@@ -1719,7 +1821,7 @@ def _compact_commercial_a4_elements(
 	header_h = 44
 	table_y = header_h + (8 if disclaimer else 4)
 	table_w = 190
-	items_h = 165 if not disclaimer else 160
+	items_h = 158 if footer_kind == "remito" else (165 if not disclaimer else 160)
 
 	elements = _compact_party_doc_header_elements(
 		p,
@@ -1749,7 +1851,7 @@ def _compact_commercial_a4_elements(
 		)
 	elements.append(
 		{
-			"id": f"{p}-items-v1",
+			"id": f"{p}-items-{items_id_suffix}",
 			"kind": "line-items",
 			"x": 10,
 			"y": table_y,
@@ -1761,7 +1863,7 @@ def _compact_commercial_a4_elements(
 			"columns": columns,
 		}
 	)
-	footer_y = table_y + items_h + 6
+	footer_y = table_y + items_h + 4
 	if footer_kind == "remito":
 		elements.extend(
 			[
@@ -1782,7 +1884,7 @@ def _compact_commercial_a4_elements(
 					"kind": "field",
 					"x": 38,
 					"y": footer_y,
-					"width": 36,
+					"width": 28,
 					"height": 6,
 					"fieldPath": "total_weight",
 					"label": "Peso total",
@@ -1791,11 +1893,38 @@ def _compact_commercial_a4_elements(
 					"textColor": "#0f172a",
 				},
 				{
+					"id": f"{p}-imp-label",
+					"kind": "text",
+					"x": 70,
+					"y": footer_y,
+					"width": 36,
+					"height": 6,
+					"staticText": "Importe tot:",
+					"fontSize": 10,
+					"bold": True,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-imp",
+					"kind": "field",
+					"x": 106,
+					"y": footer_y,
+					"width": 40,
+					"height": 6,
+					"fieldPath": "grand_total",
+					"label": "Importe total",
+					"fontSize": 11,
+					"bold": True,
+					"align": "left",
+					"textColor": "#0f172a",
+				},
+				{
 					"id": f"{p}-firma-label",
 					"kind": "text",
-					"x": 110,
-					"y": footer_y,
-					"width": 90,
+					"x": 10,
+					"y": footer_y + 10,
+					"width": 100,
 					"height": 6,
 					"staticText": "Recibi Conforme (Firma y Aclaración):",
 					"fontSize": 9,
@@ -1806,7 +1935,7 @@ def _compact_commercial_a4_elements(
 					"id": f"{p}-firma-line",
 					"kind": "shape",
 					"x": 110,
-					"y": footer_y + 12,
+					"y": footer_y + 14,
 					"width": 90,
 					"height": 1,
 					"shapeType": "line",
@@ -1904,7 +2033,7 @@ def _compact_commercial_a4_elements(
 
 
 def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem"):
-	"""Delivery Note remito — compact Armado header + shipped qty columns."""
+	"""Delivery Note remito — compact Armado header + shipped qty/importe columns."""
 	return _compact_commercial_a4_elements(
 		id_prefix=id_prefix,
 		party_label="CLIENTE:",
@@ -1917,14 +2046,16 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem"):
 			("CUIT:", "tax_id", "Horario:", "horario"),
 		],
 		columns=[
-			{"fieldPath": "code_display", "label": "Codigo", "width": 36},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 58},
-			{"fieldPath": "qty_display", "label": "Cantidad", "width": 28},
-			{"fieldPath": "uom", "label": "Uni", "width": 14},
-			{"fieldPath": "weight", "label": "Peso", "width": 18},
+			{"fieldPath": "code_display", "label": "Codigo", "width": 32},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 46},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 24},
+			{"fieldPath": "uom", "label": "Uni", "width": 12},
+			{"fieldPath": "weight", "label": "Peso", "width": 16},
+			{"fieldPath": "amount", "label": "Importe", "width": 24},
 			{"fieldPath": "warehouse", "label": "Desde", "width": 36},
 		],
 		footer_kind="remito",
+		items_id_suffix="v2",
 	)
 
 
@@ -2691,7 +2822,8 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-dnrem-items-v1",
+		# v2: Importe column + Importe tot footer (was qty/peso-only v1).
+		"resync_if_missing_id": "starter-dnrem-items-v2",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem"),
 	},
@@ -2845,6 +2977,8 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Detalle": ("Detalle", "明细"),
 		"Peso Real": ("Peso medido", "实称重量"),
 		"Peso tot:": ("Peso tot:", "总重："),
+		"Importe tot:": ("Importe tot:", "金额合计："),
+		"Importe total": ("Importe total", "金额合计"),
 		"Ubic.": ("Ubic.", "库位"),
 		"Barras": ("Barras", "条码"),
 		"Uni": ("Uni", "单位"),

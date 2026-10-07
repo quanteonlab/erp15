@@ -432,6 +432,19 @@
       "expect": "error"
     },
     {
+      "id": "get_print_data_dn_null_docname",
+      "source": "regression",
+      "bug": "Delivery Note get_print_data with null docname must controlled error (Remito Peso enrich path)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_print_data",
+      "args": {
+        "source_doctype": "Delivery Note",
+        "docname": null,
+        "warehouse": null,
+        "floor_id": null
+      },
+      "expect": "error"
+    },
+    {
       "id": "staff_cred_print_fields_and_missing_doc",
       "source": "regression",
       "bug": "Staff Cred. is synthetic like Catalog Header — get_doctype_fields must not call get_meta; empty docname must controlled error",
@@ -3783,6 +3796,17 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.resolve_ops_pin",
       "args": {
         "pin": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "search_customers_null_term",
+      "source": "regression",
+      "bug": "search_customers with null search_term must not TypeError (RM list / assigned scope)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
+      "args": {
+        "search_term": null,
+        "page_length": null
       },
       "expect": "no_500"
     },

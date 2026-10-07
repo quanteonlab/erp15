@@ -1602,6 +1602,61 @@ def suite_5_12_modules_read():
         except Exception as e:
             assert "DoesNotExistError" in type(e).__name__ or "not found" in str(e).lower()
 
+        # Remito Peso must show measured kg, not mayorista unit count (WEIGHT qty=4 → 13.43).
+        weighed = pta._enrich_print_line_item(
+            {
+                "item_code": "SMOKE-WT",
+                "item_name": "Barra",
+                "qty": 4,
+                "uom": "WEIGHT",
+                "total_weight": 13.43,
+                "amount": 100,
+            }
+        )
+        assert abs(flt(weighed.get("weight")) - 13.43) < 1e-9, weighed
+        assert abs(flt(weighed.get("total_weight")) - 13.43) < 1e-9, weighed
+        # Catalog WEIGHT without measured kg → blank (do not print unit count as kg).
+        units_only = pta._enrich_print_line_item(
+            {"item_code": "SMOKE-WT", "qty": 4, "uom": "WEIGHT", "total_weight": 0, "amount": 1}
+        )
+        assert units_only.get("weight") in ("", None, 0, "0"), units_only
+        # Real mass UOM: qty is the weight.
+        mass = pta._enrich_print_line_item(
+            {"item_code": "SMOKE-KG", "qty": 2.5, "uom": "Kg", "total_weight": 0}
+        )
+        assert abs(flt(mass.get("weight")) - 2.5) < 1e-9, mass
+        # DN remito keeps line amount for Importe even when WEIGHT + no measured kg yet.
+        dn_amt = pta._enrich_print_line_item(
+            {"item_code": "SMOKE-WT", "qty": 1, "uom": "WEIGHT", "total_weight": 0, "amount": 7900},
+            blank_unknown_weight_amount=False,
+        )
+        assert abs(flt(dn_amt.get("amount")) - 7900) < 1e-9, dn_amt
+        # SI preview: fill Amount from rate × measured kg when amount was blanked.
+        filled = pta._enrich_print_line_item(
+            {
+                "item_code": "SMOKE-WT",
+                "qty": 1,
+                "uom": "WEIGHT",
+                "rate": 18000,
+                "amount": 0,
+                "total_weight": 2,
+            },
+            blank_unknown_weight_amount=False,
+        )
+        assert abs(flt(filled.get("amount")) - 36000) < 1e-6, filled
+        assert abs(flt(filled.get("weight")) - 2) < 1e-9, filled
+        remito_els = pta._dn_remito_a4_elements()
+        items_el = next(
+            (e for e in remito_els if isinstance(e, dict) and e.get("kind") == "line-items"),
+            None,
+        )
+        assert items_el, remito_els
+        col_paths = [c.get("fieldPath") for c in (items_el.get("columns") or [])]
+        assert "amount" in col_paths, col_paths
+        assert any(
+            isinstance(e, dict) and e.get("fieldPath") == "grand_total" for e in remito_els
+        ), remito_els
+
     def check_company_settings():
         from erpnext.erpnext_integrations.ecommerce_api import company_settings as cs
         payload = cs.get_company_settings()
