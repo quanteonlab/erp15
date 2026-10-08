@@ -4961,6 +4961,65 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "DN print enrich for mat_ref/pedido_ref with empty docname is controlled, not AttributeError"
+    },
+    {
+      "id": "tms_pending_includes_preorder_null_company",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_pending_deliveries",
+      "args": {
+        "date": null,
+        "company": null,
+        "from_date": null,
+        "to_date": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Planner queue merges Orden/Preparado SOs without remito; null company/date must not 500"
+    },
+    {
+      "id": "tms_update_pending_due_sales_order_only",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_due",
+      "args": {
+        "delivery_note": null,
+        "sales_order": null,
+        "due_date": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Due update with null DN+SO+date is controlled (SO-only planning path)"
+    },
+    {
+      "id": "tms_create_trip_preorder_names_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": null,
+        "delivery_note_names": null,
+        "preorder_names": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "create_trip with null preorder_names/dns is controlled ValidationError, not TypeError"
+    },
+    {
+      "id": "auto_assign_preorders_to_mats_null_names",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.auto_assign_preorders_to_mats",
+      "args": {
+        "preorder_names": null,
+        "company": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Auto Assign MAT with null preorder_names is controlled ValidationError, not TypeError"
+    },
+    {
+      "id": "auto_assign_preorders_to_mats_empty_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.auto_assign_preorders_to_mats",
+      "args": {
+        "preorder_names": [],
+        "company": ""
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Auto Assign MAT with empty list is controlled"
     }
   ]
 }

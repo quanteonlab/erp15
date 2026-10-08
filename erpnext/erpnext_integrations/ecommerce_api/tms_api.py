@@ -637,25 +637,71 @@ def _coerce_opt_date(raw, fallback=None):
 
 
 @frappe.whitelist(allow_guest=True)
+def _active_trip_by_delivery_note():
+	"""Map DN → {trip, driver, driver_name, status} for active non-Not-Home stops."""
+	trip_names = _active_trip_names()
+	if not trip_names:
+		return {}
+	rows = frappe.db.sql(
+		"""
+		select ds.delivery_note, ds.parent as trip, dt.driver, dt.status,
+			coalesce(nullif(dt.driver_name, ''), d.full_name, dt.driver) as driver_name
+		from `tabDelivery Stop` ds
+		inner join `tabDelivery Trip` dt on dt.name = ds.parent
+		left join `tabDriver` d on d.name = dt.driver
+		where ds.parent in %(parents)s
+		  and ifnull(ds.delivery_note, '') != ''
+		  and ifnull(ds.custom_outcome, '') != 'Not Home'
+		""",
+		{"parents": trip_names},
+		as_dict=True,
+	)
+	out = {}
+	for r in rows or []:
+		dn = cstr(r.get("delivery_note") or "").strip()
+		if dn and dn not in out:
+			out[dn] = {
+				"trip": r.get("trip"),
+				"driver": r.get("driver"),
+				"driver_name": r.get("driver_name"),
+				"status": r.get("status"),
+			}
+	return out
+
+
+def _due_in_pending_window(due_d, *, window_mode, due_lo, due_hi, as_of, today_d):
+	"""Shared due filter for DN + SO planner rows. Returns (include, overdue)."""
+	if window_mode:
+		if due_d < due_lo or due_d > due_hi:
+			return False, False
+		return True, due_d < today_d
+	if due_d > as_of:
+		return False, False
+	return True, due_d < as_of
+
+
 def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None, horizon_days=None):
-	"""Unassigned remitos ready for routing.
+	"""Planner queue for Rutas: remitos + Orden/Preparado SOs in the due window.
+
+	Planning does **not** require a remito — guest preorders in Orden/Preparado
+	appear by ``Sales Order.delivery_date``. Remitos are created when claiming
+	onto a MAT. Rows already on a MAT stay visible (``assigned_trip``) so the
+	date board shows the full day; they are not dropped from the list.
 
 	Two modes:
 
 	1. **Ceiling** (default, greedy / legacy): ``date`` = as-of ceiling — include
-	   every submitted DN not on an active trip whose target ship date
-	   (SO ``delivery_date``, else DN ``custom_requested_delivery_date``, else
-	   posting_date) is on or before ``as_of``.
+	   every row whose target ship date is on or before ``as_of``.
 
 	2. **Window** (Rutas day/week UI): pass ``from_date``+``to_date`` or
-	   ``horizon_days`` (1–7) with ``date`` as window start. Only remitos whose
+	   ``horizon_days`` (1–7) with ``date`` as window start. Only rows whose
 	   due falls inside the inclusive range are returned — no overdue spill from
 	   earlier weekdays. Spans wider than 7 days are clamped.
 	"""
 	from frappe.utils import add_days, date_diff
 
-	assigned_notes = _assigned_delivery_note_names()
 	today_d = getdate()
+	trip_by_dn = _active_trip_by_delivery_note()
 
 	win_from = _coerce_opt_date(from_date)
 	win_to = _coerce_opt_date(to_date)
@@ -701,8 +747,7 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 		"is_return": 0,
 		"posting_date": [">=", since],
 	}
-	if assigned_notes:
-		filters["name"] = ["not in", assigned_notes]
+	# Keep MAT-assigned remitos in the board (annotated); do not exclude them.
 	if company and str(company).strip() and str(company).strip().lower() not in ("null", "undefined", "none"):
 		filters["company"] = str(company).strip()
 
@@ -798,10 +843,13 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 		)
 
 	out = []
+	sos_with_dn = set()
 	for n in notes:
 		address_name = n.shipping_address_name or n.customer_address
 		geo = geo_by_address.get(address_name) or {}
 		so_name = so_by_dn.get(n.name)
+		if so_name:
+			sos_with_dn.add(so_name)
 		so = so_status.get(so_name) if so_name else None
 		due = None
 		if so and so.get("delivery_date"):
@@ -811,16 +859,16 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 		else:
 			due = n.posting_date
 		due_d = getdate(due) if due else as_of
-		if window_mode:
-			# Exact window — no overdue spill from earlier weekdays.
-			if due_d < due_lo or due_d > due_hi:
-				continue
-			overdue = due_d < today_d
-		else:
-			# Not ready yet — target ship day is after the planning as-of.
-			if due_d > as_of:
-				continue
-			overdue = due_d < as_of
+		ok, overdue = _due_in_pending_window(
+			due_d,
+			window_mode=window_mode,
+			due_lo=due_lo,
+			due_hi=due_hi,
+			as_of=as_of,
+			today_d=today_d,
+		)
+		if not ok:
+			continue
 
 		display = _rutas_order_display_status(
 			dn_status=n.status,
@@ -838,9 +886,12 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 		]
 		street_display = ", ".join(b for b in street_bits if b) or address_name
 
+		assigned = trip_by_dn.get(n.name) or {}
 		out.append(
 			{
+				"kind": "delivery_note",
 				"delivery_note": n.name,
+				"preorder_name": so_name,
 				"customer": n.customer,
 				"customer_name": n.customer_name,
 				"address": street_display,
@@ -860,11 +911,108 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 				"lng": geo.get("custom_longitude"),
 				"zone": geo.get("custom_zone") or None,
 				"previous_attempt": n.name in previous_attempts,
+				"assigned_trip": assigned.get("trip"),
+				"assigned_driver": assigned.get("driver"),
+				"assigned_driver_name": assigned.get("driver_name"),
+			}
+		)
+
+	# Orden/Preparado without remito — planning rows keyed by Sales Order.
+	try:
+		preorders = _list_claimable_preorders(company=company) or []
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "get_pending_deliveries preorders")
+		preorders = []
+
+	pre_addr_names = list(
+		{p.get("address_name") for p in preorders if p.get("address_name")}
+	)
+	if pre_addr_names:
+		for row in frappe.get_all(
+			"Address",
+			filters={"name": ["in", pre_addr_names]},
+			fields=[
+				"name",
+				"address_line1",
+				"address_line2",
+				"city",
+				"custom_latitude",
+				"custom_longitude",
+				"custom_zone",
+			],
+			ignore_permissions=True,
+		):
+			geo_by_address[row.name] = row
+
+	for p in preorders:
+		so_name = cstr(p.get("preorder_name") or "").strip()
+		if not so_name or so_name in sos_with_dn:
+			continue
+		due_raw = p.get("due_date") or p.get("posting_date")
+		if not due_raw:
+			continue
+		due_d = getdate(due_raw)
+		ok, overdue = _due_in_pending_window(
+			due_d,
+			window_mode=window_mode,
+			due_lo=due_lo,
+			due_hi=due_hi,
+			as_of=as_of,
+			today_d=today_d,
+		)
+		if not ok:
+			continue
+		addr_name = p.get("address_name")
+		geo = geo_by_address.get(addr_name) or {}
+		street_bits = [
+			cstr(geo.get("address_line1") or "").strip(),
+			cstr(geo.get("address_line2") or "").strip(),
+			cstr(geo.get("city") or "").strip(),
+		]
+		street_display = ", ".join(b for b in street_bits if b) or p.get("address") or addr_name
+		display = _rutas_order_display_status(
+			dn_status=None,
+			so_status=p.get("status"),
+			previous_attempt=False,
+			overdue=overdue,
+		)
+		out.append(
+			{
+				"kind": "preorder",
+				"delivery_note": None,
+				"preorder_name": so_name,
+				"customer": p.get("customer"),
+				"customer_name": p.get("customer_name"),
+				"address": street_display,
+				"address_name": addr_name,
+				"grand_total": p.get("grand_total"),
+				"posting_date": p.get("posting_date"),
+				"due_date": str(due_d),
+				"overdue": overdue,
+				"status": display,
+				"dn_status": None,
+				"so_status": p.get("status"),
+				"sales_order": so_name,
+				"item_count": cint(p.get("item_count") or 0),
+				"qty_total": flt(p.get("qty_total") or 0),
+				"geocoded": bool(geo.get("custom_latitude")),
+				"lat": geo.get("custom_latitude"),
+				"lng": geo.get("custom_longitude"),
+				"zone": geo.get("custom_zone") or None,
+				"previous_attempt": False,
+				"assigned_trip": None,
+				"assigned_driver": None,
+				"assigned_driver_name": None,
 			}
 		)
 
 	# Overdue / oldest target dates first so the dispatcher clears the backlog.
-	out.sort(key=lambda r: (r.get("due_date") or "", r.get("delivery_note") or ""))
+	out.sort(
+		key=lambda r: (
+			r.get("due_date") or "",
+			r.get("delivery_note") or r.get("preorder_name") or "",
+		)
+	)
 	payload = {"deliveries": out, "as_of": str(as_of), "mode": "window" if window_mode else "ceiling"}
 	if window_mode:
 		payload["from_date"] = str(due_lo)
@@ -937,14 +1085,7 @@ def get_rutas_week_bundle(
 		except Exception:
 			pass
 
-	# Orden/Preparado without remito never show in get_pending_deliveries — sync first.
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.api import sync_orden_planner_remitos
-
-		sync_orden_planner_remitos(company=company)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "sync_orden_planner_remitos")
-
+	# Planning lists Orden/Preparado by SO.delivery_date — no remito sync required.
 	pending = get_pending_deliveries(
 		from_date=str(from_d), to_date=str(to_d), company=company
 	)
@@ -1288,37 +1429,66 @@ def _apply_pending_delivery_due(dn, due_d, driver=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def update_pending_delivery_due(delivery_note=None, due_date=None, driver=None):
-	"""Update the planning due date for a pending remito.
+def update_pending_delivery_due(
+	delivery_note=None, due_date=None, driver=None, sales_order=None, preorder_name=None
+):
+	"""Update the planning due date for a pending remito or Orden SO (no remito).
 
-	Writes Sales Order.delivery_date when linked; otherwise
+	Writes Sales Order.delivery_date when linked / when ``sales_order`` /
+	``preorder_name`` is passed; otherwise
 	Delivery Note.custom_requested_delivery_date (POS remitos without SO).
 
 	Optional ``driver`` force-assigns Address.custom_zone to that driver's
 	day-zone for the due weekday (overrides territory snap).
 	"""
 	dn = cstr(delivery_note or "").strip()
+	so_name = cstr(sales_order or preorder_name or "").strip()
 	due = cstr(due_date or "").strip()
-	if not dn:
-		frappe.throw(_("Delivery Note is required."))
+	if not dn and not so_name:
+		frappe.throw(_("Delivery Note or Sales Order is required."))
 	if not due:
 		frappe.throw(_("Due date is required."))
 	try:
 		due_d = getdate(due)
 	except Exception:
 		frappe.throw(_("Invalid due date."))
-	if not frappe.db.exists("Delivery Note", dn):
-		frappe.throw(_("Delivery Note not found."))
 
-	meta = _apply_pending_delivery_due(dn, due_d, driver=driver)
+	if dn:
+		if not frappe.db.exists("Delivery Note", dn):
+			frappe.throw(_("Delivery Note not found."))
+		meta = _apply_pending_delivery_due(dn, due_d, driver=driver)
+		frappe.db.commit()
+		return {
+			"delivery_note": dn,
+			"due_date": str(due_d),
+			"sales_orders": meta.get("sales_orders") or [],
+			"via": meta.get("via"),
+			"zone": meta.get("zone"),
+			"driver": meta.get("driver"),
+		}
+
+	if not frappe.db.exists("Sales Order", so_name):
+		frappe.throw(_("Sales Order not found."))
+	frappe.db.set_value("Sales Order", so_name, "delivery_date", due_d, update_modified=True)
+	try:
+		frappe.db.sql(
+			"""
+			UPDATE `tabSales Order Item`
+			SET delivery_date=%s
+			WHERE parent=%s
+			""",
+			(due_d, so_name),
+		)
+	except Exception:
+		pass
 	frappe.db.commit()
 	return {
-		"delivery_note": dn,
+		"delivery_note": None,
 		"due_date": str(due_d),
-		"sales_orders": meta.get("sales_orders") or [],
-		"via": meta.get("via"),
-		"zone": meta.get("zone"),
-		"driver": meta.get("driver"),
+		"sales_orders": [so_name],
+		"via": "sales_order",
+		"zone": None,
+		"driver": cstr(driver or "").strip() or None,
 	}
 
 
@@ -2290,10 +2460,68 @@ def _repair_dn_cancelled_so_links(dn_names):
 			)
 
 
+def _materialize_dns_for_preorders(preorder_names):
+	"""Create submitted remitos for Orden/Preparado SOs (lazy — only on MAT attach)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_delivery_note_for_sales_order,
+		_ensure_planner_delivery_note,
+		_is_guest_preorder_sales_order,
+	)
+
+	names = preorder_names or []
+	if isinstance(names, str):
+		try:
+			names = frappe.parse_json(names)
+		except Exception:
+			names = [names] if names.strip() else []
+	if not isinstance(names, (list, tuple)):
+		names = [names] if names else []
+
+	dns = []
+	for raw in names:
+		so_name = cstr(raw or "").strip()
+		if not so_name or so_name in ("null", "undefined"):
+			continue
+		existing = _delivery_note_for_sales_order(so_name)
+		if existing:
+			dns.append(existing)
+			continue
+		if not frappe.db.exists("Sales Order", so_name):
+			frappe.throw(_("Sales Order {0} not found").format(so_name))
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+		if not _is_guest_preorder_sales_order(so):
+			frappe.throw(_("Not a Guest Preorder: {0}").format(so_name))
+		if cint(so.docstatus) != 1:
+			frappe.throw(_("Confirm the order before planning: {0}").format(so_name))
+		gate = _ensure_planner_delivery_note(so)
+		dn = gate.get("delivery_note")
+		if not dn:
+			frappe.throw(
+				gate.get("delivery_warning")
+				or _("Could not create remito for {0}").format(so_name)
+			)
+		dns.append(dn)
+	return dns
+
+
 @frappe.whitelist(allow_guest=True)
 @idempotent_request
-def create_trip(date, driver=None, vehicle=None, delivery_note_names=None, company=None, pickup_warehouse=None):
+def create_trip(
+	date,
+	driver=None,
+	vehicle=None,
+	delivery_note_names=None,
+	company=None,
+	pickup_warehouse=None,
+	preorder_names=None,
+):
 	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
+	if preorder_names:
+		delivery_note_names = list(
+			dict.fromkeys([*(delivery_note_names or []), *_materialize_dns_for_preorders(preorder_names)])
+		)
 	if not delivery_note_names:
 		frappe.throw(_("Select at least one order to plan a route."))
 
@@ -3075,8 +3303,12 @@ def _trip_owning_delivery_note(delivery_note, exclude_trip=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def add_stops_to_trip(trip_name, delivery_note_names, allow_steal=0):
+def add_stops_to_trip(trip_name, delivery_note_names, allow_steal=0, preorder_names=None):
 	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
+	if preorder_names:
+		delivery_note_names = list(
+			dict.fromkeys([*(delivery_note_names or []), *_materialize_dns_for_preorders(preorder_names)])
+		)
 	if not delivery_note_names:
 		frappe.throw(_("Select at least one order to add."))
 

@@ -1144,6 +1144,9 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 		elif source_doctype == "Sales Invoice" and dn_for_mat:
 			fletero = _fletero_for_delivery_note(dn_for_mat)
 		data["fletero"] = fletero or ""
+	elif data.get("fletero"):
+		# Firstname L. — keeps Fletero + tear strips from wrapping.
+		data["fletero"] = _short_person_name(data.get("fletero"))
 	if not data.get("set_warehouse") and rows:
 		wh = next(
 			(r.get("warehouse") for r in rows if isinstance(r, dict) and r.get("warehouse")),
@@ -1177,12 +1180,22 @@ def _trip_row_for_delivery_note(dn_name):
 		return None
 
 
+def _short_person_name(full_name) -> str:
+	"""Print-friendly person: ``Firstname L.`` (drops middle / full last name)."""
+	parts = [p for p in cstr(full_name or "").strip().split() if p]
+	if not parts:
+		return ""
+	if len(parts) == 1:
+		return parts[0]
+	return f"{parts[0]} {parts[-1][0]}."
+
+
 def _fletero_for_delivery_note(dn_name) -> str:
 	"""Driver name from the active Delivery Trip stop that carries this remito."""
 	row = _trip_row_for_delivery_note(dn_name)
 	if not row:
 		return ""
-	return cstr(row.get("fletero") or "").strip()
+	return _short_person_name(row.get("fletero") or "")
 
 
 def _mat_ref_for_delivery_note(dn_name) -> str:
@@ -1745,19 +1758,21 @@ def _compact_party_doc_header_elements(
 	When ``show_party_totals``, Total Importe / Total Peso sit under Cond. IVA inside
 	the client box (frees the page footer for the tear-off strip).
 
-	``wide_meta`` = (label, fieldPath) renders a full-width row under the badge
-	(used for long Sales Order names that do not fit the 2-col meta cells).
+	``wide_meta`` = (label, fieldPath) or a list of those — full-width rows under
+	the badge (Pedido / Remito names that do not fit the 2-col meta cells).
 	"""
 	fs = font
-	fs_sm = max(8, font - 1)
+	fs_sm = max(9, font - 1)
 	rows = meta_rows or [
 		("Vend:", "vendedor", "Zona:", "zona"),
 		("Horario:", "horario", "Fletero:", "fletero"),
 		("Cargado:", "cargado", "Armado:", "armado_flag"),
 		("Facturado:", "facturado_flag", "CUIT:", "tax_id"),
 	]
-	# Taller party box when totals live under Cond. IVA.
-	box_h = 40 if show_party_totals else 28
+	wide_rows = _normalize_wide_metas(wide_meta)
+	row_pitch = 5
+	# Compact party box when totals live under Cond. IVA.
+	box_h = 32 if show_party_totals else 24
 	els = []
 	# Left: party box
 	els.extend(
@@ -1779,7 +1794,7 @@ def _compact_party_doc_header_elements(
 				"x": 12,
 				"y": y0 + 1,
 				"width": 28,
-				"height": 5,
+				"height": 4.5,
 				"staticText": party_label,
 				"fontSize": fs_sm,
 				"bold": True,
@@ -1792,7 +1807,7 @@ def _compact_party_doc_header_elements(
 				"x": 40,
 				"y": y0 + 1,
 				"width": 72,
-				"height": 5,
+				"height": 4.5,
 				"fieldPath": party_field,
 				"label": party_label,
 				"fontSize": fs,
@@ -1804,9 +1819,9 @@ def _compact_party_doc_header_elements(
 				"id": f"{p}-addr",
 				"kind": "field",
 				"x": 12,
-				"y": y0 + 8,
+				"y": y0 + 6.5,
 				"width": 100,
-				"height": 8,
+				"height": 5.5,
 				"fieldPath": address_field,
 				"label": "Dirección",
 				"fontSize": fs_sm,
@@ -1817,9 +1832,9 @@ def _compact_party_doc_header_elements(
 				"id": f"{p}-cond-label",
 				"kind": "text",
 				"x": 12,
-				"y": y0 + 18,
+				"y": y0 + 13,
 				"width": 22,
-				"height": 5,
+				"height": 4.5,
 				"staticText": cond_label,
 				"fontSize": fs_sm,
 				"align": "left",
@@ -1829,9 +1844,9 @@ def _compact_party_doc_header_elements(
 				"id": f"{p}-cond",
 				"kind": "field",
 				"x": 34,
-				"y": y0 + 18,
+				"y": y0 + 13,
 				"width": 78,
-				"height": 5,
+				"height": 4.5,
 				"fieldPath": cond_field,
 				"label": cond_label,
 				"fontSize": fs_sm,
@@ -1847,9 +1862,9 @@ def _compact_party_doc_header_elements(
 					"id": f"{p}-imp-label",
 					"kind": "text",
 					"x": 12,
-					"y": y0 + 25,
+					"y": y0 + 19.5,
 					"width": 28,
-					"height": 5,
+					"height": 4.5,
 					"staticText": "Total Importe:",
 					"fontSize": fs_sm,
 					"bold": True,
@@ -1860,9 +1875,9 @@ def _compact_party_doc_header_elements(
 					"id": f"{p}-imp",
 					"kind": "field",
 					"x": 40,
-					"y": y0 + 25,
+					"y": y0 + 19.5,
 					"width": 32,
-					"height": 5,
+					"height": 4.5,
 					"fieldPath": importe_field,
 					"label": "Total Importe",
 					"fontSize": fs_sm,
@@ -1874,9 +1889,9 @@ def _compact_party_doc_header_elements(
 					"id": f"{p}-tw-label",
 					"kind": "text",
 					"x": 74,
-					"y": y0 + 25,
+					"y": y0 + 19.5,
 					"width": 22,
-					"height": 5,
+					"height": 4.5,
 					"staticText": "Total Peso:",
 					"fontSize": fs_sm,
 					"bold": True,
@@ -1887,9 +1902,9 @@ def _compact_party_doc_header_elements(
 					"id": f"{p}-tw",
 					"kind": "field",
 					"x": 96,
-					"y": y0 + 25,
+					"y": y0 + 19.5,
 					"width": 16,
-					"height": 5,
+					"height": 4.5,
 					"fieldPath": peso_field,
 					"label": "Total Peso",
 					"fontSize": fs_sm,
@@ -1908,7 +1923,7 @@ def _compact_party_doc_header_elements(
 				"x": 120,
 				"y": y0,
 				"width": 80,
-				"height": 10,
+				"height": 9,
 				"shapeType": "rect",
 				"color": "#cbd5e1",
 				"filled": True,
@@ -1918,7 +1933,7 @@ def _compact_party_doc_header_elements(
 				"id": f"{p}-ped-label",
 				"kind": "text",
 				"x": 122,
-				"y": y0 + 2,
+				"y": y0 + 1.5,
 				"width": 22,
 				"height": 6,
 				"staticText": doc_badge_label,
@@ -1931,7 +1946,7 @@ def _compact_party_doc_header_elements(
 				"id": f"{p}-ped",
 				"kind": "field",
 				"x": 144,
-				"y": y0 + 2,
+				"y": y0 + 1.5,
 				"width": 54,
 				"height": 6,
 				"fieldPath": doc_badge_field,
@@ -1943,31 +1958,31 @@ def _compact_party_doc_header_elements(
 			},
 		]
 	)
-	meta_y = y0 + 12
-	# Full-width row for long refs (e.g. SAL-ORD-2026-00363) — 2-col cells clip them.
-	if wide_meta and len(wide_meta) >= 2:
-		wlabel, wfield = wide_meta[0], wide_meta[1]
+	meta_y = y0 + 10
+	# Full-width rows for long refs (Pedido / Remito) — 2-col cells clip them.
+	for wi, (wlabel, wfield) in enumerate(wide_rows):
+		suffix = "" if wi == 0 else str(wi)
 		els.extend(
 			[
 				{
-					"id": f"{p}-wide-l",
+					"id": f"{p}-wide{suffix}-l",
 					"kind": "text",
 					"x": 120,
 					"y": meta_y,
-					"width": 18,
-					"height": 5,
+					"width": 20,
+					"height": 4.5,
 					"staticText": wlabel,
 					"fontSize": fs_sm,
 					"align": "left",
 					"textColor": "#0f172a",
 				},
 				{
-					"id": f"{p}-wide",
+					"id": f"{p}-wide{suffix}",
 					"kind": "field",
-					"x": 138,
+					"x": 140,
 					"y": meta_y,
-					"width": 62,
-					"height": 5,
+					"width": 60,
+					"height": 4.5,
 					"fieldPath": wfield,
 					"label": wlabel,
 					"fontSize": fs_sm,
@@ -1976,10 +1991,10 @@ def _compact_party_doc_header_elements(
 				},
 			]
 		)
-		meta_y += 6
-	max_rows = 3 if wide_meta else 4
+		meta_y += row_pitch
+	max_rows = 3 if wide_rows else 4
 	for i, (l1, f1, l2, f2) in enumerate(rows[:max_rows]):
-		yy = meta_y + i * 6
+		yy = meta_y + i * row_pitch
 		els.extend(
 			[
 				{
@@ -1988,7 +2003,7 @@ def _compact_party_doc_header_elements(
 					"x": 120,
 					"y": yy,
 					"width": 18,
-					"height": 5,
+					"height": 4.5,
 					"staticText": l1,
 					"fontSize": fs_sm,
 					"align": "left",
@@ -2000,7 +2015,7 @@ def _compact_party_doc_header_elements(
 					"x": 138,
 					"y": yy,
 					"width": 22,
-					"height": 5,
+					"height": 4.5,
 					"fieldPath": f1,
 					"label": l1,
 					"fontSize": fs_sm,
@@ -2013,7 +2028,7 @@ def _compact_party_doc_header_elements(
 					"x": 160,
 					"y": yy,
 					"width": 16,
-					"height": 5,
+					"height": 4.5,
 					"staticText": l2,
 					"fontSize": fs_sm,
 					"align": "left",
@@ -2025,7 +2040,7 @@ def _compact_party_doc_header_elements(
 					"x": 176,
 					"y": yy,
 					"width": 24,
-					"height": 5,
+					"height": 4.5,
 					"fieldPath": f2,
 					"label": l2,
 					"fontSize": fs_sm,
@@ -2035,6 +2050,19 @@ def _compact_party_doc_header_elements(
 			]
 		)
 	return els
+
+
+def _normalize_wide_metas(wide_meta) -> list:
+	"""Accept ``(label, field)`` or a list of those pairs."""
+	if not wide_meta:
+		return []
+	if isinstance(wide_meta, (list, tuple)) and wide_meta and isinstance(wide_meta[0], str):
+		return [(wide_meta[0], wide_meta[1])] if len(wide_meta) >= 2 else []
+	out = []
+	for w in wide_meta:
+		if isinstance(w, (list, tuple)) and len(w) >= 2:
+			out.append((w[0], w[1]))
+	return out
 
 
 def _armado_meta_header_elements(p: str, *, font: int = 10, y0: int = 10, show_party_totals: bool = False) -> list:
@@ -2151,17 +2179,24 @@ def _compact_commercial_a4_elements(
 	p = id_prefix
 	font = 11
 	use_tear = layout == "tearoff" and footer_kind in ("remito", "invoice")
-	# Extra row when Pedido is full-width under the badge.
-	extra = 6 if wide_meta else 0
-	header_h = (52 if use_tear else 44) + extra
-	table_y = header_h + (8 if disclaimer else 4)
+	wide_n = len(_normalize_wide_metas(wide_meta))
+	# Extra mm per full-width Pedido/Remito row under the badge.
+	extra = 5 * wide_n
+	header_h = (48 if use_tear else 40) + extra
+	table_y = header_h + (6 if disclaimer else 3)
 	table_w = 190
+	# Pin remito footer / tear strips near the bottom of A4 (297mm).
+	page_h, margin_b = 297, 8
+	strip_h = 20
+	classic_foot_h = 22
 	if use_tear:
-		# Leave room for cut bar + label + 3-line stubs (~24mm).
-		items_h = (178 if not disclaimer else 172) - extra
+		footer_y = page_h - margin_b - strip_h
+		items_h = max(40, footer_y - table_y - 3)
 	elif footer_kind == "remito":
-		items_h = 158 - extra
+		footer_y = page_h - margin_b - classic_foot_h
+		items_h = max(40, footer_y - table_y - 3)
 	else:
+		footer_y = None
 		items_h = (165 if not disclaimer else 160) - extra
 
 	elements = _compact_party_doc_header_elements(
@@ -2206,7 +2241,8 @@ def _compact_commercial_a4_elements(
 			"columns": columns,
 		}
 	)
-	footer_y = table_y + items_h + 4
+	if footer_y is None:
+		footer_y = table_y + items_h + 4
 	if use_tear:
 		elements.extend(
 			_tear_off_strip_elements(
@@ -2391,8 +2427,7 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem", *, layout: str = "c
 	"""Delivery Note remito — compact Armado header + shipped qty/importe columns.
 
 	Badge shows MAT (Delivery Trip); empty when the remito is not on a trip.
-	Remito number stays in the meta grid; Pedido uses a full-width row so SO
-	names like SAL-ORD-2026-00363 are not clipped.
+	Pedido and Remito each get a full-width row (long DN names wrap otherwise).
 	"""
 	return _compact_commercial_a4_elements(
 		id_prefix=id_prefix,
@@ -2400,12 +2435,11 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem", *, layout: str = "c
 		party_field="customer_name",
 		doc_badge_label="MAT:",
 		doc_badge_field="mat_ref",
-		wide_meta=("Pedido:", "pedido_ref"),
+		wide_meta=[("Pedido:", "pedido_ref"), ("Remito:", "name")],
 		meta_rows=[
-			("Fecha:", "posting_date", "Remito:", "name"),
+			("Fecha:", "posting_date", "Horario:", "horario"),
 			("Vend:", "vendedor", "Zona:", "zona"),
 			("Almacen:", "set_warehouse", "Fletero:", "fletero"),
-			("CUIT:", "tax_id", "Horario:", "horario"),
 		],
 		columns=[
 			{"fieldPath": "code_display", "label": "Codigo", "width": 32},
@@ -2417,7 +2451,7 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem", *, layout: str = "c
 			{"fieldPath": "warehouse", "label": "Desde", "width": 36},
 		],
 		footer_kind="remito",
-		items_id_suffix="v2",
+		items_id_suffix="v3",
 		layout=layout,
 	)
 
@@ -2452,22 +2486,35 @@ def _pr_remito_a4_elements(id_prefix: str = "starter-prrem", *, disclaimer: str 
 def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 	"""English A4 Sales Invoice matching the commercial paper form.
 
-	Layout (top → bottom):
+	Layout (top → bottom), dense vertical pitch (~4 mm rows) + larger type:
 	- Title / invoice # / date (top-right)
 	- Customer box: Customer, Address, Tax status, Tax ID
 	- Line table: Code, Description, Units, Quantity, UOM, Price, Disc., Total
-	- Observations (Vendedor / Zone / Schedule / Order) + signature + totals
+	- Observations + totals near page bottom (no signature block)
 	"""
 	p = id_prefix
+	# Tall items band pushes Observaciones / Totals toward the bottom of A4.
+	y_title, y_nro, y_fecha = 5, 10, 14
+	y_cli_box, h_cli_box = 19, 14
+	y_cli, y_addr, y_tax = 20, 24.5, 29
+	y_items = 36
+	h_obs_box = 22
+	h_tot_box = 16
+	# Leave ~8mm under footer boxes on 297mm canvas.
+	y_foot = 297 - 8 - h_obs_box  # 267
+	h_items = y_foot - y_items - 2  # ~229
+	y_obs_title = y_foot + 1
+	y_vend, y_zona, y_hor, y_ped = y_foot + 5.5, y_foot + 9.5, y_foot + 13.5, y_foot + 17.5
+	y_sub, y_tot = y_foot + 2, y_foot + 8.5
 	return [
 		# ── Header (top-right) ──────────────────────────────────────────
 		{
 			"id": f"{p}-title",
 			"kind": "text",
-			"x": 100,
-			"y": 10,
-			"width": 95,
-			"height": 10,
+			"x": 90,
+			"y": y_title,
+			"width": 105,
+			"height": 5,
 			"staticText": "SALES INVOICE",
 			"fontSize": 14,
 			"bold": True,
@@ -2478,11 +2525,11 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-nro-label",
 			"kind": "text",
 			"x": 128,
-			"y": 22,
+			"y": y_nro,
 			"width": 18,
-			"height": 6,
+			"height": 4,
 			"staticText": "No.",
-			"fontSize": 9,
+			"fontSize": 11,
 			"bold": True,
 			"align": "right",
 			"textColor": "#0f172a",
@@ -2491,12 +2538,12 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-nro",
 			"kind": "field",
 			"x": 146,
-			"y": 22,
+			"y": y_nro,
 			"width": 49,
-			"height": 6,
+			"height": 4,
 			"fieldPath": "name",
 			"label": "Invoice No.",
-			"fontSize": 9,
+			"fontSize": 11,
 			"bold": True,
 			"align": "right",
 			"textColor": "#0f172a",
@@ -2505,11 +2552,11 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-fecha-label",
 			"kind": "text",
 			"x": 128,
-			"y": 30,
+			"y": y_fecha,
 			"width": 18,
-			"height": 6,
+			"height": 4,
 			"staticText": "Date:",
-			"fontSize": 9,
+			"fontSize": 11,
 			"align": "right",
 			"textColor": "#0f172a",
 		},
@@ -2517,12 +2564,12 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-fecha",
 			"kind": "field",
 			"x": 146,
-			"y": 30,
+			"y": y_fecha,
 			"width": 49,
-			"height": 6,
+			"height": 4,
 			"fieldPath": "posting_date",
 			"label": "Date",
-			"fontSize": 9,
+			"fontSize": 11,
 			"align": "right",
 			"textColor": "#0f172a",
 		},
@@ -2531,9 +2578,9 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-cli-box",
 			"kind": "shape",
 			"x": 12,
-			"y": 40,
+			"y": y_cli_box,
 			"width": 186,
-			"height": 28,
+			"height": h_cli_box,
 			"shapeType": "rect",
 			"color": "#334155",
 			"filled": False,
@@ -2542,11 +2589,11 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-cli-label",
 			"kind": "text",
 			"x": 14,
-			"y": 42,
-			"width": 24,
-			"height": 5,
+			"y": y_cli,
+			"width": 26,
+			"height": 4,
 			"staticText": "Customer:",
-			"fontSize": 9,
+			"fontSize": 11,
 			"bold": True,
 			"align": "left",
 			"textColor": "#0f172a",
@@ -2554,13 +2601,13 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 		{
 			"id": f"{p}-cli",
 			"kind": "field",
-			"x": 38,
-			"y": 42,
-			"width": 156,
-			"height": 5,
+			"x": 40,
+			"y": y_cli,
+			"width": 154,
+			"height": 4,
 			"fieldPath": "customer_name",
 			"label": "Customer",
-			"fontSize": 10,
+			"fontSize": 12,
 			"bold": True,
 			"align": "left",
 			"textColor": "#0f172a",
@@ -2569,24 +2616,24 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-addr-label",
 			"kind": "text",
 			"x": 14,
-			"y": 49,
-			"width": 24,
-			"height": 5,
+			"y": y_addr,
+			"width": 26,
+			"height": 4,
 			"staticText": "Address:",
-			"fontSize": 9,
+			"fontSize": 11,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-addr",
 			"kind": "field",
-			"x": 38,
-			"y": 49,
-			"width": 156,
-			"height": 6,
+			"x": 40,
+			"y": y_addr,
+			"width": 154,
+			"height": 4,
 			"fieldPath": "customer_address",
 			"label": "Address",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2594,24 +2641,24 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-taxst-label",
 			"kind": "text",
 			"x": 14,
-			"y": 58,
-			"width": 28,
-			"height": 5,
+			"y": y_tax,
+			"width": 30,
+			"height": 4,
 			"staticText": "Tax status:",
-			"fontSize": 9,
+			"fontSize": 11,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-taxst",
 			"kind": "field",
-			"x": 42,
-			"y": 58,
-			"width": 70,
-			"height": 5,
+			"x": 44,
+			"y": y_tax,
+			"width": 68,
+			"height": 4,
 			"fieldPath": "tax_category",
 			"label": "Tax status",
-			"fontSize": 9,
+			"fontSize": 11,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2619,11 +2666,11 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-taxid-label",
 			"kind": "text",
 			"x": 118,
-			"y": 58,
+			"y": y_tax,
 			"width": 18,
-			"height": 5,
+			"height": 4,
 			"staticText": "Tax ID:",
-			"fontSize": 9,
+			"fontSize": 11,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2631,23 +2678,23 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-taxid",
 			"kind": "field",
 			"x": 136,
-			"y": 58,
+			"y": y_tax,
 			"width": 58,
-			"height": 5,
+			"height": 4,
 			"fieldPath": "tax_id",
 			"label": "Tax ID",
-			"fontSize": 9,
+			"fontSize": 11,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
 		# ── Line items (photo columns) ──────────────────────────────────
 		{
-			"id": f"{p}-items-v1",
+			"id": f"{p}-items-v4",
 			"kind": "line-items",
 			"x": 12,
-			"y": 74,
+			"y": y_items,
 			"width": 186,
-			"height": 130,
+			"height": h_items,
 			"childTableFieldname": "items",
 			"headerBg": "#64748b",
 			"headerColor": "#ffffff",
@@ -2667,9 +2714,9 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-obs-box",
 			"kind": "shape",
 			"x": 12,
-			"y": 210,
+			"y": y_foot,
 			"width": 100,
-			"height": 42,
+			"height": h_obs_box,
 			"shapeType": "rect",
 			"color": "#334155",
 			"filled": False,
@@ -2678,11 +2725,11 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-obs-title",
 			"kind": "text",
 			"x": 14,
-			"y": 212,
+			"y": y_obs_title,
 			"width": 40,
-			"height": 5,
+			"height": 4,
 			"staticText": "Observations",
-			"fontSize": 9,
+			"fontSize": 10,
 			"bold": True,
 			"align": "left",
 			"textColor": "#0f172a",
@@ -2691,24 +2738,24 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-vend-label",
 			"kind": "text",
 			"x": 14,
-			"y": 220,
-			"width": 24,
-			"height": 5,
+			"y": y_vend,
+			"width": 26,
+			"height": 3.8,
 			"staticText": "Salesperson:",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-vend",
 			"kind": "field",
-			"x": 38,
-			"y": 220,
-			"width": 70,
-			"height": 5,
+			"x": 40,
+			"y": y_vend,
+			"width": 68,
+			"height": 3.8,
 			"fieldPath": "vendedor",
 			"label": "Salesperson",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2716,24 +2763,24 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-zona-label",
 			"kind": "text",
 			"x": 14,
-			"y": 227,
-			"width": 24,
-			"height": 5,
+			"y": y_zona,
+			"width": 26,
+			"height": 3.8,
 			"staticText": "Zone:",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-zona",
 			"kind": "field",
-			"x": 38,
-			"y": 227,
-			"width": 70,
-			"height": 5,
+			"x": 40,
+			"y": y_zona,
+			"width": 68,
+			"height": 3.8,
 			"fieldPath": "zona",
 			"label": "Zone",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2741,24 +2788,24 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-hor-label",
 			"kind": "text",
 			"x": 14,
-			"y": 234,
-			"width": 24,
-			"height": 5,
+			"y": y_hor,
+			"width": 26,
+			"height": 3.8,
 			"staticText": "Schedule:",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-hor",
 			"kind": "field",
-			"x": 38,
-			"y": 234,
-			"width": 70,
-			"height": 5,
+			"x": 40,
+			"y": y_hor,
+			"width": 68,
+			"height": 3.8,
 			"fieldPath": "horario",
 			"label": "Schedule",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2766,24 +2813,24 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-ped-label",
 			"kind": "text",
 			"x": 14,
-			"y": 241,
-			"width": 24,
-			"height": 5,
+			"y": y_ped,
+			"width": 26,
+			"height": 3.8,
 			"staticText": "Order:",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-ped",
 			"kind": "field",
-			"x": 38,
-			"y": 241,
-			"width": 70,
-			"height": 5,
+			"x": 40,
+			"y": y_ped,
+			"width": 68,
+			"height": 3.8,
 			"fieldPath": "pedido_ref",
 			"label": "Order",
-			"fontSize": 8,
+			"fontSize": 10,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2792,9 +2839,9 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-tot-box",
 			"kind": "shape",
 			"x": 120,
-			"y": 210,
+			"y": y_foot,
 			"width": 78,
-			"height": 28,
+			"height": h_tot_box,
 			"shapeType": "rect",
 			"color": "#cbd5e1",
 			"filled": True,
@@ -2804,11 +2851,11 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-sub-label",
 			"kind": "text",
 			"x": 124,
-			"y": 214,
+			"y": y_sub,
 			"width": 30,
-			"height": 6,
+			"height": 5,
 			"staticText": "Subtotal",
-			"fontSize": 10,
+			"fontSize": 11,
 			"align": "left",
 			"textColor": "#0f172a",
 		},
@@ -2816,12 +2863,12 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-sub",
 			"kind": "field",
 			"x": 154,
-			"y": 214,
+			"y": y_sub,
 			"width": 40,
-			"height": 6,
+			"height": 5,
 			"fieldPath": "net_total",
 			"label": "Subtotal",
-			"fontSize": 10,
+			"fontSize": 11,
 			"align": "right",
 			"textColor": "#0f172a",
 		},
@@ -2829,11 +2876,11 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-total-label",
 			"kind": "text",
 			"x": 124,
-			"y": 226,
+			"y": y_tot,
 			"width": 30,
-			"height": 8,
+			"height": 5.5,
 			"staticText": "TOTAL $",
-			"fontSize": 12,
+			"fontSize": 13,
 			"bold": True,
 			"align": "left",
 			"textColor": "#0f172a",
@@ -2842,38 +2889,15 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"id": f"{p}-total",
 			"kind": "field",
 			"x": 154,
-			"y": 226,
+			"y": y_tot,
 			"width": 40,
-			"height": 8,
+			"height": 5.5,
 			"fieldPath": "grand_total",
 			"label": "TOTAL",
-			"fontSize": 13,
+			"fontSize": 14,
 			"bold": True,
 			"align": "right",
 			"textColor": "#0f172a",
-		},
-		# ── Signature ───────────────────────────────────────────────────
-		{
-			"id": f"{p}-firma-label",
-			"kind": "text",
-			"x": 12,
-			"y": 260,
-			"width": 120,
-			"height": 6,
-			"staticText": "Received in Good Order (Signature and Print Name):",
-			"fontSize": 8,
-			"align": "left",
-			"textColor": "#0f172a",
-		},
-		{
-			"id": f"{p}-firma-line",
-			"kind": "shape",
-			"x": 12,
-			"y": 274,
-			"width": 100,
-			"height": 1,
-			"shapeType": "line",
-			"color": "#0f172a",
 		},
 	]
 
@@ -2884,44 +2908,29 @@ def _en_sales_invoice_with_weights_a4_elements(id_prefix: str = "starter-sienw")
 	Photo form columns: Description, Units, Weight, UM, Price, Disc., Total.
 	Peso shows measured kg or '-' when the line is not sold by weight.
 	UM is always 3 letters (Uni / Kil) — never NOS.
+
+	Header title is only the non-fiscal line (no "SALES INVOICE" /
+	"FACTURA DE VENTA" above it) — matches AR commercial paper.
 	"""
 	import copy
 
 	elements = copy.deepcopy(_en_sales_invoice_commercial_a4_elements(id_prefix=id_prefix))
-	# Non-fiscal banner (Spanish name later: Factura No valid. Con pesos).
-	elements.insert(
-		1,
-		{
-			"id": f"{id_prefix}-novalid",
-			"kind": "text",
-			"x": 100,
-			"y": 20,
-			"width": 95,
-			"height": 5,
-			"staticText": "DOCUMENT NOT VALID AS INVOICE",
-			"fontSize": 7,
-			"bold": True,
-			"align": "right",
-			"textColor": "#b91c1c",
-		},
-	)
-	# Nudge invoice # / date down so they clear the banner.
+	# Replace commercial "SALES INVOICE" with the sole non-fiscal title.
 	for el in elements:
 		if not isinstance(el, dict):
 			continue
-		eid = el.get("id") or ""
-		if eid in (
-			f"{id_prefix}-nro-label",
-			f"{id_prefix}-nro",
-			f"{id_prefix}-fecha-label",
-			f"{id_prefix}-fecha",
-		):
-			el["y"] = float(el.get("y") or 0) + 4
+		if el.get("id") == f"{id_prefix}-title":
+			el["staticText"] = "DOCUMENT NOT VALID AS INVOICE"
+			el["fontSize"] = 13
+			el["textColor"] = "#0f172a"
+			# Keep compact height from commercial ladder (do not inflate).
+			break
 
 	for el in elements:
 		if not isinstance(el, dict) or el.get("kind") != "line-items":
 			continue
-		el["id"] = f"{id_prefix}-items-v1"
+		# v5: no signature; footer near page bottom; denser header type.
+		el["id"] = f"{id_prefix}-items-v5"
 		el["columns"] = [
 			{"fieldPath": "item_name", "label": "Description", "width": 58},
 			{"fieldPath": "units_qty", "label": "Units", "width": 14},
@@ -3038,8 +3047,12 @@ def _ar_entregas_checklist_a4_elements(
 		armado_label_x = 10 + pedido_label_w
 		armado_label_w = 34
 
+	page_h, margin_b, strip_h = 297, 8, 20
 	if use_tear:
-		items_h = 80 if with_map else 178
+		# Pin cut strips near page bottom; stretch items into the free band.
+		footer_pin = page_h - margin_b - strip_h
+		map_h = 40 if with_map else 0
+		items_h = max(40, footer_pin - table_y - (map_h + 8 if with_map else 3))
 	else:
 		items_h = 95 if with_map else 175
 
@@ -3123,6 +3136,7 @@ def _ar_entregas_checklist_a4_elements(
 		footer_y += map_h + (4 if use_tear else 5)
 
 	if use_tear:
+		footer_y = page_h - margin_b - strip_h
 		elements.extend(
 			_tear_off_strip_elements(
 				p,
@@ -3131,7 +3145,7 @@ def _ar_entregas_checklist_a4_elements(
 				fletero_field="fletero",
 				date_field="posting_date",
 				copies=5,
-				marker_id=f"{p}-tear-cutbar-v5",
+				marker_id=f"{p}-tear-cutbar-v6",
 			)
 		)
 	else:
@@ -3246,7 +3260,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-sien-items-v1",
+		# v4: no signature; footer near page bottom.
+		"resync_if_missing_id": "starter-sien-items-v4",
 		# English first — do not auto-clone ES/CH until explicitly approved.
 		"skip_locale_expand": True,
 		"margin_mm": [8, 8, 8, 8],
@@ -3260,7 +3275,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-sienw-items-v1",
+		# v5: no signature; footer near page bottom.
+		"resync_if_missing_id": "starter-sienw-items-v5",
 		# Official locale names (seeded via gift_core / ensure_starter).
 		"locale_names": {
 			"es": "Factura No valid. Con pesos",
@@ -3815,7 +3831,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-pesotear-tear-cutbar-v5",
+		# v6: tear strips pinned near page bottom.
+		"resync_if_missing_id": "starter-pesotear-tear-cutbar-v6",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-pesotear",
@@ -3833,13 +3850,13 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		# MAT badge + full-width Pedido (was classic-v4 / DN-as-badge).
-		"resync_if_missing_id": "starter-dnrem-mat-v6",
+		# v7: Remito full-width under Pedido; strips/footer low; short fletero.
+		"resync_if_missing_id": "starter-dnrem-mat-v7",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem", layout="classic")
 		+ [
 			{
-				"id": "starter-dnrem-mat-v6",
+				"id": "starter-dnrem-mat-v7",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -3859,12 +3876,12 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-dnremtear-mat-v6",
+		"resync_if_missing_id": "starter-dnremtear-mat-v7",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnremtear", layout="tearoff")
 		+ [
 			{
-				"id": "starter-dnremtear-mat-v6",
+				"id": "starter-dnremtear-mat-v7",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,

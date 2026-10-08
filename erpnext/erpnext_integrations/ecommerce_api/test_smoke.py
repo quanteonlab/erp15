@@ -1100,8 +1100,12 @@ def suite_5_9_master_data():
             frappe.db.commit()
 
     def check_orden_planner_remito_and_address_gate():
-        """Orden with address → remito for planner; Orden without → not_deliverable warning."""
-        so_ok = so_bad = None
+        """Orden → next-business-day Entrega; planner lists SO without remito."""
+        from frappe.utils import add_days, getdate
+
+        from erpnext.erpnext_integrations.ecommerce_api import tms_api as tms
+
+        so_ok = None
         item_code = frappe.db.get_value(
             "Item",
             {"disabled": 0, "is_stock_item": 1},
@@ -1117,31 +1121,48 @@ def suite_5_9_master_data():
             )
             so_ok = with_addr.get("preorder_name") or with_addr.get("name")
             assert so_ok, with_addr
-            # Soft remito: sites without inventory accounts still promote to Orden.
             assert str(with_addr.get("display_status") or "") == "Orden" or with_addr.get(
                 "status"
             ) in ("To Deliver and Bill", "Orden"), with_addr
-            if with_addr.get("planner_ready"):
-                assert with_addr.get("delivery_note"), with_addr
-                assert not with_addr.get("not_deliverable"), with_addr
-                assert frappe.db.exists("Delivery Note", with_addr["delivery_note"])
-            else:
-                assert with_addr.get("delivery_warning") or with_addr.get("warnings"), with_addr
-                assert not with_addr.get("not_deliverable"), with_addr
-
-            no_addr = api.create_guest_preorder(
-                items=[{"item_code": item_code, "qty": 1, "rate": 15}],
-                guest_name="Smoke Planner NoAddr",
-                initial_status="Orden",
+            # Planning does not require a remito on Orden.
+            assert not api._delivery_note_for_sales_order(so_ok), with_addr
+            due = with_addr.get("delivery_date") or frappe.db.get_value(
+                "Sales Order", so_ok, "delivery_date"
             )
-            so_bad = no_addr.get("preorder_name") or no_addr.get("name")
-            assert so_bad, no_addr
-            assert no_addr.get("not_deliverable") is True, no_addr
-            assert no_addr.get("delivery_warning"), no_addr
-            assert not no_addr.get("delivery_note"), no_addr
-            assert not api._delivery_note_for_sales_order(so_bad)
+            assert due, with_addr
+            due_d = getdate(due)
+            today = getdate()
+            assert due_d >= add_days(today, 1), f"Entrega must be ≥ tomorrow, got {due_d}"
+            assert due_d <= add_days(today, 7), f"Entrega must not jump a week+, got {due_d}"
+            # Window covering that due must surface the SO (kind=preorder).
+            pending = tms.get_pending_deliveries(
+                from_date=str(due_d), to_date=str(due_d)
+            )
+            rows = pending.get("deliveries") or []
+            hit = [
+                r
+                for r in rows
+                if (r.get("sales_order") or r.get("preorder_name")) == so_ok
+                or r.get("delivery_note") and so_ok in str(r.get("sales_order") or "")
+            ]
+            assert hit, {
+                "so": so_ok,
+                "due": str(due_d),
+                "sample": [
+                    {
+                        "dn": r.get("delivery_note"),
+                        "so": r.get("sales_order"),
+                        "kind": r.get("kind"),
+                        "due": r.get("due_date"),
+                    }
+                    for r in rows[:8]
+                ],
+            }
+            assert hit[0].get("kind") in (None, "preorder", "delivery_note"), hit[0]
+            if hit[0].get("kind") == "preorder":
+                assert not hit[0].get("delivery_note"), hit[0]
         finally:
-            for name in (so_ok, so_bad):
+            for name in (so_ok,):
                 if not name or not frappe.db.exists("Sales Order", name):
                     continue
                 dn = api._delivery_note_for_sales_order(name)
@@ -1277,7 +1298,7 @@ def suite_5_9_master_data():
     _run("5.9.18 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
     _run("5.9.18b preorder list customer_stage", check_preorder_list_customer_stage, "S3")
     _run("5.9.18c seller_scope + amend → Revisar", check_seller_scope_list_and_amend_review, "S2")
-    _run("5.9.19 Orden→planner remito + no-address warn", check_orden_planner_remito_and_address_gate, "S2")
+    _run("5.9.19 Orden→next-day Entrega + planner without remito", check_orden_planner_remito_and_address_gate, "S2")
 
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────
@@ -1795,11 +1816,28 @@ def suite_5_12_modules_read():
         assert any(
             isinstance(e, dict) and e.get("label") == "UM" for e in (sienw_items.get("columns") or [])
         ), sienw_items
-        assert any(
-            isinstance(e, dict)
-            and e.get("staticText") == "DOCUMENT NOT VALID AS INVOICE"
+        # Sole header title — not "SALES INVOICE" + non-valid banner.
+        # Use exact id (not endswith "-title") — Observations uses id "...-obs-title".
+        header = next(
+            (e for e in sienw if isinstance(e, dict) and e.get("id") == "starter-sienw-title"),
+            None,
+        )
+        assert header and header.get("staticText") == "DOCUMENT NOT VALID AS INVOICE", header
+        assert not any(
+            isinstance(e, dict) and e.get("staticText") == "SALES INVOICE" for e in sienw
+        ), sienw
+        # Compact header pitch; no signature; footer near page bottom.
+        nro = next(e for e in sienw if isinstance(e, dict) and e.get("id") == "starter-sienw-nro")
+        fecha = next(e for e in sienw if isinstance(e, dict) and e.get("id") == "starter-sienw-fecha")
+        assert float(nro.get("y") or 0) - float(header.get("y") or 0) <= 6.5, (header, nro)
+        assert float(fecha.get("y") or 0) - float(nro.get("y") or 0) <= 6, (nro, fecha)
+        assert not any(
+            isinstance(e, dict) and str(e.get("id") or "").startswith("starter-sienw-firma")
             for e in sienw
         ), sienw
+        obs_box = next(e for e in sienw if isinstance(e, dict) and e.get("id") == "starter-sienw-obs-box")
+        assert float(obs_box.get("y") or 0) >= 250, obs_box
+        assert sienw_items.get("id") == "starter-sienw-items-v5", sienw_items.get("id")
         # Official EN + ES + CH seeded names (gift_core / ensure_starter).
         starter_names = {
             s.get("template_name")
@@ -1821,11 +1859,15 @@ def suite_5_12_modules_read():
         assert es_items, es_sienw
         es_labels = [c.get("label") for c in (es_items.get("columns") or [])]
         assert es_labels == ["Detalle", "Unid", "Peso", "UM", "Precio", "Dto", "Total"], es_labels
-        assert any(
-            isinstance(e, dict)
-            and e.get("staticText") == "DOCUMENTO NO VALIDO COMO FACTURA"
-            for e in (es_sienw.get("elements") or [])
-        ), es_sienw
+        es_els = es_sienw.get("elements") or []
+        es_header = next(
+            (e for e in es_els if isinstance(e, dict) and e.get("id") == "starter-sienw-title"),
+            None,
+        )
+        assert es_header and es_header.get("staticText") == "DOCUMENTO NO VALIDO COMO FACTURA", es_header
+        assert not any(
+            isinstance(e, dict) and e.get("staticText") == "FACTURA DE VENTA" for e in es_els
+        ), es_els
         # DN remito keeps line amount for Importe even when WEIGHT + no measured kg yet.
         dn_amt = pta._enrich_print_line_item(
             {"item_code": "SMOKE-WT", "qty": 1, "uom": "WEIGHT", "total_weight": 0, "amount": 7900},
@@ -1857,7 +1899,7 @@ def suite_5_12_modules_read():
         assert any(
             isinstance(e, dict) and e.get("fieldPath") == "grand_total" for e in remito_els
         ), remito_els
-        # Badge = MAT trip (mat_ref), not remito DN name; Pedido is wide full SO.
+        # Badge = MAT trip (mat_ref), not remito DN name; Pedido + Remito full-width.
         badge = next(
             (e for e in remito_els if isinstance(e, dict) and e.get("id", "").endswith("-ped")),
             None,
@@ -1869,6 +1911,25 @@ def suite_5_12_modules_read():
         )
         assert wide_pedido and wide_pedido.get("fieldPath") == "pedido_ref", wide_pedido
         assert flt(wide_pedido.get("width") or 0) >= 50, wide_pedido
+        wide_remito = next(
+            (e for e in remito_els if isinstance(e, dict) and e.get("id", "").endswith("-wide1")),
+            None,
+        )
+        assert wide_remito and wide_remito.get("fieldPath") == "name", wide_remito
+        # Remito must not sit in the 2-col Fecha row.
+        assert not any(
+            isinstance(e, dict)
+            and e.get("staticText") == "Remito:"
+            and str(e.get("id") or "").startswith("starter-dnrem-m")
+            for e in remito_els
+        ), remito_els
+        assert pta._short_person_name("Administrator Administrator") == "Administrator A."
+        tear_els = pta._dn_remito_a4_elements(layout="tearoff")
+        tear_bar = next(
+            (e for e in tear_els if isinstance(e, dict) and "tear-cutbar" in str(e.get("id") or "")),
+            None,
+        )
+        assert tear_bar and float(tear_bar.get("y") or 0) >= 250, tear_bar
         # Live DN: mat_ref empty when unassigned; trip name (MAT-DT) when assigned.
         bare_dn = frappe.db.sql(
             """

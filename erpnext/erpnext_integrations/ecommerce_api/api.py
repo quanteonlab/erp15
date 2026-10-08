@@ -3894,13 +3894,13 @@ def create_order(
 	so.customer = customer
 	so.order_type = order_type
 	so.transaction_date = nowdate()
-	so.delivery_date = delivery_date or add_days(nowdate(), 7)
+	so.delivery_date = delivery_date or _next_business_delivery_date()
 	# Clamp a past delivery date to the order date (ERPNext date rule).
 	try:
 		if getdate(so.delivery_date) < getdate(so.transaction_date):
 			so.delivery_date = so.transaction_date
 	except Exception:
-		so.delivery_date = add_days(nowdate(), 7)
+		so.delivery_date = _next_business_delivery_date()
 	so.company = company
 
 	company_currency = frappe.get_cached_value("Company", company, "default_currency")
@@ -4520,8 +4520,66 @@ def _tms_zone_visit_days(zone_label):
 	return []
 
 
+def _next_business_delivery_date(as_of=None):
+	"""Tomorrow (lead days) snapped to the next company working day.
+
+	Default blue Entrega when creating / confirming an Orden — not +7 and not
+	“next zone visit next week.” Zone visit days remain available via packing /
+	zone recompute paths; Orden itself promises the soonest working day.
+	"""
+	base = getdate(as_of) if as_of else getdate()
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+			_load_tms_settings,
+			_normalize_working_days,
+			_next_due_on_weekdays,
+		)
+
+		settings = _load_tms_settings()
+		lead = max(1, cint(settings.get("delivery_lead_days") or 1))
+		work = _normalize_working_days(settings.get("auto_group_working_days"))
+		earliest = add_days(base, lead)
+		due = _next_due_on_weekdays(earliest, work, strictly_after=False)
+		return str(due or earliest)
+	except Exception:
+		return str(add_days(base, 1))
+
+
+def _apply_orden_default_delivery_date(so):
+	"""Set blue Entrega to next business day when moving to Orden (if not forced)."""
+	if not so or _delivery_date_forced_from_tags(so):
+		return None
+	due = _next_business_delivery_date(
+		as_of=so.transaction_date or None
+	)
+	try:
+		due_d = getdate(due)
+	except Exception:
+		return None
+	if so.transaction_date and due_d < getdate(so.transaction_date):
+		due_d = getdate(so.transaction_date)
+	so.db_set("delivery_date", due_d, update_modified=True)
+	try:
+		frappe.db.sql(
+			"""
+			UPDATE `tabSales Order Item`
+			SET delivery_date=%s
+			WHERE parent=%s
+			""",
+			(due_d, so.name),
+		)
+	except Exception:
+		pass
+	_update_guest_preorder_tag(so, "delivery_forced", None)
+	return str(due_d)
+
+
 def _auto_delivery_date_for_zone(zone_label, as_of=None):
-	"""Next promised due from zone visit days, or greedy pack when strategy says so (i043/i045)."""
+	"""Next promised due from zone visit days, or greedy pack when strategy says so (i043/i045).
+
+	When the zone has no visit days (or lookup fails), fall back to next business
+	day — never a blind +7 calendar week.
+	"""
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
 			_load_tms_settings,
@@ -4538,7 +4596,10 @@ def _auto_delivery_date_for_zone(zone_label, as_of=None):
 	except Exception:
 		pass
 
-	return _zone_visit_due_date(zone_label, as_of=as_of)
+	zoned = _zone_visit_due_date(zone_label, as_of=as_of)
+	if zoned:
+		return zoned
+	return _next_business_delivery_date(as_of=as_of)
 
 
 def _zone_visit_due_date(zone_label, as_of=None):
@@ -5110,14 +5171,14 @@ def create_guest_preorder(
 	# Must be one of the site's allowed Sales Order order types (commonly Sales, Shopping Cart, …).
 	so.order_type = order_type or "Sales"
 	so.transaction_date = nowdate()
-	so.delivery_date = delivery_date or add_days(nowdate(), 7)
+	so.delivery_date = delivery_date or _next_business_delivery_date()
 	# ERPNext: delivery ≥ order date. A past order/delivery date (CSV backfill,
 	# replayed offline order) is clamped to the transaction date, not rejected.
 	try:
 		if getdate(so.delivery_date) < getdate(so.transaction_date):
 			so.delivery_date = so.transaction_date
 	except Exception:
-		so.delivery_date = add_days(nowdate(), 7)
+		so.delivery_date = _next_business_delivery_date()
 	so.company = company
 	so.selling_price_list = price_list
 	# Consultas are local quotes. Do not look up Currency Exchange (None → ARS).
@@ -6454,7 +6515,7 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 
 @frappe.whitelist(allow_guest=True)
 def set_guest_preorder_status(
-	preorder_name, target_status, source=None, ensure_planner_remito=1
+	preorder_name, target_status, source=None, ensure_planner_remito=0
 ):
 	"""
 	Unified status transition for the custom workflow.
@@ -6469,8 +6530,9 @@ def set_guest_preorder_status(
 	``source`` (optional): when one of armado / remito / tms_claim / tms_pod, the
 	transition is treated as external to the Órdenes table (highlight + banner).
 
-	``ensure_planner_remito``: when 0, skip inline remito/geocode (caller may
-	enqueue it — e.g. armado kiosk confirm for a fast response).
+	``ensure_planner_remito``: default 0 — Rutas planning lists Orden/Preparado by
+	Sales Order without requiring a remito. Pass 1 only when a caller explicitly
+	wants an early remito (legacy / stock paths). Remito is created on MAT claim.
 	"""
 	target_status = _normalize_target_pipeline_status(target_status)
 	if target_status not in WORKFLOW_STATUSES:
@@ -6578,15 +6640,19 @@ def set_guest_preorder_status(
 		clear_sales_order_print_tags(preorder_name, commit=False)
 	except Exception:
 		pass
+	# Orden → blue Entrega = tomorrow / next working day (not +7 / next zone week).
+	if target_status == "Orden":
+		_apply_orden_default_delivery_date(so)
+		so.reload()
 	detail = get_guest_preorder(preorder_name)
-	# Orden / Preparado → planner needs a remito. No address → warn, stay off planner.
-	# Armado confirm / create Orden enqueue remito separately for a fast response.
+	# Optional early remito (default off — planner keys off SO.delivery_date).
 	if target_status in ("Orden", "Preparado") and cint(ensure_planner_remito):
 		so.reload()
 		gate = _ensure_planner_delivery_note(so)
 		_attach_planner_gate_fields(detail, gate)
 	elif target_status in ("Orden", "Preparado"):
-		detail["planner_ready"] = False
+		# Planner-ready without remito when due is set (address optional for listing).
+		detail["planner_ready"] = bool(detail.get("delivery_date"))
 	return detail
 
 
@@ -8041,6 +8107,298 @@ def _set_dn_warehouse(dn_name, warehouse):
 
 
 @frappe.whitelist(allow_guest=True)
+def _mat_day_centroid(trip_name):
+	"""Average lat/lng of stops on a trip (for nearest-MAT scoring)."""
+	rows = frappe.get_all(
+		"Delivery Stop",
+		filters={"parent": trip_name},
+		fields=["lat", "lng"],
+		ignore_permissions=True,
+	)
+	pts = [(flt(r.lat), flt(r.lng)) for r in rows if r.lat and r.lng]
+	if not pts:
+		return None, None
+	return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+
+
+@frappe.whitelist(allow_guest=True)
+def auto_assign_preorders_to_mats(preorder_names=None, company=None):
+	"""Greedy MAT assign for Pedidos: same Entrega day → fill nearest open MAT to cap → next driver / new MAT.
+
+	Uses TMS soft caps (``driver_day_max_orders``). Remitos are created as needed.
+	Returns per-order assignment rows + created trip names.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api import tms_api
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+	raw = preorder_names
+	if isinstance(raw, str):
+		try:
+			raw = frappe.parse_json(raw)
+		except Exception:
+			raw = [raw] if cstr(raw).strip() else []
+	if not isinstance(raw, (list, tuple)):
+		raw = [raw] if raw else []
+	names = []
+	for n in raw:
+		s = cstr(n or "").strip()
+		if s and s not in ("null", "undefined") and s not in names:
+			names.append(s)
+	if not names:
+		frappe.throw(_("Select at least one order."))
+
+	company = cstr(company or "").strip() or resolve_company() or frappe.defaults.get_user_default("Company")
+	settings = tms_api._load_tms_settings()
+	max_orders = max(1, cint(settings.get("driver_day_max_orders") or 30))
+	today = getdate()
+
+	# Active drivers (fill order = existing planner list).
+	drivers = frappe.get_all(
+		"Driver",
+		filters={"status": "Active"},
+		fields=["name", "full_name"],
+		order_by="full_name asc",
+		ignore_permissions=True,
+	)
+	driver_ids = [d.name for d in drivers]
+
+	# Open MATs with stop counts + day + centroid.
+	open_trips = frappe.get_all(
+		"Delivery Trip",
+		filters={
+			"docstatus": ["<", 2],
+			"status": ["in", ["Draft", "Scheduled", ""]],
+		},
+		fields=[
+			"name",
+			"driver",
+			"driver_name",
+			"vehicle",
+			"departure_time",
+			"custom_pickup_warehouse",
+			"company",
+			"status",
+		],
+		ignore_permissions=True,
+	)
+	if company:
+		open_trips = [t for t in open_trips if not t.company or t.company == company]
+
+	trip_state = {}
+	for t in open_trips:
+		day = str(getdate(t.departure_time)) if t.departure_time else None
+		if not day:
+			continue
+		cnt = cint(
+			frappe.db.count("Delivery Stop", {"parent": t.name}) or 0
+		)
+		clat, clng = _mat_day_centroid(t.name)
+		trip_state[t.name] = {
+			"name": t.name,
+			"day": day,
+			"driver": cstr(t.driver or "").strip() or None,
+			"driver_name": t.driver_name,
+			"vehicle": t.vehicle,
+			"warehouse": getattr(t, "custom_pickup_warehouse", None),
+			"stop_count": cnt,
+			"lat": clat,
+			"lng": clng,
+			"status": t.status,
+		}
+
+	# Order payloads (delivery day + geo).
+	order_rows = []
+	for so_name in names:
+		if not frappe.db.exists("Sales Order", so_name):
+			frappe.throw(_("Sales Order {0} not found").format(so_name))
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+		if not _is_guest_preorder_sales_order(so):
+			frappe.throw(_("Not a Guest Preorder: {0}").format(so_name))
+		due = so.delivery_date or add_days(today, 1)
+		due_d = getdate(due)
+		if due_d < today:
+			due_d = add_days(today, 1)
+		lat = lng = None
+		addr = so.shipping_address_name or so.customer_address
+		if addr and frappe.db.has_column("Address", "custom_latitude"):
+			geo = frappe.db.get_value(
+				"Address",
+				addr,
+				["custom_latitude", "custom_longitude"],
+				as_dict=True,
+			)
+			if geo and geo.custom_latitude:
+				lat, lng = flt(geo.custom_latitude), flt(geo.custom_longitude)
+		order_rows.append(
+			{
+				"name": so_name,
+				"day": str(due_d),
+				"lat": lat,
+				"lng": lng,
+				"customer": so.customer,
+			}
+		)
+	order_rows.sort(key=lambda r: (r["day"], r["name"]))
+
+	def _dist(olat, olng, tlat, tlng):
+		if olat is None or olng is None or tlat is None or tlng is None:
+			return 1e12
+		return tms_api._haversine_km(olat, olng, tlat, tlng)
+
+	def _pick_trip(day, olat, olng):
+		cands = [
+			t
+			for t in trip_state.values()
+			if t["day"] == day and t["stop_count"] < max_orders
+		]
+		if not cands:
+			return None
+		cands.sort(
+			key=lambda t: (
+				_dist(olat, olng, t["lat"], t["lng"]),
+				t["stop_count"],
+				t["name"],
+			)
+		)
+		return cands[0]
+
+	def _next_driver_for_day(day):
+		"""Greedy: drivers without a trip that day first, else least-loaded."""
+		used = {
+			t["driver"]
+			for t in trip_state.values()
+			if t["day"] == day and t.get("driver")
+		}
+		for d in driver_ids:
+			if d not in used:
+				return d
+		if not driver_ids:
+			return None
+		by_drv = {}
+		for t in trip_state.values():
+			if t["day"] != day or not t.get("driver"):
+				continue
+			by_drv[t["driver"]] = by_drv.get(t["driver"], 0) + t["stop_count"]
+		return min(driver_ids, key=lambda d: (by_drv.get(d, 0), d))
+
+	def _register_trip(trip_name, day, *, stop_count=0, lat=None, lng=None):
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Delivery Trip", trip_name)
+		frappe.flags.ignore_permissions = False
+		trip_state[trip_name] = {
+			"name": trip_name,
+			"day": day,
+			"driver": cstr(doc.driver or "").strip() or None,
+			"driver_name": doc.driver_name,
+			"vehicle": doc.vehicle,
+			"warehouse": getattr(doc, "custom_pickup_warehouse", None),
+			"stop_count": stop_count,
+			"lat": lat,
+			"lng": lng,
+			"status": doc.status,
+		}
+		return trip_state[trip_name]
+
+	assignments = []
+	created_trips = []
+	for row in order_rows:
+		day = row["day"]
+		picked = _pick_trip(day, row["lat"], row["lng"])
+		created_new = False
+		if picked:
+			detail = update_guest_preorder_logistics(
+				preorder_name=row["name"],
+				trip_name=picked["name"],
+				vehicle=picked.get("vehicle"),
+				driver=picked.get("driver"),
+				warehouse=picked.get("warehouse"),
+			)
+			trip_name = picked["name"]
+		else:
+			# No open MAT with capacity → create remito + new trip for next driver (greedy).
+			dn = _delivery_note_for_sales_order(row["name"])
+			if not dn:
+				created_dn = create_delivery_note_for_preorder(row["name"])
+				dn = (created_dn or {}).get("delivery_note") or _delivery_note_for_sales_order(
+					row["name"]
+				)
+			if not dn:
+				frappe.throw(_("Could not create remito for {0}").format(row["name"]))
+			drv = _next_driver_for_day(day)
+			created = tms_api.create_trip(
+				date=day,
+				driver=drv,
+				delivery_note_names=[dn],
+				company=company,
+			)
+			trip_name = created.get("trip")
+			if not trip_name:
+				frappe.throw(_("Could not create MAT for {0}").format(row["name"]))
+			created_new = True
+			created_trips.append(trip_name)
+			picked = _register_trip(
+				trip_name,
+				day,
+				stop_count=1,
+				lat=row["lat"],
+				lng=row["lng"],
+			)
+			detail = update_guest_preorder_logistics(
+				preorder_name=row["name"],
+				trip_name=trip_name,
+				vehicle=picked.get("vehicle"),
+				driver=picked.get("driver"),
+				warehouse=picked.get("warehouse"),
+			)
+		# Refresh capacity + centroid after assign.
+		st = trip_state.get(trip_name)
+		if st and not created_new:
+			st["stop_count"] = cint(st.get("stop_count") or 0) + 1
+			if row["lat"] is not None and row["lng"] is not None:
+				if st["lat"] is None:
+					st["lat"], st["lng"] = row["lat"], row["lng"]
+				else:
+					n = st["stop_count"]
+					st["lat"] = ((st["lat"] * (n - 1)) + row["lat"]) / n
+					st["lng"] = ((st["lng"] * (n - 1)) + row["lng"]) / n
+		assignments.append(
+			{
+				"preorder_name": row["name"],
+				"trip_name": trip_name,
+				"day": day,
+				"created_trip": created_new,
+				"driver": (picked or {}).get("driver"),
+				"detail": detail,
+			}
+		)
+
+	return {
+		"ok": True,
+		"assignments": [
+			{
+				"preorder_name": a["preorder_name"],
+				"trip_name": a["trip_name"],
+				"day": a["day"],
+				"created_trip": a["created_trip"],
+				"driver": a.get("driver"),
+				"display_status": (a.get("detail") or {}).get("display_status"),
+				"delivery_note": (a.get("detail") or {}).get("delivery_note"),
+				"vehicle": (a.get("detail") or {}).get("vehicle"),
+				"vehicle_plate": (a.get("detail") or {}).get("vehicle_plate"),
+				"driver_name": (a.get("detail") or {}).get("driver_name"),
+				"warehouse": (a.get("detail") or {}).get("warehouse"),
+				"stop_idx": (a.get("detail") or {}).get("stop_idx"),
+				"trip_status": (a.get("detail") or {}).get("trip_status"),
+			}
+			for a in assignments
+		],
+		"created_trips": created_trips,
+		"max_orders": max_orders,
+	}
+
+
 def list_available_mats(search=None, limit=50, include_completed=0):
 	"""Searchable Delivery Trips (MAT-DT-…) for Pedidos assignment.
 
@@ -8486,11 +8844,12 @@ def _no_address_delivery_warning():
 
 
 def _ensure_planner_delivery_note(so):
-	"""Create a submitted remito so Orden/Preparado appears on the TMS planner.
+	"""Create a submitted remito for stock/claim paths (optional for planning).
 
-	``get_pending_deliveries`` only lists Delivery Notes. Without a remito, Orden
-	SOs stay invisible on Rutas. When there is no deliverable address we skip
-	remito creation and return ``not_deliverable`` + warning.
+	Rutas ``get_pending_deliveries`` lists Orden/Preparado Sales Orders by
+	``delivery_date`` without requiring a remito. Remitos are still created when
+	claiming onto a MAT / explicit create. When there is no deliverable address we
+	skip remito creation and return ``not_deliverable`` + warning.
 
 	Does **not** change pipeline status (Orden stays Orden until claim / manual remito).
 	"""
