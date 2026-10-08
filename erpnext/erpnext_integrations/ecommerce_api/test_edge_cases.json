@@ -4307,6 +4307,19 @@
       "bug": "Orden without address must warn not_deliverable / stay off planner, never TypeError"
     },
     {
+      "id": "create_guest_preorder_orden_seller_promote_flag_safe",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": null,
+        "guest_notes": "edge seller create orden",
+        "guest_name": "edge seller orden",
+        "initial_status": "Orden"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "create_guest_preorder null items + Orden must ValidationError (empty cart), never PermissionError from suggestion-only guard"
+    },
+    {
       "id": "set_guest_preorder_status_orden_null_name",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
       "args": {
@@ -4484,6 +4497,84 @@
       "expect": "ok",
       "source": "regression",
       "bug": "badge count endpoint must return dict without crashing when custom field missing/empty"
+    },
+    {
+      "id": "suggest_guest_preorder_change_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.suggest_guest_preorder_change",
+      "args": {
+        "preorder_name": null,
+        "change": {"details": {"guest_notes": "x"}}
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "suggest_guest_preorder_change with null name must be controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "suggest_guest_preorder_change_empty_change",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.suggest_guest_preorder_change",
+      "args": {
+        "preorder_name": "DOES-NOT-EXIST",
+        "change": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "null change / missing SO must not AttributeError — controlled error"
+    },
+    {
+      "id": "delete_creation_review_null_name_seller_suggestion_safe",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.delete_creation_review",
+      "args": {
+        "kind": "order",
+        "name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "delete_creation_review null name must be controlled ValidationError (reject-clear path must not TypeError)"
+    },
+    {
+      "id": "get_pending_suggestion_rejected_legacy_clears",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.creation_review_api.get_pending_suggestion",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "get_pending_suggestion null name must return None (never throw); rejected KV cleared on read"
+    },
+    {
+      "id": "confirm_creation_review_self_suggestion_guard_null_safe",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.confirm_creation_review",
+      "args": {
+        "kind": "order",
+        "name": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "confirm_creation_review empty name must ValidationError before self-suggestion guard"
+    },
+
+    {
+      "id": "add_lead_checklist_item_null_lead",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.add_lead_checklist_item",
+      "args": {
+        "lead": null,
+        "text": "task"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "add_lead_checklist_item null lead must be controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "set_lead_checklist_item_null_id",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.set_lead_checklist_item",
+      "args": {
+        "lead": "DOES-NOT-EXIST",
+        "item_id": null,
+        "done": 1
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_lead_checklist_item null item_id / missing lead must be controlled error"
     },
     {
       "id": "get_field_acl_catalog_ok",
@@ -4715,7 +4806,7 @@
       },
       "expect": "ok",
       "source": "regression",
-      "bug": "seller_scope=orden_here lists Pedidos for seller assigned clients in catalogDisplay.ordenPedidosDays window (default 30)"
+      "bug": "seller_scope=orden_here lists orders placed by seller (order_owner/seller_ref) or for assigned clients in ordenPedidosDays window; null args must not 500"
     },
     {
       "id": "get_guest_preorders_list_seller_scope_pedidos_alias",
@@ -4740,6 +4831,18 @@
       "expect": "ok",
       "source": "regression",
       "bug": "seller_scope=assigned lists Pedidos for salesman assigned clients in window (Tablas→Pedidos Mis clientes)"
+    },
+    {
+      "id": "get_guest_preorders_list_orden_here_no_tables_orders",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "page_length": 20,
+        "scope": "admin",
+        "seller_scope": "orden_here"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "orden_here Pedidos FAB must work for Sales without tables.orders.* (ops.catalog floor only)"
     },
     {
       "id": "get_guest_preorders_list_seller_scope_mis_clientes_alias",

@@ -226,9 +226,9 @@ APP_PERMISSIONS = [
 		"label_en": "See all clients",
 		"label_es": "Ver todos los clientes",
 		"label_zh": "查看全部客户",
-		"desc_en": "RM: view every customer.",
-		"desc_es": "RM: ver todos los clientes.",
-		"desc_zh": "关系管理：查看全部客户。",
+		"desc_en": "Client pickers / Orden Pedidos: every customer (does not open Tablas → CRM).",
+		"desc_es": "Selectores / Pedidos en Orden: todos los clientes (no abre Tablas → CRM).",
+		"desc_zh": "选客 / 下单订单：全部客户（不会打开表格→客户页）。",
 	},
 	{
 		"id": "sales.see_assigned",
@@ -236,9 +236,9 @@ APP_PERMISSIONS = [
 		"label_en": "See assigned clients",
 		"label_es": "Ver clientes asignados",
 		"label_zh": "查看已分配客户",
-		"desc_en": "RM: view only customers assigned to this salesman.",
-		"desc_es": "RM: ver solo clientes asignados a este vendedor.",
-		"desc_zh": "关系管理：仅查看分配给自己的客户。",
+		"desc_en": "Client pickers / Orden Pedidos: only customers assigned to this salesman (does not open Tablas → CRM).",
+		"desc_es": "Selectores / Pedidos en Orden: solo clientes asignados (no abre Tablas → CRM).",
+		"desc_zh": "选客 / 下单订单：仅已分配客户（不会打开表格→客户页）。",
 	},
 	{
 		"id": "sales.commit_all",
@@ -313,22 +313,22 @@ APP_PERMISSIONS = [
 	{
 		"id": "tables.orders.own",
 		"group": "tablas",
-		"label_en": "Own orders",
-		"label_es": "Pedidos propios",
-		"label_zh": "自己的订单",
-		"desc_en": "Guest preorders created by this user.",
-		"desc_es": "Pedidos de invitados creados por este usuario.",
-		"desc_zh": "此用户创建的访客预订单。",
+		"label_en": "Pedidos table (own)",
+		"label_es": "Tabla Pedidos (propios)",
+		"label_zh": "订单表（自己的）",
+		"desc_en": "Opens Tablas → Pedidos for guest orders owned by this user. Prefer Operaciones → Orden for sellers.",
+		"desc_es": "Abre Tablas → Pedidos con pedidos de este usuario. Para vendedores preferí Operaciones → Orden.",
+		"desc_zh": "打开表格→订单（本人创建的访客单）。销售请用运营→下单。",
 	},
 	{
 		"id": "tables.orders.all",
 		"group": "tablas",
-		"label_en": "All orders",
-		"label_es": "Todos los pedidos",
-		"label_zh": "全部订单",
-		"desc_en": "Every guest preorder, regardless of owner or tag.",
-		"desc_es": "Todos los pedidos de invitados, sin filtro de dueño ni tag.",
-		"desc_zh": "全部访客预订单，不按创建人或标签过滤。",
+		"label_en": "Pedidos table (all)",
+		"label_es": "Tabla Pedidos (todos)",
+		"label_zh": "订单表（全部）",
+		"desc_en": "Opens Tablas → Pedidos for every guest preorder, regardless of owner or tag.",
+		"desc_es": "Abre Tablas → Pedidos con todos los pedidos de invitados, sin filtro de dueño ni tag.",
+		"desc_zh": "打开表格→订单，显示全部访客预订单（不按创建人或标签过滤）。",
 	},
 	{
 		"id": "tools.sync",
@@ -572,15 +572,13 @@ _SALES_SCOPE_IDS = frozenset(
 )
 # Official sales floor role title is ``Sales`` (EN). Legacy sites may still have ``ventas``.
 # No Entregas / Check / Armado — those are opt-in via group permissions.
+# No tables.* — Pedidos/RM editing stays admin-only; sellers use Operaciones → Orden.
 # Catalog PDF is a normal seller tool (share price lists); still toggleable in Groups.
 _STARTER_SALES = [
 	"ops.preventa",
 	"ops.catalog",
 	"tools.sync",
 	"tools.catalog_pdf",
-	"tables.crm",
-	# Own Pedidos so Operaciones → Orden (create + confirm) works without full tables.orders.
-	"tables.orders.own",
 	"sales.see_assigned",
 	"sales.commit_assigned",
 ]
@@ -633,6 +631,17 @@ _LEGACY_STARTER_BY_TITLE = {
 			"tables.crm",
 			"tools.catalog_pdf",
 		],
+		# Pre no-tables Sales (RM + Pedidos propios).
+		[
+			"ops.preventa",
+			"ops.catalog",
+			"tools.sync",
+			"tools.catalog_pdf",
+			"tables.crm",
+			"tables.orders.own",
+			"sales.see_assigned",
+			"sales.commit_assigned",
+		],
 	],
 	"Sales": [
 		[
@@ -642,6 +651,16 @@ _LEGACY_STARTER_BY_TITLE = {
 			"tables.orders.all",
 			"tables.crm",
 			"tools.catalog_pdf",
+		],
+		[
+			"ops.preventa",
+			"ops.catalog",
+			"tools.sync",
+			"tools.catalog_pdf",
+			"tables.crm",
+			"tables.orders.own",
+			"sales.see_assigned",
+			"sales.commit_assigned",
 		],
 	],
 }
@@ -675,12 +694,15 @@ def _starter_perms_for_title(title: str) -> frozenset | None:
 def _floor_starter_needs_ops_only_upgrade(title: str, current: list[str]) -> bool:
 	"""True when a floor starter still carries *legacy* tables.*/log.* extras.
 
-	Current Sales/caja starters intentionally include some tables.* (e.g.
-	tables.crm, tables.orders.own). Those must NOT force a full reset — otherwise
-	detaching ops.catalog (or any other optional starter perm) is undone on the
-	next list_employee_groups / ensure_starter call.
+	Caja may still include ``tables.orders.own`` / tag perms (in its starter).
+	Sales starter has **no** tables.* — table extras on Sales/ventas are stripped
+	by ``_strip_sales_table_access`` instead of a full perm reset (so optional
+	ops.* toggles are not undone).
 	"""
 	if title not in _FLOOR_STARTER_TITLES:
+		return False
+	# Sales table strip is handled separately — never full-reset Sales for tables.*
+	if str(title or "").strip().lower() in ("sales", "ventas"):
 		return False
 	starter = _starter_perms_for_title(title)
 	if starter is None:
@@ -1881,8 +1903,11 @@ def _order_visibility_scope() -> dict | None:
 		if tag and tag not in seen:
 			seen.add(tag)
 			tags.append(tag)
+	user = cstr(_acting_username() or frappe.session.user or "").strip()
+	if user in ("Guest", "guest"):
+		user = ""
 	return {
-		"user": _acting_username(),
+		"user": user,
 		"own": "tables.orders.own" in perms,
 		"tags": tags,
 	}
@@ -2064,6 +2089,34 @@ def _strip_sales_floor_ops_extras(store: dict) -> bool:
 	return dirty
 
 
+def _strip_sales_table_access(store: dict) -> bool:
+	"""Sales/ventas must not keep Tablas (RM / Pedidos / …) — edit surface is admin-only.
+
+	Sellers view/create Pedidos from Operaciones → Orden (ops.catalog) instead.
+	"""
+	dirty = False
+	for name, raw in list(store.items()):
+		if name.startswith("_") or not isinstance(raw, list):
+			continue
+		title = ""
+		try:
+			if frappe.db.exists("Employee Group", name):
+				title = frappe.db.get_value("Employee Group", name, "employee_group_name") or name
+		except Exception:
+			title = name
+		title_l = (title or "").strip().lower()
+		if title_l not in ("sales", "ventas"):
+			continue
+		current = _normalize_permission_ids(raw)
+		if "*" in current:
+			continue
+		next_perms = [p for p in current if not str(p).startswith("tables.")]
+		if _perm_set(next_perms) != _perm_set(current):
+			store[name] = next_perms
+			dirty = True
+	return dirty
+
+
 def _backfill_floor_fulfillment_perms(store: dict) -> bool:
 	"""Attach new ops.check / ops.armado onto repositor + admin; catalog PDF onto Sales."""
 	dirty = False
@@ -2094,8 +2147,8 @@ def _backfill_floor_fulfillment_perms(store: dict) -> bool:
 				dirty = True
 			continue
 		if title_l in ("sales", "ventas"):
-			# Soft-add catalog PDF + own Pedidos when missing; never re-add stripped floor ops.
-			need = ["tools.catalog_pdf", "tables.orders.own"]
+			# Soft-add catalog PDF when missing; never re-add tables.* or stripped floor ops.
+			need = ["tools.catalog_pdf"]
 			missing = [p for p in need if p not in current]
 			if missing:
 				store[name] = _normalize_permission_ids(current + missing)
@@ -2122,6 +2175,7 @@ def _ensure_starter_staff_groups() -> dict:
 	dirty = _apply_default_sales_scope_to_store(store) or dirty
 	dirty = _migrate_sales_see_assigned_default(store) or dirty
 	dirty = _strip_sales_floor_ops_extras(store) or dirty
+	dirty = _strip_sales_table_access(store) or dirty
 	dirty = _backfill_floor_fulfillment_perms(store) or dirty
 	for spec in STARTER_STAFF_GROUPS:
 		title = spec["employee_group_name"]

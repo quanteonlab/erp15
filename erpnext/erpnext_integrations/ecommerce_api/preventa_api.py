@@ -20,7 +20,7 @@ import secrets
 
 import frappe
 from frappe import _
-from frappe.utils import cint, get_datetime, now_datetime
+from frappe.utils import cint, cstr, get_datetime, now_datetime
 
 from erpnext.erpnext_integrations.ecommerce_api.company_context import acting_user as _acting_user
 from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
@@ -667,6 +667,181 @@ def add_lead_note(lead, note):
 	return {"ok": True}
 
 
+# ── Lead checklist (todo) — KV, separate from formal Lead.notes / Activity ─────
+
+LEAD_CHECKLIST_KV_SCOPE = "preventa.lead_checklist"
+
+
+def _require_lead_for_checklist(lead):
+	lead = cstr(lead or "").strip()
+	if not lead:
+		frappe.throw(_("Lead is required"), frappe.ValidationError)
+	if not frappe.db.exists("Lead", lead):
+		frappe.throw(_("Lead {0} not found").format(lead), frappe.DoesNotExistError)
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Lead", lead)
+	frappe.flags.ignore_permissions = False
+	_require_owner_or_crm(doc.lead_owner)
+	return lead, doc
+
+
+def _sort_checklist_items(items: list[dict]) -> list[dict]:
+	"""Open first (newest add), then resolved (newest done)."""
+	open_items = [i for i in items if not i.get("done")]
+	done_items = [i for i in items if i.get("done")]
+	open_items.sort(key=lambda i: cstr(i.get("added_on") or ""), reverse=True)
+	done_items.sort(key=lambda i: cstr(i.get("done_on") or ""), reverse=True)
+	return open_items + done_items
+
+
+def _load_lead_checklist(lead_name: str) -> list[dict]:
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	_doc, data = kv_get(LEAD_CHECKLIST_KV_SCOPE, lead_name)
+	raw = data.get("items") if isinstance(data, dict) else None
+	if not isinstance(raw, list):
+		return []
+	out = []
+	for row in raw:
+		if not isinstance(row, dict):
+			continue
+		text = cstr(row.get("text") or "").strip()
+		item_id = cstr(row.get("id") or "").strip()
+		if not text or not item_id:
+			continue
+		out.append(
+			{
+				"id": item_id,
+				"text": text,
+				"done": bool(row.get("done")),
+				"added_by": cstr(row.get("added_by") or "") or None,
+				"added_on": cstr(row.get("added_on") or "") or None,
+				"done_by": cstr(row.get("done_by") or "") or None,
+				"done_on": cstr(row.get("done_on") or "") or None,
+			}
+		)
+	return _sort_checklist_items(out)
+
+
+def _save_lead_checklist(lead_name: str, items: list[dict]) -> list[dict]:
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	clean = []
+	for row in items or []:
+		if not isinstance(row, dict):
+			continue
+		text = cstr(row.get("text") or "").strip()
+		item_id = cstr(row.get("id") or "").strip()
+		if not text or not item_id:
+			continue
+		clean.append(
+			{
+				"id": item_id,
+				"text": text,
+				"done": bool(row.get("done")),
+				"added_by": cstr(row.get("added_by") or "") or None,
+				"added_on": cstr(row.get("added_on") or "") or None,
+				"done_by": cstr(row.get("done_by") or "") or None,
+				"done_on": cstr(row.get("done_on") or "") or None,
+			}
+		)
+	clean = _sort_checklist_items(clean)
+	kv_set(LEAD_CHECKLIST_KV_SCOPE, lead_name, {"items": clean})
+	return clean
+
+
+def _merge_lead_checklists(survivor_name: str, donor_names: list[str]) -> None:
+	"""Append donor checklist items onto the survivor (dedupe by id)."""
+	if not survivor_name:
+		return
+	merged = _load_lead_checklist(survivor_name)
+	seen = {cstr(i.get("id")) for i in merged}
+	for donor in donor_names or []:
+		for item in _load_lead_checklist(donor):
+			iid = cstr(item.get("id"))
+			if not iid or iid in seen:
+				continue
+			seen.add(iid)
+			merged.append(item)
+	_save_lead_checklist(survivor_name, merged)
+	# Drop donor rows so archive doesn't leave orphan todos.
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	for donor in donor_names or []:
+		docname, _ = kv_get(LEAD_CHECKLIST_KV_SCOPE, donor)
+		if docname:
+			frappe.delete_doc("Table Extra Data", docname, ignore_permissions=True)
+
+
+@frappe.whitelist(allow_guest=True)
+def add_lead_checklist_item(lead=None, text=None):
+	"""Add an open checklist todo for a Lead (not a formal CRM note)."""
+	lead_name, _doc = _require_lead_for_checklist(lead)
+	text = cstr(text or "").strip()
+	if not text:
+		frappe.throw(_("Checklist text is required"), frappe.ValidationError)
+	items = _load_lead_checklist(lead_name)
+	item = {
+		"id": secrets.token_hex(8),
+		"text": text[:500],
+		"done": False,
+		"added_by": _acting_user(),
+		"added_on": str(now_datetime()),
+		"done_by": None,
+		"done_on": None,
+	}
+	items.append(item)
+	saved = _save_lead_checklist(lead_name, items)
+	frappe.db.commit()
+	return {"ok": True, "item": item, "checklist": saved}
+
+
+@frappe.whitelist(allow_guest=True)
+def set_lead_checklist_item(lead=None, item_id=None, done=None, text=None, delete=0):
+	"""Toggle done / rename / delete a checklist item. Omitted fields leave as-is."""
+	lead_name, _doc = _require_lead_for_checklist(lead)
+	item_id = cstr(item_id or "").strip()
+	if not item_id:
+		frappe.throw(_("item_id is required"), frappe.ValidationError)
+	items = _load_lead_checklist(lead_name)
+	idx = next((i for i, row in enumerate(items) if row.get("id") == item_id), None)
+	if idx is None:
+		frappe.throw(_("Checklist item not found"), frappe.DoesNotExistError)
+
+	if cint(delete):
+		items.pop(idx)
+		saved = _save_lead_checklist(lead_name, items)
+		frappe.db.commit()
+		return {"ok": True, "deleted": True, "checklist": saved}
+
+	row = dict(items[idx])
+	changed = False
+
+	if text is not None:
+		new_text = cstr(text or "").strip()
+		if not new_text:
+			frappe.throw(_("Checklist text is required"), frappe.ValidationError)
+		row["text"] = new_text[:500]
+		changed = True
+
+	if done is not None:
+		is_done = bool(cint(done)) if not isinstance(done, bool) else done
+		row["done"] = is_done
+		if is_done:
+			row["done_by"] = _acting_user()
+			row["done_on"] = str(now_datetime())
+		else:
+			row["done_by"] = None
+			row["done_on"] = None
+		changed = True
+
+	if changed:
+		items[idx] = row
+	saved = _save_lead_checklist(lead_name, items)
+	frappe.db.commit()
+	return {"ok": True, "item": next((r for r in saved if r.get("id") == item_id), None), "checklist": saved}
+
+
 @frappe.whitelist(allow_guest=True)
 def move_lead(lead, to_stage, lost_reason=None, values=None, force=0):
 	"""Move a Lead to a board stage. Optional `values` are applied first so
@@ -994,6 +1169,9 @@ def merge_leads(leads=None, resolutions=None, survivor=None):
 					"added_on": row.get("added_on") or now_datetime(),
 				},
 			)
+
+	# Merge checklist todos (KV) onto survivor
+	_merge_lead_checklists(survivor_doc.name, [d.name for d in donors])
 
 	survivor_doc.flags.ignore_permissions = True
 	survivor_doc.save(ignore_permissions=True)
@@ -1562,6 +1740,7 @@ def get_lead_timeline(lead):
 		fields_out[fid] = doc.get(attr)
 
 	notes = [{"note": n.note, "added_by": n.added_by, "added_on": n.added_on} for n in (doc.notes or [])]
+	checklist = _load_lead_checklist(doc.name)
 
 	consultas = frappe.get_all(
 		"Preventa Lead Consulta",
@@ -1610,6 +1789,7 @@ def get_lead_timeline(lead):
 			"fields": fields_out,
 		},
 		"notes": notes,
+		"checklist": checklist,
 		"consultas": consultas,
 		"events": events,
 		"tags": tags_map_for_docs("Lead", [lead]).get(lead, []),

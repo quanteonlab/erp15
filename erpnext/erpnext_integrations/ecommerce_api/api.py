@@ -5353,12 +5353,17 @@ def create_guest_preorder(
 			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so.name}")
 
 	# Operaciones → Orden: submit now; remito/geocode deferred (was the long stall).
+	# Sellers may create Orden here; later edits stay suggestion-only.
 	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
 	promoted = None
 	if want_orden and resolved_rows:
-		promoted = set_guest_preorder_status(
-			so.name, "Orden", ensure_planner_remito=0
-		)
+		frappe.flags.creating_guest_preorder = True
+		try:
+			promoted = set_guest_preorder_status(
+				so.name, "Orden", ensure_planner_remito=0
+			)
+		finally:
+			frappe.flags.creating_guest_preorder = False
 		so_name = cstr((promoted or {}).get("name") or so.name)
 		frappe.flags.ignore_permissions = True
 		so = frappe.get_doc("Sales Order", so_name)
@@ -5508,6 +5513,8 @@ def _attach_creation_review_fields(rows: list) -> None:
 
 def _requeue_seller_amend_review(preorder_name: str, reason: str = "seller_amend") -> bool:
 	"""Park SO in admin Revisar after a non-admin seller material amend/edit."""
+	if frappe.flags.get("applying_creation_review_suggestion"):
+		return False
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
 			mark_seller_amend_for_review,
@@ -5527,6 +5534,59 @@ def _requeue_seller_amend_review(preorder_name: str, reason: str = "seller_amend
 		return False
 
 
+def _can_live_mutate_guest_preorder() -> bool:
+	"""Admins and Pedidos-table staff may mutate SO body live; sellers suggestion-only.
+
+	Create-time promote (Consulta→Orden inside ``create_guest_preorder``) is allowed
+	for sellers — they may place new orders; only post-create edits/pipeline moves
+	are suggestion-only.
+	"""
+	if frappe.flags.get("applying_creation_review_suggestion"):
+		return True
+	if frappe.flags.get("creating_guest_preorder"):
+		return True
+	from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+		is_creation_review_admin,
+	)
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _can_app
+
+	if is_creation_review_admin():
+		return True
+	return bool(
+		_can_app("tables.orders")
+		or _can_app("tables.orders.all")
+		or _can_app("tables.orders.own")
+	)
+
+
+def _require_guest_preorder_live_mutate(pipeline_source=None):
+	"""Block non-admin / non-Pedidos sellers from live SO edits (use suggest API)."""
+	if _can_live_mutate_guest_preorder():
+		return
+	# TMS / kiosk / armado transitions are PIN-gated upstream.
+	if pipeline_source:
+		return
+	frappe.throw(
+		_(
+			"Sellers may only queue suggestions for Revisar — "
+			"direct edits and pipeline changes are not allowed."
+		),
+		frappe.PermissionError,
+	)
+
+
+def _guest_preorder_within_cutoff(order: dict, cutoff_date) -> bool:
+	if cutoff_date is None:
+		return True
+	try:
+		tx = order.get("transaction_date")
+		if tx and getdate(tx) < getdate(cutoff_date):
+			return False
+	except Exception:
+		return False
+	return True
+
+
 def _guest_preorder_matches_seller_scope(
 	order: dict,
 	seller_scope: str,
@@ -5543,21 +5603,23 @@ def _guest_preorder_matches_seller_scope(
 		return False
 	tags = _parse_remarks_tags(_guest_preorder_tag_text(order))
 	seller = cstr(tags.get("seller_ref") or "").strip()
+	order_owner = cstr(tags.get("order_owner") or "").strip()
 	if seller_scope == "mine":
 		return seller == uid
-	if _is_assigned_client_seller_scope(seller_scope):
-		# Pedidos table / Orden FAB: guest preorders for assigned clients in window.
+	if seller_scope == "orden_here":
+		# Operaciones → Orden FAB: orders this seller placed here, OR for assigned clients.
+		cust = cstr(order.get("customer") or "").strip()
+		placed_here = seller == uid or order_owner == uid
+		assigned_ok = bool(cust and assigned_customers and cust in assigned_customers)
+		if not (placed_here or assigned_ok):
+			return False
+		return _guest_preorder_within_cutoff(order, cutoff_date)
+	if seller_scope == "assigned":
+		# Pedidos table Mis clientes: guest preorders for assigned clients in window.
 		cust = cstr(order.get("customer") or "").strip()
 		if not cust or not assigned_customers or cust not in assigned_customers:
 			return False
-		if cutoff_date is not None:
-			try:
-				tx = order.get("transaction_date")
-				if tx and getdate(tx) < getdate(cutoff_date):
-					return False
-			except Exception:
-				return False
-		return True
+		return _guest_preorder_within_cutoff(order, cutoff_date)
 	return True
 
 
@@ -5570,6 +5632,7 @@ def get_guest_preorders_list(
 	scope="pos",
 	include_archived=0,
 	seller_scope=None,
+	customer=None,
 ):
 	"""
 	List Guest Preorders created by `create_guest_preorder`.
@@ -5579,24 +5642,34 @@ def get_guest_preorders_list(
 	``include_archived=1`` only when a UI explicitly needs them.
 	Superseded cancelled orders (replaced by an amendment) are always excluded.
 
+	``customer`` — optional Customer name filter (CRM party Pedidos tab).
+
 	``seller_scope``:
 	  - ``mine`` — only SOs tagged ``seller_ref:<acting user>`` (seller link)
-	  - ``assigned`` / ``orden_here`` — Pedidos for this seller's assigned clients
-	    in the admin lookback window (``catalogDisplay.ordenPedidosDays``, default 30)
+	  - ``assigned`` — Pedidos for this seller's assigned clients (windowed)
+	  - ``orden_here`` — Operaciones → Orden FAB: orders this seller placed
+	    (``order_owner`` / ``seller_ref``) **or** for assigned clients (windowed)
 	"""
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
 		return {"preorders": [], "total_count": 0, "window_days": 30}
 
+	customer_filter = cstr(customer or "").strip()
+	if customer_filter.lower() in ("null", "undefined", "none", "*"):
+		customer_filter = ""
+
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 		_acting_username,
 		_assigned_customer_names,
+		_can_app,
 		_order_visibility_scope,
 		guest_preorder_matches_scope,
 	)
 
 	seller_scope = _normalize_seller_scope(seller_scope)
-	acting_uid = cstr(_acting_username() or "").strip()
+	acting_uid = cstr(_acting_username() or frappe.session.user or "").strip()
+	if acting_uid in ("Guest", "guest"):
+		acting_uid = ""
 	window_days = (
 		_orden_pedidos_window_days() if _is_assigned_client_seller_scope(seller_scope) else None
 	)
@@ -5626,24 +5699,51 @@ def get_guest_preorders_list(
 		include_archived = 1
 
 	scope = _order_visibility_scope()
-	if scope is not None and not scope.get("own") and not scope.get("tags"):
+	# Sales floor (ops.catalog / preventa) may list Pedidos via Orden FAB without
+	# tables.orders.* — seller_scope filters to assigned clients / orders they placed.
+	seller_floor_list = bool(
+		seller_scope
+		and acting_uid
+		and (
+			_can_app("ops.catalog")
+			or _can_app("ops.preventa")
+			or _can_app("sales.see_assigned")
+		)
+	)
+	if (
+		scope is not None
+		and not scope.get("own")
+		and not scope.get("tags")
+		and not seller_floor_list
+	):
 		out = {"preorders": [], "total_count": 0}
 		if window_days is not None:
 			out["window_days"] = window_days
 		return out
 
-	# No assigned clients → empty Pedidos list (still report the window).
-	if _is_assigned_client_seller_scope(seller_scope) and not assigned_customers:
+	# Mis clientes with no assignments → empty (still report the window).
+	# orden_here still lists orders this seller placed even without assignments.
+	if seller_scope == "assigned" and not assigned_customers:
 		return {"preorders": [], "total_count": 0, "window_days": window_days or 30}
 
 	filters = {tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]}
 	if seller_scope == "mine" and acting_uid:
 		# Prefer rows that also carry this seller_ref (tag order is not guaranteed).
 		filters[tag_fn] = ["like", f"%seller_ref:{acting_uid}%"]
-	elif _is_assigned_client_seller_scope(seller_scope):
+	elif seller_scope == "assigned":
 		filters["customer"] = ["in", list(assigned_customers)]
 		if cutoff_date is not None:
 			filters["transaction_date"] = [">=", str(cutoff_date)]
+	elif seller_scope == "orden_here":
+		# Do not restrict SQL to assigned customers — also need order_owner / seller_ref rows.
+		if cutoff_date is not None:
+			filters["transaction_date"] = [">=", str(cutoff_date)]
+
+	# Explicit customer filter (CRM party Pedidos tab / click-from-order).
+	if customer_filter:
+		if seller_scope == "assigned" and assigned_customers and customer_filter not in assigned_customers:
+			return {"preorders": [], "total_count": 0, "window_days": window_days or 30}
+		filters["customer"] = customer_filter
 
 	if status:
 		st = cstr(status).strip()
@@ -5837,6 +5937,29 @@ def get_guest_preorders_list(
 
 	# Creation-review (Revisar) status for seller-amend badges.
 	_attach_creation_review_fields(filtered)
+	# Pending seller suggestions → Pedidos yellow row highlight.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			SUGGESTION_KV_SCOPE,
+		)
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get_many
+
+		names = [cstr(o.get("name") or "").strip() for o in filtered if o.get("name")]
+		sug_map = kv_get_many(SUGGESTION_KV_SCOPE, names) if names else {}
+		for o in filtered:
+			data = sug_map.get(o["name"]) or {}
+			change = data.get("change") if isinstance(data, dict) else None
+			status = (
+				cstr(data.get("status") or "pending").lower() if isinstance(data, dict) else ""
+			)
+			active = bool(isinstance(change, dict) and change and status != "rejected")
+			o["has_suggestion"] = active
+			o["suggestion_actor"] = (data.get("actor") if active and isinstance(data, dict) else None) or None
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "list_guest_preorders suggestion attach")
+		for o in filtered:
+			o.setdefault("has_suggestion", False)
+			o.setdefault("suggestion_actor", None)
 	for o in filtered:
 		o.pop("_tag_raw", None)
 	out = {"preorders": filtered, "total_count": total_count}
@@ -5896,6 +6019,7 @@ def get_guest_preorder(preorder_name):
 			else None
 		),
 		"review_reason": tags.get("review_reason") or None,
+		"pending_suggestion": None,
 		"guest_name": tags.get("guest_name") or None,
 		"guest_phone": tags.get("guest_phone") or None,
 		"guest_email": tags.get("guest_email") or None,
@@ -5974,6 +6098,14 @@ def get_guest_preorder(preorder_name):
 		payload["tags"] = tags_map_for_docs("Sales Order", [preorder_name]).get(preorder_name) or []
 	except Exception:
 		payload["tags"] = []
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			get_pending_suggestion,
+		)
+
+		payload["pending_suggestion"] = get_pending_suggestion(preorder_name)
+	except Exception:
+		payload["pending_suggestion"] = None
 	return payload
 
 
@@ -6542,6 +6674,7 @@ def set_guest_preorder_status(
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
 	pipeline_source = _normalize_pipeline_source(source)
+	_require_guest_preorder_live_mutate(pipeline_source=pipeline_source)
 
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
@@ -6714,6 +6847,7 @@ def unarchive_guest_preorder(preorder_name=None):
 	successor is also cancelled). Amend names skip collisions (Frappe's
 	default ``prefix-n`` naming does not).
 	"""
+	_require_guest_preorder_live_mutate()
 	name = cstr(preorder_name or "").strip()
 	if not name:
 		frappe.throw(_("Sales Order name is required"))
@@ -6759,6 +6893,7 @@ def unmark_prepared_guest_preorder(preorder_name):
 @frappe.whitelist()
 def cancel_guest_preorder(preorder_name=None):
 	"""Cancel (archive) a guest preorder. Works on both draft and submitted orders."""
+	_require_guest_preorder_live_mutate()
 	name = cstr(preorder_name or "").strip()
 	if not name or name.lower() in ("null", "undefined", "none"):
 		frappe.throw(_("Sales Order name is required"))
@@ -6827,6 +6962,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 	if isinstance(data, str):
 		data = frappe.parse_json(data) or {}
 	data = frappe._dict(data or {})
+	_require_guest_preorder_live_mutate()
 
 	if not preorder_name or not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
@@ -7072,6 +7208,8 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	"""
 	import json as _json
 
+	_require_guest_preorder_live_mutate()
+
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
@@ -7185,6 +7323,8 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	"""Update item rates/qty and global discount on a draft preorder (docstatus=0 only)."""
 	import json as _json
 
+	_require_guest_preorder_live_mutate()
+
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
@@ -7230,6 +7370,7 @@ def reprice_guest_preorder_from_price_list(preorder_name, price_list=None):
 	WEIGHT lines keep list $/Kg (PRECIO POR 1 KG). Nos/CAJA get list $/unit.
 	Does not touch measured total_weight — only money columns.
 	"""
+	_require_guest_preorder_live_mutate()
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
@@ -8485,6 +8626,7 @@ def update_guest_preorder_logistics(
 	Vehicle / driver options for the UI should come from the selected MAT
 	(and planner context); changing them updates the trip assignment.
 	"""
+	_require_guest_preorder_live_mutate()
 	name = cstr(preorder_name or "").strip()
 	if not name or not frappe.db.exists("Sales Order", name):
 		frappe.throw(_("Sales Order {0} not found").format(name or "?"))
@@ -12781,6 +12923,14 @@ def count_pending_creation_reviews():
 	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
 
 	return cr.count_pending_creation_reviews()
+
+
+@frappe.whitelist(allow_guest=True)
+def suggest_guest_preorder_change(preorder_name=None, change=None):
+	"""Seller suggestion-only: queue a patch for Revisar without applying it."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.suggest_guest_preorder_change(preorder_name=preorder_name, change=change)
 
 
 @frappe.whitelist(allow_guest=True)

@@ -1581,6 +1581,30 @@ def suite_5_12_modules_read():
                 f"list_leads_admin must nest contact data under fields: {list(lead.keys())}"
             assert "stage" in lead, f"list_leads_admin missing stage: {list(lead.keys())}"
 
+        # Checklist todos (KV) — add / resolve / delete; formal notes stay on Lead.notes.
+        chk_lead = frappe.new_doc("Lead")
+        chk_lead.lead_name = "Smoke Checklist Lead"
+        chk_lead.lead_owner = frappe.session.user
+        chk_lead.flags.ignore_permissions = True
+        chk_lead.insert(ignore_permissions=True)
+        frappe.db.commit()
+        try:
+            added = pa.add_lead_checklist_item(lead=chk_lead.name, text="Call warehouse")
+            assert added and added.get("ok") and added.get("item"), added
+            item_id = added["item"]["id"]
+            tl = pa.get_lead_timeline(chk_lead.name)
+            assert any(i.get("id") == item_id and not i.get("done") for i in (tl.get("checklist") or [])), tl
+            toggled = pa.set_lead_checklist_item(lead=chk_lead.name, item_id=item_id, done=1)
+            assert toggled.get("ok") and toggled.get("item", {}).get("done"), toggled
+            deleted = pa.set_lead_checklist_item(lead=chk_lead.name, item_id=item_id, delete=1)
+            assert deleted.get("ok") and deleted.get("deleted"), deleted
+            tl2 = pa.get_lead_timeline(chk_lead.name)
+            assert not any(i.get("id") == item_id for i in (tl2.get("checklist") or [])), tl2
+        finally:
+            if frappe.db.exists("Lead", chk_lead.name):
+                frappe.delete_doc("Lead", chk_lead.name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
         # duplicate_lead must not 409 on unique email (clone clears email_id)
         src = frappe.new_doc("Lead")
         src.lead_name = "Smoke Dup Source"
@@ -3460,6 +3484,83 @@ def suite_5_15_creation_review():
                 frappe.db.sql("delete from `tabSales Order` where name=%s", so_name)
             frappe.db.commit()
 
+    def check_seller_suggestion_queues_without_apply():
+        """Non-admin suggest_* parks SO in Revisar without mutating guest fields."""
+        staff = _ensure_smoke_creation_review_staff()
+        so_name = None
+        prev = frappe.session.user
+        try:
+            frappe.set_user("Administrator")
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke suggestion base",
+                guest_name="Smoke Suggest Guest",
+                guest_phone="5491100003344",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            frappe.db.set_value("Sales Order", so_name, "owner", staff)
+            frappe.db.commit()
+
+            frappe.set_user(staff)
+            # Live status change must be blocked for sellers without tables.orders.
+            blocked = False
+            try:
+                api.set_guest_preorder_status(so_name, "Orden")
+            except Exception:
+                blocked = True
+            assert blocked, "seller must not live-mutate pipeline"
+
+            sug = api.suggest_guest_preorder_change(
+                preorder_name=so_name,
+                change={"details": {"guest_notes": "suggested note from seller"}},
+            )
+            assert sug.get("ok"), sug
+            assert sug.get("review_status") == cr.STATUS_PENDING
+            frappe.set_user(prev)
+
+            # Live SO body unchanged until confirm.
+            detail = api.get_guest_preorder(so_name)
+            assert (detail.get("guest_notes") or "") == "smoke suggestion base", detail.get(
+                "guest_notes"
+            )
+            assert detail.get("pending_suggestion"), detail
+            assert frappe.db.get_value("Sales Order", so_name, cr.FIELDNAME) == cr.STATUS_PENDING
+
+            listed = api.list_creation_reviews(kind="order", status="Pending", limit=50)
+            row = next((r for r in listed if r.get("name") == so_name), None)
+            assert row and row.get("has_suggestion"), row
+
+            confirmed = api.confirm_creation_review(kind="order", name=so_name)
+            assert confirmed.get("ok") and confirmed.get("suggestion_applied"), confirmed
+            after = api.get_guest_preorder(so_name)
+            assert (after.get("guest_notes") or "") == "suggested note from seller", after.get(
+                "guest_notes"
+            )
+            assert not after.get("pending_suggestion")
+
+            # Reject discards the queued patch (SO body unchanged; no leftover suggestion).
+            sug2 = api.suggest_guest_preorder_change(
+                preorder_name=so_name,
+                change={"details": {"guest_notes": "second suggestion"}},
+            )
+            assert sug2.get("ok"), sug2
+            rejected = api.delete_creation_review(kind="order", name=so_name)
+            assert rejected.get("ok") and rejected.get("action") == "suggestion_rejected", rejected
+            assert frappe.db.exists("Sales Order", so_name), "reject must not delete SO"
+            after_rej = api.get_guest_preorder(so_name)
+            assert (after_rej.get("guest_notes") or "") == "suggested note from seller", after_rej.get(
+                "guest_notes"
+            )
+            assert not after_rej.get("pending_suggestion"), after_rej.get("pending_suggestion")
+        finally:
+            frappe.set_user(prev)
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                cr.clear_pending_suggestion(so_name)
+                frappe.db.sql("delete from `tabSales Order Item` where parent=%s", so_name)
+                frappe.db.sql("delete from `tabSales Order` where name=%s", so_name)
+            frappe.db.commit()
+
     def check_admin_skips_queue():
         prev = frappe.session.user
         cust_name = None
@@ -3478,9 +3579,64 @@ def suite_5_15_creation_review():
                 frappe.delete_doc("Customer", cust_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_seller_can_create_orden():
+        """Suggestion-only sellers may create Orden; later pipeline stays blocked."""
+        from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+
+        staff = _ensure_smoke_creation_review_staff()
+        so_name = None
+        prev = frappe.session.user
+        item = _get_test_item()
+        # Force IAM groups without Pedidos so live-mutate is denied (open IAM
+        # otherwise defaults _can_app → True and hides the regression).
+        orig_perm_info = ea._acting_perm_info
+        ea._acting_perm_info = lambda: {
+            "source": "groups",
+            "permissions": ["ops.preventa", "ops.orden"],
+        }
+        try:
+            frappe.set_user(staff)
+            assert not api._can_live_mutate_guest_preorder(), "test setup: live mutate must be denied"
+            out = api.create_guest_preorder(
+                items=[{"item_code": item["item_code"], "qty": 1, "rate": 12}],
+                guest_name="Smoke Seller Create Orden",
+                guest_phone="5491100004455",
+                initial_status="Orden",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name, out
+            assert out.get("display_status") == "Orden" or cint(
+                frappe.db.get_value("Sales Order", so_name, "docstatus")
+            ) == 1, out
+            assert not frappe.flags.get("creating_guest_preorder")
+            blocked = False
+            try:
+                api.set_guest_preorder_status(so_name, "Preparado")
+            except Exception as e:
+                blocked = True
+                assert "suggestions" in str(e).lower() or isinstance(e, frappe.PermissionError), e
+            assert blocked, "seller must not live-advance pipeline after create"
+        finally:
+            ea._acting_perm_info = orig_perm_info
+            frappe.set_user(prev)
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.db.sql("delete from `tabSales Order Item` where parent=%s", so_name)
+                frappe.db.sql("delete from `tabSales Order` where name=%s", so_name)
+            frappe.db.commit()
+
     _run("5.15.1 non-admin customer → pending → confirm", check_customer_confirm, "S2")
     _run("5.15.2 non-admin order → pending → delete", check_order_delete, "S2")
-    _run("5.15.3 admin customer skips review queue", check_admin_skips_queue, "S3")
+    _run(
+        "5.15.3 seller suggestion → Revisar → confirm applies",
+        check_seller_suggestion_queues_without_apply,
+        "S2",
+    )
+    _run("5.15.4 admin customer skips review queue", check_admin_skips_queue, "S3")
+    _run(
+        "5.15.5 seller create Orden allowed; later pipeline suggestion-only",
+        check_seller_can_create_orden,
+        "S2",
+    )
 
 
 # ── Suite 5.16 — Presentation demo pack (seed / status / clear) ───────────────
