@@ -1712,8 +1712,6 @@ def suite_5_12_modules_read():
         assert rows is not None
         groups = ea.list_employee_groups()
         assert groups is not None
-        # Detaching ops.catalog from Sales must stick — ensure_starter must not
-        # rewrite the group just because tables.crm / tables.orders.own remain.
         sales = next(
             (
                 g
@@ -1722,6 +1720,16 @@ def suite_5_12_modules_read():
             ),
             None,
         )
+        # Sales always gets ops.orden (Operaciones → Orden), even without Catálogo.
+        if sales:
+            if getattr(frappe.local, "_staff_starter_ensured", False):
+                frappe.local._staff_starter_ensured = False
+            ea.ensure_starter_staff_groups()
+            again = ea.list_employee_groups()
+            sales2 = next(g for g in (again.get("groups") or []) if g.get("name") == sales["name"])
+            assert "ops.orden" in (sales2.get("permissions") or []), sales2.get("permissions")
+            assert any(p.get("id") == "ops.orden" for p in (perms.get("permissions") or [])), perms
+        # Detaching ops.catalog from Sales must stick (Orden is separate).
         if sales and "ops.catalog" in (sales.get("permissions") or []):
             original = list(sales.get("permissions") or [])
             without = [p for p in original if p != "ops.catalog"]
@@ -1733,6 +1741,7 @@ def suite_5_12_modules_read():
                 again = ea.list_employee_groups()
                 sales2 = next(g for g in (again.get("groups") or []) if g.get("name") == sales["name"])
                 assert "ops.catalog" not in (sales2.get("permissions") or []), sales2.get("permissions")
+                assert "ops.orden" in (sales2.get("permissions") or []), sales2.get("permissions")
             finally:
                 ea.save_employee_group_permissions(sales["name"], original)
 

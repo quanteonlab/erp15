@@ -49,6 +49,16 @@ APP_PERMISSIONS = [
 		"desc_es": "Mostrar Catálogo en la barra y en Inicio. /catalog sigue accesible sin este permiso.",
 		"desc_zh": "在导航/首页显示目录。无此权限仍可打开 /catalog。",
 	},
+	{
+		"id": "ops.orden",
+		"group": "operaciones",
+		"label_en": "Order",
+		"label_es": "Orden",
+		"label_zh": "下单",
+		"desc_en": "Show Operaciones → Orden (create / confirm guest orders). Independent of Catalog and Tablas → Pedidos.",
+		"desc_es": "Mostrar Operaciones → Orden (crear / confirmar pedidos). Independiente de Catálogo y de Tablas → Pedidos.",
+		"desc_zh": "显示 运营 → 下单（创建/确认访客订单）。与目录、表格→订单无关。",
+	},
 
 	{
 		"id": "ops.receiving",
@@ -316,9 +326,9 @@ APP_PERMISSIONS = [
 		"label_en": "Pedidos table (own)",
 		"label_es": "Tabla Pedidos (propios)",
 		"label_zh": "订单表（自己的）",
-		"desc_en": "Opens Tablas → Pedidos for guest orders owned by this user. Prefer Operaciones → Orden for sellers.",
-		"desc_es": "Abre Tablas → Pedidos con pedidos de este usuario. Para vendedores preferí Operaciones → Orden.",
-		"desc_zh": "打开表格→订单（本人创建的访客单）。销售请用运营→下单。",
+		"desc_en": "Opens Tablas → Pedidos for guest orders owned by this user. Prefer the Orden permission (ops.orden) for sellers.",
+		"desc_es": "Abre Tablas → Pedidos con pedidos de este usuario. Para vendedores preferí el permiso Orden (ops.orden).",
+		"desc_zh": "打开表格→订单（本人创建的访客单）。销售请用权限「下单」(ops.orden)。",
 	},
 	{
 		"id": "tables.orders.all",
@@ -489,6 +499,7 @@ def _accept_permission_id(key: str) -> str | None:
 PERMISSION_TO_ROLES = {
 	"ops.pos": ["Sales User"],
 	"ops.catalog": ["Sales User"],
+	"ops.orden": ["Sales User"],
 	"ops.receiving": ["Stock User", "Purchase User"],
 	"ops.delivery": ["Stock User"],
 	"ops.check": ["Stock User"],
@@ -573,10 +584,11 @@ _SALES_SCOPE_IDS = frozenset(
 # Official sales floor role title is ``Sales`` (EN). Legacy sites may still have ``ventas``.
 # No Entregas / Check / Armado — those are opt-in via group permissions.
 # No tables.* — Pedidos/RM editing stays admin-only; sellers use Operaciones → Orden.
+# Catalog is optional (navbar soft-gate); Orden is the dedicated seller order surface.
 # Catalog PDF is a normal seller tool (share price lists); still toggleable in Groups.
 _STARTER_SALES = [
 	"ops.preventa",
-	"ops.catalog",
+	"ops.orden",
 	"tools.sync",
 	"tools.catalog_pdf",
 	"sales.see_assigned",
@@ -884,6 +896,7 @@ _SYNC_ROLES = {"Administrator", "System Manager"}
 _COARSE_FLAG = {
 	"ops.pos": "pos",
 	"ops.catalog": "pos",
+	"ops.orden": "pos",
 	"ops.preventa": "pos",
 	"ops.check": "receiving",
 	"ops.armado": "receiving",
@@ -2092,7 +2105,7 @@ def _strip_sales_floor_ops_extras(store: dict) -> bool:
 def _strip_sales_table_access(store: dict) -> bool:
 	"""Sales/ventas must not keep Tablas (RM / Pedidos / …) — edit surface is admin-only.
 
-	Sellers view/create Pedidos from Operaciones → Orden (ops.catalog) instead.
+	Sellers view/create Pedidos from Operaciones → Orden (ops.orden) instead.
 	"""
 	dirty = False
 	for name, raw in list(store.items()):
@@ -2147,8 +2160,9 @@ def _backfill_floor_fulfillment_perms(store: dict) -> bool:
 				dirty = True
 			continue
 		if title_l in ("sales", "ventas"):
-			# Soft-add catalog PDF when missing; never re-add tables.* or stripped floor ops.
-			need = ["tools.catalog_pdf"]
+			# Soft-add Orden + catalog PDF; never re-add tables.* or stripped floor ops.
+			# ops.orden is independent of ops.catalog (sellers may drop Catálogo).
+			need = ["ops.orden", "tools.catalog_pdf"]
 			missing = [p for p in need if p not in current]
 			if missing:
 				store[name] = _normalize_permission_ids(current + missing)
@@ -3348,6 +3362,7 @@ def set_customer_salesmen(customer=None, user_ids=None):
 		and (
 			_can_app("sales.commit_assigned")
 			or _can_app("sales.commit_all")
+			or _can_app("ops.orden")
 			or _can_app("ops.catalog")
 			or _can_app("ops.preventa")
 		)
