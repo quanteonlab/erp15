@@ -138,12 +138,21 @@ WORKFLOW_ONLY_DOCTYPES = {"Company Archive Entry": "classify_document"}
 # Generic *create* would leave half a record (a bare Driver has no Employee, so it
 # never shows in Employees) — create through the workflow; edits stay generic.
 CREATE_VIA_WORKFLOW = {"Driver": "create_driver", "Employee": "save_employee"}
+# Rendered/validated by the React app (g015): layout JSON is only meaningful to
+# the React designer, so generic create/update is refused → the React tools.
+REACT_SURFACE_DOCTYPES = {
+	"ECommerce Print Template": "preview_template_edit / apply_template_edit",
+	"ECommerce Floor Map": "preview_section_edit / apply_section_edit",
+}
 # Fields whose generic patch is lossy: a child-table patch REPLACES the list, so
 # adding members by patching Employee Group would drop everyone not echoed back.
 FIELD_VIA_WORKFLOW = {("Employee Group", "employee_list"): "save_employee"}
 
 
 def _require_generic_write(doctype: str, *, for_create: bool = False) -> None:
+	tools = REACT_SURFACE_DOCTYPES.get(doctype)
+	if tools:
+		frappe.throw(_("{0} is edited only with the {1} tools").format(doctype, tools), frappe.PermissionError)
 	workflow = WORKFLOW_ONLY_DOCTYPES.get(doctype)
 	if workflow:
 		frappe.throw(
@@ -2103,3 +2112,76 @@ def export_playbook_feedback(since=None) -> list[dict]:
 			frappe.delete_doc("Table Extra Data", name, ignore_permissions=True, force=True)
 		frappe.db.commit()
 	return out
+
+
+# ---------------------------------------------------------------------------
+# React-hosted MCP surfaces (g015): the React app verifies the same mcp_ token
+# here and keeps using this preview store, so the contract stays server-side.
+# ---------------------------------------------------------------------------
+
+REACT_SURFACES = {"print", "templates", "sections"}
+
+
+def _react_surface(surface) -> str:
+	surface = cstr(surface).strip()
+	if surface not in REACT_SURFACES:
+		frappe.throw(_("Unknown React MCP surface: {0}").format(surface))
+	return surface
+
+
+@frappe.whitelist()
+def mcp_react_session(mcp_token=None, surface=None, write=0):
+	"""Verify an mcp_ token for a React surface → who is acting and what they may touch."""
+
+	@_guard("react_session", payload=lambda: {"surface": surface, "write": write})
+	def _impl():
+		sfc = _react_surface(surface)
+		ctx = _ctx(mcp_token, write=cint_confirm(write))
+		frappe.local._mcp_ctx = ctx
+		matrix = _matrix()
+		return {
+			"site": frappe.local.site,
+			"surface": sfc,
+			"actor": ctx["actor"],
+			"key_id": ctx["key_id"],
+			"matrix": {dt: {"view": bool(v.get("view")), "edit": bool(v.get("edit"))} for dt, v in matrix.items()},
+		}
+
+	return _impl()
+
+
+def _react_preview_payload(surface: str, payload) -> dict:
+	data = _parse_json(payload, payload)
+	if not isinstance(data, dict):
+		frappe.throw(_("payload must be an object"))
+	# Namespaced so a React preview can never satisfy a gateway apply (or vice versa).
+	return {"op": f"react:{surface}", "payload": data}
+
+
+@frappe.whitelist()
+def mcp_preview_remember(mcp_token=None, surface=None, payload=None):
+	"""Store a React surface preview; returns the single-use preview_id."""
+
+	@_guard("react_preview", payload=lambda: {"surface": surface})
+	def _impl():
+		sfc = _react_surface(surface)
+		ctx = _ctx(mcp_token, write=True)
+		frappe.local._mcp_ctx = ctx
+		return {"preview_id": _remember_preview(ctx, _react_preview_payload(sfc, payload)), "expires_in_sec": PREVIEW_TTL_SEC}
+
+	return _impl()
+
+
+@frappe.whitelist()
+def mcp_preview_consume(mcp_token=None, surface=None, payload=None, preview_id=None):
+	"""Consume a React surface preview (identical payload, single use) before its apply."""
+
+	@_guard("react_apply", payload=lambda: {"surface": surface})
+	def _impl():
+		sfc = _react_surface(surface)
+		ctx = _ctx(mcp_token, write=True)
+		frappe.local._mcp_ctx = ctx
+		_consume_preview(ctx, _react_preview_payload(sfc, payload), preview_id)
+		return {"ok": True, "actor": ctx["actor"]}
+
+	return _impl()

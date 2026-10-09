@@ -523,6 +523,52 @@ def test_soft_lock_edges():
 	_assert(tms._should_soft_lock(None, "2026-09-30", 1) is False, "null due free")
 
 
+def test_preorder_soft_lock_releases_without_remito():
+	"""Pedidos without remito (delivery_note None) must release like remitos when over cap."""
+	movable = []
+	for i in range(4):
+		row = _stop(None, -34.60 - (i * 0.002), -58.38 - (i * 0.002), address_name=f"P{i}",
+			preferred_driver="DRV-A", due_date="2026-10-01", zone="T1-THU", sales_order=f"SO-P{i}")
+		movable.append(row)
+	out = _pack(movable=movable, max_orders=2, lead_days=1, as_of="2026-09-30", nearby_km=50)
+	keys = [a.get("sales_order") for a in out["assignments"]]
+	_assert(sorted(keys) == ["SO-P0", "SO-P1", "SO-P2", "SO-P3"], f"each pedido placed once: {keys}")
+	_assert(not [f for f in out["fills"] if f.get("over_cap")], f"no over-cap day: {out['fills']}")
+
+
+def test_overflow_spills_to_next_day_in_order():
+	"""Capacity full on day 1 for every driver → next working day, then the next."""
+	movable = [
+		_stop(f"S{i}", -34.60 - (i * 0.001), -58.38 - (i * 0.001), address_name=f"S{i}", overdue=True)
+		for i in range(5)
+	]
+	out = _pack(movable=movable, max_orders=1, nearby_km=50)
+	per_day = {}
+	for a in out["assignments"]:
+		per_day[a["proposed_due_date"]] = per_day.get(a["proposed_due_date"], 0) + 1
+	_assert(per_day.get("2026-10-01") == 2 and per_day.get("2026-10-02") == 2, f"2 drivers × 1/day: {per_day}")
+	_assert(per_day.get("2026-10-05") == 1, f"remainder on the following working day: {per_day}")
+
+
+def test_armado_plan_groups_by_day_and_driver():
+	plan = tms._armado_plan([
+		{"sales_order": "SO-2", "proposed_due_date": "2026-10-02", "driver": "DRV-A", "needs_armado": True},
+		{"sales_order": "SO-1", "proposed_due_date": "2026-10-01", "driver": "DRV-B", "needs_armado": True},
+		{"sales_order": "SO-3", "proposed_due_date": "2026-10-01", "driver": "DRV-B", "needs_armado": False},
+		{"sales_order": "SO-4", "proposed_due_date": "2026-10-01", "driver": None, "needs_armado": True},
+	])
+	_assert([d["date"] for d in plan] == ["2026-10-01", "2026-10-02"], f"earliest ship day first: {plan}")
+	_assert(plan[0]["count"] == 2, f"Preparado excluded: {plan[0]}")
+	_assert({g["driver"] for g in plan[0]["by_driver"]} == {"DRV-B", None}, plan[0])
+
+
+def test_needs_armado_states():
+	_assert(tms._needs_armado("SO-1", "Orden"), "Orden needs armado")
+	_assert(tms._needs_armado("SO-1", "To Deliver and Bill"), "unconfirmed native status needs armado")
+	_assert(not tms._needs_armado("SO-1", "Preparado"), "Preparado already armado")
+	_assert(not tms._needs_armado(None, None), "POS remito without SO: no armado")
+
+
 TESTS = [
 	test_unique_address_time_vs_order_count,
 	test_drive_buffer_adds_per_leg,
@@ -543,6 +589,10 @@ TESTS = [
 	test_parse_receive_days,
 	test_allowed_days_empty_receive_uses_work_days,
 	test_soft_lock_edges,
+	test_preorder_soft_lock_releases_without_remito,
+	test_overflow_spills_to_next_day_in_order,
+	test_armado_plan_groups_by_day_and_driver,
+	test_needs_armado_states,
 ]
 
 

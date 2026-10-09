@@ -5523,6 +5523,66 @@
       "expect": "fail",
       "source": "regression",
       "bug": "Bad token rejected before reading any file"
+    },
+    {
+      "id": "tms_commit_greedy_pack_preorder_unknown_so",
+      "source": "regression",
+      "bug": "commit_greedy_pack used to silently skip every pedido without remito; an unknown SO must be skipped, not crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.commit_greedy_pack",
+      "args": {
+        "preview": {
+          "assignments": [
+            {
+              "delivery_note": null,
+              "sales_order": "SO-EDGE-DOES-NOT-EXIST",
+              "proposed_due_date": "2026-12-01",
+              "driver": "null",
+              "kind": "preorder",
+              "needs_armado": true
+            }
+          ]
+        }
+      },
+      "expect": {
+        "ok": true,
+        "updated": 0,
+        "skipped": 1
+      }
+    },
+    {
+      "id": "tms_commit_greedy_pack_preorder_dirty_due",
+      "source": "regression",
+      "bug": "pedido row with empty remito + empty due is skipped (no write, no crash)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.commit_greedy_pack",
+      "args": {
+        "preview": {
+          "assignments": [
+            {
+              "delivery_note": "",
+              "sales_order": "SO-EDGE-X",
+              "proposed_due_date": "",
+              "driver": null
+            }
+          ]
+        }
+      },
+      "expect": {
+        "ok": true,
+        "updated": 0
+      }
+    },
+    {
+      "id": "tms_update_pending_delivery_due_unknown_so_with_driver",
+      "source": "regression",
+      "bug": "SO path now honours driver (address day-zone); unknown SO stays a controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_due",
+      "args": {
+        "delivery_note": null,
+        "sales_order": "SO-EDGE-NOPE",
+        "due_date": "2026-12-01",
+        "driver": "undefined"
+      },
+      "expect": "fail"
     }
   ]
 }

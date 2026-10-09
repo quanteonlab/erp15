@@ -1365,12 +1365,17 @@ def _zone_code_for_driver_day(driver, due_d):
 
 def _assign_dn_zone(dn, zone_code):
 	"""Set Address.custom_zone for a Delivery Note's shipping address."""
-	code = cstr(zone_code or "").strip()
-	if not code or not frappe.db.has_column("Address", "custom_zone"):
-		return None
 	addr = frappe.db.get_value("Delivery Note", dn, "shipping_address_name") or frappe.db.get_value(
 		"Delivery Note", dn, "customer_address"
 	)
+	return _assign_address_zone(addr, zone_code)
+
+
+def _assign_address_zone(addr, zone_code):
+	"""Set Address.custom_zone (the planner reads the driver from the day-zone)."""
+	code = cstr(zone_code or "").strip()
+	if not code or not frappe.db.has_column("Address", "custom_zone"):
+		return None
 	if not addr or not frappe.db.exists("Address", addr):
 		return None
 	cur = cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip()
@@ -1428,6 +1433,30 @@ def _apply_pending_delivery_due(dn, due_d, driver=None):
 	}
 
 
+def _apply_preorder_due(so_name, due_d, driver=None):
+	"""Planning due for an Orden/Preparado Sales Order that has no remito yet.
+
+	Same contract as ``_apply_pending_delivery_due``: SO (and line) delivery_date,
+	and with ``driver`` the shipping address gets that driver's day-zone so the
+	planner/armado lists show who carries it.
+	"""
+	frappe.db.set_value("Sales Order", so_name, "delivery_date", due_d, update_modified=True)
+	frappe.db.sql("UPDATE `tabSales Order Item` SET delivery_date=%s WHERE parent=%s", (due_d, so_name))
+	zone = None
+	drv = cstr(driver or "").strip() or None
+	if drv:
+		try:
+			code = _zone_code_for_driver_day(drv, due_d)
+			if code:
+				addr = frappe.db.get_value("Sales Order", so_name, "shipping_address_name") or frappe.db.get_value(
+					"Sales Order", so_name, "customer_address"
+				)
+				zone = _assign_address_zone(addr, code)
+		except Exception:
+			zone = None
+	return {"sales_orders": [so_name], "via": "sales_order", "zone": zone, "driver": drv}
+
+
 @frappe.whitelist(allow_guest=True)
 def update_pending_delivery_due(
 	delivery_note=None, due_date=None, driver=None, sales_order=None, preorder_name=None
@@ -1469,27 +1498,9 @@ def update_pending_delivery_due(
 
 	if not frappe.db.exists("Sales Order", so_name):
 		frappe.throw(_("Sales Order not found."))
-	frappe.db.set_value("Sales Order", so_name, "delivery_date", due_d, update_modified=True)
-	try:
-		frappe.db.sql(
-			"""
-			UPDATE `tabSales Order Item`
-			SET delivery_date=%s
-			WHERE parent=%s
-			""",
-			(due_d, so_name),
-		)
-	except Exception:
-		pass
+	meta = _apply_preorder_due(so_name, due_d, driver=driver)
 	frappe.db.commit()
-	return {
-		"delivery_note": None,
-		"due_date": str(due_d),
-		"sales_orders": [so_name],
-		"via": "sales_order",
-		"zone": None,
-		"driver": cstr(driver or "").strip() or None,
-	}
+	return {"delivery_note": None, "due_date": str(due_d), **meta}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -7046,7 +7057,10 @@ def _pack_remitos_core(
 
 	# Soft-lock protects armado, but not over soft cap: release excess so greedy
 	# can rebalance tomorrow/near dues that would otherwise leave one driver at 42+.
-	locked_by_dn = {l["delivery_note"]: l for l in locked if l.get("delivery_note")}
+	def _rk(r):  # remito, or the pedido itself when it has no remito yet
+		return r.get("delivery_note") or r.get("sales_order")
+
+	locked_by_dn = {_rk(l): l for l in locked if _rk(l)}
 	released_rows = []
 	for key, stops in list(buckets.items()):
 		ok, _cnt, _mins = _fits_soft_cap(
@@ -7054,7 +7068,7 @@ def _pack_remitos_core(
 		)
 		if ok:
 			continue
-		soft_rows = [s for s in stops if s.get("delivery_note") in locked_by_dn]
+		soft_rows = [s for s in stops if _rk(s) in locked_by_dn]
 		# Release least urgent first (reverse of pack priority)
 		soft_rows.sort(key=lambda r: _greedy_priority_tuple(r, as_of), reverse=True)
 		for s in soft_rows:
@@ -7074,10 +7088,10 @@ def _pack_remitos_core(
 			except ValueError:
 				continue
 			released_rows.append(s)
-			locked_by_dn.pop(s.get("delivery_note"), None)
+			locked_by_dn.pop(_rk(s), None)
 
 	if released_rows:
-		locked = [l for l in locked if l.get("delivery_note") in locked_by_dn]
+		locked = [l for l in locked if _rk(l) in locked_by_dn]
 		to_place.extend(released_rows)
 
 	to_place.sort(key=lambda r: _greedy_priority_tuple(r, as_of))
@@ -7218,6 +7232,40 @@ def _pack_remitos_core(
 	}
 
 
+# Pipeline states where the order is already armado (picked/packed) or past it.
+_ARMADO_DONE_STATUSES = {"Preparado", "Delivery", "En Delivery", "Completado", "Completed", "Closed"}
+
+
+def _needs_armado(sales_order, so_status) -> bool:
+	"""Pedido still to be armado: linked SO not yet Preparado (remito-only POS rows: no)."""
+	return bool(sales_order) and cstr(so_status or "").strip() not in _ARMADO_DONE_STATUSES
+
+
+def _armado_plan(assignments) -> list[dict]:
+	"""Armado list grouped by planned ship day (earliest first) → driver.
+
+	Greedy: what ships first gets armado first, so day 1 is tomorrow's armado.
+	"""
+	days: dict[str, dict] = {}
+	for a in assignments or []:
+		if not a.get("needs_armado") or not a.get("proposed_due_date"):
+			continue
+		day = days.setdefault(a["proposed_due_date"], {"date": a["proposed_due_date"], "count": 0, "drivers": {}})
+		drv = a.get("driver") or ""
+		day["drivers"].setdefault(drv, []).append(
+			{"sales_order": a.get("sales_order"), "customer_name": a.get("customer_name"), "overflow": bool(a.get("overflow"))}
+		)
+		day["count"] += 1
+	return [
+		{
+			"date": d["date"],
+			"count": d["count"],
+			"by_driver": [{"driver": k or None, "orders": v} for k, v in sorted(d["drivers"].items())],
+		}
+		for d in sorted(days.values(), key=lambda x: x["date"])
+	]
+
+
 def _build_greedy_pack_preview(
 	as_of=None,
 	horizon_days=None,
@@ -7325,13 +7373,20 @@ def _build_greedy_pack_preview(
 
 	movable = []
 	fixed = []
+	on_trip = 0
 	for d in deliveries:
+		if d.get("assigned_trip"):
+			# Already on a MAT: counted as capacity via trip_cap, never re-dated here.
+			on_trip += 1
+			continue
 		so = cstr(d.get("sales_order") or "").strip()
 		forced = _so_delivery_forced(so) if so else False
 		addr = cstr(d.get("address_name") or "").strip()
 		due_s = cstr(d.get("due_date") or "").strip() or None
 		try:
-			overdue = bool(due_s and getdate(due_s) < as_of_d)
+			# Due today but not on a trip = not going out today → replan from the
+			# next business day like anything overdue (default: plan tomorrow on).
+			overdue = bool(due_s and getdate(due_s) <= as_of_d)
 		except Exception:
 			overdue = bool(d.get("overdue"))
 		row = {
@@ -7349,6 +7404,8 @@ def _build_greedy_pack_preview(
 			"receive_days": recv_map.get(addr) or [],
 			# Unlock remitos already due tomorrow so they can move later.
 			"force_unlock": bool(skip_tm and due_s == tomorrow_s),
+			"kind": d.get("kind") or "delivery_note",
+			"needs_armado": _needs_armado(so, d.get("so_status")),
 		}
 		zkey = (row["zone"] or "").upper()
 		row["preferred_driver"] = zone_driver.get(zkey) if zkey else None
@@ -7395,9 +7452,19 @@ def _build_greedy_pack_preview(
 		prefer_sticky=sticky,
 	)
 
+	armado_by_key = {
+		(r.get("delivery_note") or r.get("sales_order")): (r.get("needs_armado"), r.get("kind"))
+		for r in movable + fixed
+	}
+	for a in core["assignments"]:
+		needs, kind = armado_by_key.get(a.get("delivery_note") or a.get("sales_order"), (False, None))
+		a["needs_armado"] = bool(needs)
+		a["kind"] = kind
+
 	return {
 		"strategy": "fast_deliver_greedy",
 		"packing_strategy_setting": _packing_strategy(settings),
+		"armado_plan": _armado_plan(core["assignments"]),
 		"as_of": str(as_of_d),
 		"horizon_days": horizon,
 		"lead_days": lead,
@@ -7430,6 +7497,7 @@ def _build_greedy_pack_preview(
 		"forced_count": len(fixed),
 		"soft_locked_count": core.get("locked_count") or 0,
 		"trip_capacity_stops": len(trip_cap),
+		"on_trip_count": on_trip,
 	}
 
 
@@ -7509,6 +7577,17 @@ def commit_greedy_pack(preview=None):
 		dn = cstr(a.get("delivery_note") or "").strip()
 		due = cstr(a.get("proposed_due_date") or "").strip()
 		so = cstr(a.get("sales_order") or "").strip()
+		if due and not dn and so:
+			# Orden/Preparado pedido with no remito yet — plan the SO itself.
+			if not frappe.db.exists("Sales Order", so) or _so_delivery_forced(so):
+				skipped += 1
+				continue
+			try:
+				_apply_preorder_due(so, getdate(due), driver=cstr(a.get("driver") or "").strip() or None)
+				updated += 1
+			except Exception as exc:
+				errors.append({"sales_order": so, "error": str(exc)})
+			continue
 		if not due or not dn:
 			skipped += 1
 			continue

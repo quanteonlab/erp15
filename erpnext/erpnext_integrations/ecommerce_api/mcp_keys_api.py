@@ -79,6 +79,9 @@ MCP_DOCTYPE_MATRIX = [
 	{"doctype": "Employee Group", "group": "staff", "label_en": "Employee groups", "label_es": "Grupos de empleados", "view": 1, "edit": 1},
 	{"doctype": "Branch", "group": "staff", "label_en": "Branches", "label_es": "Sucursales", "view": 1, "edit": 0},
 	{"doctype": "User", "group": "staff", "label_en": "Users", "label_es": "Usuarios", "view": 1, "edit": 0},
+	# print / layout — edited only through the React-hosted MCP surfaces (g015)
+	{"doctype": "ECommerce Print Template", "group": "print", "label_en": "Print templates", "label_es": "Plantillas de impresión", "view": 1, "edit": 1},
+	{"doctype": "ECommerce Floor Map", "group": "print", "label_en": "Floor maps & sections", "label_es": "Mapas y sectores", "view": 1, "edit": 1},
 	# org
 	{"doctype": "Company", "group": "org", "label_en": "Company", "label_es": "Empresa", "view": 1, "edit": 0},
 ]
