@@ -25,6 +25,9 @@ import time
 
 import frappe
 from frappe import _
+from frappe.utils import cstr, flt
+
+from erpnext.erpnext_integrations.ecommerce_api.item_pricing import effective_item_price, effective_item_rates
 
 from erpnext.erpnext_integrations.ecommerce_api.mcp_keys_api import (
 	AUDIT_SCOPE,
@@ -569,6 +572,12 @@ def mcp_search(mcp_token=None, doctype=None, query=None, limit=10):
 			limit_page_length=limit,
 			ignore_permissions=True,
 		)
+		if doctype == "Item" and rows:
+			pl = _default_selling_price_list()
+			rates = effective_item_rates([r.name for r in rows], pl)
+			for r in rows:
+				r["price"] = rates.get(r.name)
+				r["price_list"] = pl
 		return {"doctype": doctype, "matches": _sanitize_output(rows), "count": len(rows)}
 
 	return _impl(mcp_token, doctype, query, limit)
@@ -653,6 +662,236 @@ def mcp_get_record(mcp_token=None, doctype=None, name=None):
 		return {"doctype": doctype, "name": name, "doc": _sanitize_output(_json_safe(doc.as_dict()))}
 
 	return _impl(mcp_token, doctype, name)
+
+
+MAX_RESOLVE_LINES = 200
+MAX_PDF_BYTES = 10 * 1024 * 1024
+
+
+def _default_selling_price_list() -> str:
+	return frappe.db.get_single_value("Selling Settings", "selling_price_list") or "Standard Selling"
+
+
+def _norm_text(value) -> str:
+	import unicodedata
+
+	text = unicodedata.normalize("NFKD", cstr(value)).encode("ascii", "ignore").decode().lower()
+	return " ".join("".join(ch if ch.isalnum() else " " for ch in text).split())
+
+
+def _item_candidates_by_name(name: str, limit: int = 5) -> list[dict]:
+	"""Items whose name shares the most words with ``name`` (score 0–1)."""
+	words = [w for w in _norm_text(name).split() if len(w) > 1]
+	if not words:
+		return []
+	# Pre-filter on the longest word, then score every candidate on word overlap.
+	anchor = max(words, key=len)
+	rows = frappe.get_all(
+		"Item",
+		filters={"disabled": 0, "has_variants": 0},
+		or_filters=[["item_name", "like", f"%{anchor}%"], ["name", "like", f"%{anchor}%"]],
+		fields=["name", "item_name", "stock_uom"],
+		limit_page_length=200,
+		ignore_permissions=True,
+	)
+	wanted = set(words)
+	scored = []
+	for r in rows:
+		have = set(_norm_text(r.item_name).split())
+		hits = len(wanted & have)
+		if not hits:
+			continue
+		score = round(hits / len(wanted | have), 3)  # Jaccard: penalises extra words both ways
+		scored.append({"item_code": r.name, "item_name": r.item_name, "stock_uom": r.stock_uom, "score": score})
+	scored.sort(key=lambda x: -x["score"])
+	return scored[:limit]
+
+
+def _resolve_line(line: dict) -> dict:
+	"""Best Item for one document line: exact code → barcode → fuzzy name."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _item_codes_for_barcode
+
+	code = cstr(line.get("item_code") or line.get("code") or "").strip()
+	barcode = cstr(line.get("barcode") or "").strip()
+	name = cstr(line.get("name") or line.get("description") or "").strip()
+	for raw, how in ((code, "item_code"), (barcode, "barcode"), (code, "barcode")):
+		if not raw:
+			continue
+		hit = raw if how == "item_code" and frappe.db.exists("Item", raw) else None
+		if how == "barcode":
+			codes = _item_codes_for_barcode(raw)
+			hit = codes[0] if codes else None
+		if hit:
+			item = frappe.db.get_value("Item", hit, ["name", "item_name", "stock_uom", "disabled"], as_dict=True)
+			return {
+				"match": {"item_code": item.name, "item_name": item.item_name, "stock_uom": item.stock_uom, "score": 1.0},
+				"matched_by": how,
+				"alternatives": [],
+				"needs_review": bool(item.disabled),
+				"note": "item is disabled" if item.disabled else None,
+			}
+	candidates = _item_candidates_by_name(name) if name else []
+	best = candidates[0] if candidates else None
+	runner_up = candidates[1]["score"] if len(candidates) > 1 else 0
+	# Confident only when the name matches well AND clearly beats the next guess.
+	confident = bool(best) and best["score"] >= 0.6 and best["score"] - runner_up >= 0.15
+	return {
+		"match": best,
+		"matched_by": "name" if best else None,
+		"alternatives": candidates[1:],
+		"needs_review": not confident,
+		"note": None if best else "no item found — ask the user or search_records(doctype='Item')",
+	}
+
+
+@frappe.whitelist()
+def mcp_resolve_items(mcp_token=None, lines=None, price_list=None):
+	"""Match document lines (code / barcode / name) to Items in one call.
+
+	Each result carries the best match, alternatives, ``needs_review`` and the
+	effective price on ``price_list`` (default selling list). Lines echo the
+	caller's qty / rate so a PDF can be turned into ``create_order`` items.
+	"""
+
+	@_guard("resolve_items", doctype="Item", payload=lambda: {"lines": lines, "price_list": price_list})
+	def _impl(mcp_token, lines, price_list):
+		ctx = _ctx(mcp_token)
+		frappe.local._mcp_ctx = ctx
+		_can_view(_matrix(), "Item")
+		lines = _parse_json(lines, lines)
+		if not isinstance(lines, list) or not lines:
+			frappe.throw(_("lines must be a non-empty list of {item_code | barcode | name, qty, rate}"))
+		if len(lines) > MAX_RESOLVE_LINES:
+			frappe.throw(_("At most {0} lines per call").format(MAX_RESOLVE_LINES))
+		pl = cstr(price_list or "").strip() or _default_selling_price_list()
+		out = []
+		for idx, line in enumerate(lines, start=1):
+			if not isinstance(line, dict):
+				line = {"name": cstr(line)}
+			res = _resolve_line(line)
+			match = res["match"]
+			price = None
+			if match:
+				row = effective_item_price(match["item_code"], pl)
+				price = flt(row.price_list_rate) if row else None
+			out.append(
+				{
+					"line": idx,
+					"input": _sanitize_output(_json_safe(line)),
+					**res,
+					"price": price,
+					"qty": line.get("qty"),
+					"document_rate": line.get("rate"),
+				}
+			)
+		return {
+			"price_list": pl,
+			"lines": out,
+			"resolved": sum(1 for r in out if r["match"] and not r["needs_review"]),
+			"needs_review": sum(1 for r in out if r["needs_review"]),
+		}
+
+	return _impl(mcp_token, lines, price_list)
+
+
+def _inline_local_resources(html: str) -> str:
+	"""Inline /assets stylesheets and /assets|/files images as data: URIs.
+
+	get_pdf expands relative URLs to http://<site name>/…, which does not
+	resolve inside the server (HostNotFoundError in dev and in the Docker
+	image), and it forces disable-local-file-access, so file:// is out too.
+	Inlining needs no network and no knowledge of the web server's address.
+	"""
+	import base64
+	import mimetypes
+	import os
+	import re
+
+	roots = {
+		"/assets/": os.path.abspath(os.path.join(frappe.local.sites_path, "assets")),
+		"/files/": os.path.abspath(frappe.get_site_path("public", "files")),
+	}
+
+	def _disk(url: str) -> str | None:
+		path = url.split("?", 1)[0].split("#", 1)[0]
+		for web, root in roots.items():
+			if path.startswith(web):
+				# normpath (not realpath): sites/assets/<app> are symlinks into apps/,
+				# but a ../ in the URL still cannot climb out of the public root.
+				full = os.path.normpath(os.path.join(root, path[len(web) :]))
+				if full.startswith(root + os.sep) and os.path.isfile(full):
+					return full
+		return None
+
+	def _stylesheet(match):
+		full = _disk(match.group(2))
+		if not full:
+			return ""
+		# Stay a <link>: an inline <style> would be rewritten by scrub_urls
+		# (url(...) → "… !important"), which broke the print grid.
+		with open(full, "rb") as f:
+			return f'<link type="text/css" rel="stylesheet" href="data:text/css;base64,{base64.b64encode(f.read()).decode()}">'
+
+	def _data_uri(match):
+		attr, quote, url = match.group(1), match.group(2), match.group(3)
+		full = _disk(url)
+		if not full:
+			return f"{attr}{quote}data:,"
+		mime = mimetypes.guess_type(full)[0] or "application/octet-stream"
+		with open(full, "rb") as f:
+			return f"{attr}{quote}data:{mime};base64,{base64.b64encode(f.read()).decode()}"
+
+	html = re.sub(r"""<link\b[^>]*?href\s*=\s*(["'])(/assets/[^"']+?\.css[^"']*)\1[^>]*>""", _stylesheet, html)
+	html = re.sub(r"""(\bsrc\s*=\s*)(["'])(/(?:assets|files)/[^"']*)""", _data_uri, html)
+	# src="" would be expanded to the (unresolvable) site root and fetched.
+	return re.sub(r"""(\bsrc\s*=\s*)(["'])\2""", r"\1\2data:,\2", html)
+
+
+def _render_pdf(doctype: str, name: str, print_format: str | None) -> bytes:
+	from frappe.utils.pdf import get_pdf
+
+	html = _inline_local_resources(frappe.get_print(doctype, name, print_format=print_format))
+	return get_pdf(html)
+
+
+@frappe.whitelist()
+def mcp_get_print_pdf(mcp_token=None, doctype=None, name=None, print_format=None):
+	"""Render a viewable document with its print format; returns base64 PDF."""
+
+	@_guard("print_pdf", doctype=lambda: doctype, name=lambda: name)
+	def _impl(mcp_token, doctype, name, print_format):
+		import base64
+
+		ctx = _ctx(mcp_token)
+		frappe.local._mcp_ctx = ctx
+		doctype = str(doctype or "").strip()
+		name = str(name or "").strip()
+		if not doctype or not name:
+			frappe.throw(_("doctype and name are required"))
+		_can_view(_matrix(), doctype)
+		if not frappe.db.exists(doctype, name):
+			frappe.throw(_("{0} {1} not found").format(doctype, name), frappe.DoesNotExistError)
+		print_format = cstr(print_format or "").strip() or None
+		if print_format and not frappe.db.exists("Print Format", {"name": print_format, "doc_type": doctype}):
+			frappe.throw(_("Print Format {0} does not exist for {1}").format(print_format, doctype))
+		frappe.flags.ignore_permissions = True
+		try:
+			pdf = _render_pdf(doctype, name, print_format)
+		finally:
+			frappe.flags.ignore_permissions = False
+		if len(pdf) > MAX_PDF_BYTES:
+			frappe.throw(_("PDF is larger than {0} MB").format(MAX_PDF_BYTES // (1024 * 1024)))
+		return {
+			"doctype": doctype,
+			"name": name,
+			"print_format": print_format or "default",
+			"filename": f"{name}.pdf",
+			"mime_type": "application/pdf",
+			"size_bytes": len(pdf),
+			"pdf_base64": base64.b64encode(pdf).decode(),
+		}
+
+	return _impl(mcp_token, doctype, name, print_format)
 
 
 # ---------------------------------------------------------------------------
@@ -780,8 +1019,76 @@ def cint_confirm(value) -> bool:
 _PREORDER_STATUSES = ["Consulta", "Orden", "Preparado", "Delivery", "Completado", "En Delivery"]
 
 
+_ORDER_LINE_SCHEMA = {
+	"type": "object",
+	"properties": {
+		"item_code": {"type": "string", "description": "Item code or barcode (use resolve_items first)"},
+		"qty": {"type": "number"},
+		"rate": {
+			"type": "number",
+			"description": "Optional. Omit to use the current price-list price; set it to copy a document exactly.",
+		},
+		"uom": {"type": "string"},
+	},
+	"required": ["item_code", "qty"],
+}
+
+
 def _workflow_catalog() -> list[dict]:
 	return [
+		{
+			"name": "create_order",
+			"doctype": "Sales Order",
+			"description": (
+				"Create a Pedido (Sales Order in the Órdenes pipeline) in one step — same path as the "
+				"catalog/Operaciones create. Lines without a rate get the current price-list price; "
+				"lines with a rate keep it (copying a PDF/quote exactly). initial_status Orden submits it. "
+				"The preview prices every line and flags unknown items."
+			),
+			"args_schema": {
+				"type": "object",
+				"properties": {
+					"customer": {"type": "string", "description": "Customer name; omit for Consumidor Final"},
+					"items": {"type": "array", "items": _ORDER_LINE_SCHEMA},
+					"initial_status": {"type": "string", "enum": ["Consulta", "Orden"]},
+					"delivery_date": {"type": "string", "description": "YYYY-MM-DD; default next business day"},
+					"price_list": {"type": "string"},
+					"notes": {"type": "string"},
+				},
+				"required": ["items"],
+			},
+		},
+		{
+			"name": "reprice_order",
+			"doctype": "Sales Order",
+			"description": (
+				"Reset every line rate of a Pedido (draft or submitted, no cancel) to the current "
+				"price-list price. The preview lists each line's current → new rate and the new total."
+			),
+			"args_schema": {
+				"type": "object",
+				"properties": {"name": {"type": "string"}, "price_list": {"type": "string"}},
+				"required": ["name"],
+			},
+		},
+		{
+			"name": "update_order_lines",
+			"doctype": "Sales Order",
+			"description": (
+				"Replace the lines of a Pedido (draft or submitted, no cancel). Send the FULL new list: "
+				"lines not included are removed. A line without rate keeps its current rate, or gets the "
+				"price-list price if it is new."
+			),
+			"args_schema": {
+				"type": "object",
+				"properties": {
+					"name": {"type": "string"},
+					"items": {"type": "array", "items": _ORDER_LINE_SCHEMA},
+					"additional_discount_amount": {"type": "number"},
+				},
+				"required": ["name", "items"],
+			},
+		},
 		{
 			"name": "set_preorder_status",
 			"doctype": "Sales Order",
@@ -857,6 +1164,133 @@ def _workflow_catalog() -> list[dict]:
 	]
 
 
+def _order_lines_arg(args: dict) -> list[dict]:
+	items = _parse_json(args.get("items"), args.get("items"))
+	if not isinstance(items, list) or not items:
+		frappe.throw(_("items must be a non-empty list of {item_code, qty, rate?}"))
+	for row in items:
+		if not isinstance(row, dict) or not cstr(row.get("item_code")).strip():
+			frappe.throw(_("Every line needs an item_code"))
+	return items
+
+
+def _guest_preorder(name: str):
+	from erpnext.erpnext_integrations.ecommerce_api.api import _is_guest_preorder_sales_order
+
+	if not name or not frappe.db.exists("Sales Order", name):
+		frappe.throw(_("Sales Order {0} not found").format(name), frappe.DoesNotExistError)
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("{0} is not a Pedido (not created through the order pipeline)").format(name))
+	if so.docstatus == 2:
+		frappe.throw(_("{0} is cancelled (Archivado)").format(name))
+	return so
+
+
+def _priced_lines(items: list[dict], price_list: str, current: dict | None = None):
+	"""Resolve + price lines the way the apply will. Returns (lines, total, issues)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _item_codes_for_barcode
+
+	current = current or {}
+	lines, issues, total = [], [], 0.0
+	for idx, row in enumerate(items, start=1):
+		raw = cstr(row.get("item_code")).strip()
+		code = raw if frappe.db.exists("Item", raw) else next(iter(_item_codes_for_barcode(raw) or []), None)
+		if not code:
+			issues.append(f"Line {idx}: item {raw} not found (use resolve_items)")
+			continue
+		qty = flt(row.get("qty", 1))
+		if qty <= 0:
+			issues.append(f"Line {idx}: qty must be > 0")
+		eff = effective_item_price(code, price_list)
+		list_rate = flt(eff.price_list_rate) if eff else None
+		if row.get("rate") not in (None, ""):
+			rate, source = flt(row.get("rate")), "given"
+		elif code in current:
+			rate, source = current[code], "kept"
+		else:
+			rate, source = list_rate, "price_list"
+		if not rate:
+			issues.append(f"Line {idx}: {code} has no price on {price_list} — pass a rate")
+			rate = 0.0
+		amount = round(qty * rate, 2)
+		total += amount
+		lines.append(
+			{
+				"line": idx,
+				"item_code": code,
+				"item_name": frappe.db.get_value("Item", code, "item_name"),
+				"qty": qty,
+				"rate": rate,
+				"rate_source": source,
+				"price_list_rate": list_rate,
+				"amount": amount,
+			}
+		)
+	return lines, round(total, 2), issues
+
+
+def _workflow_preview(name: str, args: dict) -> tuple[list[str], dict | None]:
+	"""(issues, details) shown at preview time so the user sees exactly what applies."""
+	if name == "create_order":
+		pl = cstr(args.get("price_list") or "").strip() or _default_selling_price_list()
+		issues = []
+		customer = cstr(args.get("customer") or "").strip()
+		if customer and not frappe.db.exists("Customer", customer):
+			issues.append(f"Customer {customer} not found (search_records doctype=Customer)")
+		lines, total, line_issues = _priced_lines(_order_lines_arg(args), pl)
+		return issues + line_issues, {
+			"customer": customer or "Consumidor Final",
+			"initial_status": args.get("initial_status") or "Consulta",
+			"price_list": pl,
+			"lines": lines,
+			"estimated_total": total,
+		}
+	if name == "reprice_order":
+		so = _guest_preorder(cstr(args.get("name")))
+		pl = cstr(args.get("price_list") or "").strip() or so.selling_price_list or _default_selling_price_list()
+		lines = []
+		for row in so.items:
+			eff = effective_item_price(row.item_code, pl)
+			new = flt(eff.price_list_rate) if eff else None
+			lines.append(
+				{
+					"item_code": row.item_code,
+					"item_name": row.item_name,
+					"qty": flt(row.qty),
+					"from_rate": flt(row.rate),
+					"to_rate": new if new else flt(row.rate),
+					"note": None if new else "no price on list — unchanged",
+				}
+			)
+		new_total = round(sum(line["qty"] * line["to_rate"] for line in lines), 2)
+		return [], {
+			"order": so.name,
+			"price_list": pl,
+			"lines": lines,
+			"from_total": flt(so.grand_total),
+			"to_total_before_discount": new_total,
+		}
+	if name == "update_order_lines":
+		so = _guest_preorder(cstr(args.get("name")))
+		current = {row.item_code: flt(row.rate) for row in so.items}
+		lines, total, issues = _priced_lines(_order_lines_arg(args), so.selling_price_list or _default_selling_price_list(), current)
+		new_codes = {line["item_code"] for line in lines}
+		return issues, {
+			"order": so.name,
+			"from_lines": [
+				{"item_code": r.item_code, "item_name": r.item_name, "qty": flt(r.qty), "rate": flt(r.rate)} for r in so.items
+			],
+			"to_lines": lines,
+			"removed": [code for code in current if code not in new_codes],
+			"from_total": flt(so.grand_total),
+			"to_total_before_discount": total,
+		}
+	return _workflow_preview_issues(name, args), None
+
+
 def _workflow_preview_issues(name: str, args: dict) -> list[str]:
 	"""Problems the apply would hit, surfaced at preview time so the agent can
 	ask the user for them before requesting approval."""
@@ -879,6 +1313,57 @@ def _workflow_preview_issues(name: str, args: dict) -> list[str]:
 
 
 def _run_workflow(name: str, args: dict):
+	if name == "create_order":
+		from erpnext.erpnext_integrations.ecommerce_api.api import create_guest_preorder
+
+		pl = cstr(args.get("price_list") or "").strip() or _default_selling_price_list()
+		lines, _total, issues = _priced_lines(_order_lines_arg(args), pl)
+		if issues:
+			frappe.throw("; ".join(issues))
+		items = [
+			{
+				"item_code": line["item_code"],
+				"qty": line["qty"],
+				"rate": line["rate"],
+				**({"uom": src["uom"]} if src.get("uom") else {}),
+			}
+			for line, src in zip(lines, _order_lines_arg(args))
+		]
+		return create_guest_preorder(
+			items,
+			customer=cstr(args.get("customer") or "").strip() or None,
+			price_list=pl,
+			delivery_date=args.get("delivery_date") or None,
+			guest_notes=args.get("notes") or None,
+			initial_status=args.get("initial_status") or None,
+			send_client_pin=0,
+		)
+	if name == "reprice_order":
+		from erpnext.erpnext_integrations.ecommerce_api.api import reprice_guest_preorder_from_price_list
+
+		so = _guest_preorder(cstr(args.get("name")))
+		return reprice_guest_preorder_from_price_list(so.name, price_list=args.get("price_list") or None)
+	if name == "update_order_lines":
+		from erpnext.erpnext_integrations.ecommerce_api.api import update_guest_preorder_items
+
+		so = _guest_preorder(cstr(args.get("name")))
+		current = {row.item_code: flt(row.rate) for row in so.items}
+		src_rows = _order_lines_arg(args)
+		lines, _total, issues = _priced_lines(src_rows, so.selling_price_list or _default_selling_price_list(), current)
+		if issues:
+			frappe.throw("; ".join(issues))
+		items = [
+			{
+				"item_code": line["item_code"],
+				"qty": line["qty"],
+				"rate": line["rate"],
+				**({"uom": src["uom"]} if src.get("uom") else {}),
+			}
+			for line, src in zip(lines, src_rows)
+		]
+		return update_guest_preorder_items(
+			so.name, items, additional_discount_amount=flt(args.get("additional_discount_amount") or 0)
+		)
 	if name == "set_preorder_status":
 		from erpnext.erpnext_integrations.ecommerce_api.api import set_guest_preorder_status
 
@@ -973,7 +1458,7 @@ def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0, previe
 		if missing:
 			frappe.throw(_("Missing required args: {0}").format(", ".join(missing)))
 		signed = {"op": "workflow", "workflow": workflow, "args": args}
-		issues = [] if cint_confirm(confirm) else _workflow_preview_issues(workflow, args)
+		issues, details = ([], None) if cint_confirm(confirm) else _workflow_preview(workflow, args)
 		if not cint_confirm(confirm) and issues:
 			return {
 				"workflow": workflow,
@@ -981,17 +1466,22 @@ def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0, previe
 				"requires_confirm": False,
 				"applied": False,
 				"issues": issues,
+				**({"details": _sanitize_output(_json_safe(details))} if details else {}),
 				"hint": "Fix these first (ask the user for the missing values), then preview again.",
 			}
 		if not cint_confirm(confirm):
 			return {
 				"workflow": workflow,
 				"args": _sanitize_output(_json_safe(args)),
+				**({"details": _sanitize_output(_json_safe(details))} if details else {}),
 				"requires_confirm": True,
 				"applied": False,
 				"preview_id": _remember_preview(ctx, signed),
 				"expires_in_sec": PREVIEW_TTL_SEC,
-				"hint": "Show the user the target record and these args, then re-call with confirm=1 and this preview_id.",
+				"hint": (
+					"Show the user the details (every line: item / qty / rate / amount, and the total) "
+					"or the target record, then re-call with confirm=1 and this preview_id."
+				),
 			}
 		_consume_preview(ctx, signed, preview_id)
 		result = _run_workflow(workflow, args)

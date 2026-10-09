@@ -1,0 +1,49 @@
+{
+ "actions": [],
+ "creation": "2026-10-09 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "link_doctype",
+  "link_name",
+  "note"
+ ],
+ "fields": [
+  {
+   "default": "Item",
+   "fieldname": "link_doctype",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Link DocType",
+   "options": "Item\nEmployee\nSupplier\nCustomer\nAsset",
+   "reqd": 1
+  },
+  {
+   "fieldname": "link_name",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "label": "Link Name",
+   "options": "link_doctype",
+   "reqd": 1
+  },
+  {
+   "fieldname": "note",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Note"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-10-09 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "Archive Related Ref",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 0
+}

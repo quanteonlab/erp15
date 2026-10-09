@@ -432,3 +432,4 @@ erpnext.patches.v15_0.add_item_unit_weight_band_fields
 erpnext.patches.v15_0.add_tms_tracking_code_field
 erpnext.patches.v15_0.add_tms_zone_field
 erpnext.patches.v15_0.add_tms_delivery_frequency_field
+erpnext.patches.v15_0.collapse_superseded_item_prices

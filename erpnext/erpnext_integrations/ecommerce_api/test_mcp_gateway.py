@@ -15,6 +15,7 @@ import traceback
 import uuid
 
 import frappe
+from frappe.utils import flt
 
 from erpnext.erpnext_integrations.ecommerce_api import mcp_api, mcp_keys_api as keys
 
@@ -254,6 +255,142 @@ def run():
 
 		check("workflows: preview_id gate, required args, unknown, matrix", workflow_gate)
 
+		_set_matrix({})  # back to the default matrix for the order/price checks
+		item_code = f"{PROBE_TAG}-ITEM-{uuid.uuid4().hex[:6]}"
+		pl = mcp_api._default_selling_price_list()
+
+		def _price(rate, valid_from=None):
+			doc = frappe.get_doc(
+				{
+					"doctype": "Item Price",
+					"item_code": item_code,
+					"price_list": pl,
+					"price_list_rate": rate,
+					"valid_from": valid_from,
+				}
+			)
+			doc.insert(ignore_permissions=True)
+			return doc.name
+
+		def effective_price_and_collapse():
+			from frappe.utils import add_days, nowdate
+
+			from erpnext.erpnext_integrations.ecommerce_api.api import get_item_price
+			from erpnext.erpnext_integrations.ecommerce_api.item_pricing import effective_item_price
+
+			item = frappe.get_doc(
+				{
+					"doctype": "Item",
+					"item_code": item_code,
+					"item_name": f"{PROBE_TAG} Ascensor Cuantico Probe",
+					"item_group": frappe.db.get_value("Item Group", {"is_group": 0}, "name") or "All Item Groups",
+					"stock_uom": "Nos",
+					"is_stock_item": 0,
+					"is_sales_item": 1,
+				}
+			)
+			item.insert(ignore_permissions=True)
+			created.append(("Item", item_code))
+			# Same shape as the El ascensor cuántico bug: undated 7651, then two dated rows.
+			frappe.flags.in_item_price_collapse = True  # seed the duplicates the hook would retire
+			try:
+				frappe.db.set_value("Item Price", _price(7651), "valid_from", None)  # legacy undated row
+				_price(6429.22, "2026-01-31")
+				_price(5216.29, "2026-02-12")
+			finally:
+				frappe.flags.in_item_price_collapse = False
+			assert flt(get_item_price(item_code, pl)) == 5216.29, get_item_price(item_code, pl)
+			assert flt(mcp_api.mcp_search(token, "Item", item_code)["matches"][0]["price"]) == 5216.29
+			# A new price taking effect today retires every row it supersedes.
+			_price(5300, nowdate())
+			rows = frappe.get_all("Item Price", filters={"item_code": item_code, "price_list": pl}, pluck="price_list_rate", ignore_permissions=True)
+			assert [flt(r) for r in rows] == [5300.0], rows
+			# Future price is kept alongside; the current one still wins today.
+			_price(9999, add_days(nowdate(), 30))
+			assert flt(effective_item_price(item_code, pl).price_list_rate) == 5300.0
+			assert frappe.db.count("Item Price", {"item_code": item_code, "price_list": pl}) == 2
+
+		check("prices: effective row = latest valid_from; save hook retires superseded rows", effective_price_and_collapse)
+
+		def resolve_items():
+			out = mcp_api.mcp_resolve_items(
+				token,
+				[
+					{"item_code": item_code, "qty": 2},
+					{"name": "ascensor cuantico probe", "qty": 1, "rate": 10},
+					{"name": f"zz-nothing-{uuid.uuid4().hex[:8]}"},
+				],
+			)
+			first, by_name, missing = out["lines"]
+			assert first["matched_by"] == "item_code" and first["price"] == 5300.0 and not first["needs_review"], first
+			assert by_name["match"] and by_name["match"]["item_code"] == item_code, by_name
+			assert by_name["document_rate"] == 10 and by_name["qty"] == 1
+			assert missing["match"] is None and missing["needs_review"], missing
+			_expect_raise(frappe.ValidationError, mcp_api.mcp_resolve_items, token, [])
+
+		check("resolve_items: code / name / unknown + effective price", resolve_items)
+
+		def order_workflows():
+			if not frappe.db.exists("Customer", "Consumidor Final"):
+				print("  - skip order workflows (no Consumidor Final)")
+				return
+			args = {"items": [{"item_code": item_code, "qty": 2}, {"item_code": item_code + "-NOPE", "qty": 1}]}
+			bad = mcp_api.mcp_run_workflow(token, "create_order", args, 0)
+			assert bad["issues"] and not bad.get("preview_id"), bad
+			# Exact document rate (above list) → stored as a margin by ERPNext.
+			args = {"items": [{"item_code": item_code, "qty": 2, "rate": 7651}], "initial_status": "Orden"}
+			pv = mcp_api.mcp_run_workflow(token, "create_order", args, 0)
+			line = pv["details"]["lines"][0]
+			assert line["rate"] == 7651 and line["rate_source"] == "given" and pv["details"]["estimated_total"] == 15302, pv
+			res = mcp_api.mcp_run_workflow(token, "create_order", args, 1, preview_id=pv["preview_id"])["result"]
+			so_name = res["preorder_name"]
+			created.append(("Sales Order", so_name))
+			so = frappe.get_doc("Sales Order", so_name)
+			assert so.docstatus == 1 and flt(so.items[0].rate) == 7651, (so.docstatus, so.items[0].rate)
+			# Stale margin regression: reprice must land on the list price, not list + old margin.
+			pv = mcp_api.mcp_run_workflow(token, "reprice_order", {"name": so_name}, 0)
+			assert pv["details"]["lines"][0]["to_rate"] == 5300.0, pv["details"]
+			mcp_api.mcp_run_workflow(token, "reprice_order", {"name": so_name}, 1, preview_id=pv["preview_id"])
+			so.reload()
+			assert flt(so.items[0].rate) == 5300.0 and flt(so.grand_total) == 10600.0, (so.items[0].rate, so.grand_total)
+			assert flt(so.items[0].stock_uom_rate) == 5300.0, so.items[0].stock_uom_rate
+			# Lines edit on the submitted order: qty change, rate kept.
+			upd = {"name": so_name, "items": [{"item_code": item_code, "qty": 3}]}
+			pv = mcp_api.mcp_run_workflow(token, "update_order_lines", upd, 0)
+			assert pv["details"]["to_lines"][0]["rate_source"] == "kept", pv["details"]
+			mcp_api.mcp_run_workflow(token, "update_order_lines", upd, 1, preview_id=pv["preview_id"])
+			so.reload()
+			assert flt(so.grand_total) == 15900.0 and "Fifteen Thousand" in (so.in_words or ""), (so.grand_total, so.in_words)
+			# Generic (non-pipeline) orders are refused with a clear message.
+			plain = frappe.get_all("Sales Order", filters={"docstatus": 0}, pluck="name", limit_page_length=50, ignore_permissions=True)
+			from erpnext.erpnext_integrations.ecommerce_api.api import _is_guest_preorder_sales_order
+
+			plain = [n for n in plain if not _is_guest_preorder_sales_order(frappe.get_doc("Sales Order", n))]
+			if plain:
+				msg = _expect_raise(frappe.ValidationError, mcp_api.mcp_run_workflow, token, "reprice_order", {"name": plain[0]}, 0)
+				assert "not a Pedido" in msg, msg
+			state["so_name"] = so_name
+
+		def in_request(fn):
+			def wrapped():
+				with _FakeRequest():
+					fn()
+
+			return wrapped
+
+		check("order workflows: create (exact rate) → reprice (no stale margin) → edit lines", in_request(order_workflows))
+
+		def print_pdf():
+			if not state.get("so_name"):
+				raise AssertionError("no probe order to print")
+			out = mcp_api.mcp_get_print_pdf(token, "Sales Order", state["so_name"])
+			import base64
+
+			assert base64.b64decode(out["pdf_base64"])[:5] == b"%PDF-", out["size_bytes"]
+			_expect_raise(frappe.PermissionError, mcp_api.mcp_get_print_pdf, token, "GL Entry", "x")
+
+		check("get_print_pdf renders a real PDF; non-matrix doctype refused", in_request(print_pdf))
+
 		def rotate_revokes():
 			fresh = keys.rotate_mcp_link()
 			key_ids.add(fresh["key_id"])
@@ -274,9 +411,14 @@ def run():
 	finally:
 		for doctype, name in reversed(created):
 			try:
+				if doctype == "Sales Order" and frappe.db.get_value(doctype, name, "docstatus") == 1:
+					frappe.get_doc(doctype, name).cancel()
+				if doctype == "Item":
+					for price in frappe.get_all("Item Price", filters={"item_code": name}, pluck="name", ignore_permissions=True):
+						frappe.delete_doc("Item Price", price, ignore_permissions=True, force=True)
 				frappe.delete_doc(doctype, name, ignore_permissions=True, force=True)
 			except Exception:
-				pass
+				print(f"  ! cleanup {doctype} {name}: {traceback.format_exc(limit=1)}")
 		for row in frappe.get_all(
 			"Table Extra Data",
 			filters={"scope": keys.AUDIT_SCOPE},

@@ -98,12 +98,12 @@ def _upsert_item_price(
 ) -> None:
     from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
 
+    from erpnext.erpnext_integrations.ecommerce_api.item_pricing import effective_item_price
+
     pl = price_list or _default_price_list()
-    existing = frappe.db.get_value(
-        "Item Price",
-        {"item_code": item_code, "price_list": pl, "selling": 1},
-        "name",
-    )
+    # Edit the row ERPNext prices with — not an arbitrary dated duplicate.
+    effective = effective_item_price(item_code, pl)
+    existing = effective.name if effective else None
     values = {"price_list_rate": rate}
     if frappe.db.has_column("Item Price", "custom_manual_override") and manual_override:
         values["custom_manual_override"] = 1
@@ -244,33 +244,6 @@ def _reconcile_item_stock_qty(item_code: str, warehouse: str, target_qty: float)
         sr.submit()
     finally:
         frappe.flags.ignore_permissions = False
-
-
-def _upsert_item_price(item_code: str, rate: float, price_list: str | None = None) -> None:
-    from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
-
-    pl = price_list or _default_price_list()
-    existing = frappe.db.get_value(
-        "Item Price",
-        {"item_code": item_code, "price_list": pl, "selling": 1},
-        "name",
-    )
-    if existing:
-        old = frappe.db.get_value("Item Price", existing, "price_list_rate")
-        frappe.db.set_value("Item Price", existing, "price_list_rate", rate)
-        log_field_changes("Item Price", existing, [("price_list_rate", old, rate)])
-    else:
-        doc = frappe.get_doc(
-            {
-                "doctype": "Item Price",
-                "item_code": item_code,
-                "price_list": pl,
-                "selling": 1,
-                "price_list_rate": rate,
-            }
-        )
-        doc.insert(ignore_permissions=True)
-        log_field_changes("Item Price", doc.name, [("price_list_rate", None, rate)])
 
 
 def _parse_filters(filters):
@@ -3626,6 +3599,16 @@ def list_field_history(doctype, name, limit=50, price_list=None):
     )
 
     return _impl(doctype, name, limit=limit, price_list=price_list)
+
+
+@frappe.whitelist()
+def get_item_price_chart(item_code=None, price_lists=None, limit=80):
+    """Rentability selling-tab: multi price-list rate history for the line chart."""
+    from erpnext.erpnext_integrations.ecommerce_api.table_history import (
+        get_item_price_chart as _impl,
+    )
+
+    return _impl(item_code=item_code, price_lists=price_lists, limit=limit)
 
 
 @frappe.whitelist()

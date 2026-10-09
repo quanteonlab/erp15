@@ -490,6 +490,8 @@ def get_accounting_constants(as_of_date=None):
 		"this_month_caja_opening_total": caja["this_month_caja_opening_total"],
 		"this_month_si_white_count": month_mode["si_white_count"],
 		"this_month_si_black_count": month_mode["si_black_count"],
+		# Archivo (paper + payments hub) — ops vs posted for month close
+		**_archivo_constants(month_start, today),
 	}
 
 
@@ -646,13 +648,46 @@ def get_accounting_detail_tables(as_of_date=None, limit=None):
 	except (TypeError, ValueError):
 		lim = DETAIL_ROW_LIMIT
 	lim = max(1, min(80, lim))
+	archivo_dump = {"headers": [], "rows": [], "total": 0, "truncated": False}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.archivo_api import (
+			archivo_month_dump,
+		)
+
+		archivo_dump = archivo_month_dump(month_start, today, lim)
+	except Exception:
+		pass
 	return {
 		"as_of": today,
 		"month_start": month_start,
 		"limit": lim,
 		"compras_oc": _compras_oc_dump(month_start, today, lim),
 		"sueldos_ctc": _sueldos_ctc_dump(lim),
+		"archivo_gastos": archivo_dump,
 	}
+
+
+def _archivo_constants(month_start, as_of) -> dict:
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.archivo_api import (
+			archivo_month_constants,
+		)
+
+		return archivo_month_constants(month_start, as_of)
+	except Exception:
+		return {
+			"this_month_archivo_ops_total": 0.0,
+			"this_month_archivo_posted_total": 0.0,
+			"this_month_archivo_to_pay": 0.0,
+			"this_month_archivo_paid": 0.0,
+			"this_month_archivo_local_only": 0.0,
+			"this_month_archivo_fines": 0.0,
+			"this_month_archivo_utilities": 0.0,
+			"this_month_archivo_petty": 0.0,
+			"archivo_docs_active_count": 0,
+			"archivo_docs_expired_count": 0,
+			"archivo_missing_attachment_count": 0,
+		}
 
 
 def _safe_count(doctype: str, filters: dict) -> int:

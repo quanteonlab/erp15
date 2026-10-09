@@ -1313,6 +1313,17 @@ def suite_5_10_product_manager():
         assert isinstance(ctx, dict), f"expected dict, got {type(ctx)}"
         assert "price_lists" in ctx or "default_price_list" in ctx, f"keys={list(ctx.keys())[:12]}"
 
+    def check_item_price_chart():
+        empty = pm.get_item_price_chart(item_code=None, price_lists=None)
+        assert isinstance(empty, dict) and "series" in empty, empty
+        assert empty.get("series") == []
+        sku = frappe.db.get_value("Item Price", {"selling": 1}, "item_code")
+        if not sku:
+            return
+        chart = pm.get_item_price_chart(item_code=sku)
+        assert isinstance(chart, dict) and chart.get("item_code") == sku, chart
+        assert isinstance(chart.get("series"), list), chart
+
     def check_product_rows():
         rows = pm.get_product_rows(page=1, page_length=5, price_list="Standard Selling")
         assert rows is not None
@@ -1372,6 +1383,9 @@ def suite_5_10_product_manager():
             "ar_aging_0_30",
             "employees_salary_total",
             "caja_sessions_open_count",
+            "this_month_archivo_ops_total",
+            "this_month_archivo_posted_total",
+            "this_month_archivo_to_pay",
         ):
             assert key in consts, f"missing starter constant {key}; keys={list(consts.keys())[-12:]}"
             assert isinstance(consts[key], (int, float)), f"{key} not numeric: {consts[key]!r}"
@@ -1388,7 +1402,7 @@ def suite_5_10_product_manager():
     def check_accounting_detail_tables():
         dumps = pm.get_accounting_detail_tables(as_of_date=None, limit=10)
         assert isinstance(dumps, dict), f"expected dict, got {type(dumps)}"
-        for key in ("compras_oc", "sueldos_ctc"):
+        for key in ("compras_oc", "sueldos_ctc", "archivo_gastos"):
             block = dumps.get(key)
             assert isinstance(block, dict), f"missing {key}: {dumps}"
             assert "headers" in block and "rows" in block, f"bad {key}: {block}"
@@ -1431,6 +1445,7 @@ def suite_5_10_product_manager():
         )
 
     _run("5.10.1 get_pm_context", check_pm_context, "S2")
+    _run("5.10.1b get_item_price_chart", check_item_price_chart, "S2")
     _run("5.10.2 get_product_rows page", check_product_rows, "S2")
     _run("5.10.3 list_uoms", check_uoms, "S3")
     _run("5.10.4 list_item_attribute_names", check_attr_names, "S3")
@@ -1712,15 +1727,27 @@ def suite_5_12_modules_read():
         assert rows is not None
         groups = ea.list_employee_groups()
         assert groups is not None
+        if getattr(frappe.local, "_staff_starter_ensured", False):
+            frappe.local._staff_starter_ensured = False
+        ea.ensure_starter_staff_groups()
+        groups = ea.list_employee_groups()
+        sales_titles = [
+            (g.get("employee_group_name") or "").strip()
+            for g in (groups.get("groups") or [])
+            if (g.get("employee_group_name") or "").strip().lower() in ("sales", "ventas")
+        ]
+        # Official seed is lowercase ``ventas``; legacy ``Sales`` must be folded away.
+        assert "Sales" not in sales_titles, sales_titles
+        assert any(t.lower() == "ventas" for t in sales_titles), sales_titles
         sales = next(
             (
                 g
                 for g in (groups.get("groups") or [])
-                if (g.get("employee_group_name") or "").strip().lower() in ("sales", "ventas")
+                if (g.get("employee_group_name") or "").strip().lower() == "ventas"
             ),
             None,
         )
-        # Sales always gets ops.orden (Operaciones → Orden), even without Catálogo.
+        # ventas always gets ops.orden (Operaciones → Orden), even without Catálogo.
         if sales:
             if getattr(frappe.local, "_staff_starter_ensured", False):
                 frappe.local._staff_starter_ensured = False
@@ -1729,7 +1756,7 @@ def suite_5_12_modules_read():
             sales2 = next(g for g in (again.get("groups") or []) if g.get("name") == sales["name"])
             assert "ops.orden" in (sales2.get("permissions") or []), sales2.get("permissions")
             assert any(p.get("id") == "ops.orden" for p in (perms.get("permissions") or [])), perms
-        # Detaching ops.catalog from Sales must stick (Orden is separate).
+        # Detaching ops.catalog from ventas must stick (Orden is separate).
         if sales and "ops.catalog" in (sales.get("permissions") or []):
             original = list(sales.get("permissions") or [])
             without = [p for p in original if p != "ops.catalog"]
@@ -3732,6 +3759,79 @@ def suite_5_16_presentation_demo():
     _run("5.16.1 seed → status → clear (untagged kept)", check_seed_status_clear, "S2")
 
 
+def suite_5_18_archivo():
+    print("\n[Suite 5.18] Archivo — paper + payments hub")
+
+    from erpnext.erpnext_integrations.ecommerce_api import archivo_api as aa
+    from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+    if not frappe.db.exists("DocType", "Company Archive Entry"):
+        print("  skip — Company Archive Entry DocType not migrated")
+        return
+
+    created = []
+
+    def check_kinds():
+        out = aa.list_archivo_kinds()
+        assert isinstance(out.get("kinds"), list) and len(out["kinds"]) >= 5, out
+        assert "cash_out" in (out.get("sync_templates") or []), out
+
+    def check_create_paper_and_expense():
+        company = resolve_company() or frappe.db.get_value("Company", {}, "name")
+        paper = aa.create_archivo_entry(
+            title="SMOKE contrato",
+            kind="employment_contract",
+            sync_template="paper",
+            company=company,
+            notes="I014_SMOKE",
+        )
+        assert paper.get("name") and paper.get("amount") in (None, 0), paper
+        assert paper.get("sync_template") == "paper", paper
+        created.append(paper["name"])
+
+        exp = aa.create_archivo_entry(
+            title="SMOKE outing",
+            kind="petty_expense",
+            amount=123.45,
+            company=company,
+            notes="I014_SMOKE",
+            mark_paid=0,
+        )
+        assert exp.get("name") and flt(exp.get("amount")) == 123.45, exp
+        assert exp.get("workflow_status") in ("to_pay", "draft"), exp
+        created.append(exp["name"])
+
+        listed = aa.list_archivo_entries(search="SMOKE", limit=20)
+        names = {r["name"] for r in listed.get("rows") or []}
+        assert paper["name"] in names and exp["name"] in names, listed
+
+        agg = aa.get_archivo_aggregates()
+        assert "totals" in agg and "ops_total" in agg["totals"], agg
+
+    def check_custom_kind():
+        out = aa.save_archivo_custom_kind(
+            code="smoke_permiso",
+            label_es="SMOKE permiso",
+            sync_template="paper",
+        )
+        assert out.get("ok"), out
+        codes = {k["code"] for k in out.get("kinds") or []}
+        assert "smoke_permiso" in codes, codes
+
+    def cleanup_archivo():
+        for name in created:
+            if frappe.db.exists("Company Archive Entry", name):
+                frappe.delete_doc("Company Archive Entry", name, ignore_permissions=True, force=True)
+        frappe.db.commit()
+
+    try:
+        _run("5.18.1 list_archivo_kinds", check_kinds, "S2")
+        _run("5.18.2 create paper + expense + list/agg", check_create_paper_and_expense, "S2")
+        _run("5.18.3 save custom kind", check_custom_kind, "S3")
+    finally:
+        cleanup_archivo()
+
+
 def run(do_cleanup="1"):
     """
     Run all smoke suites and optionally clean up test records.
@@ -3763,6 +3863,7 @@ def run(do_cleanup="1"):
     suite_5_15_creation_review()
     suite_5_16_presentation_demo()
     suite_5_17_mcp_gateway()
+    suite_5_18_archivo()
 
     passed = _print_summary()
 

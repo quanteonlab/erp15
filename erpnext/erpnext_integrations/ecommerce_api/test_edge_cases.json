@@ -919,6 +919,39 @@
       "expect": "ok"
     },
     {
+      "id": "get_item_price_chart_null_item",
+      "source": "regression",
+      "bug": "get_item_price_chart with null item_code must return empty series (not TypeError/500)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_item_price_chart",
+      "args": {
+        "item_code": null,
+        "price_lists": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_item_price_chart_empty_item",
+      "source": "regression",
+      "bug": "get_item_price_chart with empty item_code must return empty series",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_item_price_chart",
+      "args": {
+        "item_code": "",
+        "price_lists": []
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_item_price_chart_string_null_lists",
+      "source": "regression",
+      "bug": "get_item_price_chart with price_lists='null' string must coerce and not crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_item_price_chart",
+      "args": {
+        "item_code": "MISSING-SKU-CHART",
+        "price_lists": "null"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "get_catalog_taxonomy_null_lang",
       "source": "regression",
       "bug": "get_catalog_taxonomy with null lang must return groups/brands maps",
@@ -5137,6 +5170,172 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "Auto Assign MAT with empty list is controlled"
+    },
+    {
+      "id": "create_archivo_entry_null_title",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.create_archivo_entry",
+      "args": {
+        "title": null,
+        "kind": "petty_expense",
+        "amount": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "create_archivo_entry with null title must controlled error not TypeError"
+    },
+    {
+      "id": "create_archivo_entry_empty_title",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.create_archivo_entry",
+      "args": {
+        "title": "",
+        "kind": "other_document",
+        "amount": ""
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "create_archivo_entry with empty title is controlled ValidationError"
+    },
+    {
+      "id": "list_archivo_entries_null_filters",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.list_archivo_entries",
+      "args": {
+        "search": null,
+        "kind": null,
+        "sync_template": "null",
+        "limit": null,
+        "start": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_archivo_entries dirty filters must not 500"
+    },
+    {
+      "id": "get_archivo_entry_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.get_archivo_entry",
+      "args": {
+        "name": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "get_archivo_entry null name controlled error"
+    },
+    {
+      "id": "save_archivo_custom_kind_bad_code",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.save_archivo_custom_kind",
+      "args": {
+        "code": "BAD CODE!",
+        "label_es": "x",
+        "sync_template": "paper"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "custom kind with invalid code is controlled ValidationError"
+    },
+    {
+      "id": "post_archivo_entry_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.post_archivo_entry",
+      "args": {
+        "name": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "post_archivo_entry null name controlled"
+    },
+    {
+      "id": "link_archivo_voucher_nulls",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.link_archivo_voucher",
+      "args": {
+        "name": null,
+        "voucher_type": null,
+        "voucher_name": ""
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "link_archivo_voucher nulls controlled"
+    },
+    {
+      "id": "get_archivo_aggregates_null_dates",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.get_archivo_aggregates",
+      "args": {
+        "from_date": null,
+        "to_date": "undefined",
+        "group_by": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "get_archivo_aggregates dirty dates defaults safely"
+    },
+    {
+      "id": "get_item_price_null_args",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_item_price",
+      "args": {
+        "item_code": null,
+        "price_list": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "get_item_price now resolves the effective (latest valid_from) row; null args return 0 instead of crashing"
+    },
+    {
+      "id": "get_item_price_unknown_customer_falls_back",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_item_price",
+      "args": {
+        "item_code": "NOPE-ITEM",
+        "price_list": "Standard Selling",
+        "customer": "undefined",
+        "uom": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Customer with no customer-specific price falls back to the general effective price (was 0)"
+    },
+    {
+      "id": "mcp_resolve_items_dirty_bad_token",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_resolve_items",
+      "args": {
+        "mcp_token": "mcp_x_y",
+        "lines": "not-json",
+        "price_list": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Auth is checked before parsing dirty lines"
+    },
+    {
+      "id": "mcp_get_print_pdf_dirty_bad_token",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_get_print_pdf",
+      "args": {
+        "mcp_token": "",
+        "doctype": null,
+        "name": "undefined",
+        "print_format": "null"
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Print PDF rejects a blank token before touching the print pipeline"
+    },
+    {
+      "id": "reprice_guest_preorder_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.reprice_guest_preorder_from_price_list",
+      "args": {
+        "preorder_name": null,
+        "price_list": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Reprice (now clears stale margins) must fail cleanly on a missing order"
+    },
+    {
+      "id": "get_item_prices_bulk_non_json_codes",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_item_prices_bulk",
+      "args": {
+        "item_codes": "not-json",
+        "price_list": "Standard Selling",
+        "price_lists": "also-not-json"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Non-JSON item_codes / price_lists strings crashed with JSONDecodeError; now read as a comma list"
     }
   ]
 }

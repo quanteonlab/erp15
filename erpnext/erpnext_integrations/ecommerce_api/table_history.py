@@ -180,6 +180,159 @@ def list_field_history(doctype, name, limit=50, price_list=None):
 	return {"rows": rows[:limit], "doctype": doctype, "name": name}
 
 
+def _parse_price_lists_arg(price_lists) -> list[str]:
+	if price_lists is None or price_lists == "" or price_lists == "null":
+		return []
+	if isinstance(price_lists, str):
+		raw = price_lists.strip()
+		if not raw or raw in ("null", "undefined"):
+			return []
+		try:
+			parsed = json.loads(raw)
+			if isinstance(parsed, list):
+				price_lists = parsed
+			else:
+				price_lists = [raw]
+		except Exception:
+			price_lists = [p.strip() for p in raw.split(",") if p.strip()]
+	if not isinstance(price_lists, (list, tuple)):
+		return []
+	out = []
+	seen = set()
+	for pl in price_lists:
+		name = str(pl or "").strip()
+		if not name or name in seen:
+			continue
+		seen.add(name)
+		out.append(name)
+	return out
+
+
+def _day_key(dt_raw: str) -> str:
+	s = str(dt_raw or "").strip()
+	if not s:
+		return ""
+	# "2026-03-02 14:22:00.000000" / ISO → YYYY-MM-DD
+	return s[:10]
+
+
+def _selling_price_list_names() -> list[str]:
+	rows = frappe.get_all(
+		"Price List",
+		filters={"selling": 1, "enabled": 1},
+		fields=["name"],
+		order_by="name asc",
+		ignore_permissions=True,
+	)
+	return [r.name for r in rows if r.get("name")]
+
+
+def _series_points_for_price_list(item_code: str, price_list: str, limit: int) -> list[dict]:
+	"""Build chronological rate points for one selling price list (day-collapsed)."""
+	ips = frappe.get_all(
+		"Item Price",
+		filters={"item_code": item_code, "price_list": price_list, "selling": 1},
+		fields=["name", "price_list_rate", "creation", "valid_from", "modified"],
+		order_by="creation asc",
+		ignore_permissions=True,
+	)
+	raw_points: list[tuple[str, float]] = []
+	for ip in ips:
+		versions = [
+			v
+			for v in _versions_for("Item Price", ip.name, limit=limit)
+			if v.get("field") == "price_list_rate"
+		]
+		# Oldest → newest (versions_for is desc)
+		versions_asc = list(reversed(versions))
+		if versions_asc:
+			first = versions_asc[0]
+			at0 = str(first.get("datetime_raw") or "")
+			# Seed with the rate *before* the first logged change (at row creation if possible).
+			try:
+				prev0 = float(first.get("previous")) if first.get("previous") not in (None, "") else None
+			except (TypeError, ValueError):
+				prev0 = None
+			seed_at = str(ip.valid_from or ip.creation or "") or at0
+			if prev0 is not None and seed_at:
+				raw_points.append((seed_at, prev0))
+			for ver in versions_asc:
+				try:
+					new_rate = float(ver.get("new") or 0)
+				except (TypeError, ValueError):
+					continue
+				at2 = str(ver.get("datetime_raw") or "")
+				if at2:
+					raw_points.append((at2, new_rate))
+		else:
+			# No Version log — single point at creation/valid_from with current rate.
+			rate = float(ip.price_list_rate or 0)
+			at = str(ip.valid_from or ip.creation or ip.modified or "")
+			if at:
+				raw_points.append((at, rate))
+
+	# Collapse same calendar day → last change that day (X axis groups by day).
+	by_day: dict[str, tuple[str, float]] = {}
+	for at, rate in sorted(raw_points, key=lambda p: p[0]):
+		day = _day_key(at)
+		if not day:
+			continue
+		by_day[day] = (at, rate)
+
+	points = [
+		{"day": day, "rate": rate, "at": at}
+		for day, (at, rate) in sorted(by_day.items(), key=lambda kv: kv[0])
+	]
+	return points[-limit:]
+
+
+@frappe.whitelist()
+def get_item_price_chart(item_code=None, price_lists=None, limit=80):
+	"""Multi-series price history for Rentability detail chart.
+
+	One series per selling price list. X = calendar day (same-day edits collapsed
+	to the last rate that day). Y = price_list_rate from Item Price Version + row
+	creation/valid_from.
+	"""
+	item_code = str(item_code or "").strip()
+	if not item_code or item_code in ("null", "undefined"):
+		return {"item_code": "", "series": []}
+	if not frappe.db.exists("Item", item_code):
+		return {"item_code": item_code, "series": []}
+
+	limit = max(1, min(200, cint(limit) or 80))
+	lists = _parse_price_lists_arg(price_lists)
+	if not lists:
+		lists = _selling_price_list_names()
+
+	series = []
+	for pl in lists:
+		points = _series_points_for_price_list(item_code, pl, limit)
+		if not points:
+			# Still emit empty series so the UI legend can show the list name.
+			# Prefer a single current-rate point when Item Price exists without Version.
+			current = frappe.db.get_value(
+				"Item Price",
+				{"item_code": item_code, "price_list": pl, "selling": 1},
+				["price_list_rate", "modified", "creation"],
+				as_dict=True,
+			)
+			if current and current.get("price_list_rate") is not None:
+				at = str(current.get("modified") or current.get("creation") or "")
+				day = _day_key(at)
+				if day:
+					points = [
+						{
+							"day": day,
+							"rate": float(current.price_list_rate or 0),
+							"at": at,
+						}
+					]
+		series.append({"price_list": pl, "points": points})
+
+	return {"item_code": item_code, "series": series}
+
+
 def _revert_item_barcode(item_code: str, value: str) -> None:
 	from erpnext.erpnext_integrations.ecommerce_api.product_manager import _upsert_barcode
 

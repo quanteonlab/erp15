@@ -2053,25 +2053,15 @@ def get_item_price(item_code, price_list, customer=None, uom=None):
 	Returns:
 		float: Price list rate
 	"""
-	filters = {
-		"item_code": item_code,
-		"price_list": price_list,
-	}
+	from erpnext.erpnext_integrations.ecommerce_api.item_pricing import effective_item_price
 
+	# Same row ERPNext prices with: valid today, latest valid_from; a customer
+	# price wins over the general one when both exist.
+	row = None
 	if customer:
-		filters["customer"] = customer
-
-	if uom:
-		filters["uom"] = uom
-
-	price = frappe.db.get_value(
-		"Item Price",
-		filters,
-		"price_list_rate",
-		order_by="valid_from desc",
-	)
-
-	return flt(price) if price else 0.0
+		row = effective_item_price(item_code, price_list, uom=uom, customer=customer)
+	row = row or effective_item_price(item_code, price_list, uom=uom)
+	return flt(row.price_list_rate) if row else 0.0
 
 
 @frappe.whitelist(allow_guest=True)
@@ -2088,15 +2078,22 @@ def get_item_prices_bulk(item_codes, price_list=None, price_lists=None):
 	"""
 	import json
 
-	if isinstance(item_codes, str):
-		item_codes = json.loads(item_codes)
-	item_codes = [c for c in (item_codes or []) if c]
+	def _as_list(raw):
+		# JSON list from the client; a bare / comma-separated string from dirty callers.
+		if not isinstance(raw, str):
+			return raw
+		try:
+			parsed = json.loads(raw)
+		except ValueError:
+			return [part.strip() for part in raw.split(",")]
+		return parsed if isinstance(parsed, list) else [parsed]
+
+	item_codes = [c for c in (_as_list(item_codes) or []) if c and isinstance(c, str)]
 	if not item_codes:
 		return {}
 
 	if price_lists:
-		if isinstance(price_lists, str):
-			price_lists = json.loads(price_lists)
+		price_lists = _as_list(price_lists)
 		price_lists = [pl for pl in (price_lists or []) if pl]
 		if not price_lists:
 			return {}
@@ -4921,6 +4918,12 @@ def _calculate_guest_preorder_totals(so):
 	"""ERPNext qty×rate, then WEIGHT rebilled as $/kg × kg."""
 	with _allow_weight_fractional_stock_qty(so):
 		so.run_method("calculate_taxes_and_totals")
+	# Submitted edits save with ignore_validate_update_after_submit, which skips
+	# the validate steps that refresh these — the print showed the old rate/total.
+	for row in so.items or []:
+		row.stock_uom_rate = flt(row.rate) / (flt(row.conversion_factor) or 1)
+	if hasattr(so, "set_total_in_words"):
+		so.set_total_in_words()
 
 
 def _repair_guest_preorder_weight_totals(so) -> bool:
@@ -5484,31 +5487,65 @@ def _orden_pedidos_window_days() -> int:
 
 
 def _attach_creation_review_fields(rows: list) -> None:
-	"""Attach creation_review (+ review_reason from tags) onto list/detail rows."""
+	"""Attach creation_review (+ review_reason / review_actor) onto list/detail rows.
+
+	Also attaches ``customer_creation_review`` / ``customer_review_actor`` so the
+	Cliente column only badges when the *Customer* itself is Pending in Revisar.
+	"""
 	from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import FIELDNAME
 
 	names = [cstr(r.get("name") or "").strip() for r in (rows or []) if r.get("name")]
 	names = [n for n in names if n]
-	if not names or not frappe.db.has_column("Sales Order", FIELDNAME):
-		for r in rows or []:
-			r.setdefault("creation_review", None)
-			r.setdefault("review_reason", None)
-		return
-	status_map = {
-		r.name: getattr(r, FIELDNAME, None)
-		for r in frappe.get_all(
-			"Sales Order",
-			filters={"name": ["in", names]},
-			fields=["name", FIELDNAME],
+	has_so_col = bool(names and frappe.db.has_column("Sales Order", FIELDNAME))
+	status_map = {}
+	if has_so_col:
+		status_map = {
+			r.name: getattr(r, FIELDNAME, None)
+			for r in frappe.get_all(
+				"Sales Order",
+				filters={"name": ["in", names]},
+				fields=["name", FIELDNAME],
+				ignore_permissions=True,
+			)
+		}
+
+	cust_names = sorted(
+		{
+			cstr(r.get("customer") or "").strip()
+			for r in (rows or [])
+			if cstr(r.get("customer") or "").strip()
+		}
+	)
+	cust_status = {}
+	cust_owner = {}
+	if cust_names and frappe.db.has_column("Customer", FIELDNAME):
+		for row in frappe.get_all(
+			"Customer",
+			filters={"name": ["in", cust_names]},
+			fields=["name", FIELDNAME, "owner"],
 			ignore_permissions=True,
-		)
-	}
+		):
+			cust_status[row.name] = getattr(row, FIELDNAME, None)
+			cust_owner[row.name] = cstr(row.owner or "").strip() or None
+
 	for r in rows or []:
 		name = cstr(r.get("name") or "").strip()
-		r["creation_review"] = status_map.get(name) or None
+		tags = _parse_remarks_tags(_guest_preorder_tag_text(r))
+		r["creation_review"] = status_map.get(name) if has_so_col else (r.get("creation_review") or None)
 		if r.get("review_reason") is None:
-			tags = _parse_remarks_tags(_guest_preorder_tag_text(r))
 			r["review_reason"] = tags.get("review_reason") or None
+		# Who parked the SO (Pedidos pipeline badge ``r:josefi``).
+		actor = (
+			cstr(tags.get("review_actor") or "").strip()
+			or cstr(tags.get("order_owner") or "").strip()
+			or cstr(tags.get("seller_ref") or "").strip()
+			or cstr(r.get("suggestion_actor") or "").strip()
+			or None
+		)
+		r["review_actor"] = actor or None
+		cust = cstr(r.get("customer") or "").strip()
+		r["customer_creation_review"] = cust_status.get(cust) if cust else None
+		r["customer_review_actor"] = cust_owner.get(cust) if cust else None
 
 
 def _requeue_seller_amend_review(preorder_name: str, reason: str = "seller_amend") -> bool:
@@ -5954,7 +5991,11 @@ def get_guest_preorders_list(
 			)
 			active = bool(isinstance(change, dict) and change and status != "rejected")
 			o["has_suggestion"] = active
-			o["suggestion_actor"] = (data.get("actor") if active and isinstance(data, dict) else None) or None
+			sug_actor = (data.get("actor") if active and isinstance(data, dict) else None) or None
+			o["suggestion_actor"] = sug_actor
+			# Prefer suggestion actor when the park was a seller suggestion.
+			if not o.get("review_actor") and sug_actor:
+				o["review_actor"] = sug_actor
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "list_guest_preorders suggestion attach")
 		for o in filtered:
@@ -6019,6 +6060,12 @@ def get_guest_preorder(preorder_name):
 			else None
 		),
 		"review_reason": tags.get("review_reason") or None,
+		"review_actor": (
+			tags.get("review_actor")
+			or tags.get("order_owner")
+			or tags.get("seller_ref")
+			or None
+		),
 		"pending_suggestion": None,
 		"guest_name": tags.get("guest_name") or None,
 		"guest_phone": tags.get("guest_phone") or None,
@@ -6106,6 +6153,15 @@ def get_guest_preorder(preorder_name):
 		payload["pending_suggestion"] = get_pending_suggestion(preorder_name)
 	except Exception:
 		payload["pending_suggestion"] = None
+	# Prefer suggestion actor when the park was a seller suggestion.
+	sug = payload.get("pending_suggestion")
+	if (
+		not payload.get("review_actor")
+		and isinstance(sug, dict)
+		and sug.get("actor")
+		and cstr(sug.get("status") or "pending").lower() != "rejected"
+	):
+		payload["review_actor"] = sug.get("actor")
 	return payload
 
 
@@ -7241,6 +7297,24 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	return get_guest_preorder(preorder_name)
 
 
+def _set_line_rate(row, rate, price_list_rate=None) -> None:
+	"""Set a Sales Order line to exactly ``rate``.
+
+	ERPNext stores a manual rate above the list price as margin_type=Amount; on
+	the next save a stale margin is re-added (rate = price_list_rate + margin),
+	so repricing 7651 → 5216.29 came out as 10085.71. Clear it — ERPNext
+	recomputes the margin/discount from the new rate.
+	"""
+	row.rate = flt(rate)
+	if price_list_rate is not None:
+		row.price_list_rate = flt(price_list_rate)
+	row.margin_type = None
+	row.margin_rate_or_amount = 0
+	row.rate_with_margin = 0
+	row.base_rate_with_margin = 0
+	row.discount_amount = 0
+
+
 def _apply_item_changes(so, items, additional_discount_amount):
 	"""Apply item list changes to a Sales Order document (not yet saved)."""
 	new_item_map = {i["item_code"]: i for i in items}
@@ -7252,7 +7326,8 @@ def _apply_item_changes(so, items, additional_discount_amount):
 	existing_codes = {row.item_code for row in so.items}
 	for row in so.items:
 		override = new_item_map[row.item_code]
-		row.rate = flt(override.get("rate", row.rate))
+		if override.get("rate") is not None and abs(flt(override.get("rate")) - flt(row.rate)) >= 0.0001:
+			_set_line_rate(row, override.get("rate"))
 		row.qty = flt(override.get("qty", row.qty))
 		row.discount_percentage = flt(override.get("discount_percentage", 0))
 		# WEIGHT / CAJA / Nos from Pedidos "Tipo de peso" — must land on row.uom
@@ -7344,7 +7419,8 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	for row in so.items:
 		if row.item_code in item_map:
 			override = item_map[row.item_code]
-			row.rate = flt(override.get("rate", row.rate))
+			if override.get("rate") is not None and abs(flt(override.get("rate")) - flt(row.rate)) >= 0.0001:
+				_set_line_rate(row, override.get("rate"))
 			row.qty = flt(override.get("qty", row.qty))
 			row.discount_percentage = flt(override.get("discount_percentage", 0))
 			if override.get("uom") is not None or override.get("stock_uom") is not None:
@@ -7395,9 +7471,9 @@ def reprice_guest_preorder_from_price_list(preorder_name, price_list=None):
 			new_rate = flt(get_item_price(row.item_code, pl) or 0)
 		if new_rate <= 0:
 			continue
-		if abs(flt(row.rate) - new_rate) < 0.0001:
+		if abs(flt(row.rate) - new_rate) < 0.0001 and not flt(row.margin_rate_or_amount):
 			continue
-		row.rate = new_rate
+		_set_line_rate(row, new_rate, price_list_rate=new_rate)
 		changed += 1
 
 	if changed:

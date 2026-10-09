@@ -118,7 +118,39 @@ def maybe_mark_creation_review_pending(doctype: str, name: str, actor=None) -> b
 	if not frappe.db.exists(doctype, name):
 		return False
 	frappe.db.set_value(doctype, name, FIELDNAME, STATUS_PENDING, update_modified=False)
+	# Stamp who parked it (Pedidos shows ``r:josefi`` from this tag).
+	if doctype == "Sales Order":
+		_stamp_so_review_actor(name, actor)
 	return True
+
+
+def _stamp_so_review_actor(name: str, actor=None) -> None:
+	"""Write ``review_actor:<user>`` on the guest-preorder tag field."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import (
+			_guest_preorder_tag_fieldname,
+			_sanitize_guest_tag,
+			_update_guest_preorder_tag,
+		)
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import _acting_username
+
+		who = (
+			cstr(actor or "").strip()
+			or cstr(_acting_username() or "").strip()
+			or cstr(frappe.session.user or "").strip()
+		)
+		if not who or who == "Guest":
+			return
+		tag_fn = _guest_preorder_tag_fieldname()
+		if not tag_fn or not frappe.db.exists("Sales Order", name):
+			return
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", name)
+		frappe.flags.ignore_permissions = False
+		_update_guest_preorder_tag(so, "review_actor", _sanitize_guest_tag(who)[:140])
+		frappe.db.set_value("Sales Order", name, tag_fn, getattr(so, tag_fn, None), update_modified=False)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"stamp review_actor {name}")
 
 
 def mark_seller_amend_for_review(name: str, actor=None, reason: str = "seller_amend") -> bool:
@@ -158,6 +190,9 @@ def mark_seller_amend_for_review(name: str, actor=None, reason: str = "seller_am
 		so = frappe.get_doc("Sales Order", name)
 		frappe.flags.ignore_permissions = False
 		_update_guest_preorder_tag(so, "review_reason", _sanitize_guest_tag(reason) or "seller_amend")
+		who = cstr(actor or "").strip()
+		if who and who != "Guest":
+			_update_guest_preorder_tag(so, "review_actor", _sanitize_guest_tag(who)[:140])
 		frappe.db.set_value("Sales Order", name, tag_fn, getattr(so, tag_fn, None), update_modified=False)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"mark_seller_amend_for_review tag {name}")

@@ -1,7 +1,7 @@
 """Tagged presentation demo pack: sample orders + fake team, wipeable from Settings.
 
 Only rows with ``custom_demo_pack = presentation`` are created / cleared.
-Starter Employee Groups (repositor / caja / Sales / Driver / admin) are never wiped.
+Starter Employee Groups (repositor / caja / ventas / driver / admin) are never wiped.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ _DEMO_TEAM = [
 		"first_name": "Bruno",
 		"last_name": "Ventas",
 		"email": "demo.ventas@example.invalid",
-		"groups": ["Sales"],
+		"groups": ["ventas"],
 		"pin": "222222",
 	},
 	{
@@ -53,7 +53,7 @@ _DEMO_TEAM = [
 		"first_name": "Diego",
 		"last_name": "Conductor",
 		"email": "demo.conductor@example.invalid",
-		"groups": ["Driver"],
+		"groups": ["driver"],
 		"pin": "444444",
 	},
 ]

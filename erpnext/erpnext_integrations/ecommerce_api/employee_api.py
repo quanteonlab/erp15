@@ -311,6 +311,16 @@ APP_PERMISSIONS = [
 		"desc_zh": "员工名册、门店与组分配。",
 	},
 	{
+		"id": "tables.archivo",
+		"group": "tablas",
+		"label_en": "Documents",
+		"label_es": "Documentos",
+		"label_zh": "文档",
+		"desc_en": "Company papers, bills, expenses, and payments (optional ERP post).",
+		"desc_es": "Documentos, facturas, gastos y pagos (opcional contabilizar en ERP).",
+		"desc_zh": "公司文档、账单、费用与付款（可选过账到 ERP）。",
+	},
+	{
 		"id": "tables.cajas",
 		"group": "tablas",
 		"label_en": "Cash registers",
@@ -525,6 +535,7 @@ PERMISSION_TO_ROLES = {
 	"tables.lotes": ["Stock User", "Purchase User", "Purchase Manager"],
 	"tables.mats": ["Stock User", "Sales User"],
 	"tables.employees": ["HR User"],
+	"tables.archivo": ["Accounts User", "Purchase User", "HR User"],
 	"tables.cajas": ["Accounts User"],
 	"tables.orders": ["Sales User"],
 	"tables.orders.own": ["Sales User"],
@@ -605,8 +616,29 @@ _SALES_STRIP_OPS = frozenset({"ops.delivery", "ops.check", "ops.armado"})
 
 # Prior starter lists (pre ops-only defaults). Matching groups are upgraded in place
 # so unmodified floor roles lose log.*/tables.* without touching customised groups.
-# ``ventas`` stays here so existing sites still get the ops-only upgrade; it is not seeded.
-_FLOOR_STARTER_TITLES = frozenset({"repositor", "caja", "ventas", "Sales", "Driver"})
+# Legacy ``Sales`` / ``Driver`` titles stay for fingerprint upgrades until folded.
+_FLOOR_STARTER_TITLES = frozenset({"repositor", "caja", "ventas", "Sales", "driver", "Driver"})
+_LEGACY_VENTAS_FINGERPRINTS = [
+	[
+		"ops.preventa",
+		"ops.catalog",
+		"tables.orders",
+		"tables.orders.all",
+		"tables.crm",
+		"tools.catalog_pdf",
+	],
+	# Pre no-tables Sales (RM + Pedidos propios).
+	[
+		"ops.preventa",
+		"ops.catalog",
+		"tools.sync",
+		"tools.catalog_pdf",
+		"tables.crm",
+		"tables.orders.own",
+		"sales.see_assigned",
+		"sales.commit_assigned",
+	],
+]
 _LEGACY_STARTER_BY_TITLE = {
 	"repositor": [
 		[
@@ -634,47 +666,9 @@ _LEGACY_STARTER_BY_TITLE = {
 			"tools.labels",
 		],
 	],
-	"ventas": [
-		[
-			"ops.preventa",
-			"ops.catalog",
-			"tables.orders",
-			"tables.orders.all",
-			"tables.crm",
-			"tools.catalog_pdf",
-		],
-		# Pre no-tables Sales (RM + Pedidos propios).
-		[
-			"ops.preventa",
-			"ops.catalog",
-			"tools.sync",
-			"tools.catalog_pdf",
-			"tables.crm",
-			"tables.orders.own",
-			"sales.see_assigned",
-			"sales.commit_assigned",
-		],
-	],
-	"Sales": [
-		[
-			"ops.preventa",
-			"ops.catalog",
-			"tables.orders",
-			"tables.orders.all",
-			"tables.crm",
-			"tools.catalog_pdf",
-		],
-		[
-			"ops.preventa",
-			"ops.catalog",
-			"tools.sync",
-			"tools.catalog_pdf",
-			"tables.crm",
-			"tables.orders.own",
-			"sales.see_assigned",
-			"sales.commit_assigned",
-		],
-	],
+	"ventas": list(_LEGACY_VENTAS_FINGERPRINTS),
+	# Legacy English title (folded into ``ventas`` by ``_canonicalize_starter_group_titles``).
+	"Sales": list(_LEGACY_VENTAS_FINGERPRINTS),
 }
 
 
@@ -684,19 +678,30 @@ def _perm_set(ids) -> frozenset:
 
 def _is_legacy_starter_perms(title: str, current: list[str]) -> bool:
 	cur = _perm_set(current)
-	for legacy in _LEGACY_STARTER_BY_TITLE.get(title) or []:
-		if cur == _perm_set(legacy):
-			return True
+	keys = [title]
+	# Official + legacy English title share fingerprints.
+	if str(title or "").strip().lower() in ("ventas", "sales"):
+		keys = ["ventas", "Sales"]
+	seen = set()
+	for key in keys:
+		if key in seen:
+			continue
+		seen.add(key)
+		for legacy in _LEGACY_STARTER_BY_TITLE.get(key) or []:
+			if cur == _perm_set(legacy):
+				return True
 	return False
 
 
 def _starter_perms_for_title(title: str) -> frozenset | None:
-	"""Current starter permission set for a floor title (ventas → Sales)."""
+	"""Current starter permission set for a floor title."""
 	wanted = (title or "").strip()
 	if not wanted:
 		return None
-	if wanted.lower() == "ventas":
+	if wanted.lower() in ("ventas", "sales"):
 		return _perm_set(_STARTER_SALES)
+	if wanted.lower() == "driver":
+		return _perm_set(_STARTER_DRIVER)
 	for spec in STARTER_STAFF_GROUPS:
 		if spec.get("employee_group_name") == wanted:
 			return _perm_set(spec.get("permissions") or [])
@@ -707,13 +712,13 @@ def _floor_starter_needs_ops_only_upgrade(title: str, current: list[str]) -> boo
 	"""True when a floor starter still carries *legacy* tables.*/log.* extras.
 
 	Caja may still include ``tables.orders.own`` / tag perms (in its starter).
-	Sales starter has **no** tables.* — table extras on Sales/ventas are stripped
+	Ventas starter has **no** tables.* — table extras on ventas/Sales are stripped
 	by ``_strip_sales_table_access`` instead of a full perm reset (so optional
 	ops.* toggles are not undone).
 	"""
 	if title not in _FLOOR_STARTER_TITLES:
 		return False
-	# Sales table strip is handled separately — never full-reset Sales for tables.*
+	# Ventas table strip is handled separately — never full-reset for tables.*
 	if str(title or "").strip().lower() in ("sales", "ventas"):
 		return False
 	starter = _starter_perms_for_title(title)
@@ -728,11 +733,12 @@ def _floor_starter_needs_ops_only_upgrade(title: str, current: list[str]) -> boo
 	return bool(extras)
 
 
+# Official lowercase starter titles (legacy ``Sales`` / ``Driver`` are folded away).
 STARTER_STAFF_GROUPS = [
 	{"employee_group_name": "repositor", "permissions": list(_STARTER_REPOSITOR)},
 	{"employee_group_name": "caja", "permissions": list(_STARTER_CAJA)},
-	{"employee_group_name": "Sales", "permissions": list(_STARTER_SALES)},
-	{"employee_group_name": "Driver", "permissions": list(_STARTER_DRIVER)},
+	{"employee_group_name": "ventas", "permissions": list(_STARTER_SALES)},
+	{"employee_group_name": "driver", "permissions": list(_STARTER_DRIVER)},
 	{
 		"employee_group_name": "admin",
 		"permissions": sorted(KNOWN_PERMISSION_IDS),
@@ -924,6 +930,7 @@ _COARSE_FLAG = {
 	"tables.lotes": "receiving",
 	"tables.mats": "receiving",
 	"tables.employees": "receiving",
+	"tables.archivo": "payments",
 	"ops.buying": "receiving",
 	"log.sections": "receiving",
 	"log.prints": "receiving",
@@ -1396,7 +1403,25 @@ def save_employee(name=None, data=None):
 
 
 def _set_employee_groups(employee: str, group_names: list[str]) -> None:
-	wanted = set(g for g in group_names if g)
+	# Resolve titles (``ventas`` / legacy ``Sales``) to Employee Group names.
+	_title_alias = {"sales": "ventas"}
+	wanted = set()
+	for g in group_names or []:
+		raw = cstr(g or "").strip()
+		if not raw:
+			continue
+		lookup = _title_alias.get(raw.lower(), raw)
+		resolved = (
+			raw
+			if frappe.db.exists("Employee Group", raw)
+			else (
+				_find_employee_group_by_title(lookup)
+				or (frappe.db.exists("Employee Group", lookup) and lookup)
+				or None
+			)
+		)
+		if resolved:
+			wanted.add(resolved)
 	current = set(
 		frappe.get_all(
 			"Employee Group Table",
@@ -2170,11 +2195,225 @@ def _backfill_floor_fulfillment_perms(store: dict) -> bool:
 	return dirty
 
 
+def _migrate_perm_store_group_key(store: dict, old_name: str, new_name: str) -> bool:
+	"""Move permission list from old Employee Group name → new. Prefer non-empty dest."""
+	old_name = cstr(old_name or "").strip()
+	new_name = cstr(new_name or "").strip()
+	if not old_name or not new_name or old_name == new_name:
+		return False
+	if old_name not in store:
+		return False
+	src = store.get(old_name)
+	dest = store.get(new_name)
+	if not dest and isinstance(src, list):
+		store[new_name] = src
+	store.pop(old_name, None)
+	return True
+
+
+def _migrate_field_acl_group_key(old_name: str, new_name: str) -> None:
+	old_name = cstr(old_name or "").strip()
+	new_name = cstr(new_name or "").strip()
+	if not old_name or not new_name or old_name == new_name:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.field_acl import (
+			_load_field_acl_store,
+			_save_field_acl_store,
+		)
+
+		acl = _load_field_acl_store()
+		if old_name not in acl:
+			return
+		if new_name not in acl:
+			acl[new_name] = acl[old_name]
+		acl.pop(old_name, None)
+		_save_field_acl_store(acl)
+	except Exception:
+		frappe.log_error(title=f"migrate field acl {old_name}→{new_name}")
+
+
+def _merge_employee_group_members(src_name: str, dest_name: str) -> None:
+	"""Copy members from src Employee Group into dest (no duplicates)."""
+	if not src_name or not dest_name or src_name == dest_name:
+		return
+	if not frappe.db.exists("Employee Group", src_name):
+		return
+	if not frappe.db.exists("Employee Group", dest_name):
+		return
+	frappe.flags.ignore_permissions = True
+	src = frappe.get_doc("Employee Group", src_name)
+	dest = frappe.get_doc("Employee Group", dest_name)
+	existing = {cstr(r.employee or "").strip() for r in (dest.employee_list or [])}
+	dirty = False
+	for row in src.employee_list or []:
+		emp = cstr(row.employee or "").strip()
+		if not emp or emp in existing:
+			continue
+		dest.append(
+			"employee_list",
+			{
+				"employee": emp,
+				"employee_name": row.employee_name,
+				"user_id": row.user_id,
+			},
+		)
+		existing.add(emp)
+		dirty = True
+	if dirty:
+		dest.save(ignore_permissions=True)
+
+
+def _rename_employee_group_doc(old_name: str, new_title: str) -> str:
+	"""Rename Employee Group doc to ``new_title`` (name + employee_group_name)."""
+	old_name = cstr(old_name or "").strip()
+	new_title = cstr(new_title or "").strip()
+	if not old_name or not new_title:
+		return old_name
+	if not frappe.db.exists("Employee Group", old_name):
+		return old_name
+	frappe.flags.ignore_permissions = True
+	if old_name == new_title:
+		cur = frappe.db.get_value("Employee Group", old_name, "employee_group_name")
+		if cstr(cur or "").strip() != new_title:
+			frappe.db.set_value(
+				"Employee Group",
+				old_name,
+				"employee_group_name",
+				new_title,
+				update_modified=False,
+			)
+		return old_name
+	if frappe.db.exists("Employee Group", new_title):
+		# Caller should merge instead of rename into an existing name.
+		return old_name
+	frappe.rename_doc("Employee Group", old_name, new_title, force=True, merge=False)
+	frappe.db.set_value(
+		"Employee Group",
+		new_title,
+		"employee_group_name",
+		new_title,
+		update_modified=False,
+	)
+	return new_title
+
+
+def _fold_sales_groups_to_ventas(store: dict) -> bool:
+	"""Collapse legacy ``Sales`` into official lowercase ``ventas``."""
+	rows = frappe.get_all(
+		"Employee Group",
+		fields=["name", "employee_group_name"],
+		ignore_permissions=True,
+	)
+	candidates = []
+	for row in rows or []:
+		title = cstr(row.employee_group_name or row.name or "").strip()
+		if title.lower() in ("sales", "ventas"):
+			candidates.append(row)
+	if not candidates:
+		return False
+
+	def _score(row) -> tuple:
+		title = cstr(row.employee_group_name or row.name or "").strip().lower()
+		name = cstr(row.name or "").strip().lower()
+		# Prefer exact official title / name.
+		return (0 if title == "ventas" else 1, 0 if name == "ventas" else 1, name)
+
+	candidates.sort(key=_score)
+	canonical = candidates[0]
+	canon_name = cstr(canonical.name or "").strip()
+	dirty = False
+
+	# Rename canonical to ``ventas`` when it is still Sales / wrong casing.
+	canon_title = cstr(canonical.employee_group_name or canon_name).strip()
+	if canon_title.lower() != "ventas" or canon_name != "ventas":
+		if not frappe.db.exists("Employee Group", "ventas") or canon_name == "ventas":
+			new_name = _rename_employee_group_doc(canon_name, "ventas")
+			if new_name != canon_name:
+				_migrate_perm_store_group_key(store, canon_name, new_name)
+				_migrate_field_acl_group_key(canon_name, new_name)
+				canon_name = new_name
+				dirty = True
+			elif canon_title != "ventas":
+				frappe.db.set_value(
+					"Employee Group",
+					canon_name,
+					"employee_group_name",
+					"ventas",
+					update_modified=False,
+				)
+				dirty = True
+
+	for row in candidates[1:]:
+		src = cstr(row.name or "").strip()
+		if not src or src == canon_name:
+			continue
+		_merge_employee_group_members(src, canon_name)
+		if _migrate_perm_store_group_key(store, src, canon_name):
+			dirty = True
+		_migrate_field_acl_group_key(src, canon_name)
+		try:
+			frappe.delete_doc("Employee Group", src, ignore_permissions=True, force=True)
+			dirty = True
+		except Exception:
+			frappe.log_error(title=f"delete legacy Sales group {src}")
+	return dirty
+
+
+def _canonicalize_driver_group_title(store: dict) -> bool:
+	"""Rename Employee Group ``Driver`` → lowercase ``driver``."""
+	found = _find_employee_group_by_title("driver")
+	if not found:
+		return False
+	title = cstr(
+		frappe.db.get_value("Employee Group", found, "employee_group_name") or found
+	).strip()
+	if found == "driver" and title == "driver":
+		return False
+	if frappe.db.exists("Employee Group", "driver") and found != "driver":
+		# Two casing variants as separate docs (rare) — merge into lowercase.
+		_merge_employee_group_members(found, "driver")
+		_migrate_perm_store_group_key(store, found, "driver")
+		_migrate_field_acl_group_key(found, "driver")
+		try:
+			frappe.delete_doc("Employee Group", found, ignore_permissions=True, force=True)
+		except Exception:
+			frappe.log_error(title=f"delete legacy Driver group {found}")
+		return True
+	new_name = _rename_employee_group_doc(found, "driver")
+	dirty = False
+	if new_name != found:
+		_migrate_perm_store_group_key(store, found, new_name)
+		_migrate_field_acl_group_key(found, new_name)
+		dirty = True
+	elif title != "driver":
+		frappe.db.set_value(
+			"Employee Group", found, "employee_group_name", "driver", update_modified=False
+		)
+		dirty = True
+	return dirty
+
+
+def _canonicalize_starter_group_titles(store: dict) -> bool:
+	"""One-shot: fold legacy Sales/Driver into official lowercase ventas/driver."""
+	dirty = False
+	try:
+		dirty = _fold_sales_groups_to_ventas(store) or dirty
+	except Exception:
+		frappe.log_error(title="fold Sales→ventas")
+	try:
+		dirty = _canonicalize_driver_group_title(store) or dirty
+	except Exception:
+		frappe.log_error(title="canonicalize Driver→driver")
+	return dirty
+
+
 def _ensure_starter_staff_groups() -> dict:
-	"""Create repositor / caja / admin if missing. Do not overwrite customised lists.
+	"""Create repositor / caja / ventas / driver / admin if missing.
 
 	Empty lists get the current starter perms. Groups still on a known legacy starter
-	fingerprint (pre ops-only) are upgraded in place.
+	fingerprint (pre ops-only) are upgraded in place. Legacy ``Sales`` / ``Driver``
+	titles are folded into lowercase ``ventas`` / ``driver``.
 	"""
 	if getattr(frappe.local, "_staff_starter_ensured", False):
 		return {"created": [], "attached": [], "upgraded": [], "skipped": []}
@@ -2185,7 +2424,8 @@ def _ensure_starter_staff_groups() -> dict:
 	attached = []
 	upgraded = []
 	skipped = []
-	dirty = _apply_caja_orders_split(store)
+	dirty = _canonicalize_starter_group_titles(store)
+	dirty = _apply_caja_orders_split(store) or dirty
 	dirty = _apply_default_sales_scope_to_store(store) or dirty
 	dirty = _migrate_sales_see_assigned_default(store) or dirty
 	dirty = _strip_sales_floor_ops_extras(store) or dirty
@@ -2238,8 +2478,11 @@ def _ensure_starter_staff_groups() -> dict:
 
 @frappe.whitelist()
 def ensure_starter_staff_groups():
-	"""Create the default groups (repositor, caja, admin) if missing."""
+	"""Create the default groups (repositor, caja, ventas, driver, admin) if missing."""
 	_require_app_permission("settings.manage_groups")
+	# Allow re-run after code deploy so Sales→ventas fold can happen again.
+	if getattr(frappe.local, "_staff_starter_ensured", False):
+		frappe.local._staff_starter_ensured = False
 	result = _ensure_starter_staff_groups()
 	return {
 		"ok": True,
@@ -2920,23 +3163,23 @@ def _rebuild_by_user(by_customer: dict) -> dict:
 
 
 def _sales_group_names() -> list[str]:
-	"""Official ``Sales`` group only; fall back to legacy ``ventas`` if Sales missing."""
-	if frappe.db.exists("Employee Group", "Sales"):
-		return ["Sales"]
-	found = _find_employee_group_by_title("Sales")
-	if found:
-		return [found]
-	# Legacy ES title from older seeds — do not dual-attach once Sales exists.
+	"""Official ``ventas`` group; fall back to legacy ``Sales`` if ventas missing."""
 	if frappe.db.exists("Employee Group", "ventas"):
 		return ["ventas"]
-	found_legacy = _find_employee_group_by_title("ventas")
+	found = _find_employee_group_by_title("ventas")
+	if found:
+		return [found]
+	# Legacy English title from older seeds — do not dual-attach once ventas exists.
+	if frappe.db.exists("Employee Group", "Sales"):
+		return ["Sales"]
+	found_legacy = _find_employee_group_by_title("Sales")
 	if found_legacy:
 		return [found_legacy]
 	return []
 
 
 def _add_employee_to_sales_groups(employee: str) -> None:
-	"""Append employee to the official Sales group (legacy ventas only if Sales absent)."""
+	"""Append employee to the official ``ventas`` group (legacy Sales only if ventas absent)."""
 	emp = _norm_optional_str(employee)
 	if not emp or not frappe.db.exists("Employee", emp):
 		return

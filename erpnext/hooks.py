@@ -344,7 +344,10 @@ doc_events = {
 		],
 	},
 	"Item Price": {
-		"on_update": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.on_item_price_update",
+		"on_update": [
+			"erpnext.erpnext_integrations.ecommerce_api.price_list_rules.on_item_price_update",
+			"erpnext.erpnext_integrations.ecommerce_api.item_pricing.on_item_price_update",
+		],
 		"after_insert": "erpnext.erpnext_integrations.ecommerce_api.price_list_rules.on_item_price_update",
 	},
 	tuple(period_closing_doctypes): {
@@ -460,6 +463,7 @@ scheduler_events = {
 		"erpnext.utilities.bulk_transaction.retry",
 	],
 	"daily": [
+		"erpnext.erpnext_integrations.ecommerce_api.item_pricing.daily_collapse_superseded_item_prices",
 		"erpnext.support.doctype.issue.issue.auto_close_tickets",
 		"erpnext.crm.doctype.opportunity.opportunity.auto_close_opportunity",
 		"erpnext.controllers.accounts_controller.update_invoice_status",

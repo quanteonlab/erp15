@@ -3832,14 +3832,14 @@ def _serialize_driver(driver_name):
 
 
 def _ensure_driver_staff_group():
-	"""Ensure Employee Group titled ``Driver`` (or legacy ``driver``) exists."""
+	"""Ensure Employee Group titled ``driver`` (legacy ``Driver`` folded on ensure)."""
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 		_ensure_starter_staff_groups,
 		_find_employee_group_by_title,
 	)
 
 	_ensure_starter_staff_groups()
-	return _find_employee_group_by_title("Driver") or _find_employee_group_by_title("driver")
+	return _find_employee_group_by_title("driver") or _find_employee_group_by_title("Driver")
 
 
 def _rand_driver_password(length: int = 16) -> str:
