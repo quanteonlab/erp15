@@ -3113,6 +3113,21 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	zone_by_customer = _customer_delivery_zone_map(cust_names)
 	stage_by_customer = _customer_preventa_stage_map(cust_names)
 
+	from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import FIELDNAME as CR_FIELD
+
+	has_cr = frappe.db.has_column("Customer", CR_FIELD)
+	cr_map: dict = {}
+	owner_map: dict = {}
+	if has_cr and cust_names:
+		for row in frappe.get_all(
+			"Customer",
+			filters={"name": ["in", cust_names]},
+			fields=["name", CR_FIELD, "owner"],
+			ignore_permissions=True,
+		):
+			cr_map[row.name] = getattr(row, CR_FIELD, None)
+			owner_map[row.name] = cstr(row.owner or "").strip() or None
+
 	out_customers = []
 	for r in rows:
 		salesmen = customer_salesmen(r.name)
@@ -3140,6 +3155,8 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"assigned": r.name in assigned_set,
 				"stage": st.get("stage"),
 				"stage_label": st.get("stage_label"),
+				"creation_review": cr_map.get(r.name),
+				"review_actor": owner_map.get(r.name),
 			}
 		)
 	return {"customers": out_customers}

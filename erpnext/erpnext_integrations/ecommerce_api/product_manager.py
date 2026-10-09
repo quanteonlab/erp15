@@ -1927,7 +1927,6 @@ def set_active_bulk(item_codes, is_active):
         item_codes = json.loads(item_codes)
 
     disabled_val = 0 if cint(is_active) else 1
-    clear_draft = cint(is_active) == 1
     has_draft = frappe.db.has_column("Item", "custom_is_draft")
     frappe.flags.ignore_permissions = True
     try:
@@ -1935,7 +1934,7 @@ def set_active_bulk(item_codes, is_active):
             vals = {"disabled": disabled_val}
             if has_draft:
                 # Activate clears draft; deactivate of a live product is not a draft.
-                vals["custom_is_draft"] = 0 if clear_draft else 0
+                vals["custom_is_draft"] = 0
             frappe.db.set_value("Item", code, vals)
         frappe.db.commit()
     finally:
