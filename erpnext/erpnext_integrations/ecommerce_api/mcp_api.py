@@ -135,13 +135,27 @@ FILTER_OPS = {"=", "!=", "like", "not like", "in", "not in", ">", "<", ">=", "<=
 # DocTypes whose writes must go through a domain workflow (generic create /
 # update would skip its rules) → the workflow to use instead.
 WORKFLOW_ONLY_DOCTYPES = {"Company Archive Entry": "classify_document"}
+# Generic *create* would leave half a record (a bare Driver has no Employee, so it
+# never shows in Employees) — create through the workflow; edits stay generic.
+CREATE_VIA_WORKFLOW = {"Driver": "create_driver", "Employee": "save_employee"}
+# Fields whose generic patch is lossy: a child-table patch REPLACES the list, so
+# adding members by patching Employee Group would drop everyone not echoed back.
+FIELD_VIA_WORKFLOW = {("Employee Group", "employee_list"): "save_employee"}
 
 
-def _require_generic_write(doctype: str) -> None:
+def _require_generic_write(doctype: str, *, for_create: bool = False) -> None:
 	workflow = WORKFLOW_ONLY_DOCTYPES.get(doctype)
 	if workflow:
 		frappe.throw(
 			_("{0} is edited only through run_workflow('{1}')").format(doctype, workflow),
+			frappe.PermissionError,
+		)
+	workflow = CREATE_VIA_WORKFLOW.get(doctype) if for_create else None
+	if workflow:
+		frappe.throw(
+			_("Create {0} with run_workflow('{1}') — it applies the same defaults, groups and links as the app").format(
+				doctype, workflow
+			),
 			frappe.PermissionError,
 		)
 
@@ -396,6 +410,14 @@ def _validate_fields(doctype: str, fields, *, for_create: bool) -> dict:
 	rejected: dict = {}
 	for key, value in fields.items():
 		key = str(key)
+		workflow = FIELD_VIA_WORKFLOW.get((doctype, key))
+		if workflow:
+			frappe.throw(
+				_("{0}.{1} is changed through run_workflow('{2}') (per employee, groups=[…])").format(
+					doctype, key, workflow
+				),
+				frappe.PermissionError,
+			)
 		if key in blocked or any(key.startswith(prefix) for prefix in BLOCKED_PREFIXES):
 			if for_create and key == "name":
 				clean[key] = value
@@ -672,9 +694,98 @@ def mcp_get_record(mcp_token=None, doctype=None, name=None):
 		frappe.flags.ignore_permissions = True
 		doc = frappe.get_doc(doctype, name)
 		frappe.flags.ignore_permissions = False
-		return {"doctype": doctype, "name": name, "doc": _sanitize_output(_json_safe(doc.as_dict()))}
+		out = {"doctype": doctype, "name": name, "doc": _sanitize_output(_json_safe(doc.as_dict()))}
+		if doctype == "Sales Order":
+			view = _pedido_view(doc)
+			if view:
+				out["pedido_view"] = view
+		return out
 
 	return _impl(mcp_token, doctype, name)
+
+
+def _pedido_view(so) -> dict | None:
+	"""What the Órdenes pipeline shows for a Pedido, next to the raw ERPNext numbers.
+
+	Órdenes soft-fills lines whose stored rate is 0 with the selling price list rate
+	(``get_guest_preorder`` → ``lineEffectiveRate`` in the UI) and bills WEIGHT lines
+	as $/kg × kg. The raw document keeps rate 0, so without this block an assistant
+	reads ARS 0 where the user sees a real total.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_guest_preorder_estimated_total,
+		_guest_preorder_line_amount,
+		_is_guest_preorder_sales_order,
+		get_item_prices_bulk,
+	)
+
+	if not _is_guest_preorder_sales_order(so):
+		return None
+	price_list = cstr(getattr(so, "selling_price_list", None)) or "Standard Selling"
+	zero_codes = [d.item_code for d in (so.items or []) if flt(d.rate) <= 0 and d.item_code]
+	list_rates = {}
+	if zero_codes:
+		try:
+			list_rates = get_item_prices_bulk(zero_codes, price_list=price_list) or {}
+		except Exception:
+			list_rates = {}
+
+	lines, unpriced, ui_total = [], [], 0.0
+	for d in so.items or []:
+		doc_amount = _guest_preorder_line_amount(d)
+		if flt(d.rate) > 0:
+			ui_rate, source, ui_amount = flt(d.rate), "document", doc_amount
+		else:
+			ui_rate = flt(list_rates.get(d.item_code) or 0)
+			source = "price_list_fallback" if ui_rate > 0 else "unpriced"
+			row = frappe._dict(d.as_dict())
+			row.rate, row.amount = ui_rate, 0
+			ui_amount = _guest_preorder_line_amount(row)
+			unpriced.append(d.item_code)
+		ui_total += ui_amount
+		lines.append(
+			{
+				"idx": d.idx,
+				"item_code": d.item_code,
+				"item_name": d.item_name,
+				"qty": flt(d.qty),
+				"uom": d.uom,
+				"delivered_qty": flt(getattr(d, "delivered_qty", 0)),
+				"document_rate": flt(d.rate),
+				"document_amount": doc_amount,
+				"shown_rate": ui_rate,
+				"shown_amount": ui_amount,
+				"rate_source": source,
+			}
+		)
+	shown_total = max(ui_total - flt(getattr(so, "additional_discount_amount", None) or 0), 0.0)
+	document_total = _guest_preorder_estimated_total(so)
+	notes = []
+	if unpriced:
+		notes.append(
+			f"{len(unpriced)} line(s) ({', '.join(unpriced)}) have rate 0 in the ERPNext document. "
+			f"Órdenes displays the current '{price_list}' price for them (rate_source=price_list_fallback); "
+			"that price is NOT saved, so prints/invoices from this document show 0 for those lines. "
+			"This is expected for older consultas — not data loss. To persist the shown prices, "
+			f"run_workflow('reprice_order', {{\"name\": \"{so.name}\"}}) (preview first)."
+		)
+	short = [l for l in lines if l["delivered_qty"] and l["delivered_qty"] < l["qty"]]
+	if short:
+		notes.append(
+			"Partially delivered: "
+			+ ", ".join(f"{l['item_code']} {l['delivered_qty']:g}/{l['qty']:g}" for l in short)
+			+ " (delivered_qty from Delivery Notes vs ordered qty)."
+		)
+	return {
+		"price_list": price_list,
+		"shown_total": shown_total,
+		"document_total": document_total,
+		"currency": so.currency,
+		"lines": lines,
+		"notes": notes,
+		"hint": "Report shown_total / shown_rate as what the user sees in Órdenes; "
+		"document_* are the stored ERPNext values.",
+	}
 
 
 MAX_RESOLVE_LINES = 200
@@ -1125,7 +1236,7 @@ def mcp_create_record(mcp_token=None, doctype=None, fields=None, confirm=0, prev
 		if not doctype:
 			frappe.throw(_("doctype is required"))
 		_can_edit(_matrix(), doctype)
-		_require_generic_write(doctype)
+		_require_generic_write(doctype, for_create=True)
 		changes = _validate_fields(doctype, _parse_json(fields, fields), for_create=True)
 		signed = {"op": "create", "doctype": doctype, "fields": changes}
 		if not cint_confirm(confirm):
@@ -1244,6 +1355,51 @@ def _workflow_catalog() -> list[dict]:
 					"notes": {"type": "string"},
 				},
 				"required": ["items"],
+			},
+		},
+		{
+			"name": "create_driver",
+			"doctype": "Driver",
+			"description": (
+				"Create a driver the way the dispatcher does: an Employee (listed in Employees, "
+				"group driver) plus the linked Driver used for trips. Pass driver=<HR-DRI-…> instead "
+				"of creating to attach an Employee to an existing Driver that has none."
+			),
+			"args_schema": {
+				"type": "object",
+				"properties": {
+					"full_name": {"type": "string", "description": "First and last name"},
+					"cell_number": {"type": "string"},
+					"company": {"type": "string"},
+					"driver": {"type": "string", "description": "Existing Driver with no Employee to repair"},
+				},
+				"required": [],
+			},
+		},
+		{
+			"name": "save_employee",
+			"doctype": "Employee",
+			"description": (
+				"Create an employee (no name) or update one (name=HR-EMP-…) through the Employees page "
+				"save: defaults for mandatory HR fields, a new ops PIN, and staff groups by title "
+				"(ventas / sales, caja, repositor, driver, admin). groups REPLACES that employee's "
+				"groups — the preview shows current → new. Does not create a login. For a driver use "
+				"create_driver (it also creates the Driver record)."
+			),
+			"args_schema": {
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "description": "Existing Employee to update; omit to create"},
+					"first_name": {"type": "string"},
+					"last_name": {"type": "string"},
+					"employee_name": {"type": "string", "description": "Full name (alternative to first/last)"},
+					"groups": {"type": "array", "items": {"type": "string"}},
+					"cell_number": {"type": "string"},
+					"designation": {"type": "string"},
+					"company": {"type": "string"},
+					"status": {"type": "string", "enum": ["Active", "Inactive", "Left"]},
+				},
+				"required": [],
 			},
 		},
 		{
@@ -1420,8 +1576,114 @@ def _priced_lines(items: list[dict], price_list: str, current: dict | None = Non
 	return lines, round(total, 2), issues
 
 
+def _driver_args(args: dict) -> tuple[str | None, str, list[str]]:
+	"""(existing driver to repair | None, full_name, issues) for create_driver."""
+	issues = []
+	driver = cstr(args.get("driver") or "").strip() or None
+	full_name = " ".join(cstr(args.get("full_name") or "").split())
+	if driver:
+		row = frappe.db.get_value("Driver", driver, ["full_name", "employee"], as_dict=True)
+		if not row:
+			issues.append(f"Driver {driver} not found")
+		elif row.employee:
+			issues.append(f"Driver {driver} is already linked to Employee {row.employee}")
+		else:
+			full_name = full_name or cstr(row.full_name).strip()
+	elif not full_name:
+		issues.append("full_name is required (or driver=<existing Driver> to repair)")
+	elif frappe.db.exists("Driver", {"full_name": full_name}):
+		issues.append(f"A driver named {full_name} already exists (search_records doctype=Driver)")
+	company = cstr(args.get("company") or "").strip()
+	if company and not frappe.db.exists("Company", company):
+		issues.append(f"Company {company} not found")
+	return driver, full_name, issues
+
+
+_EMPLOYEE_ARGS = {"name", "first_name", "last_name", "employee_name", "groups", "cell_number", "designation", "company", "status"}
+
+
+def _employee_groups_of(employee: str) -> list[str]:
+	return sorted(
+		set(
+			frappe.get_all(
+				"Employee Group Table", filters={"employee": employee}, pluck="parent", ignore_permissions=True
+			)
+		)
+	)
+
+
+def _resolve_staff_groups(raw) -> tuple[list[str], list[str]]:
+	"""Group titles/names → Employee Group names (same aliases as the Employees page)."""
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _find_employee_group_by_title
+
+	alias = {"sales": "ventas", "vendedor": "ventas", "vendedores": "ventas", "chofer": "driver"}
+	resolved, unknown = [], []
+	for g in _parse_json(raw, raw) or []:
+		title = cstr(g).strip()
+		if not title:
+			continue
+		lookup = alias.get(title.lower(), title)
+		hit = (
+			(frappe.db.exists("Employee Group", title) and title)
+			or _find_employee_group_by_title(lookup)
+			or (frappe.db.exists("Employee Group", lookup) and lookup)
+		)
+		(resolved if hit else unknown).append(hit or title)
+	return sorted(set(resolved)), unknown
+
+
+def _employee_args(args: dict) -> tuple[list[str], dict]:
+	"""(issues, details) for save_employee — shared by preview and apply."""
+	issues = []
+	extra = set(args) - _EMPLOYEE_ARGS
+	if extra:
+		issues.append(f"Unknown args: {', '.join(sorted(extra))}")
+	name = cstr(args.get("name") or "").strip() or None
+	full = " ".join(
+		(cstr(args.get("employee_name")) or f"{cstr(args.get('first_name'))} {cstr(args.get('last_name'))}").split()
+	)
+	details = {"action": "update" if name else "create", "employee": name, "employee_name": full or None}
+	if name:
+		if not frappe.db.exists("Employee", name):
+			issues.append(f"Employee {name} not found")
+		else:
+			details["employee_name"] = full or frappe.db.get_value("Employee", name, "employee_name")
+			details["current_groups"] = _employee_groups_of(name)
+	elif not full:
+		issues.append("first_name / employee_name is required to create an employee")
+	elif frappe.db.exists("Employee", {"employee_name": full, "status": "Active"}):
+		issues.append(f"An active employee named {full} already exists — pass name=HR-EMP-… to update it")
+	if "groups" in args:
+		groups, unknown = _resolve_staff_groups(args.get("groups"))
+		if unknown:
+			issues.append(f"Unknown group(s): {', '.join(unknown)} (list_records doctype=Employee Group)")
+		details["groups"] = groups
+	company = cstr(args.get("company") or "").strip()
+	if company and not frappe.db.exists("Company", company):
+		issues.append(f"Company {company} not found")
+	for key in ("cell_number", "designation", "company", "status"):
+		if args.get(key) not in (None, ""):
+			details[key] = args.get(key)
+	if not name:
+		details["also"] = "new ops PIN; HR defaults (gender, date_of_birth, date_of_joining=today)"
+	return issues, details
+
+
 def _workflow_preview(name: str, args: dict) -> tuple[list[str], dict | None]:
 	"""(issues, details) shown at preview time so the user sees exactly what applies."""
+	if name == "save_employee":
+		return _employee_args(args)
+	if name == "create_driver":
+		driver, full_name, issues = _driver_args(args)
+		company = cstr(args.get("company") or "").strip() or frappe.defaults.get_user_default("Company")
+		return issues, {
+			"action": "link_employee_to_existing_driver" if driver else "create_employee_and_driver",
+			"driver": driver,
+			"employee_name": full_name,
+			"company": company,
+			"employee_group": "driver",
+			"cell_number": cstr(args.get("cell_number") or "").strip() or None,
+		}
 	if name == "create_order":
 		pl = cstr(args.get("price_list") or "").strip() or _default_selling_price_list()
 		issues = []
@@ -1524,7 +1786,60 @@ def _workflow_preview_issues(name: str, args: dict) -> list[str]:
 	return [f"Missing required field(s) to convert: {', '.join(missing)}"] if missing else []
 
 
+def _run_create_driver(args: dict) -> dict:
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _set_employee_groups
+	from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+		_ensure_driver_staff_group,
+		_insert_driver_with_employee,
+		_insert_employee_for_driver,
+	)
+
+	driver, full_name, issues = _driver_args(args)
+	if issues:
+		frappe.throw("; ".join(issues))
+	company = cstr(args.get("company") or "").strip() or None
+	cell = cstr(args.get("cell_number") or "").strip() or None
+	if driver:
+		emp = _insert_employee_for_driver(full_name, company=company)
+		frappe.db.set_value("Driver", driver, "employee", emp.name)
+		if cell:
+			frappe.db.set_value("Driver", driver, "cell_number", cell)
+		emp_name = emp.name
+	else:
+		doc = _insert_driver_with_employee(full_name, cell_number=cell, company=company)
+		driver, emp_name = doc.name, doc.employee
+	group = _ensure_driver_staff_group()
+	if group:
+		_set_employee_groups(emp_name, [group])
+	frappe.db.commit()
+	return {"driver": driver, "employee": emp_name, "full_name": full_name, "employee_group": group}
+
+
+def _run_save_employee(args: dict) -> dict:
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import save_employee
+
+	issues, details = _employee_args(args)
+	if issues:
+		frappe.throw("; ".join(issues))
+	data = {k: args[k] for k in ("first_name", "last_name", "employee_name", "cell_number", "designation", "company", "status") if args.get(k) not in (None, "")}
+	if "groups" in details:
+		data["groups"] = details["groups"]
+	res = save_employee(name=details["employee"], data=data)
+	emp = (res or {}).get("employee") or {}
+	emp_name = emp.get("name") or details["employee"]
+	return {
+		"employee": emp_name,
+		"employee_name": emp.get("employee_name") or details["employee_name"],
+		"groups": _employee_groups_of(emp_name) if emp_name else [],
+		"created": not details["employee"],
+	}
+
+
 def _run_workflow(name: str, args: dict):
+	if name == "create_driver":
+		return _run_create_driver(args)
+	if name == "save_employee":
+		return _run_save_employee(args)
 	if name == "classify_document":
 		from erpnext.erpnext_integrations.ecommerce_api.archivo_api import classify_archivo_entry
 

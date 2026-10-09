@@ -3704,6 +3704,14 @@ def create_driver_quick(full_name, cell_number=None, company=None):
 	if existing:
 		frappe.throw(_("A driver named {0} already exists.").format(full_name))
 
+	driver = _insert_driver_with_employee(full_name, cell_number=cell_number, company=company)
+	frappe.db.commit()
+
+	return {"name": driver.name, "full_name": driver.full_name, "address": driver.address}
+
+
+def _insert_employee_for_driver(full_name, company=None):
+	"""Minimal Employee behind a Driver (what the Employees table lists)."""
 	company = company or frappe.defaults.get_user_default("Company")
 	parts = full_name.split()
 	first_name = parts[0]
@@ -3724,7 +3732,12 @@ def create_driver_quick(full_name, cell_number=None, company=None):
 	)
 	emp.flags.ignore_mandatory = True
 	emp.insert(ignore_permissions=True)
+	return emp
 
+
+def _insert_driver_with_employee(full_name, cell_number=None, company=None):
+	"""Employee + linked Driver, no commit (callers own the transaction)."""
+	emp = _insert_employee_for_driver(full_name, company=company)
 	driver = frappe.get_doc(
 		{
 			"doctype": "Driver",
@@ -3735,9 +3748,7 @@ def create_driver_quick(full_name, cell_number=None, company=None):
 		}
 	)
 	driver.insert(ignore_permissions=True)
-	frappe.db.commit()
-
-	return {"name": driver.name, "full_name": driver.full_name, "address": driver.address}
+	return driver
 
 
 def _dirty_str(val):

@@ -391,6 +391,59 @@ def run():
 
 		check("get_print_pdf renders a real PDF; non-matrix doctype refused", in_request(print_pdf))
 
+		def pedido_view_soft_fill():
+			# Regression: old consultas keep rate 0 in ERPNext while Órdenes shows the list price;
+			# get_record must expose that (pedido_view) so the assistant doesn't report ARS 0.
+			if not state.get("so_name"):
+				raise AssertionError("no probe order")
+			name = state["so_name"]
+			row = frappe.get_doc("Sales Order", name).items[0]
+			frappe.db.set_value("Sales Order Item", row.name, {"rate": 0, "amount": 0}, update_modified=False)
+			view = mcp_api.mcp_get_record(token, "Sales Order", name)["pedido_view"]
+			line = view["lines"][0]
+			assert line["rate_source"] == "price_list_fallback" and line["shown_rate"] == 5300.0, line
+			assert line["document_rate"] == 0 and view["shown_total"] == 15900.0, view
+			assert any("reprice_order" in n for n in view["notes"]), view["notes"]
+
+		check("get_record: Pedido rate-0 lines show the Órdenes list-price fallback", in_request(pedido_view_soft_fill))
+
+		def driver_workflow():
+			# Regression: generic create left bare Drivers with no Employee (invisible in Employees).
+			full_name = f"{PROBE_TAG} Chofer {uuid.uuid4().hex[:6]}"
+			msg = _expect_raise(frappe.PermissionError, mcp_api.mcp_create_record, token, "Driver", {"full_name": full_name}, 0)
+			assert "create_driver" in msg, msg
+			pv = mcp_api.mcp_run_workflow(token, "create_driver", {"full_name": full_name}, 0)
+			assert pv["details"]["action"] == "create_employee_and_driver", pv
+			res = mcp_api.mcp_run_workflow(token, "create_driver", {"full_name": full_name}, 1, preview_id=pv["preview_id"])["result"]
+			created.extend([("Employee", res["employee"]), ("Driver", res["driver"])])
+			assert frappe.db.get_value("Driver", res["driver"], "employee") == res["employee"], res
+			dup = mcp_api.mcp_run_workflow(token, "create_driver", {"full_name": full_name}, 0)
+			assert any("already exists" in i for i in dup.get("issues") or []), dup
+
+		check("create_driver: Employee + Driver; generic Driver create refused", in_request(driver_workflow))
+
+		def employee_workflow():
+			# Regression: generic Employee create skipped groups/PIN/defaults, and patching
+			# Employee Group.employee_list replaced (dropped) every existing member.
+			msg = _expect_raise(frappe.PermissionError, mcp_api.mcp_create_record, token, "Employee", {"first_name": "X"}, 0)
+			assert "save_employee" in msg, msg
+			group = frappe.get_all("Employee Group", pluck="name", limit_page_length=1, ignore_permissions=True)
+			if group:
+				_expect_raise(
+					frappe.PermissionError, mcp_api.mcp_update_record, token, "Employee Group", group[0], {"employee_list": []}, 0
+				)
+			full_name = f"{PROBE_TAG} Vendedor {uuid.uuid4().hex[:6]}"
+			args = {"employee_name": full_name, "groups": ["sales"]}
+			pv = mcp_api.mcp_run_workflow(token, "save_employee", args, 0)
+			assert pv["details"]["groups"] == ["ventas"], pv
+			res = mcp_api.mcp_run_workflow(token, "save_employee", args, 1, preview_id=pv["preview_id"])["result"]
+			created.append(("Employee", res["employee"]))
+			assert res["created"] and res["groups"] == ["ventas"], res
+			bad = mcp_api.mcp_run_workflow(token, "save_employee", {"employee_name": "Y Z", "groups": ["nope"]}, 0)
+			assert any("Unknown group" in i for i in bad.get("issues") or []), bad
+
+		check("save_employee: create in group ventas; generic Employee create / group patch refused", in_request(employee_workflow))
+
 		def document_triage():
 			import base64
 
