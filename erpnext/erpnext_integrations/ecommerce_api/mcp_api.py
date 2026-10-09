@@ -2019,3 +2019,87 @@ def mcp_run_workflow(mcp_token=None, workflow=None, args=None, confirm=0, previe
 		return {"workflow": workflow, "applied": True, "result": _sanitize_output(_json_safe(result))}
 
 	return _impl(mcp_token, workflow, args, confirm, preview_id)
+
+
+# ---------------------------------------------------------------------------
+# Playbook feedback (mcp-erp playbooks.csv improvement loop)
+# ---------------------------------------------------------------------------
+
+PLAYBOOK_FEEDBACK_SCOPE = "mcp.playbook_feedback"
+PLAYBOOK_FEEDBACK_KINDS = {"correction", "step_failed", "missing_process", "unclear_rule", "worked_well"}
+PLAYBOOK_FEEDBACK_KEEP = 500
+
+
+@frappe.whitelist()
+def mcp_playbook_feedback(
+	mcp_token=None, process_id=None, what_happened=None, suggestion=None, step=None, kind=None, user_quote=None
+):
+	"""Store one piece of playbook feedback from the assistant (no ERP data is
+	changed, so no preview). Pulled into mcp-erp playbooks/feedback.csv by
+	``mcp-erp/scripts/pull_playbook_feedback.py`` for a human to apply."""
+
+	@_guard("playbook_feedback", payload=lambda: {"process_id": process_id, "kind": kind})
+	def _impl():
+		ctx = _ctx(mcp_token, write=True)
+		frappe.local._mcp_ctx = ctx
+		what = cstr(what_happened).strip()
+		if not what:
+			frappe.throw(_("what_happened is required"))
+		k = cstr(kind).strip() or "correction"
+		if k not in PLAYBOOK_FEEDBACK_KINDS:
+			frappe.throw(_("kind must be one of: {0}").format(", ".join(sorted(PLAYBOOK_FEEDBACK_KINDS))))
+		row = {
+			"id": secrets.token_hex(6),
+			"ts": _now_iso(),
+			"site": frappe.local.site,
+			"actor": ctx.get("actor"),
+			"key_id": ctx.get("key_id"),
+			"process_id": cstr(process_id).strip()[:20] or "NEW",
+			"step": cstr(step).strip()[:10],
+			"kind": k,
+			"what_happened": what[:2000],
+			"suggestion": cstr(suggestion).strip()[:2000],
+			"user_quote": cstr(user_quote).strip()[:1000],
+		}
+		frappe.get_doc(
+			{
+				"doctype": "Table Extra Data",
+				"scope": PLAYBOOK_FEEDBACK_SCOPE,
+				"row_key": f"{row['ts']}|{row['id']}",
+				"data_json": json.dumps(row, ensure_ascii=False),
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.commit()
+		return {"recorded": True, "id": row["id"]}
+
+	return _impl()
+
+
+def export_playbook_feedback(since=None) -> list[dict]:
+	"""bench execute target for the pull script (not whitelisted). Prunes to the newest
+	PLAYBOOK_FEEDBACK_KEEP rows so the store stays small once pulled."""
+	filters = {"scope": PLAYBOOK_FEEDBACK_SCOPE}
+	if since:
+		filters["creation"] = [">", since]
+	rows = frappe.get_all(
+		"Table Extra Data",
+		filters=filters,
+		fields=["name", "data_json"],
+		order_by="creation asc",
+		limit_page_length=0,
+		ignore_permissions=True,
+	)
+	out = [_parse_json(r.data_json, {}) for r in rows]
+	total = frappe.db.count("Table Extra Data", {"scope": PLAYBOOK_FEEDBACK_SCOPE})
+	if total > PLAYBOOK_FEEDBACK_KEEP:
+		for name in frappe.get_all(
+			"Table Extra Data",
+			filters={"scope": PLAYBOOK_FEEDBACK_SCOPE},
+			pluck="name",
+			order_by="creation asc",
+			limit_page_length=total - PLAYBOOK_FEEDBACK_KEEP,
+			ignore_permissions=True,
+		):
+			frappe.delete_doc("Table Extra Data", name, ignore_permissions=True, force=True)
+		frappe.db.commit()
+	return out
