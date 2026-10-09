@@ -346,6 +346,20 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 	out["um_display"] = _um_display(tx_uom)
 	out["units_qty"] = _line_units_requested(out, line_wpu=line_wpu, total_w=total_w)
 	out["peso_display"] = _format_peso_display(total_w, tx_uom=tx_uom)
+	# Classic Factura Kg/U columns: show rate in Precio Kg. XOR Precio U.
+	rate = _positive_float(out.get("rate"))
+	sell_by_kg = bool(
+		weight_based or _is_mass_uom(tx_uom) or _is_catalog_weight_uom(tx_uom)
+	)
+	if sell_by_kg and rate is not None:
+		out["precio_kg"] = rate
+		out["precio_u"] = ""
+	elif rate is not None:
+		out["precio_kg"] = ""
+		out["precio_u"] = rate
+	else:
+		out["precio_kg"] = ""
+		out["precio_u"] = ""
 	# Armado sheets: hide $ until weighed. Remito/SI keep billed amount for Importe.
 	if (
 		blank_unknown_weight_amount
@@ -1431,306 +1445,567 @@ _PAPER_SIZE_MM = {
 }
 
 
-def _ar_documento_no_valido_a4_elements(*, party_label: str, party_field: str, id_prefix: str):
-	"""A4 commercial layout matching 'DOCUMENTO NO VALIDO COMO FACTURA'.
+def _ar_documento_no_valido_a4_elements(
+	party_label: str,
+	party_field: str,
+	id_prefix: str,
+	columns: list | None = None,
+	title: str = "DOCUMENTO NO VALIDO COMO FACTURA",
+	address_field: str = "customer_address",
+	show_money_totals: bool = True,
+	items_id: str | None = None,
+):
+	"""A4 commercial layout matching 'DOCUMENTO NO VALIDO COMO FACTURA' paper forms.
 
-	Used for both Sales Invoice (Cliente) and Purchase Receipt (Proveedor).
-	Columns include Precio Kg. / Precio U. for bazar weight+unit mixes.
+	Used for Classic página 1–3 (sistema / factura Kg-U / remito) and Purchase Receipt.
+	Dense ~4.5–5 mm header/footer pitch + larger type + roomy table rows (v3).
 	"""
 	p = id_prefix
-	return [
+	cols = columns or [
+		{"fieldPath": "item_code", "label": "Código", "width": 18},
+		{"fieldPath": "item_name", "label": "Descripción", "width": 48},
+		{"fieldPath": "uom", "label": "Unidades", "width": 16},
+		{"fieldPath": "qty", "label": "Cantidad", "width": 14},
+		{"fieldPath": "precio_kg", "label": "Precio Kg.", "width": 20},
+		{"fieldPath": "precio_u", "label": "Precio U.", "width": 20},
+		{"fieldPath": "discount_percentage", "label": "Descuento", "width": 18},
+		{"fieldPath": "amount", "label": "Importe", "width": 22},
+	]
+	# Dense header (mm): title → N° → Fecha → party rows @ ~5 mm.
+	y_title, y_nro, y_fecha = 4, 10, 15
+	y_party, y_dir, y_iva, y_ri = 22, 27, 32, 37
+	# Clear gap under party block so last row never collides with table header.
+	y_items = 50
+	# Footer pinned near A4 bottom with tight Subtotal / TOTAL / firma stack.
+	y_sub, y_tot, y_firma, y_firma_line = 268, 275, 283, 290
+	h_items = y_sub - y_items - 3  # ~215
+	fs_title, fs, fs_sm, fs_tot = 13, 11, 10, 14
+	fs_table = 11
+	els = [
 		# Header (right)
 		{
 			"id": f"{p}-title",
 			"kind": "text",
-			"x": 95,
-			"y": 12,
-			"width": 100,
-			"height": 10,
-			"staticText": "DOCUMENTO NO VALIDO COMO FACTURA",
-			"fontSize": 11,
+			"x": 80,
+			"y": y_title,
+			"width": 115,
+			"height": 6,
+			"staticText": title,
+			"fontSize": fs_title,
 			"bold": True,
 			"align": "right",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-nro-label",
 			"kind": "text",
-			"x": 130,
-			"y": 24,
+			"x": 128,
+			"y": y_nro,
 			"width": 18,
-			"height": 6,
+			"height": 4.5,
 			"staticText": "N°",
-			"fontSize": 9,
+			"fontSize": fs,
 			"bold": True,
 			"align": "right",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-nro",
 			"kind": "field",
-			"x": 148,
-			"y": 24,
-			"width": 47,
-			"height": 6,
+			"x": 146,
+			"y": y_nro,
+			"width": 49,
+			"height": 4.5,
 			"fieldPath": "name",
 			"label": "N°",
-			"fontSize": 9,
+			"fontSize": fs,
 			"bold": True,
 			"align": "right",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-fecha-label",
 			"kind": "text",
-			"x": 130,
-			"y": 32,
+			"x": 128,
+			"y": y_fecha,
 			"width": 18,
-			"height": 6,
+			"height": 4.5,
 			"staticText": "Fecha:",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "right",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-fecha",
 			"kind": "field",
-			"x": 148,
-			"y": 32,
-			"width": 47,
-			"height": 6,
+			"x": 146,
+			"y": y_fecha,
+			"width": 49,
+			"height": 4.5,
 			"fieldPath": "posting_date",
 			"label": "Fecha",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "right",
+			"textColor": "#1e3a5f",
 		},
 		# Party block (left)
 		{
 			"id": f"{p}-party-label",
 			"kind": "text",
-			"x": 15,
-			"y": 48,
+			"x": 12,
+			"y": y_party,
 			"width": 28,
-			"height": 6,
+			"height": 4.5,
 			"staticText": f"{party_label} :",
-			"fontSize": 9,
+			"fontSize": fs,
+			"bold": True,
 			"align": "left",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-party",
 			"kind": "field",
-			"x": 43,
-			"y": 48,
-			"width": 85,
-			"height": 6,
+			"x": 40,
+			"y": y_party,
+			"width": 88,
+			"height": 4.5,
 			"fieldPath": party_field,
 			"label": party_label,
-			"fontSize": 9,
+			"fontSize": fs,
+			"bold": True,
 			"align": "left",
+			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-dir-label",
 			"kind": "text",
-			"x": 15,
-			"y": 56,
+			"x": 12,
+			"y": y_dir,
 			"width": 28,
-			"height": 6,
+			"height": 4.5,
 			"staticText": "Dirección :",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-dir",
 			"kind": "field",
-			"x": 43,
-			"y": 56,
-			"width": 85,
-			"height": 6,
-			"fieldPath": "address_display",
+			"x": 40,
+			"y": y_dir,
+			"width": 88,
+			"height": 4.5,
+			"fieldPath": address_field,
 			"label": "Dirección",
-			"fontSize": 8,
+			"fontSize": fs_sm,
 			"align": "left",
+			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-iva-label",
 			"kind": "text",
-			"x": 15,
-			"y": 64,
+			"x": 12,
+			"y": y_iva,
 			"width": 28,
-			"height": 6,
+			"height": 4.5,
 			"staticText": "IVA:",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-iva",
 			"kind": "field",
-			"x": 43,
-			"y": 64,
-			"width": 50,
-			"height": 6,
+			"x": 40,
+			"y": y_iva,
+			"width": 52,
+			"height": 4.5,
 			"fieldPath": "tax_category",
 			"label": "IVA",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-cuit-label",
 			"kind": "text",
-			"x": 100,
-			"y": 64,
+			"x": 98,
+			"y": y_iva,
 			"width": 18,
-			"height": 6,
+			"height": 4.5,
 			"staticText": "CUIT:",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-cuit",
 			"kind": "field",
-			"x": 118,
-			"y": 64,
-			"width": 50,
-			"height": 6,
+			"x": 116,
+			"y": y_iva,
+			"width": 52,
+			"height": 4.5,
 			"fieldPath": "tax_id",
 			"label": "CUIT",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-ri-label",
 			"kind": "text",
-			"x": 15,
-			"y": 72,
+			"x": 12,
+			"y": y_ri,
 			"width": 42,
-			"height": 6,
+			"height": 4.5,
 			"staticText": "Responsable Inscripto :",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-ri",
-			"kind": "text",
-			"x": 57,
-			"y": 72,
+			"kind": "field",
+			"x": 54,
+			"y": y_ri,
 			"width": 40,
-			"height": 6,
-			"staticText": "",
-			"fontSize": 9,
+			"height": 4.5,
+			"fieldPath": "tax_category",
+			"label": "Responsable Inscripto",
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#0f172a",
 		},
 		{
 			"id": f"{p}-cond-label",
 			"kind": "text",
-			"x": 100,
-			"y": 72,
+			"x": 98,
+			"y": y_ri,
 			"width": 40,
-			"height": 6,
+			"height": 4.5,
 			"staticText": "Condición de Venta :",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-cond",
 			"kind": "field",
-			"x": 140,
-			"y": 72,
-			"width": 55,
-			"height": 6,
+			"x": 138,
+			"y": y_ri,
+			"width": 57,
+			"height": 4.5,
 			"fieldPath": "payment_terms_template",
 			"label": "Condición",
-			"fontSize": 9,
+			"fontSize": fs,
 			"align": "left",
+			"textColor": "#0f172a",
 		},
 		# Line items — navy header bar like the paper form
 		{
-			"id": f"{p}-items",
+			"id": items_id or f"{p}-items-v3",
 			"kind": "line-items",
 			"x": 12,
-			"y": 86,
+			"y": y_items,
 			"width": 186,
-			"height": 120,
+			"height": h_items,
 			"childTableFieldname": "items",
 			"headerBg": "#1e3a5f",
 			"headerColor": "#ffffff",
+			"fontSize": fs_table,
+			"columns": cols,
+		},
+	]
+	# Money fields only when requested; remito still prints Subtotal/TOTAL labels.
+	els.extend(
+		[
+			{
+				"id": f"{p}-sub-label",
+				"kind": "text",
+				"x": 128,
+				"y": y_sub,
+				"width": 32,
+				"height": 5.5,
+				"staticText": "Subtotal",
+				"fontSize": fs,
+				"align": "right",
+				"textColor": "#1e3a5f",
+			},
+			{
+				"id": f"{p}-total-label",
+				"kind": "text",
+				"x": 128,
+				"y": y_tot,
+				"width": 32,
+				"height": 6.5,
+				"staticText": "TOTAL",
+				"fontSize": fs_tot,
+				"bold": True,
+				"align": "right",
+				"textColor": "#1e3a5f",
+			},
+		]
+	)
+	if show_money_totals:
+		els.extend(
+			[
+				{
+					"id": f"{p}-sub",
+					"kind": "field",
+					"x": 160,
+					"y": y_sub,
+					"width": 35,
+					"height": 5.5,
+					"fieldPath": "net_total",
+					"label": "Subtotal",
+					"fontSize": fs,
+					"align": "right",
+					"textColor": "#0f172a",
+				},
+				{
+					"id": f"{p}-total",
+					"kind": "field",
+					"x": 160,
+					"y": y_tot,
+					"width": 35,
+					"height": 6.5,
+					"fieldPath": "grand_total",
+					"label": "TOTAL",
+					"fontSize": fs_tot,
+					"bold": True,
+					"align": "right",
+					"textColor": "#0f172a",
+				},
+			]
+		)
+	els.extend(
+		[
+			{
+				"id": f"{p}-firma-label",
+				"kind": "text",
+				"x": 108,
+				"y": y_firma,
+				"width": 87,
+				"height": 5,
+				"staticText": "Recibí Conforme (Firma y Aclaración):",
+				"fontSize": fs_sm,
+				"align": "left",
+				"textColor": "#1e3a5f",
+			},
+			{
+				"id": f"{p}-firma-line",
+				"kind": "shape",
+				"x": 108,
+				"y": y_firma_line,
+				"width": 87,
+				"height": 1,
+				"shapeType": "line",
+				"color": "#1e3a5f",
+			},
+		]
+	)
+	return els
+
+
+def _classic_entregas_armado_a4_elements(id_prefix: str = "starter-clsent"):
+	"""Classic página 4 — ENTREGAS / armado (qty + warehouse + barcode, no prices).
+
+	Dense ~4.5–5 mm header/footer pitch + larger type + roomy table rows (v3).
+	"""
+	p = id_prefix
+	y_title, y_nro = 4, 12
+	y_cli, y_id, y_fecha = 20, 25, 30
+	y_items = 42
+	y_sub, y_tot, y_firma = 268, 275, 283
+	h_items = y_sub - y_items - 3
+	fs, fs_sm, fs_tot = 11, 10, 14
+	fs_table = 11
+	return [
+		{
+			"id": f"{p}-title",
+			"kind": "text",
+			"x": 55,
+			"y": y_title,
+			"width": 100,
+			"height": 8,
+			"staticText": "ENTREGAS",
+			"fontSize": 20,
+			"bold": True,
+			"align": "center",
+			"textColor": "#1e3a5f",
+		},
+		{
+			"id": f"{p}-nro",
+			"kind": "field",
+			"x": 55,
+			"y": y_nro,
+			"width": 100,
+			"height": 5.5,
+			"fieldPath": "name",
+			"label": "N°",
+			"fontSize": 13,
+			"bold": True,
+			"align": "center",
+			"textColor": "#1e3a5f",
+		},
+		{
+			"id": f"{p}-alm-label",
+			"kind": "text",
+			"x": 150,
+			"y": y_title,
+			"width": 45,
+			"height": 4.5,
+			"staticText": "Almacen",
+			"fontSize": fs,
+			"align": "right",
+			"textColor": "#1e3a5f",
+		},
+		{
+			"id": f"{p}-alm",
+			"kind": "field",
+			"x": 140,
+			"y": y_title + 5,
+			"width": 55,
+			"height": 6,
+			"fieldPath": "warehouse_name",
+			"label": "Almacen",
+			"fontSize": 14,
+			"bold": True,
+			"align": "right",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-cli-label",
+			"kind": "text",
+			"x": 12,
+			"y": y_cli,
+			"width": 28,
+			"height": 4.5,
+			"staticText": "Cliente :",
+			"fontSize": fs,
+			"bold": True,
+			"align": "left",
+			"textColor": "#1e3a5f",
+		},
+		{
+			"id": f"{p}-cli",
+			"kind": "field",
+			"x": 40,
+			"y": y_cli,
+			"width": 98,
+			"height": 4.5,
+			"fieldPath": "customer_name",
+			"label": "Cliente",
+			"fontSize": fs,
+			"bold": True,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-id-label",
+			"kind": "text",
+			"x": 12,
+			"y": y_id,
+			"width": 48,
+			"height": 4.5,
+			"staticText": "Numero de identificador:",
+			"fontSize": fs,
+			"align": "left",
+			"textColor": "#1e3a5f",
+		},
+		{
+			"id": f"{p}-id",
+			"kind": "field",
+			"x": 60,
+			"y": y_id,
+			"width": 78,
+			"height": 4.5,
+			"fieldPath": "tax_id",
+			"label": "CUIT",
+			"fontSize": fs,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-fecha-label",
+			"kind": "text",
+			"x": 12,
+			"y": y_fecha,
+			"width": 36,
+			"height": 4.5,
+			"staticText": "Fecha de Envio:",
+			"fontSize": fs,
+			"align": "left",
+			"textColor": "#1e3a5f",
+		},
+		{
+			"id": f"{p}-fecha",
+			"kind": "field",
+			"x": 48,
+			"y": y_fecha,
+			"width": 52,
+			"height": 4.5,
+			"fieldPath": "delivery_date",
+			"label": "Fecha de Envio",
+			"fontSize": fs,
+			"align": "left",
+			"textColor": "#0f172a",
+		},
+		{
+			"id": f"{p}-items-v3",
+			"kind": "line-items",
+			"x": 12,
+			"y": y_items,
+			"width": 186,
+			"height": h_items,
+			"childTableFieldname": "items",
+			"headerBg": "#1e3a5f",
+			"headerColor": "#ffffff",
+			"fontSize": fs_table,
 			"columns": [
-				{"fieldPath": "item_code", "label": "Código", "width": 20},
-				{"fieldPath": "item_name", "label": "Descripción", "width": 40},
-				{"fieldPath": "uom", "label": "Unidades", "width": 16},
-				{"fieldPath": "qty", "label": "Cantidad", "width": 16},
-				{"fieldPath": "weight", "label": "Peso", "width": 14},
-				{"fieldPath": "price_list_rate", "label": "Precio Kg.", "width": 18},
-				{"fieldPath": "rate", "label": "Precio U.", "width": 18},
-				{"fieldPath": "discount_percentage", "label": "Descuento", "width": 14},
-				{"fieldPath": "amount", "label": "Importe", "width": 16},
+				{"fieldPath": "item_code", "label": "Código", "width": 28},
+				{"fieldPath": "item_name", "label": "Descripción", "width": 70},
+				{"fieldPath": "qty", "label": "Cantidad", "width": 22},
+				{"fieldPath": "warehouse", "label": "Desde", "width": 28},
+				{"fieldPath": "barcode", "label": "Codigo de Barras", "width": 38},
 			],
 		},
-		# Totals (right)
 		{
 			"id": f"{p}-sub-label",
 			"kind": "text",
-			"x": 130,
-			"y": 220,
-			"width": 30,
-			"height": 7,
+			"x": 128,
+			"y": y_sub,
+			"width": 32,
+			"height": 5.5,
 			"staticText": "Subtotal",
-			"fontSize": 10,
+			"fontSize": fs,
 			"align": "right",
-		},
-		{
-			"id": f"{p}-sub",
-			"kind": "field",
-			"x": 160,
-			"y": 220,
-			"width": 35,
-			"height": 7,
-			"fieldPath": "net_total",
-			"label": "Subtotal",
-			"fontSize": 10,
-			"align": "right",
+			"textColor": "#1e3a5f",
 		},
 		{
 			"id": f"{p}-total-label",
 			"kind": "text",
-			"x": 130,
-			"y": 230,
-			"width": 30,
-			"height": 8,
+			"x": 128,
+			"y": y_tot,
+			"width": 32,
+			"height": 6.5,
 			"staticText": "TOTAL",
-			"fontSize": 12,
+			"fontSize": fs_tot,
 			"bold": True,
 			"align": "right",
+			"textColor": "#1e3a5f",
 		},
-		{
-			"id": f"{p}-total",
-			"kind": "field",
-			"x": 160,
-			"y": 230,
-			"width": 35,
-			"height": 8,
-			"fieldPath": "grand_total",
-			"label": "TOTAL",
-			"fontSize": 12,
-			"bold": True,
-			"align": "right",
-		},
-		# Signature
 		{
 			"id": f"{p}-firma-label",
 			"kind": "text",
-			"x": 110,
-			"y": 255,
-			"width": 85,
-			"height": 6,
-			"staticText": "Recibi Conforme (Firma y Aclaración):",
-			"fontSize": 8,
+			"x": 100,
+			"y": y_firma,
+			"width": 95,
+			"height": 5,
+			"staticText": "Recibí Conforme (Firma y Aclaración):",
+			"fontSize": fs_sm,
 			"align": "left",
-		},
-		{
-			"id": f"{p}-firma-line",
-			"kind": "shape",
-			"x": 110,
-			"y": 268,
-			"width": 85,
-			"height": 1,
-			"shapeType": "line",
-			"color": "#0f172a",
+			"textColor": "#1e3a5f",
 		},
 	]
 
@@ -1773,6 +2048,15 @@ def _compact_party_doc_header_elements(
 	row_pitch = 5
 	# Compact party box when totals live under Cond. IVA.
 	box_h = 32 if show_party_totals else 24
+	# 50/50 header: CLIENTE | Pedido+meta (gives Cargado room for dd/MM/yy-HH:mm:ss).
+	page_x, page_w, gap = 10.0, 190.0, 2.0
+	col_w = (page_w - gap) / 2.0  # 94mm each
+	cli_x = page_x
+	ped_x = page_x + col_w + gap
+	# Meta grid inside Pedido column: equal halves, short labels, wide values.
+	meta_half = col_w / 2.0
+	lbl_w, gap_lv = 16.0, 1.0
+	val_w = meta_half - lbl_w - gap_lv
 	els = []
 	# Left: party box
 	els.extend(
@@ -1780,9 +2064,9 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-cli-box",
 				"kind": "shape",
-				"x": 10,
+				"x": cli_x,
 				"y": y0,
-				"width": 105,
+				"width": col_w,
 				"height": box_h,
 				"shapeType": "rect",
 				"color": "#94a3b8",
@@ -1791,7 +2075,7 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-cli-label",
 				"kind": "text",
-				"x": 12,
+				"x": cli_x + 2,
 				"y": y0 + 1,
 				"width": 28,
 				"height": 4.5,
@@ -1804,9 +2088,9 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-cli",
 				"kind": "field",
-				"x": 40,
+				"x": cli_x + 30,
 				"y": y0 + 1,
-				"width": 72,
+				"width": col_w - 34,
 				"height": 4.5,
 				"fieldPath": party_field,
 				"label": party_label,
@@ -1818,9 +2102,9 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-addr",
 				"kind": "field",
-				"x": 12,
+				"x": cli_x + 2,
 				"y": y0 + 6.5,
-				"width": 100,
+				"width": col_w - 4,
 				"height": 5.5,
 				"fieldPath": address_field,
 				"label": "Dirección",
@@ -1831,7 +2115,7 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-cond-label",
 				"kind": "text",
-				"x": 12,
+				"x": cli_x + 2,
 				"y": y0 + 13,
 				"width": 22,
 				"height": 4.5,
@@ -1843,9 +2127,9 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-cond",
 				"kind": "field",
-				"x": 34,
+				"x": cli_x + 24,
 				"y": y0 + 13,
-				"width": 78,
+				"width": col_w - 28,
 				"height": 4.5,
 				"fieldPath": cond_field,
 				"label": cond_label,
@@ -1861,7 +2145,7 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-imp-label",
 					"kind": "text",
-					"x": 12,
+					"x": cli_x + 2,
 					"y": y0 + 19.5,
 					"width": 28,
 					"height": 4.5,
@@ -1874,9 +2158,9 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-imp",
 					"kind": "field",
-					"x": 40,
+					"x": cli_x + 30,
 					"y": y0 + 19.5,
-					"width": 32,
+					"width": 30,
 					"height": 4.5,
 					"fieldPath": importe_field,
 					"label": "Total Importe",
@@ -1888,9 +2172,9 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-tw-label",
 					"kind": "text",
-					"x": 74,
+					"x": cli_x + 62,
 					"y": y0 + 19.5,
-					"width": 22,
+					"width": 20,
 					"height": 4.5,
 					"staticText": "Total Peso:",
 					"fontSize": fs_sm,
@@ -1901,9 +2185,9 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-tw",
 					"kind": "field",
-					"x": 96,
+					"x": cli_x + 82,
 					"y": y0 + 19.5,
-					"width": 16,
+					"width": col_w - 86,
 					"height": 4.5,
 					"fieldPath": peso_field,
 					"label": "Total Peso",
@@ -1914,15 +2198,15 @@ def _compact_party_doc_header_elements(
 				},
 			]
 		)
-	# Right: document number badge + meta grid
+	# Right: document number badge + meta grid (50% of header)
 	els.extend(
 		[
 			{
 				"id": f"{p}-ped-box",
 				"kind": "shape",
-				"x": 120,
+				"x": ped_x,
 				"y": y0,
-				"width": 80,
+				"width": col_w,
 				"height": 9,
 				"shapeType": "rect",
 				"color": "#cbd5e1",
@@ -1932,7 +2216,7 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-ped-label",
 				"kind": "text",
-				"x": 122,
+				"x": ped_x + 2,
 				"y": y0 + 1.5,
 				"width": 22,
 				"height": 6,
@@ -1945,9 +2229,9 @@ def _compact_party_doc_header_elements(
 			{
 				"id": f"{p}-ped",
 				"kind": "field",
-				"x": 144,
+				"x": ped_x + 24,
 				"y": y0 + 1.5,
-				"width": 54,
+				"width": col_w - 28,
 				"height": 6,
 				"fieldPath": doc_badge_field,
 				"label": doc_badge_label,
@@ -1967,7 +2251,7 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-wide{suffix}-l",
 					"kind": "text",
-					"x": 120,
+					"x": ped_x,
 					"y": meta_y,
 					"width": 20,
 					"height": 4.5,
@@ -1979,9 +2263,9 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-wide{suffix}",
 					"kind": "field",
-					"x": 140,
+					"x": ped_x + 20,
 					"y": meta_y,
-					"width": 60,
+					"width": col_w - 20,
 					"height": 4.5,
 					"fieldPath": wfield,
 					"label": wlabel,
@@ -1995,14 +2279,16 @@ def _compact_party_doc_header_elements(
 	max_rows = 3 if wide_rows else 4
 	for i, (l1, f1, l2, f2) in enumerate(rows[:max_rows]):
 		yy = meta_y + i * row_pitch
+		xa = ped_x
+		xb = ped_x + meta_half
 		els.extend(
 			[
 				{
 					"id": f"{p}-m{i}a-l",
 					"kind": "text",
-					"x": 120,
+					"x": xa,
 					"y": yy,
-					"width": 18,
+					"width": lbl_w,
 					"height": 4.5,
 					"staticText": l1,
 					"fontSize": fs_sm,
@@ -2012,9 +2298,9 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-m{i}a",
 					"kind": "field",
-					"x": 138,
+					"x": xa + lbl_w + gap_lv,
 					"y": yy,
-					"width": 22,
+					"width": val_w,
 					"height": 4.5,
 					"fieldPath": f1,
 					"label": l1,
@@ -2025,9 +2311,9 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-m{i}b-l",
 					"kind": "text",
-					"x": 160,
+					"x": xb,
 					"y": yy,
-					"width": 16,
+					"width": lbl_w,
 					"height": 4.5,
 					"staticText": l2,
 					"fontSize": fs_sm,
@@ -2037,9 +2323,9 @@ def _compact_party_doc_header_elements(
 				{
 					"id": f"{p}-m{i}b",
 					"kind": "field",
-					"x": 176,
+					"x": xb + lbl_w + gap_lv,
 					"y": yy,
-					"width": 24,
+					"width": val_w,
 					"height": 4.5,
 					"fieldPath": f2,
 					"label": l2,
@@ -2252,7 +2538,7 @@ def _compact_commercial_a4_elements(
 				fletero_field="fletero",
 				date_field="posting_date",
 				copies=5,
-				marker_id=f"{p}-tear-cutbar-v5",
+				marker_id=f"{p}-tear-cutbar-v6",
 			)
 		)
 	elif footer_kind == "remito":
@@ -2442,16 +2728,16 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem", *, layout: str = "c
 			("Almacen:", "set_warehouse", "Fletero:", "fletero"),
 		],
 		columns=[
-			{"fieldPath": "code_display", "label": "Codigo", "width": 32},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 46},
-			{"fieldPath": "qty_display", "label": "Cantidad", "width": 24},
-			{"fieldPath": "uom", "label": "Uni", "width": 12},
-			{"fieldPath": "weight", "label": "Peso", "width": 16},
-			{"fieldPath": "amount", "label": "Importe", "width": 24},
-			{"fieldPath": "warehouse", "label": "Desde", "width": 36},
+			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 64},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 18},
+			{"fieldPath": "uom", "label": "Uni", "width": 10},
+			{"fieldPath": "weight", "label": "Peso", "width": 14},
+			{"fieldPath": "amount", "label": "Importe", "width": 20},
+			{"fieldPath": "warehouse", "label": "Desde", "width": 28},
 		],
 		footer_kind="remito",
-		items_id_suffix="v3",
+		items_id_suffix="v4",
 		layout=layout,
 	)
 
@@ -2471,15 +2757,16 @@ def _pr_remito_a4_elements(id_prefix: str = "starter-prrem", *, disclaimer: str 
 			("Zona:", "zona", "Horario:", "horario"),
 		],
 		columns=[
-			{"fieldPath": "code_display", "label": "Codigo", "width": 36},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 62},
-			{"fieldPath": "qty_display", "label": "Cantidad", "width": 28},
-			{"fieldPath": "uom", "label": "Uni", "width": 14},
-			{"fieldPath": "warehouse", "label": "Destino", "width": 30},
-			{"fieldPath": "amount", "label": "Importe", "width": 20},
+			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 72},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 20},
+			{"fieldPath": "uom", "label": "Uni", "width": 10},
+			{"fieldPath": "warehouse", "label": "Destino", "width": 24},
+			{"fieldPath": "amount", "label": "Importe", "width": 18},
 		],
 		footer_kind="receipt",
 		disclaimer=disclaimer,
+		items_id_suffix="v2",
 	)
 
 
@@ -2689,7 +2976,7 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 		},
 		# ── Line items (photo columns) ──────────────────────────────────
 		{
-			"id": f"{p}-items-v4",
+			"id": f"{p}-items-v5",
 			"kind": "line-items",
 			"x": 12,
 			"y": y_items,
@@ -2699,14 +2986,14 @@ def _en_sales_invoice_commercial_a4_elements(id_prefix: str = "starter-sien"):
 			"headerBg": "#64748b",
 			"headerColor": "#ffffff",
 			"columns": [
-				{"fieldPath": "item_code", "label": "Code", "width": 22},
-				{"fieldPath": "item_name", "label": "Description", "width": 52},
-				{"fieldPath": "stock_qty", "label": "Units", "width": 14},
-				{"fieldPath": "qty", "label": "Quantity", "width": 20},
-				{"fieldPath": "uom", "label": "UOM", "width": 14},
-				{"fieldPath": "rate", "label": "Price", "width": 22},
-				{"fieldPath": "discount_percentage", "label": "Disc.", "width": 14},
-				{"fieldPath": "amount", "label": "Total", "width": 22},
+				{"fieldPath": "item_code", "label": "Code", "width": 18},
+				{"fieldPath": "item_name", "label": "Description", "width": 68},
+				{"fieldPath": "stock_qty", "label": "Units", "width": 12},
+				{"fieldPath": "qty", "label": "Quantity", "width": 14},
+				{"fieldPath": "uom", "label": "UOM", "width": 10},
+				{"fieldPath": "rate", "label": "Price", "width": 16},
+				{"fieldPath": "discount_percentage", "label": "Disc.", "width": 10},
+				{"fieldPath": "amount", "label": "Total", "width": 16},
 			],
 		},
 		# ── Observations (bottom-left) ──────────────────────────────────
@@ -2929,16 +3216,17 @@ def _en_sales_invoice_with_weights_a4_elements(id_prefix: str = "starter-sienw")
 	for el in elements:
 		if not isinstance(el, dict) or el.get("kind") != "line-items":
 			continue
-		# v5: no signature; footer near page bottom; denser header type.
-		el["id"] = f"{id_prefix}-items-v5"
+		# v6: Detalle ~half the row via relative column weights.
+		el["id"] = f"{id_prefix}-items-v6"
+		# Relative weights (renderer → %): Detalle gets ~half the row.
 		el["columns"] = [
-			{"fieldPath": "item_name", "label": "Description", "width": 58},
-			{"fieldPath": "units_qty", "label": "Units", "width": 14},
-			{"fieldPath": "peso_display", "label": "Weight", "width": 18},
-			{"fieldPath": "um_display", "label": "UM", "width": 12},
-			{"fieldPath": "rate", "label": "Price", "width": 22},
-			{"fieldPath": "discount_percentage", "label": "Disc.", "width": 14},
-			{"fieldPath": "amount", "label": "Total", "width": 22},
+			{"fieldPath": "item_name", "label": "Description", "width": 78},
+			{"fieldPath": "units_qty", "label": "Units", "width": 12},
+			{"fieldPath": "peso_display", "label": "Weight", "width": 14},
+			{"fieldPath": "um_display", "label": "UM", "width": 10},
+			{"fieldPath": "rate", "label": "Price", "width": 16},
+			{"fieldPath": "discount_percentage", "label": "Disc.", "width": 12},
+			{"fieldPath": "amount", "label": "Total", "width": 16},
 		]
 		break
 	return elements
@@ -2972,16 +3260,17 @@ def _si_compact_a4_elements(
 		doc_badge_label="Doc:",
 		meta_rows=meta,
 		columns=[
-			{"fieldPath": "code_display", "label": "Codigo", "width": 32},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 52},
-			{"fieldPath": "qty_display", "label": "Cant.", "width": 22},
-			{"fieldPath": "rate", "label": "Precio", "width": 22},
-			{"fieldPath": "discount_percentage", "label": "Desc%", "width": 16},
-			{"fieldPath": "amount", "label": "Importe", "width": 26},
+			{"fieldPath": "code_display", "label": "Codigo", "width": 26},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 70},
+			{"fieldPath": "qty_display", "label": "Cant.", "width": 16},
+			{"fieldPath": "rate", "label": "Precio", "width": 18},
+			{"fieldPath": "discount_percentage", "label": "Desc%", "width": 12},
+			{"fieldPath": "amount", "label": "Importe", "width": 20},
 		],
 		footer_kind="invoice",
 		disclaimer=disclaimer,
 		layout=layout,
+		items_id_suffix="v2",
 	)
 
 
@@ -3014,12 +3303,12 @@ def _ar_entregas_checklist_a4_elements(
 	if mode == "peso_indefinido":
 		# Single table: pedido cols + armado confirm cols (shared row height).
 		cols = [
-			{"fieldPath": "code_display", "label": "Codigo", "width": 34},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 52},
-			{"fieldPath": "qty_display", "label": "Cantidad", "width": 26},
-			{"fieldPath": "actual_weight", "label": "Peso medido", "width": 22, "fillIn": True},
-			{"fieldPath": "confirm_uni", "label": "Uni", "width": 14, "fillIn": True},
-			{"fieldPath": "confirm_qty", "label": "Cantidad", "width": 20, "fillIn": True},
+			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 64},
+			{"fieldPath": "qty_display", "label": "Cantidad", "width": 18},
+			{"fieldPath": "actual_weight", "label": "Peso medido", "width": 18, "fillIn": True},
+			{"fieldPath": "confirm_uni", "label": "Uni", "width": 12, "fillIn": True},
+			{"fieldPath": "confirm_qty", "label": "Cantidad", "width": 16, "fillIn": True},
 		]
 		table_w = 168
 		# PEDIDO: Codigo+Detalle+Cantidad; ARMADO: Peso medido + confirm cols
@@ -3028,10 +3317,10 @@ def _ar_entregas_checklist_a4_elements(
 		armado_label_w = 56
 	else:
 		cols = [
-			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 44},
-			{"fieldPath": "qty", "label": "Cant.", "width": 14},
-			{"fieldPath": "warehouse", "label": "Desde", "width": 22},
+			{"fieldPath": "code_display", "label": "Codigo", "width": 24},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 58},
+			{"fieldPath": "qty", "label": "Cant.", "width": 12},
+			{"fieldPath": "warehouse", "label": "Desde", "width": 20},
 		]
 		if with_location:
 			cols.append({"fieldPath": "location", "label": "Ubic.", "width": 16})
@@ -3106,7 +3395,7 @@ def _ar_entregas_checklist_a4_elements(
 	)
 	elements.append(
 		{
-			"id": f"{p}-items-v6",
+			"id": f"{p}-items-v7",
 			"kind": "line-items",
 			"x": 10,
 			"y": table_y,
@@ -3145,7 +3434,7 @@ def _ar_entregas_checklist_a4_elements(
 				fletero_field="fletero",
 				date_field="posting_date",
 				copies=5,
-				marker_id=f"{p}-tear-cutbar-v6",
+				marker_id=f"{p}-tear-cutbar-v7",
 			)
 		)
 	else:
@@ -3205,7 +3494,107 @@ def _ar_entregas_checklist_a4_elements(
 
 
 
+# Classic paper-form column sets (páginas 1–3 from client photos).
+_CLASSIC_SISTEMA_COLUMNS = [
+	{"fieldPath": "item_code", "label": "Código", "width": 22},
+	{"fieldPath": "item_name", "label": "Descripción", "width": 58},
+	{"fieldPath": "uom", "label": "Unidades", "width": 18},
+	{"fieldPath": "qty", "label": "Cantidad", "width": 18},
+	{"fieldPath": "rate", "label": "Precio Unit", "width": 22},
+	{"fieldPath": "discount_percentage", "label": "Bonificación", "width": 22},
+	{"fieldPath": "amount", "label": "Importe", "width": 26},
+]
+_CLASSIC_FACTURA_KGU_COLUMNS = [
+	{"fieldPath": "item_code", "label": "Código", "width": 18},
+	{"fieldPath": "item_name", "label": "Descripción", "width": 48},
+	{"fieldPath": "uom", "label": "Unidades", "width": 16},
+	{"fieldPath": "qty", "label": "Cantidad", "width": 14},
+	{"fieldPath": "precio_kg", "label": "Precio Kg.", "width": 20},
+	{"fieldPath": "precio_u", "label": "Precio U.", "width": 20},
+	{"fieldPath": "discount_percentage", "label": "Descuento", "width": 18},
+	{"fieldPath": "amount", "label": "Importe", "width": 22},
+]
+_CLASSIC_REMITO_COLUMNS = [
+	{"fieldPath": "item_code", "label": "Código", "width": 28},
+	{"fieldPath": "item_name", "label": "Descripción", "width": 90},
+	{"fieldPath": "uom", "label": "Unidades", "width": 28},
+	{"fieldPath": "qty", "label": "Cantidad", "width": 28},
+]
+
+
 _STARTER_TEMPLATES = [
+	# ── Classic paper forms (páginas 1–4) — additive; do not replace older starters ─
+	{
+		"template_name": "Classic · Documento sistema (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		# v2: denser header/footer + larger type
+		"resync_if_missing_id": "starter-clssis-items-v3",
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_documento_no_valido_a4_elements(
+			party_label="Cliente",
+			party_field="customer_name",
+			id_prefix="starter-clssis",
+			columns=_CLASSIC_SISTEMA_COLUMNS,
+			items_id="starter-clssis-items-v3",
+		),
+	},
+	{
+		"template_name": "Classic · Factura Kg/U (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		# v2: denser header/footer + larger type
+		"resync_if_missing_id": "starter-clsfac-items-v3",
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_documento_no_valido_a4_elements(
+			party_label="Cliente",
+			party_field="customer_name",
+			id_prefix="starter-clsfac",
+			columns=_CLASSIC_FACTURA_KGU_COLUMNS,
+			items_id="starter-clsfac-items-v3",
+		),
+	},
+	{
+		"template_name": "Classic · Remito (A4)",
+		"source_doctype": "Delivery Note",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		# v2: denser header/footer + larger type
+		"resync_if_missing_id": "starter-clsrem-items-v3",
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_documento_no_valido_a4_elements(
+			party_label="Cliente",
+			party_field="customer_name",
+			id_prefix="starter-clsrem",
+			columns=_CLASSIC_REMITO_COLUMNS,
+			show_money_totals=False,
+			items_id="starter-clsrem-items-v3",
+		),
+	},
+	{
+		"template_name": "Classic · Entregas / Armado (A4)",
+		"source_doctype": "Delivery Checklist",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		# v2: denser header/footer + larger type
+		"resync_if_missing_id": "starter-clsent-items-v3",
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _classic_entregas_armado_a4_elements(id_prefix="starter-clsent"),
+	},
 	# ── Sales Invoice · AR commercial A4 (gifted core, compact Armado header) ─
 	{
 		"template_name": "Documento no válido como factura (A4)",
@@ -3214,8 +3603,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		# Restore classic footer totals after accidental tearoff overwrite.
-		"resync_if_missing_id": "starter-siad-classic-v4",
+		# v6: 50/50 CLIENTE|Pedido header (Cargado datetime).
+		"resync_if_missing_id": "starter-siad-classic-v6",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _si_compact_a4_elements(
 			id_prefix="starter-siad",
@@ -3224,7 +3613,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-siad-classic-v4",
+				"id": "starter-siad-classic-v6",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -3244,13 +3633,26 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-siadtear-tear-cutbar-v5",
+		"resync_if_missing_id": "starter-siadtear-header50-v7",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _si_compact_a4_elements(
 			id_prefix="starter-siadtear",
 			disclaimer="DOCUMENTO NO VALIDO COMO FACTURA",
 			layout="tearoff",
-		),
+		)
+		+ [
+			{
+				"id": "starter-siadtear-header50-v7",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	# ── Sales Invoice · English commercial A4 (photo form; locales on request) ─
 	{
@@ -3260,8 +3662,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		# v4: no signature; footer near page bottom.
-		"resync_if_missing_id": "starter-sien-items-v4",
+		# v5: wider Description column weight.
+		"resync_if_missing_id": "starter-sien-items-v5",
 		# English first — do not auto-clone ES/CH until explicitly approved.
 		"skip_locale_expand": True,
 		"margin_mm": [8, 8, 8, 8],
@@ -3275,8 +3677,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		# v5: no signature; footer near page bottom.
-		"resync_if_missing_id": "starter-sienw-items-v5",
+		# v6: Detalle ~half-row via relative column weights.
+		"resync_if_missing_id": "starter-sienw-items-v6",
 		# Official locale names (seeded via gift_core / ensure_starter).
 		"locale_names": {
 			"es": "Factura No valid. Con pesos",
@@ -3292,7 +3694,7 @@ _STARTER_TEMPLATES = [
 		"paper_kind": "A4",
 		"is_default": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-inv-items-v2",
+		"resync_if_missing_id": "starter-inv-items-v3",
 		"margin_mm": [15, 15, 15, 15],
 		"elements": [
 			{"id": "starter-inv-title", "kind": "text", "x": 15, "y": 15, "width": 110, "height": 12, "staticText": "INVOICE", "fontSize": 20, "bold": True, "align": "left"},
@@ -3303,7 +3705,7 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-inv-bill-to-label", "kind": "text", "x": 15, "y": 32, "width": 90, "height": 6, "staticText": "Bill To", "fontSize": 8, "bold": True, "align": "left"},
 			{"id": "starter-inv-customer", "kind": "field", "x": 15, "y": 38, "width": 100, "height": 8, "fieldPath": "customer_name", "label": "Customer", "fontSize": 11, "align": "left"},
 			{
-				"id": "starter-inv-items-v2",
+				"id": "starter-inv-items-v3",
 				"kind": "line-items",
 				"x": 15,
 				"y": 60,
@@ -3311,12 +3713,12 @@ _STARTER_TEMPLATES = [
 				"height": 90,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_code", "label": "Item", "width": 26},
-					{"fieldPath": "item_name", "label": "Description", "width": 52},
-					{"fieldPath": "qty", "label": "Qty", "width": 16},
-					{"fieldPath": "weight", "label": "Weight", "width": 18},
-					{"fieldPath": "rate", "label": "Rate", "width": 22},
-					{"fieldPath": "amount", "label": "Amount", "width": 26},
+					{"fieldPath": "item_code", "label": "Item", "width": 22},
+					{"fieldPath": "item_name", "label": "Description", "width": 64},
+					{"fieldPath": "qty", "label": "Qty", "width": 12},
+					{"fieldPath": "weight", "label": "Weight", "width": 14},
+					{"fieldPath": "rate", "label": "Rate", "width": 16},
+					{"fieldPath": "amount", "label": "Amount", "width": 18},
 				],
 			},
 			{"id": "starter-inv-total-label", "kind": "text", "x": 130, "y": 155, "width": 30, "height": 8, "staticText": "Total", "fontSize": 10, "bold": True, "align": "right"},
@@ -3346,10 +3748,10 @@ _STARTER_TEMPLATES = [
 				"height": 55,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_name", "label": "Item", "width": 28},
+					{"fieldPath": "item_name", "label": "Item", "width": 40},
 					{"fieldPath": "qty", "label": "Cant", "width": 10},
 					{"fieldPath": "weight", "label": "Peso", "width": 12},
-					{"fieldPath": "amount", "label": "Monto", "width": 22},
+					{"fieldPath": "amount", "label": "Monto", "width": 16},
 				],
 			},
 			{"id": "starter-pos80-total-label", "kind": "text", "x": 4, "y": 102, "width": 28, "height": 7, "staticText": "TOTAL", "fontSize": 10, "bold": True, "align": "left"},
@@ -3375,9 +3777,9 @@ _STARTER_TEMPLATES = [
 				"height": 50,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_name", "label": "Item", "width": 28},
-					{"fieldPath": "qty", "label": "Cant", "width": 10},
-					{"fieldPath": "amount", "label": "$", "width": 14},
+					{"fieldPath": "item_name", "label": "Item", "width": 34},
+					{"fieldPath": "qty", "label": "Cant", "width": 8},
+					{"fieldPath": "amount", "label": "$", "width": 12},
 				],
 			},
 			{"id": "starter-pos58-total-label", "kind": "text", "x": 3, "y": 80, "width": 20, "height": 6, "staticText": "TOTAL", "fontSize": 9, "bold": True, "align": "left"},
@@ -3484,7 +3886,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-prad-items-v1",
+		"resync_if_missing_id": "starter-prad-items-v2",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _pr_remito_a4_elements(
 			id_prefix="starter-prad",
@@ -3498,7 +3900,7 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-prrem-items-v1",
+		"resync_if_missing_id": "starter-prrem-items-v2",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _pr_remito_a4_elements(id_prefix="starter-prrem"),
 	},
@@ -3509,7 +3911,7 @@ _STARTER_TEMPLATES = [
 		"paper_kind": "A4",
 		"is_default": False,
 		"resync": True,
-		"resync_if_missing_id": "starter-pra4a-items-v1",
+		"resync_if_missing_id": "starter-pra4a-items-v2",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _pr_remito_a4_elements(id_prefix="starter-pra4a"),
 	},
@@ -3739,8 +4141,8 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		# Restore classic footer after accidental tearoff overwrite.
-		"resync_if_missing_id": "starter-peso-classic-v4",
+		# v6: 50/50 CLIENTE|Pedido header so Cargado fits full datetime.
+		"resync_if_missing_id": "starter-peso-classic-v6",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-peso",
@@ -3751,7 +4153,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-peso-classic-v4",
+				"id": "starter-peso-classic-v6",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -3770,7 +4172,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-alm-classic-v4",
+		"resync_if_missing_id": "starter-alm-classic-v6",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-alm",
@@ -3781,7 +4183,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-alm-classic-v4",
+				"id": "starter-alm-classic-v6",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -3800,7 +4202,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-almmap-classic-v4",
+		"resync_if_missing_id": "starter-almmap-classic-v6",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-almmap",
@@ -3811,7 +4213,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-almmap-classic-v4",
+				"id": "starter-almmap-classic-v6",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -3831,8 +4233,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		# v6: tear strips pinned near page bottom.
-		"resync_if_missing_id": "starter-pesotear-tear-cutbar-v6",
+		# v8: 50/50 header (Cargado) + tear strips near page bottom.
+		"resync_if_missing_id": "starter-pesotear-tear-cutbar-v8",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-pesotear",
@@ -3840,7 +4242,20 @@ _STARTER_TEMPLATES = [
 			with_map=False,
 			mode="peso_indefinido",
 			layout="tearoff",
-		),
+		)
+		+ [
+			{
+				"id": "starter-pesotear-tear-cutbar-v8",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	# ── Delivery Note · A4 remito (compact Armado header) ───────────────
 	{
@@ -3850,13 +4265,13 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		# v7: Remito full-width under Pedido; strips/footer low; short fletero.
-		"resync_if_missing_id": "starter-dnrem-mat-v7",
+		# v9: 50/50 CLIENTE|Pedido header (Cargado datetime).
+		"resync_if_missing_id": "starter-dnrem-mat-v9",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem", layout="classic")
 		+ [
 			{
-				"id": "starter-dnrem-mat-v7",
+				"id": "starter-dnrem-mat-v9",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -3876,12 +4291,12 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-dnremtear-mat-v7",
+		"resync_if_missing_id": "starter-dnremtear-mat-v9",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnremtear", layout="tearoff")
 		+ [
 			{
-				"id": "starter-dnremtear-mat-v7",
+				"id": "starter-dnremtear-mat-v9",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -3900,7 +4315,7 @@ _STARTER_TEMPLATES = [
 		"paper_kind": "Thermal 80mm",
 		"is_default": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-dnconf-items-v2",
+		"resync_if_missing_id": "starter-dnconf-items-v3",
 		"margin_mm": [4, 4, 4, 4],
 		"elements": [
 			{"id": "starter-dnconf-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "Confirmación de Entrega", "fontSize": 12, "bold": True, "align": "center"},
@@ -3911,7 +4326,7 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-dnconf-date-label", "kind": "text", "x": 4, "y": 40, "width": 30, "height": 5, "staticText": "Fecha", "fontSize": 7, "align": "left"},
 			{"id": "starter-dnconf-date", "kind": "field", "x": 4, "y": 45, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
 			{
-				"id": "starter-dnconf-items-v2",
+				"id": "starter-dnconf-items-v3",
 				"kind": "line-items",
 				"x": 4,
 				"y": 53,
@@ -3919,11 +4334,11 @@ _STARTER_TEMPLATES = [
 				"height": 40,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_name", "label": "Item", "width": 28},
-					{"fieldPath": "qty", "label": "Cant", "width": 12},
-					{"fieldPath": "weight", "label": "Peso", "width": 12},
-					{"fieldPath": "total_weight", "label": "P.tot", "width": 12},
-					{"fieldPath": "amount", "label": "Monto", "width": 14},
+					{"fieldPath": "item_name", "label": "Item", "width": 36},
+					{"fieldPath": "qty", "label": "Cant", "width": 10},
+					{"fieldPath": "weight", "label": "Peso", "width": 10},
+					{"fieldPath": "total_weight", "label": "P.tot", "width": 10},
+					{"fieldPath": "amount", "label": "Monto", "width": 12},
 				],
 			},
 			{"id": "starter-dnconf-tw-label", "kind": "text", "x": 4, "y": 96, "width": 30, "height": 5, "staticText": "Peso total", "fontSize": 7, "align": "left"},
@@ -3956,7 +4371,7 @@ _STARTER_TEMPLATES = [
 		"source_doctype": "Delivery Note",
 		"paper_kind": "Thermal 80mm",
 		"resync": True,
-		"resync_if_missing_id": "starter-dnret-items-v2",
+		"resync_if_missing_id": "starter-dnret-items-v3",
 		"margin_mm": [4, 4, 4, 4],
 		"elements": [
 			{"id": "starter-dnret-title", "kind": "text", "x": 4, "y": 4, "width": 72, "height": 8, "staticText": "Recibo de Devolución", "fontSize": 12, "bold": True, "align": "center"},
@@ -3964,7 +4379,7 @@ _STARTER_TEMPLATES = [
 			{"id": "starter-dnret-customer", "kind": "field", "x": 4, "y": 23, "width": 72, "height": 6, "fieldPath": "customer_name", "label": "Customer", "fontSize": 9, "align": "left"},
 			{"id": "starter-dnret-date", "kind": "field", "x": 4, "y": 31, "width": 72, "height": 6, "fieldPath": "posting_date", "label": "Date", "fontSize": 9, "align": "left"},
 			{
-				"id": "starter-dnret-items-v2",
+				"id": "starter-dnret-items-v3",
 				"kind": "line-items",
 				"x": 4,
 				"y": 41,
@@ -3972,10 +4387,10 @@ _STARTER_TEMPLATES = [
 				"height": 40,
 				"childTableFieldname": "items",
 				"columns": [
-					{"fieldPath": "item_name", "label": "Item", "width": 36},
-					{"fieldPath": "qty", "label": "Cant", "width": 14},
-					{"fieldPath": "weight", "label": "Peso", "width": 14},
-					{"fieldPath": "total_weight", "label": "P.tot", "width": 14},
+					{"fieldPath": "item_name", "label": "Item", "width": 42},
+					{"fieldPath": "qty", "label": "Cant", "width": 12},
+					{"fieldPath": "weight", "label": "Peso", "width": 12},
+					{"fieldPath": "total_weight", "label": "P.tot", "width": 12},
 				],
 			},
 		],

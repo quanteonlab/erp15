@@ -2929,6 +2929,11 @@ def suite_5_12_modules_read():
         out = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "commerce"}})
         settings = (out or {}).get("settings") or {}
         assert (settings.get("catalogDisplay") or {}).get("catalogTemplate") == "commerce", settings.get("catalogDisplay")
+        out_nova = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "nova_mobile"}})
+        settings_nova = (out_nova or {}).get("settings") or {}
+        assert (settings_nova.get("catalogDisplay") or {}).get("catalogTemplate") == "nova_mobile", settings_nova.get(
+            "catalogDisplay"
+        )
         out2 = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "classic"}})
         settings2 = (out2 or {}).get("settings") or {}
         assert (settings2.get("catalogDisplay") or {}).get("catalogTemplate") == "classic"

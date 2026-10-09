@@ -180,7 +180,8 @@ def _normalize_header_preset(val) -> str:
 
 
 def _normalize_catalog_template(val) -> str:
-	if val in ("commerce", "coming_soon", "classic"):
+	# coming_soon kept for legacy saved settings; UI no longer offers it.
+	if val in ("commerce", "nova_mobile", "coming_soon", "classic"):
 		return val
 	return "classic"
 

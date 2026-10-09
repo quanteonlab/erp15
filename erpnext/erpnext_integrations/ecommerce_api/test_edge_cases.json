@@ -905,6 +905,20 @@
       "expect": "ok"
     },
     {
+      "id": "save_shop_ui_catalog_template_nova_mobile",
+      "source": "regression",
+      "bug": "save_shop_ui_settings must keep catalogDisplay.catalogTemplate (nova_mobile); backend used to coerce unknown templates to classic so Settings UI could not switch to Nova Mobile",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {
+        "settings": {
+          "catalogDisplay": {
+            "catalogTemplate": "nova_mobile"
+          }
+        }
+      },
+      "expect": "ok"
+    },
+    {
       "id": "get_catalog_taxonomy_null_lang",
       "source": "regression",
       "bug": "get_catalog_taxonomy with null lang must return groups/brands maps",
