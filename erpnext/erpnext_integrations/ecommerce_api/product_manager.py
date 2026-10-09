@@ -764,10 +764,19 @@ def ensure_product_manager_custom_fields() -> None:
                     "reqd": 0,
                 },
                 {
+                    "fieldname": "custom_is_draft",
+                    "fieldtype": "Check",
+                    "label": "Product Draft",
+                    "insert_after": "custom_review_notes",
+                    "description": "1 = awaiting Review approval (inactive draft). Cleared when activated/approved.",
+                    "default": "0",
+                    "reqd": 0,
+                },
+                {
                     "fieldname": "custom_pos_return_qty",
                     "fieldtype": "Float",
                     "label": "POS Return Qty",
-                    "insert_after": "custom_review_notes",
+                    "insert_after": "custom_is_draft",
                     "description": "Cumulative qty returned via POS Sesiones → Devolver.",
                     "reqd": 0,
                 },
@@ -989,8 +998,20 @@ def get_product_rows(
     if filters.get("active_only"):
         conditions.append("i.disabled = 0")
 
+    if filters.get("draft_only"):
+        # New products awaiting Review approval (disabled + draft flag).
+        if frappe.db.has_column("Item", "custom_is_draft"):
+            conditions.append("IFNULL(i.custom_is_draft, 0) = 1")
+        else:
+            # Pre-migrate sites: fall back to disabled-only so the filter is usable.
+            conditions.append("IFNULL(i.disabled, 0) = 1")
+
     if filters.get("disabled_only"):
-        conditions.append("IFNULL(i.disabled, 0) = 1")
+        # Manually deactivated — exclude drafts so Draft has its own chip.
+        if frappe.db.has_column("Item", "custom_is_draft"):
+            conditions.append("IFNULL(i.disabled, 0) = 1 AND IFNULL(i.custom_is_draft, 0) = 0")
+        else:
+            conditions.append("IFNULL(i.disabled, 0) = 1")
 
     if cint(filters.get("no_image")):
         conditions.append("(i.image IS NULL OR i.image = '')")
@@ -1141,6 +1162,11 @@ def get_product_rows(
         if frappe.db.has_column("Item", "custom_physical_section")
         else "'' AS physical_section"
     )
+    draft_select = (
+        "IFNULL(i.custom_is_draft, 0) AS is_draft"
+        if frappe.db.has_column("Item", "custom_is_draft")
+        else "0 AS is_draft"
+    )
 
     sql = f"""
         SELECT
@@ -1161,6 +1187,7 @@ def get_product_rows(
             {sell_by_select},
             {batch_select},
             {physical_select},
+            {draft_select},
             i.disabled               AS _disabled,
             COALESCE(i.custom_normalized_title, NULL)  AS _raw_norm,
             COALESCE(NULLIF(TRIM(i.custom_normalized_title), ''), i.item_name) AS normalized_title,
@@ -1475,6 +1502,18 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
 
         if "is_active" in changes:
             updates["disabled"] = 0 if cint(changes["is_active"]) else 1
+            # Activating clears draft. Manual deactivate keeps/clears draft flag
+            # unless caller explicitly passes is_draft.
+            if frappe.db.has_column("Item", "custom_is_draft"):
+                if cint(changes["is_active"]):
+                    updates["custom_is_draft"] = 0
+                elif "is_draft" in changes:
+                    updates["custom_is_draft"] = 1 if cint(changes["is_draft"]) else 0
+                else:
+                    # Explicit deactivate of a live product → not a draft.
+                    updates["custom_is_draft"] = 0
+        elif "is_draft" in changes and frappe.db.has_column("Item", "custom_is_draft"):
+            updates["custom_is_draft"] = 1 if cint(changes["is_draft"]) else 0
 
         if "brand" in changes:
             updates["brand"] = _ensure_brand(changes.get("brand") or "")
@@ -1691,6 +1730,14 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
         frappe.throw(_("SKU already exists: {0}").format(candidate_code))
 
     is_active = 1 if cint(activate) else cint(changes.get("is_active") or 0)
+    # Suggestion / Save-without-activate paths create Drafts (inactive + flagged).
+    # Activating (or Save and Activate) clears the draft flag.
+    if "is_draft" in changes:
+        is_draft = 1 if cint(changes.get("is_draft")) else 0
+    else:
+        is_draft = 0 if is_active else 1
+    if is_active:
+        is_draft = 0
     item_group = (changes.get("source_category") or "").strip() or _default_item_group()
     stock_uom = _normalize_stock_uom(changes.get("stock_uom"))
 
@@ -1702,27 +1749,29 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
         frappe.get_doc({"doctype": "Brand", "brand": brand_name}).insert(ignore_permissions=True)
 
     _ensure_pack_columns_nullable()
+    ensure_product_manager_custom_fields()
     pack_qty = _normalize_pack_change_value("pack_qty", changes.get("pack_qty"))
     pack_size = _normalize_pack_change_value("pack_size", changes.get("pack_size"))
     pack_unit = _normalize_pack_change_value("unit", changes.get("unit"))
 
-    item_doc = frappe.get_doc(
-        {
-            "doctype": "Item",
-            "item_code": candidate_code,
-            "item_name": title,
-            "item_group": item_group,
-            "stock_uom": stock_uom,
-            "disabled": 0 if is_active else 1,
-            "brand": brand_name or None,
-            "custom_normalized_title": (changes.get("normalized_title") or "").strip() or None,
-            "custom_pack_qty": pack_qty,
-            "custom_pack_size": pack_size,
-            "custom_pack_unit": pack_unit,
-            "custom_review_notes": (changes.get("review_notes") or "").strip() or None,
-            "image": (changes.get("image") or "").strip() or None,
-        }
-    )
+    item_payload = {
+        "doctype": "Item",
+        "item_code": candidate_code,
+        "item_name": title,
+        "item_group": item_group,
+        "stock_uom": stock_uom,
+        "disabled": 0 if is_active else 1,
+        "brand": brand_name or None,
+        "custom_normalized_title": (changes.get("normalized_title") or "").strip() or None,
+        "custom_pack_qty": pack_qty,
+        "custom_pack_size": pack_size,
+        "custom_pack_unit": pack_unit,
+        "custom_review_notes": (changes.get("review_notes") or "").strip() or None,
+        "image": (changes.get("image") or "").strip() or None,
+    }
+    if frappe.db.has_column("Item", "custom_is_draft"):
+        item_payload["custom_is_draft"] = 1 if is_draft else 0
+    item_doc = frappe.get_doc(item_payload)
 
     if "unit_sku" in changes:
         if not _ensure_unit_sku_column():
@@ -1778,6 +1827,7 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
         ("source_category", None, item_group),
         ("stock_uom", None, stock_uom),
         ("is_active", None, 1 if is_active else 0),
+        ("is_draft", None, 1 if is_draft else 0),
     ]
     if brand_name:
         create_history.append(("brand", None, brand_name))
@@ -1877,10 +1927,16 @@ def set_active_bulk(item_codes, is_active):
         item_codes = json.loads(item_codes)
 
     disabled_val = 0 if cint(is_active) else 1
+    clear_draft = cint(is_active) == 1
+    has_draft = frappe.db.has_column("Item", "custom_is_draft")
     frappe.flags.ignore_permissions = True
     try:
         for code in item_codes:
-            frappe.db.set_value("Item", code, "disabled", disabled_val)
+            vals = {"disabled": disabled_val}
+            if has_draft:
+                # Activate clears draft; deactivate of a live product is not a draft.
+                vals["custom_is_draft"] = 0 if clear_draft else 0
+            frappe.db.set_value("Item", code, vals)
         frappe.db.commit()
     finally:
         frappe.flags.ignore_permissions = False

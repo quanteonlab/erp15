@@ -11,20 +11,20 @@
  ],
  "fields": [
   {
-   "default": "Item",
+   "default": "Tag",
    "fieldname": "link_doctype",
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Link DocType",
-   "options": "Item\nEmployee\nSupplier\nCustomer\nAsset",
+   "options": "Tag\nItem\nEmployee\nSupplier\nCustomer\nAsset\nPurchase Invoice\nPayment Entry\nJournal Entry\nPurchase Order",
    "reqd": 1
   },
   {
+   "description": "ERP name when found, or free-text metatag when not in ERP",
    "fieldname": "link_name",
-   "fieldtype": "Dynamic Link",
+   "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Link Name",
-   "options": "link_doctype",
    "reqd": 1
   },
   {

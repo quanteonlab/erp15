@@ -132,6 +132,19 @@ CHILD_ROW_STRIP = {
 
 FILTER_OPS = {"=", "!=", "like", "not like", "in", "not in", ">", "<", ">=", "<=", "between"}
 
+# DocTypes whose writes must go through a domain workflow (generic create /
+# update would skip its rules) → the workflow to use instead.
+WORKFLOW_ONLY_DOCTYPES = {"Company Archive Entry": "classify_document"}
+
+
+def _require_generic_write(doctype: str) -> None:
+	workflow = WORKFLOW_ONLY_DOCTYPES.get(doctype)
+	if workflow:
+		frappe.throw(
+			_("{0} is edited only through run_workflow('{1}')").format(doctype, workflow),
+			frappe.PermissionError,
+		)
+
 
 def _parse_json(raw, default):
 	if raw is None or raw == "":
@@ -894,6 +907,140 @@ def mcp_get_print_pdf(mcp_token=None, doctype=None, name=None, print_format=None
 	return _impl(mcp_token, doctype, name, print_format)
 
 
+ARCHIVE_DOCTYPE = "Company Archive Entry"
+TRIAGE_MAX_FILES = 5
+TRIAGE_MAX_INLINE_BYTES = 5 * 1024 * 1024
+TRIAGE_MAX_TEXT_CHARS = 20000
+TRIAGE_MAX_PDF_PAGES = 30
+
+
+def _archivo_kinds_for_triage() -> list[dict]:
+	from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+	return [
+		{"code": k["code"], "label_es": k["label_es"], "label_en": k["label_en"], "sync_template": k["sync_template"]}
+		for k in archivo_api.list_archivo_kinds().get("kinds") or []
+		if k.get("code") != archivo_api.INBOX_KIND
+	]
+
+
+@frappe.whitelist()
+def mcp_list_document_inbox(mcp_token=None, status=None, limit=20, start=0):
+	"""Documentos review inbox: ``queue`` (uploaded, unsorted), ``drafts``
+	(classified, awaiting a person) or ``all``. Oldest first."""
+
+	@_guard("document_inbox", doctype=ARCHIVE_DOCTYPE, payload=lambda: {"status": status})
+	def _impl(mcp_token, status, limit, start):
+		from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+		ctx = _ctx(mcp_token)
+		frappe.local._mcp_ctx = ctx
+		_can_view(_matrix(), ARCHIVE_DOCTYPE)
+		out = archivo_api.list_archivo_inbox(
+			status=status, limit=max(1, min(int(limit or 20), MAX_PAGE_LENGTH)), start=start
+		)
+		keep = (
+			"name", "title", "kind", "inbox_status", "workflow_status", "posting_date", "party_type",
+			"party", "amount", "currency", "attachment_count", "notes", "owner", "creation",
+		)
+		return {
+			"rows": [{k: r.get(k) for k in keep} for r in out["rows"]],
+			"total": out["total"],
+			"counts": out["counts"],
+			"kinds": _archivo_kinds_for_triage(),
+			"hint": "get_document_for_triage(name) → read the files → run_workflow('classify_document', …)",
+		}
+
+	return _impl(mcp_token, status, limit, start)
+
+
+def _pdf_text(content: bytes) -> tuple[str, int]:
+	import io
+
+	from pypdf import PdfReader
+
+	reader = PdfReader(io.BytesIO(content))
+	parts = []
+	for page in reader.pages[:TRIAGE_MAX_PDF_PAGES]:
+		try:
+			parts.append(page.extract_text() or "")
+		except Exception:
+			parts.append("")
+	return "\n\n".join(parts).strip(), len(reader.pages)
+
+
+def _triage_file(row) -> dict:
+	"""File metadata + extracted text, and the raw bytes for images/PDFs the
+	assistant can read itself (scans have no text layer)."""
+	import base64
+	import mimetypes
+
+	mime = mimetypes.guess_type(row.file_name or row.file_url or "")[0] or "application/octet-stream"
+	info = {"file_name": row.file_name, "file_url": row.file_url, "mime_type": mime}
+	try:
+		frappe.flags.ignore_permissions = True
+		content = frappe.get_doc("File", row.name).get_content()
+	except Exception as e:
+		return {**info, "error": f"could not read file: {e}"}
+	finally:
+		frappe.flags.ignore_permissions = False
+	if isinstance(content, str):
+		content = content.encode()
+	info["size_bytes"] = len(content)
+	if mime == "application/pdf":
+		try:
+			text, pages = _pdf_text(content)
+			info["pages"] = pages
+			info["text"] = text[:TRIAGE_MAX_TEXT_CHARS]
+			info["text_truncated"] = len(text) > TRIAGE_MAX_TEXT_CHARS
+		except Exception as e:
+			info["text_error"] = str(e)[:200]
+	elif mime.startswith("text/"):
+		text = content.decode("utf-8", errors="replace")
+		info["text"] = text[:TRIAGE_MAX_TEXT_CHARS]
+		info["text_truncated"] = len(text) > TRIAGE_MAX_TEXT_CHARS
+	if (mime.startswith("image/") or mime == "application/pdf") and len(content) <= TRIAGE_MAX_INLINE_BYTES:
+		info["content_base64"] = base64.b64encode(content).decode()
+	elif mime.startswith("image/") or mime == "application/pdf":
+		info["content_omitted"] = f"larger than {TRIAGE_MAX_INLINE_BYTES // (1024 * 1024)} MB"
+	return info
+
+
+@frappe.whitelist()
+def mcp_get_document_for_triage(mcp_token=None, name=None):
+	"""One Documentos row + its files (PDF text, image/PDF bytes) + the kinds
+	it can be classified as."""
+
+	@_guard("document_triage", doctype=ARCHIVE_DOCTYPE, name=lambda: name)
+	def _impl(mcp_token, name):
+		from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+		ctx = _ctx(mcp_token)
+		frappe.local._mcp_ctx = ctx
+		_can_view(_matrix(), ARCHIVE_DOCTYPE)
+		name = cstr(name).strip()
+		if not name or not frappe.db.exists(ARCHIVE_DOCTYPE, name):
+			frappe.throw(_("{0} {1} not found").format(ARCHIVE_DOCTYPE, name), frappe.DoesNotExistError)
+		entry = archivo_api.get_archivo_entry(name)
+		files = frappe.get_all(
+			"File",
+			filters={"attached_to_doctype": ARCHIVE_DOCTYPE, "attached_to_name": name},
+			fields=["name", "file_name", "file_url"],
+			order_by="creation asc",
+			limit_page_length=TRIAGE_MAX_FILES,
+			ignore_permissions=True,
+		)
+		return {
+			"entry": _sanitize_output(_json_safe(entry)),
+			"inbox_status": "queue" if entry.get("kind") == archivo_api.INBOX_KIND else entry.get("workflow_status"),
+			"files": [_triage_file(f) for f in files],
+			"kinds": _archivo_kinds_for_triage(),
+			"classify_fields": list(archivo_api.CLASSIFY_FIELDS),
+		}
+
+	return _impl(mcp_token, name)
+
+
 # ---------------------------------------------------------------------------
 # Writes (preview → confirm)
 # ---------------------------------------------------------------------------
@@ -928,6 +1075,7 @@ def mcp_update_record(mcp_token=None, doctype=None, name=None, fields=None, conf
 		if not doctype or not name:
 			frappe.throw(_("doctype and name are required"))
 		_can_edit(_matrix(), doctype)
+		_require_generic_write(doctype)
 		changes = _validate_fields(doctype, _parse_json(fields, fields), for_create=False)
 		doc = _load_doc_for_edit(doctype, name)
 		diff = [
@@ -977,6 +1125,7 @@ def mcp_create_record(mcp_token=None, doctype=None, fields=None, confirm=0, prev
 		if not doctype:
 			frappe.throw(_("doctype is required"))
 		_can_edit(_matrix(), doctype)
+		_require_generic_write(doctype)
 		changes = _validate_fields(doctype, _parse_json(fields, fields), for_create=True)
 		signed = {"op": "create", "doctype": doctype, "fields": changes}
 		if not cint_confirm(confirm):
@@ -1034,8 +1183,47 @@ _ORDER_LINE_SCHEMA = {
 }
 
 
+_CLASSIFY_SCHEMA = {
+	"type": "object",
+	"properties": {
+		"name": {"type": "string", "description": "Documentos row (ARCH-…)"},
+		"kind": {"type": "string", "description": "A code from kinds (required for queue rows)"},
+		"title": {"type": "string"},
+		"posting_date": {"type": "string", "description": "YYYY-MM-DD (document date)"},
+		"due_date": {"type": "string"},
+		"valid_from": {"type": "string"},
+		"valid_to": {"type": "string"},
+		"amount": {"type": "number"},
+		"currency": {"type": "string"},
+		"party_type": {"type": "string", "enum": ["Supplier", "Employee", "Other"]},
+		"party": {"type": "string"},
+		"payment_reference": {"type": "string", "description": "Invoice / receipt number"},
+		"payment_method": {"type": "string", "enum": ["cash", "transfer", "card", "mp", "other"]},
+		"notes": {"type": "string"},
+		"related_refs": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {"link_doctype": {"type": "string"}, "link_name": {"type": "string"}},
+			},
+		},
+	},
+	"required": ["name"],
+}
+
+
 def _workflow_catalog() -> list[dict]:
 	return [
+		{
+			"name": "classify_document",
+			"doctype": ARCHIVE_DOCTYPE,
+			"description": (
+				"Classify a Documentos inbox row (queue or draft): kind, title, dates, amount, party, "
+				"reference, notes, related tags. The row always stays a DRAFT — a person confirms it in "
+				"Revisar → Documentos; nothing is paid or posted (Contabilizar) from here."
+			),
+			"args_schema": _CLASSIFY_SCHEMA,
+		},
 		{
 			"name": "create_order",
 			"doctype": "Sales Order",
@@ -1288,6 +1476,30 @@ def _workflow_preview(name: str, args: dict) -> tuple[list[str], dict | None]:
 			"from_total": flt(so.grand_total),
 			"to_total_before_discount": total,
 		}
+	if name == "classify_document":
+		from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+		changes = {k: v for k, v in args.items() if k != "name"}
+		try:
+			archivo_api.validate_archivo_classification(args.get("name"), changes)
+		except frappe.DoesNotExistError:
+			raise
+		except Exception as e:
+			return [cstr(e)], None
+		current = archivo_api.get_archivo_entry(args.get("name"))
+		diff = [
+			{"field": k, "from": _json_safe(current.get(k)), "to": _json_safe(v)}
+			for k, v in changes.items()
+			if _json_safe(current.get(k)) != _json_safe(v)
+		]
+		if current.get("workflow_status") != "draft":
+			diff.append({"field": "workflow_status", "from": current.get("workflow_status"), "to": "draft"})
+		return [], {
+			"document": args.get("name"),
+			"title": current.get("title"),
+			"changes": diff,
+			"after_apply": "Stays a draft (Borrador) until a person confirms it in Revisar → Documentos.",
+		}
 	return _workflow_preview_issues(name, args), None
 
 
@@ -1313,6 +1525,10 @@ def _workflow_preview_issues(name: str, args: dict) -> list[str]:
 
 
 def _run_workflow(name: str, args: dict):
+	if name == "classify_document":
+		from erpnext.erpnext_integrations.ecommerce_api.archivo_api import classify_archivo_entry
+
+		return classify_archivo_entry(args.get("name"), {k: v for k, v in args.items() if k != "name"})
 	if name == "create_order":
 		from erpnext.erpnext_integrations.ecommerce_api.api import create_guest_preorder
 

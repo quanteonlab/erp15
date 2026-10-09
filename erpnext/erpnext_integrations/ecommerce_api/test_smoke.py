@@ -1368,6 +1368,22 @@ def suite_5_10_product_manager():
         sku = out["item_code"]
         stock_uom = frappe.db.get_value("Item", sku, "stock_uom")
         assert stock_uom == "Nos", f"expected Nos, got {stock_uom!r}"
+        # Save-without-activate / suggestion create → Draft (inactive + flagged).
+        pm.ensure_product_manager_custom_fields()
+        if frappe.db.has_column("Item", "custom_is_draft"):
+            disabled, is_draft = frappe.db.get_value(
+                "Item", sku, ["disabled", "custom_is_draft"]
+            )
+            assert cint(disabled) == 1 and cint(is_draft) == 1, (
+                f"expected draft Item, got disabled={disabled} is_draft={is_draft}"
+            )
+            draft_rows = pm.get_product_rows(
+                filters={"draft_only": 1, "item_codes": [sku]}, page=1, page_length=5
+            )
+            rows = (draft_rows or {}).get("rows") or []
+            assert any(r.get("client_sku") == sku for r in rows), (
+                f"draft_only filter missed {sku}: {draft_rows}"
+            )
         frappe.delete_doc("Item", sku, ignore_permissions=True, force=True)
 
     def check_accounting_constants_starter():
@@ -3818,6 +3834,52 @@ def suite_5_18_archivo():
         codes = {k["code"] for k in out.get("kinds") or []}
         assert "smoke_permiso" in codes, codes
 
+    def check_inbox_enqueue_classify_confirm():
+        """i051: Enqueue Bulk → queue (hidden from Documentos) → classify (draft) → confirm."""
+        import base64
+
+        pdf = base64.b64encode(b"%PDF-1.4 SMOKE i051").decode()
+        out = aa.enqueue_archivo_bulk(
+            files=[
+                {"file_name": "SMOKE factura luz.pdf", "content_b64": pdf},
+                {"file_name": "SMOKE broken.pdf", "content_b64": ""},
+            ]
+        )
+        assert len(out["created"]) == 1 and len(out["errors"]) == 1, out
+        assert out["errors"][0]["file_name"] == "SMOKE broken.pdf", out
+        name = out["created"][0]["name"]
+        created.append(name)
+        row = aa.get_archivo_entry(name)
+        assert row["kind"] == aa.INBOX_KIND and row["workflow_status"] == "pending_review", row
+        assert row["title"] == "SMOKE factura luz" and row["attachment_count"] == 1, row
+
+        queue = {r["name"] for r in aa.list_archivo_inbox(status="queue", limit=500)["rows"]}
+        assert name in queue, "enqueued row missing from the queue"
+        default = {r["name"] for r in aa.list_archivo_entries(search="SMOKE", limit=200)["rows"]}
+        assert name not in default, "queue rows must be hidden from the default Documentos list"
+
+        bad = aa.confirm_archivo_entries(names=[name])
+        assert not bad["confirmed"] and "Classify" in bad["errors"][0]["error"], bad
+
+        aa.classify_archivo_entry(name, {"kind": "utility_bill", "amount": 4321, "party": "SMOKE Edenor"})
+        row = aa.get_archivo_entry(name)
+        assert row["kind"] == "utility_bill" and row["workflow_status"] == "draft", row
+        assert row["sync_template"] == "payable" and flt(row["amount"]) == 4321, row
+        drafts = {r["name"] for r in aa.list_archivo_inbox(status="drafts", limit=500)["rows"]}
+        assert name in drafts
+        assert name not in {r["name"] for r in aa.list_archivo_entries(search="SMOKE", limit=200)["rows"]}
+        assert name in {r["name"] for r in aa.list_archivo_entries(search="SMOKE", view="drafts", limit=200)["rows"]}
+
+        ok = aa.confirm_archivo_entries(names=[name])
+        assert ok["confirmed"] and ok["confirmed"][0]["workflow_status"] == "to_pay", ok
+        assert name in {r["name"] for r in aa.list_archivo_entries(search="SMOKE", limit=200)["rows"]}
+        # Confirmed rows are out of the inbox; the assistant can no longer reclassify them.
+        try:
+            aa.classify_archivo_entry(name, {"kind": "rent"})
+            raise AssertionError("classify must refuse a confirmed row")
+        except frappe.ValidationError:
+            pass
+
     def cleanup_archivo():
         for name in created:
             if frappe.db.exists("Company Archive Entry", name):
@@ -3828,6 +3890,7 @@ def suite_5_18_archivo():
         _run("5.18.1 list_archivo_kinds", check_kinds, "S2")
         _run("5.18.2 create paper + expense + list/agg", check_create_paper_and_expense, "S2")
         _run("5.18.3 save custom kind", check_custom_kind, "S3")
+        _run("5.18.4 enqueue bulk → queue → classify → confirm (i051)", check_inbox_enqueue_classify_confirm, "S2")
     finally:
         cleanup_archivo()
 

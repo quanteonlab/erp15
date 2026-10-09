@@ -1447,6 +1447,24 @@
       "expect": "ok"
     },
     {
+      "id": "get_product_rows_draft_only_null_filters",
+      "source": "regression",
+      "bug": "draft_only filter (suggestion/recepción create-as-Draft) must not 500 on dirty filters",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_product_rows",
+      "args": {
+        "filters": {
+          "draft_only": 1,
+          "search": null,
+          "item_codes": null
+        },
+        "page": 1,
+        "page_length": 5,
+        "price_list": null,
+        "warehouse": ""
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_claim_orders_null_pin_empty_lists",
       "source": "regression",
       "bug": "claim_orders_to_trip with null pin and empty lists must not 500",
@@ -5210,6 +5228,40 @@
       "bug": "list_archivo_entries dirty filters must not 500"
     },
     {
+      "id": "list_archivo_entries_only_archived",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.list_archivo_entries",
+      "args": {
+        "only_archived": 1,
+        "include_archived": null,
+        "limit": 10
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "only_archived / include_archived filters must not 500"
+    },
+    {
+      "id": "set_archivo_archived_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.set_archivo_archived",
+      "args": {
+        "name": null,
+        "archived": 1
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "set_archivo_archived null name controlled error"
+    },
+    {
+      "id": "mark_archivo_paid_null_paid_amount",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.mark_archivo_paid",
+      "args": {
+        "name": null,
+        "paid_amount": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "mark_archivo_paid null name/paid_amount controlled error"
+    },
+    {
       "id": "get_archivo_entry_null_name",
       "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.get_archivo_entry",
       "args": {
@@ -5252,6 +5304,56 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "link_archivo_voucher nulls controlled"
+    },
+    {
+      "id": "search_archivo_link_targets_null_doctype",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.search_archivo_link_targets",
+      "args": {
+        "doctype": null,
+        "search_term": "",
+        "page_length": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "search_archivo_link_targets null doctype must controlled error not TypeError"
+    },
+    {
+      "id": "create_archivo_entry_free_text_tag_ref",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.create_archivo_entry",
+      "args": {
+        "title": "__edge_archivo_tag__",
+        "kind": "other_document",
+        "related_refs": [
+          { "link_doctype": "Tag", "link_name": "contrato papel kiosco" },
+          { "link_doctype": "Employee", "link_name": "not-a-real-employee" }
+        ]
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "related_refs accept free-text Tag and non-existent Employee as Data metatags"
+    },
+    {
+      "id": "search_archivo_link_targets_employee_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.search_archivo_link_targets",
+      "args": {
+        "doctype": "Employee",
+        "search_term": "",
+        "page_length": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_archivo_link_targets Employee empty term returns rows"
+    },
+    {
+      "id": "search_archivo_link_targets_bad_doctype",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.search_archivo_link_targets",
+      "args": {
+        "doctype": "Sales Invoice",
+        "search_term": "x"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "search_archivo_link_targets unsupported doctype controlled"
     },
     {
       "id": "get_archivo_aggregates_null_dates",
@@ -5336,6 +5438,91 @@
       "expect": "ok",
       "source": "regression",
       "bug": "Non-JSON item_codes / price_lists strings crashed with JSONDecodeError; now read as a comma list"
+    },
+    {
+      "id": "enqueue_archivo_bulk_null_files",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.enqueue_archivo_bulk",
+      "args": {
+        "files": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Null files list is a controlled ValidationError (i051 Enqueue Bulk)"
+    },
+    {
+      "id": "enqueue_archivo_bulk_dirty_items",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.enqueue_archivo_bulk",
+      "args": {
+        "files": "[\"not-an-object\", {\"file_name\": null, \"content_b64\": \"%%%\"}]"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Bad items are reported per file in errors[]; nothing is created and nothing 500s"
+    },
+    {
+      "id": "list_archivo_inbox_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.list_archivo_inbox",
+      "args": {
+        "status": "undefined",
+        "limit": null,
+        "start": "x"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Dirty inbox filters fall back to the queue view"
+    },
+    {
+      "id": "confirm_archivo_entries_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.confirm_archivo_entries",
+      "args": {
+        "names": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Null names is a controlled ValidationError"
+    },
+    {
+      "id": "confirm_archivo_entries_unknown",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.confirm_archivo_entries",
+      "args": {
+        "names": "[\"ARCH-NOPE\", null]"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Unknown names are per-row errors, not a crash"
+    },
+    {
+      "id": "list_archivo_entries_dirty_view",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.list_archivo_entries",
+      "args": {
+        "view": "weird",
+        "limit": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Unknown view falls back to the default (drafts + queue hidden)"
+    },
+    {
+      "id": "mcp_list_document_inbox_null_token",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_list_document_inbox",
+      "args": {
+        "mcp_token": null,
+        "status": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Auth before touching the Documentos inbox"
+    },
+    {
+      "id": "mcp_get_document_for_triage_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_get_document_for_triage",
+      "args": {
+        "mcp_token": "mcp_x_y",
+        "name": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "Bad token rejected before reading any file"
     }
   ]
 }

@@ -391,6 +391,54 @@ def run():
 
 		check("get_print_pdf renders a real PDF; non-matrix doctype refused", in_request(print_pdf))
 
+		def document_triage():
+			import base64
+
+			from frappe.utils.pdf import get_pdf
+
+			from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+			pdf = get_pdf("<p>Factura Edenor N 0001-123 Total $ 4321</p>")
+			out = archivo_api.enqueue_archivo_bulk(
+				files=[{"file_name": f"{PROBE_TAG} factura.pdf", "content_b64": base64.b64encode(pdf).decode()}]
+			)
+			name = out["created"][0]["name"]
+			created.append(("Company Archive Entry", name))
+
+			inbox = mcp_api.mcp_list_document_inbox(token, "queue", 100)
+			assert name in {r["name"] for r in inbox["rows"]}, inbox["counts"]
+			assert inbox["kinds"] and all(k["code"] != archivo_api.INBOX_KIND for k in inbox["kinds"])
+
+			tri = mcp_api.mcp_get_document_for_triage(token, name)
+			f = tri["files"][0]
+			assert f["mime_type"] == "application/pdf" and "4321" in f.get("text", ""), f.get("text")
+			assert base64.b64decode(f["content_base64"])[:5] == b"%PDF-"
+			assert tri["inbox_status"] == "queue"
+
+			# Generic writes cannot bypass the draft rule.
+			msg = _expect_raise(frappe.PermissionError, mcp_api.mcp_update_record, token, "Company Archive Entry", name, {"title": "x"}, 0)
+			assert "classify_document" in msg, msg
+
+			bad = mcp_api.mcp_run_workflow(token, "classify_document", {"name": name, "title": "x"}, 0)
+			assert bad["issues"] and not bad.get("preview_id"), bad
+			args = {"name": name, "kind": "utility_bill", "amount": 4321, "party": "Edenor", "payment_reference": "0001-123"}
+			pv = mcp_api.mcp_run_workflow(token, "classify_document", args, 0)
+			fields = {c["field"]: c["to"] for c in pv["details"]["changes"]}
+			assert fields["kind"] == "utility_bill" and fields["workflow_status"] == "draft", pv["details"]
+			assert frappe.db.get_value("Company Archive Entry", name, "kind") == archivo_api.INBOX_KIND, "preview wrote"
+			mcp_api.mcp_run_workflow(token, "classify_document", args, 1, preview_id=pv["preview_id"])
+			row = frappe.db.get_value("Company Archive Entry", name, ["kind", "workflow_status", "amount", "erp_sync_status"], as_dict=True)
+			assert row.kind == "utility_bill" and row.workflow_status == "draft", row
+			assert flt(row.amount) == 4321 and row.erp_sync_status == "local_only", row
+
+			_set_matrix({"Company Archive Entry": {"view": 0, "edit": 0}})
+			try:
+				_expect_raise(frappe.PermissionError, mcp_api.mcp_list_document_inbox, token)
+			finally:
+				_set_matrix({})
+
+		check("documents: inbox → triage (PDF text) → classify stays draft; generic edit refused", document_triage)
+
 		def rotate_revokes():
 			fresh = keys.rotate_mcp_link()
 			key_ids.add(fresh["key_id"])

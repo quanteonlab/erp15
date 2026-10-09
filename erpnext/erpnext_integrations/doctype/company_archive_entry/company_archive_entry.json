@@ -22,6 +22,7 @@
   "party",
   "section_money",
   "amount",
+  "amount_paid",
   "currency",
   "column_break_3",
   "payment_method",
@@ -29,6 +30,7 @@
   "payment_reference",
   "expense_account",
   "paid_from_account",
+  "is_archived",
   "section_links",
   "linked_purchase_invoice",
   "linked_payment_entry",
@@ -158,10 +160,22 @@
    "label": "Amount"
   },
   {
+   "default": "0",
+   "fieldname": "amount_paid",
+   "fieldtype": "Currency",
+   "label": "Amount Paid"
+  },
+  {
    "fieldname": "currency",
    "fieldtype": "Link",
    "label": "Currency",
    "options": "Currency"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_archived",
+   "fieldtype": "Check",
+   "label": "Archived"
   },
   {
    "fieldname": "column_break_3",

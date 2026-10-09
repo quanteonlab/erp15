@@ -22,7 +22,29 @@ KINDS_SCOPE = "archivo.kinds"
 
 SYNC_TEMPLATES = frozenset({"payable", "cash_out", "paper", "none"})
 PARTY_TYPES = frozenset({"", "Supplier", "Employee", "Other"})
-RELATED_DOCTYPES = frozenset({"Item", "Employee", "Supplier", "Customer", "Asset"})
+RELATED_DOCTYPES = frozenset(
+	{
+		"Tag",
+		"Item",
+		"Employee",
+		"Supplier",
+		"Customer",
+		"Asset",
+		"Purchase Invoice",
+		"Payment Entry",
+		"Journal Entry",
+		"Purchase Order",
+	}
+)
+# Soft related_refs may also harden these Contabilizar link fields when the name exists in ERP.
+VOUCHER_LINK_FIELDS = {
+	"Purchase Invoice": "linked_purchase_invoice",
+	"Payment Entry": "linked_payment_entry",
+	"Journal Entry": "linked_journal_entry",
+	"Asset": "linked_asset",
+	"Purchase Order": "linked_purchase_order",
+	"Employee": "linked_employee",
+}
 
 WORKFLOW_MONEY = frozenset(
 	{
@@ -62,7 +84,17 @@ SYSTEM_KINDS = [
 	{"code": "insurance_doc", "label_es": "Póliza / seguro", "label_en": "Insurance doc", "sync_template": "paper"},
 	{"code": "permit_license", "label_es": "Permiso / habilitación", "label_en": "Permit / license", "sync_template": "paper"},
 	{"code": "other_document", "label_es": "Otro documento", "label_en": "Other document", "sync_template": "paper"},
+	# i051 — Enqueue Bulk lands here until a person or the MCP assistant classifies it.
+	{"code": "inbox_unsorted", "label_es": "Sin clasificar (cola)", "label_en": "Unsorted (queue)", "sync_template": "none"},
 ]
+
+# i051 — Documentos inbox. Queue = enqueued files nobody classified yet;
+# drafts = classified (often by the MCP assistant) but not confirmed by a person.
+# Both are hidden from the default Documentos list and reviewed in Revisar → Documentos.
+INBOX_KIND = "inbox_unsorted"
+ENQUEUE_MAX_FILES = 20
+ENQUEUE_MAX_FILE_MB = 32
+LIST_VIEWS = frozenset({"", "drafts", "queue", "all"})
 
 _KIND_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 
@@ -198,16 +230,36 @@ def _normalize_related_refs(raw) -> list[dict]:
 	for row in rows:
 		if not isinstance(row, dict):
 			continue
-		dt = _as_str(row.get("link_doctype"))
+		dt = _as_str(row.get("link_doctype")) or "Tag"
 		nm = _as_str(row.get("link_name"))
-		if dt not in RELATED_DOCTYPES or not nm:
+		if not nm:
 			continue
+		# Unknown types collapse to free-text Tag (metatag).
+		if dt not in RELATED_DOCTYPES:
+			dt = "Tag"
 		key = (dt, nm)
 		if key in seen:
 			continue
 		seen.add(key)
 		out.append({"link_doctype": dt, "link_name": nm, "note": _as_str(row.get("note"))[:140]})
 	return out
+
+
+def _sync_hard_links_from_related(doc) -> None:
+	"""Mirror related_refs → linked_* only when the target DocType row exists."""
+	refs = []
+	for r in doc.get("related_refs") or []:
+		dt = r.link_doctype if hasattr(r, "link_doctype") else r.get("link_doctype")
+		nm = r.link_name if hasattr(r, "link_name") else r.get("link_name")
+		refs.append((_as_str(dt), _as_str(nm)))
+	for vt, field in VOUCHER_LINK_FIELDS.items():
+		match = None
+		for dt, nm in refs:
+			if dt == vt and nm and frappe.db.exists(vt, nm):
+				match = nm
+		setattr(doc, field, match)
+	# Soft free-text Employee tags must not leave a stale hard link when nothing matches.
+	# (setattr above already clears when match is None.)
 
 
 def _attachment_count(name: str) -> int:
@@ -235,6 +287,14 @@ def _row_dict(doc) -> dict:
 					"note": r.note if hasattr(r, "note") else r.get("note"),
 				}
 			)
+	# Surface legacy hard links that were never mirrored into related_refs.
+	seen = {( _as_str(r.get("link_doctype")), _as_str(r.get("link_name")) ) for r in related}
+	for vt, field in VOUCHER_LINK_FIELDS.items():
+		vn = getattr(doc, field, None) or (doc.get(field) if hasattr(doc, "get") else None)
+		vn = _as_str(vn)
+		if vn and (vt, vn) not in seen:
+			related.append({"link_doctype": vt, "link_name": vn, "note": None})
+			seen.add((vt, vn))
 	amt = doc.amount if hasattr(doc, "amount") else doc.get("amount")
 	return {
 		"name": name,
@@ -250,7 +310,18 @@ def _row_dict(doc) -> dict:
 		"party_type": doc.party_type if hasattr(doc, "party_type") else doc.get("party_type"),
 		"party": doc.party if hasattr(doc, "party") else doc.get("party"),
 		"amount": flt(amt) if amt not in (None, "") else None,
+		"amount_paid": flt(
+			getattr(doc, "amount_paid", None)
+			if hasattr(doc, "amount_paid")
+			else (doc.get("amount_paid") if hasattr(doc, "get") else None)
+		)
+		or 0,
 		"currency": doc.currency if hasattr(doc, "currency") else doc.get("currency"),
+		"is_archived": cint(
+			getattr(doc, "is_archived", None)
+			if hasattr(doc, "is_archived")
+			else (doc.get("is_archived") if hasattr(doc, "get") else 0)
+		),
 		"payment_method": doc.payment_method if hasattr(doc, "payment_method") else doc.get("payment_method"),
 		"mode_of_payment": doc.mode_of_payment if hasattr(doc, "mode_of_payment") else doc.get("mode_of_payment"),
 		"payment_reference": doc.payment_reference if hasattr(doc, "payment_reference") else doc.get("payment_reference"),
@@ -269,7 +340,21 @@ def _row_dict(doc) -> dict:
 		"sync_error_message": getattr(doc, "sync_error_message", None),
 		"related_refs": related,
 		"attachment_count": _attachment_count(name) if name else 0,
-		"modified": str(getattr(doc, "modified", "") or ""),
+		"modified": str(
+			getattr(doc, "modified", None)
+			or (doc.get("modified") if hasattr(doc, "get") else None)
+			or ""
+		),
+		"modified_by": getattr(doc, "modified_by", None)
+		or (doc.get("modified_by") if hasattr(doc, "get") else None),
+		"owner": getattr(doc, "owner", None)
+		or (doc.get("owner") if hasattr(doc, "get") else None),
+		"creation": str(
+			getattr(doc, "creation", None)
+			or (doc.get("creation") if hasattr(doc, "get") else None)
+			or ""
+		)
+		or None,
 	}
 
 
@@ -432,10 +517,21 @@ def list_archivo_entries(
 	has_amount=None,
 	related_doctype=None,
 	related_name=None,
+	include_archived=None,
+	only_archived=None,
 	limit=100,
 	start=0,
+	view=None,
 ):
-	"""List Archivo rows with filters."""
+	"""List Archivo rows with filters.
+
+	By default archived rows are hidden. Pass ``only_archived=1`` for the archive
+	view, or ``include_archived=1`` to mix active + archived.
+
+	``view`` (i051): default hides drafts and the unsorted queue — those are
+	reviewed in Revisar → Documentos. ``drafts`` / ``queue`` show only those,
+	``all`` shows everything. An explicit ``workflow_status`` / ``kind`` wins.
+	"""
 	_require_app_permission()
 	_require_doctype()
 	try:
@@ -460,6 +556,22 @@ def list_archivo_entries(
 	es = _as_str(erp_sync_status)
 	if es:
 		filters["erp_sync_status"] = es
+	if cint(only_archived):
+		filters["is_archived"] = 1
+	elif not cint(include_archived):
+		filters["is_archived"] = 0
+
+	view = _as_str(view).lower()
+	if view not in LIST_VIEWS:
+		view = ""
+	if view == "drafts":
+		filters.setdefault("workflow_status", "draft")
+		filters.setdefault("kind", ["!=", INBOX_KIND])
+	elif view == "queue":
+		filters["kind"] = INBOX_KIND
+	elif view == "":
+		filters.setdefault("workflow_status", ["!=", "draft"])
+		filters.setdefault("kind", ["!=", INBOX_KIND])
 
 	fd = _as_str(from_date)
 	td = _as_str(to_date)
@@ -494,7 +606,9 @@ def list_archivo_entries(
 			"party_type",
 			"party",
 			"amount",
+			"amount_paid",
 			"currency",
+			"is_archived",
 			"payment_method",
 			"payment_reference",
 			"linked_purchase_invoice",
@@ -507,6 +621,9 @@ def list_archivo_entries(
 			"notes",
 			"sync_error_message",
 			"modified",
+			"modified_by",
+			"owner",
+			"creation",
 		],
 		order_by="posting_date desc, modified desc",
 		limit_start=st,
@@ -672,6 +789,9 @@ def create_archivo_entry(
 			"related_refs": _normalize_related_refs(related_refs),
 		}
 	)
+	_sync_hard_links_from_related(doc)
+	if any(getattr(doc, f, None) for f in VOUCHER_LINK_FIELDS.values()):
+		doc.erp_sync_status = "linked"
 	doc.insert(ignore_permissions=True)
 	frappe.db.commit()
 	return _row_dict(doc)
@@ -744,6 +864,11 @@ def update_archivo_entry(name=None, changes=None):
 		doc.set("related_refs", [])
 		for row in _normalize_related_refs(changes.get("related_refs")):
 			doc.append("related_refs", row)
+		_sync_hard_links_from_related(doc)
+		if any(getattr(doc, f, None) for f in VOUCHER_LINK_FIELDS.values()):
+			if doc.erp_sync_status == "local_only":
+				doc.erp_sync_status = "linked"
+				doc.sync_error_message = None
 
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
@@ -820,9 +945,266 @@ def list_archivo_files(name=None):
 	return {"files": rows}
 
 
+# ---------------------------------------------------------------------------
+# i051 — Enqueue Bulk + review inbox (Revisar → Documentos, MCP triage)
+# ---------------------------------------------------------------------------
+
+
+def _decode_b64(raw) -> bytes:
+	import base64
+
+	text = _as_str(raw)
+	if "," in text and text.lower().startswith("data:"):
+		text = text.split(",", 1)[1]
+	if not text:
+		return b""
+	try:
+		return base64.b64decode(text, validate=False)
+	except Exception:
+		frappe.throw(_("Invalid base64 content"))
+
+
+def _enqueue_max_bytes() -> int:
+	"""Proposal cap (32 MB) or the site's File limit, whichever is lower."""
+	from frappe.utils.file_manager import get_max_file_size
+
+	return min(ENQUEUE_MAX_FILE_MB * 1024 * 1024, int(get_max_file_size() or 0) or ENQUEUE_MAX_FILE_MB * 1024 * 1024)
+
+
+def _inbox_filters(status: str) -> dict:
+	base = {"is_archived": 0}
+	if status == "queue":
+		return {**base, "kind": INBOX_KIND, "workflow_status": ["!=", "void"]}
+	if status == "drafts":
+		return {**base, "kind": ["!=", INBOX_KIND], "workflow_status": "draft"}
+	return {}
+
+
+def archivo_inbox_counts() -> dict:
+	return {
+		"queue": int(frappe.db.count(DOCTYPE, _inbox_filters("queue")) or 0),
+		"drafts": int(frappe.db.count(DOCTYPE, _inbox_filters("drafts")) or 0),
+	}
+
+
+def _inbox_limits() -> dict:
+	return {"max_files": ENQUEUE_MAX_FILES, "max_file_bytes": _enqueue_max_bytes()}
+
+
 @frappe.whitelist(allow_guest=True)
-def mark_archivo_paid(name=None, payment_date=None, payment_method=None, payment_reference=None):
-	"""Ops-only mark paid (no GL). Use post_archivo_payment for PE."""
+def enqueue_archivo_bulk(files=None):
+	"""One queued Documentos row per file (kind ``inbox_unsorted``, pending_review,
+	private attachment). Each file is its own transaction: one bad file is
+	reported in ``errors`` and never blocks the rest."""
+	_require_app_permission()
+	_require_doctype()
+	items = _parse_json(files, files if isinstance(files, list) else None)
+	if not isinstance(items, list) or not items:
+		frappe.throw(_("files must be a non-empty list of {file_name, content_b64}"))
+	if len(items) > ENQUEUE_MAX_FILES:
+		frappe.throw(_("At most {0} files per upload").format(ENQUEUE_MAX_FILES))
+	company = resolve_company()
+	if not company:
+		frappe.throw(_("company is required"))
+	max_bytes = _enqueue_max_bytes()
+
+	created, errors = [], []
+	for idx, item in enumerate(items, start=1):
+		file_name = _as_str(item.get("file_name")) if isinstance(item, dict) else ""
+		file_name = file_name or f"documento-{idx}"
+		try:
+			if not isinstance(item, dict):
+				frappe.throw(_("Each file must be an object {file_name, content_b64}"))
+			content = _decode_b64(item.get("content_b64"))
+			if not content:
+				frappe.throw(_("Empty file"))
+			if len(content) > max_bytes:
+				frappe.throw(
+					_("File is larger than {0} MB").format(round(max_bytes / (1024 * 1024), 1))
+				)
+			title = file_name.rsplit(".", 1)[0].strip() if "." in file_name else file_name
+			frappe.flags.ignore_permissions = True
+			doc = frappe.get_doc(
+				{
+					"doctype": DOCTYPE,
+					"title": (title or file_name)[:140],
+					"kind": INBOX_KIND,
+					"sync_template": "none",
+					"posting_date": nowdate(),
+					"company": company,
+					"workflow_status": "pending_review",
+					"erp_sync_status": "local_only",
+					"currency": _default_currency(company),
+				}
+			)
+			doc.insert(ignore_permissions=True)
+			file_doc = save_file(file_name, content, DOCTYPE, doc.name, is_private=1)
+			frappe.db.commit()
+			created.append(
+				{
+					"name": doc.name,
+					"title": doc.title,
+					"file_name": file_doc.file_name,
+					"file_url": file_doc.file_url,
+				}
+			)
+		except Exception as e:
+			frappe.db.rollback()
+			frappe.clear_messages()
+			errors.append({"index": idx, "file_name": file_name, "error": cstr(e)[:300] or e.__class__.__name__})
+	return {"created": created, "errors": errors, "counts": archivo_inbox_counts()}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_archivo_inbox(status=None, limit=100, start=0):
+	"""Revisar → Documentos: ``queue`` (unsorted uploads), ``drafts`` (classified,
+	awaiting a person) or ``all`` (both). Oldest first, like a work queue."""
+	_require_app_permission()
+	_require_doctype()
+	status = _as_str(status).lower() or "queue"
+	if status not in ("queue", "drafts", "all"):
+		status = "queue"
+	try:
+		lim = max(1, min(500, cint(limit) or 100))
+	except (TypeError, ValueError):
+		lim = 100
+	try:
+		st = max(0, cint(start) or 0)
+	except (TypeError, ValueError):
+		st = 0
+
+	parts = ["queue", "drafts"] if status == "all" else [status]
+	names = []
+	for part in parts:
+		names += frappe.get_all(DOCTYPE, filters=_inbox_filters(part), pluck="name", ignore_permissions=True)
+	rows = []
+	if names:
+		frappe.flags.ignore_permissions = True
+		docs = frappe.get_all(
+			DOCTYPE,
+			filters={"name": ["in", names]},
+			fields=["name"],
+			order_by="creation asc",
+			limit_start=st,
+			limit_page_length=lim,
+			ignore_permissions=True,
+		)
+		for r in docs:
+			doc = frappe.get_doc(DOCTYPE, r.name)
+			row = _row_dict(doc)
+			row["inbox_status"] = "queue" if doc.kind == INBOX_KIND else "draft"
+			rows.append(row)
+	return {
+		"rows": rows,
+		"total": len(names),
+		"start": st,
+		"limit": lim,
+		"counts": archivo_inbox_counts(),
+		"limits": _inbox_limits(),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def confirm_archivo_entries(names=None):
+	"""A person accepts classified drafts → they leave the inbox with the
+	kind's normal workflow (paper → filed, money with amount → to_pay)."""
+	_require_app_permission()
+	_require_doctype()
+	items = _parse_json(names, names if isinstance(names, list) else None)
+	if isinstance(items, str):
+		items = [items]
+	if not isinstance(items, list) or not items:
+		frappe.throw(_("names must be a non-empty list"))
+	confirmed, errors = [], []
+	for raw in items[:200]:
+		name = _as_str(raw)
+		try:
+			if not name or not frappe.db.exists(DOCTYPE, name):
+				frappe.throw(_("Archivo entry {0} not found").format(name or "—"))
+			frappe.flags.ignore_permissions = True
+			doc = frappe.get_doc(DOCTYPE, name)
+			if doc.kind == INBOX_KIND:
+				frappe.throw(_("Classify it first (kind is still unsorted)"))
+			if doc.workflow_status not in ("draft", "pending_review"):
+				frappe.throw(_("Not awaiting review (status {0})").format(doc.workflow_status))
+			ws = _default_workflow(doc.sync_template, doc.amount)
+			if ws == "draft":
+				frappe.throw(_("Missing amount — add it or pick a paper kind"))
+			doc.workflow_status = ws
+			doc.save(ignore_permissions=True)
+			frappe.db.commit()
+			confirmed.append(_row_dict(doc))
+		except Exception as e:
+			frappe.db.rollback()
+			frappe.clear_messages()
+			errors.append({"name": name, "error": cstr(e)[:300] or e.__class__.__name__})
+	return {"confirmed": confirmed, "errors": errors, "counts": archivo_inbox_counts()}
+
+
+# Fields the MCP assistant may set when classifying (money path stays human:
+# no accounts, payment links, paid flags or Contabilizar).
+CLASSIFY_FIELDS = (
+	"title",
+	"kind",
+	"posting_date",
+	"due_date",
+	"valid_from",
+	"valid_to",
+	"amount",
+	"currency",
+	"party_type",
+	"party",
+	"payment_reference",
+	"payment_method",
+	"notes",
+	"related_refs",
+)
+
+
+def validate_archivo_classification(name, changes) -> dict:
+	"""Raise if this classification may not be applied; returns the clean changes."""
+	_require_doctype()
+	name = _as_str(name)
+	if not name or not frappe.db.exists(DOCTYPE, name):
+		frappe.throw(_("Archivo entry {0} not found").format(name or "—"), frappe.DoesNotExistError)
+	changes = _parse_json(changes, changes if isinstance(changes, dict) else {})
+	if not isinstance(changes, dict) or not changes:
+		frappe.throw(_("changes must be a non-empty object"))
+	unknown = sorted(set(changes) - set(CLASSIFY_FIELDS))
+	if unknown:
+		frappe.throw(_("Fields not allowed when classifying: {0}").format(", ".join(unknown)))
+	current = frappe.db.get_value(DOCTYPE, name, ["kind", "workflow_status", "erp_sync_status"], as_dict=True)
+	in_queue = current.kind == INBOX_KIND
+	if not in_queue and current.workflow_status != "draft":
+		frappe.throw(_("{0} is not in the review inbox (status {1})").format(name, current.workflow_status))
+	if current.erp_sync_status in ("posted", "partial"):
+		frappe.throw(_("{0} is already posted to ERP").format(name))
+	kind = _as_str(changes.get("kind")).lower()
+	if kind == INBOX_KIND or (in_queue and not kind):
+		frappe.throw(_("Pick a real kind (see list_archivo_kinds) — unsorted is not a classification"))
+	if "party_type" in changes and _as_str(changes.get("party_type")) not in PARTY_TYPES:
+		frappe.throw(_("party_type must be one of: Supplier, Employee, Other"))
+	if kind and kind not in _system_kind_map() and not any(k["code"] == kind for k in _load_custom_kinds()):
+		frappe.throw(_("Unknown kind {0} (see list_archivo_kinds)").format(kind))
+	return changes
+
+
+def classify_archivo_entry(name, changes) -> dict:
+	"""Apply a classification and leave the row as ``draft`` for a person to
+	confirm in Revisar → Documentos. Only queue / draft rows qualify."""
+	changes = validate_archivo_classification(name, changes)
+	return update_archivo_entry(_as_str(name), {**changes, "workflow_status": "draft"})
+
+
+@frappe.whitelist(allow_guest=True)
+def mark_archivo_paid(
+	name=None,
+	payment_date=None,
+	payment_method=None,
+	payment_reference=None,
+	paid_amount=None,
+):
+	"""Ops-only mark paid / partial (no GL). Use post_archivo_payment for PE."""
 	_require_app_permission()
 	_require_doctype()
 	name = _as_str(name)
@@ -832,7 +1214,23 @@ def mark_archivo_paid(name=None, payment_date=None, payment_method=None, payment
 	doc = frappe.get_doc(DOCTYPE, name)
 	if doc.sync_template == "paper":
 		frappe.throw(_("Paper rows cannot be marked paid"))
-	doc.workflow_status = "paid"
+	total = flt(doc.amount)
+	already = flt(getattr(doc, "amount_paid", 0))
+	if paid_amount not in (None, "", "null", "undefined"):
+		inc = flt(paid_amount)
+		if inc <= 0:
+			frappe.throw(_("paid_amount must be > 0"))
+		doc.amount_paid = already + inc
+	else:
+		# Full remaining
+		doc.amount_paid = total if total > 0 else already
+	paid = flt(doc.amount_paid)
+	if total > 0 and paid + 0.0001 < total:
+		doc.workflow_status = "partially_paid"
+	else:
+		doc.workflow_status = "paid"
+		if total > 0:
+			doc.amount_paid = total
 	doc.payment_date = _as_str(payment_date) or nowdate()
 	if payment_method is not None:
 		doc.payment_method = _as_str(payment_method) or None
@@ -841,6 +1239,228 @@ def mark_archivo_paid(name=None, payment_date=None, payment_method=None, payment
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
 	return _row_dict(doc)
+
+
+@frappe.whitelist(allow_guest=True)
+def set_archivo_archived(name=None, archived=1):
+	"""Soft-archive (hide from default list) or restore."""
+	_require_app_permission()
+	_require_doctype()
+	name = _as_str(name)
+	if not name:
+		frappe.throw(_("name is required"))
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc(DOCTYPE, name)
+	doc.is_archived = 1 if cint(archived) else 0
+	doc.save(ignore_permissions=True)
+	frappe.db.commit()
+	return _row_dict(doc)
+
+
+LINK_SEARCH_DOCTYPES = frozenset(
+	{
+		"Purchase Invoice",
+		"Payment Entry",
+		"Journal Entry",
+		"Asset",
+		"Purchase Order",
+		"Employee",
+		"Supplier",
+		"Customer",
+		"Item",
+	}
+)
+
+
+def _link_search_rows(doctype: str, search_term: str, page_length: int, company: str | None):
+	"""Typeahead rows for Vincular / party / related_refs. ignore_permissions."""
+	q = _as_str(search_term)
+	like = f"%{q}%" if q else None
+	limit = max(1, min(50, cint(page_length) or 15))
+	filters: dict = {}
+	or_filters = None
+	fields = ["name"]
+	order_by = "modified desc"
+	label_field = None
+
+	if doctype == "Purchase Invoice":
+		fields = ["name", "supplier", "supplier_name", "bill_no", "grand_total", "posting_date", "status"]
+		if company:
+			filters["company"] = company
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["bill_no", "like", like],
+				["supplier", "like", like],
+				["supplier_name", "like", like],
+			]
+	elif doctype == "Payment Entry":
+		fields = ["name", "party_type", "party", "paid_amount", "posting_date", "reference_no", "status"]
+		if company:
+			filters["company"] = company
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["party", "like", like],
+				["reference_no", "like", like],
+			]
+	elif doctype == "Journal Entry":
+		fields = ["name", "title", "user_remark", "total_debit", "posting_date", "voucher_type"]
+		if company:
+			filters["company"] = company
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["title", "like", like],
+				["user_remark", "like", like],
+			]
+	elif doctype == "Asset":
+		fields = ["name", "asset_name", "item_code", "status", "purchase_date"]
+		if company:
+			filters["company"] = company
+		order_by = "modified desc"
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["asset_name", "like", like],
+				["item_code", "like", like],
+			]
+		label_field = "asset_name"
+	elif doctype == "Purchase Order":
+		fields = ["name", "supplier", "supplier_name", "grand_total", "transaction_date", "status"]
+		if company:
+			filters["company"] = company
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["supplier", "like", like],
+				["supplier_name", "like", like],
+			]
+	elif doctype == "Employee":
+		fields = ["name", "employee_name", "status", "company", "user_id"]
+		if company:
+			filters["company"] = company
+		order_by = "employee_name asc"
+		label_field = "employee_name"
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["employee_name", "like", like],
+				["user_id", "like", like],
+			]
+	elif doctype == "Supplier":
+		fields = ["name", "supplier_name", "supplier_group"]
+		order_by = "supplier_name asc"
+		label_field = "supplier_name"
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["supplier_name", "like", like],
+			]
+	elif doctype == "Customer":
+		fields = ["name", "customer_name", "customer_group"]
+		order_by = "customer_name asc"
+		label_field = "customer_name"
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["customer_name", "like", like],
+			]
+	elif doctype == "Item":
+		fields = ["name", "item_name", "item_group", "disabled"]
+		order_by = "item_name asc"
+		label_field = "item_name"
+		filters["disabled"] = 0
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["item_name", "like", like],
+			]
+	else:
+		return []
+
+	rows = frappe.get_all(
+		doctype,
+		filters=filters or None,
+		or_filters=or_filters,
+		fields=fields,
+		order_by=order_by,
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	out = []
+	for r in rows:
+		name = r.get("name")
+		label = (label_field and r.get(label_field)) or name
+		subtitle_parts = []
+		if doctype == "Purchase Invoice":
+			if r.get("bill_no"):
+				subtitle_parts.append(str(r.get("bill_no")))
+			if r.get("supplier_name") or r.get("supplier"):
+				subtitle_parts.append(str(r.get("supplier_name") or r.get("supplier")))
+			if r.get("posting_date"):
+				subtitle_parts.append(str(r.get("posting_date")))
+			if r.get("grand_total") is not None:
+				subtitle_parts.append(str(r.get("grand_total")))
+		elif doctype == "Payment Entry":
+			if r.get("party"):
+				subtitle_parts.append(f"{r.get('party_type') or ''}:{r.get('party')}".strip(":"))
+			if r.get("reference_no"):
+				subtitle_parts.append(str(r.get("reference_no")))
+			if r.get("paid_amount") is not None:
+				subtitle_parts.append(str(r.get("paid_amount")))
+		elif doctype == "Journal Entry":
+			if r.get("title"):
+				subtitle_parts.append(str(r.get("title")))
+			elif r.get("user_remark"):
+				subtitle_parts.append(str(r.get("user_remark"))[:60])
+			if r.get("posting_date"):
+				subtitle_parts.append(str(r.get("posting_date")))
+		elif doctype == "Asset":
+			if r.get("item_code"):
+				subtitle_parts.append(str(r.get("item_code")))
+			if r.get("status"):
+				subtitle_parts.append(str(r.get("status")))
+		elif doctype == "Purchase Order":
+			if r.get("supplier_name") or r.get("supplier"):
+				subtitle_parts.append(str(r.get("supplier_name") or r.get("supplier")))
+			if r.get("transaction_date"):
+				subtitle_parts.append(str(r.get("transaction_date")))
+		elif doctype == "Employee":
+			if r.get("status"):
+				subtitle_parts.append(str(r.get("status")))
+			if r.get("user_id"):
+				subtitle_parts.append(str(r.get("user_id")))
+		elif doctype in ("Supplier", "Customer"):
+			grp = r.get("supplier_group") or r.get("customer_group")
+			if grp:
+				subtitle_parts.append(str(grp))
+		elif doctype == "Item":
+			if r.get("item_group"):
+				subtitle_parts.append(str(r.get("item_group")))
+		out.append(
+			{
+				"name": name,
+				"label": label,
+				"subtitle": " · ".join(subtitle_parts) if subtitle_parts else None,
+				"doctype": doctype,
+			}
+		)
+	return out
+
+
+@frappe.whitelist(allow_guest=True)
+def search_archivo_link_targets(doctype=None, search_term=None, page_length=15, company=None):
+	"""Typeahead for Vincular / party / related_refs (PI, PE, JE, Asset, Employee, …)."""
+	_require_app_permission()
+	dt = _as_str(doctype)
+	if not dt:
+		frappe.throw(_("doctype is required"))
+	if dt not in LINK_SEARCH_DOCTYPES:
+		frappe.throw(_("Unsupported doctype for search"))
+	active = resolve_company(company)
+	rows = _link_search_rows(dt, _as_str(search_term), page_length, active or None)
+	return {"doctype": dt, "rows": rows}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -873,6 +1493,15 @@ def link_archivo_voucher(
 	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc(DOCTYPE, name)
 	setattr(doc, field_map[vt], vn)
+
+	# Mirror into unified related_refs chips.
+	already = any(
+		(r.link_doctype if hasattr(r, "link_doctype") else r.get("link_doctype")) == vt
+		and (r.link_name if hasattr(r, "link_name") else r.get("link_name")) == vn
+		for r in (doc.related_refs or [])
+	)
+	if not already:
+		doc.append("related_refs", {"link_doctype": vt, "link_name": vn})
 
 	# Pull amount/date/party from voucher when empty
 	if vt == "Purchase Invoice":
@@ -1112,11 +1741,19 @@ def post_archivo_payment(name=None, paid_amount=None):
 		pe.insert(ignore_permissions=True)
 		pe.submit()
 		doc.linked_payment_entry = pe.name
-		doc.workflow_status = "paid"
 		doc.payment_date = pe.posting_date
-		# Refresh outstanding
+		# Refresh outstanding → paid vs partial
 		pi.reload()
-		doc.erp_sync_status = "posted" if flt(pi.outstanding_amount) <= 0.0001 else "partial"
+		outstanding = flt(pi.outstanding_amount)
+		total = flt(doc.amount) or flt(pi.grand_total)
+		paid_so_far = max(0.0, total - outstanding) if total else flt(doc.amount_paid) + amt
+		doc.amount_paid = paid_so_far
+		if outstanding <= 0.0001:
+			doc.workflow_status = "paid"
+			doc.erp_sync_status = "posted"
+		else:
+			doc.workflow_status = "partially_paid"
+			doc.erp_sync_status = "partial"
 		doc.sync_error_message = None
 		doc.save(ignore_permissions=True)
 		frappe.db.commit()
@@ -1244,6 +1881,7 @@ def get_archivo_aggregates(from_date=None, to_date=None, group_by=None):
 			COUNT(*) AS cnt
 		FROM `tabCompany Archive Entry`
 		WHERE IFNULL(workflow_status,'') != 'void'
+		  AND IFNULL(is_archived,0) = 0
 		  AND posting_date BETWEEN %s AND %s
 		GROUP BY `{gb}`
 		ORDER BY total DESC
@@ -1262,11 +1900,12 @@ def get_archivo_aggregates(from_date=None, to_date=None, group_by=None):
 				AND IFNULL(workflow_status,'') != 'void'
 				THEN IFNULL(amount,0) ELSE 0 END), 0) AS posted_total,
 			COALESCE(SUM(CASE WHEN workflow_status IN ('to_pay','overdue','partially_paid')
-				THEN IFNULL(amount,0) ELSE 0 END), 0) AS to_pay,
+				THEN GREATEST(IFNULL(amount,0) - IFNULL(amount_paid,0), 0) ELSE 0 END), 0) AS to_pay,
 			COALESCE(SUM(CASE WHEN workflow_status = 'paid'
 				THEN IFNULL(amount,0) ELSE 0 END), 0) AS paid
 		FROM `tabCompany Archive Entry`
 		WHERE posting_date BETWEEN %s AND %s
+		  AND IFNULL(is_archived,0) = 0
 		""",
 		(fd, td),
 		as_dict=True,
@@ -1323,6 +1962,7 @@ def archivo_month_constants(month_start, as_of) -> dict:
 				COALESCE(SUM(CASE WHEN kind = 'petty_expense' THEN IFNULL(amount,0) ELSE 0 END), 0) AS petty
 			FROM `tabCompany Archive Entry`
 			WHERE posting_date BETWEEN %s AND %s
+			  AND IFNULL(is_archived,0) = 0
 			""",
 			(month_start, as_of),
 			as_dict=True,
@@ -1332,6 +1972,7 @@ def archivo_month_constants(month_start, as_of) -> dict:
 				"""
 				SELECT COUNT(*) FROM `tabCompany Archive Entry`
 				WHERE sync_template = 'paper'
+				  AND IFNULL(is_archived,0) = 0
 				  AND workflow_status IN ('filed','active')
 				  AND (valid_to IS NULL OR valid_to = '' OR valid_to >= %s)
 				""",
@@ -1344,6 +1985,7 @@ def archivo_month_constants(month_start, as_of) -> dict:
 				"""
 				SELECT COUNT(*) FROM `tabCompany Archive Entry`
 				WHERE sync_template = 'paper'
+				  AND IFNULL(is_archived,0) = 0
 				  AND (workflow_status = 'expired'
 				       OR (valid_to IS NOT NULL AND valid_to != '' AND valid_to < %s
 				           AND workflow_status IN ('filed','active')))
@@ -1358,6 +2000,7 @@ def archivo_month_constants(month_start, as_of) -> dict:
 				"""
 				SELECT COUNT(*) FROM `tabCompany Archive Entry` a
 				WHERE IFNULL(a.workflow_status,'') != 'void'
+				  AND IFNULL(a.is_archived,0) = 0
 				  AND NOT EXISTS (
 					SELECT 1 FROM `tabFile` f
 					WHERE f.attached_to_doctype = %s AND f.attached_to_name = a.name

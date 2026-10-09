@@ -58,6 +58,8 @@ MCP_DOCTYPE_MATRIX = [
 	{"doctype": "Purchase Order", "group": "purchases", "label_en": "Purchase orders", "label_es": "Órdenes de compra", "view": 1, "edit": 1},
 	{"doctype": "Supplier", "group": "purchases", "label_en": "Suppliers", "label_es": "Proveedores", "view": 1, "edit": 1},
 	{"doctype": "Purchase Invoice", "group": "purchases", "label_en": "Purchase invoices", "label_es": "Facturas de compra", "view": 1, "edit": 0},
+	# i051 — triage queue; edits go only through run_workflow("classify_document").
+	{"doctype": "Company Archive Entry", "group": "purchases", "label_en": "Documents (bills, receipts, papers)", "label_es": "Documentos", "view": 1, "edit": 1},
 	# cash
 	{"doctype": "POS Profile", "group": "cash", "label_en": "Cash registers", "label_es": "Cajas", "view": 1, "edit": 1},
 	{"doctype": "POS Cash Session", "group": "cash", "label_en": "Cash sessions", "label_es": "Sesiones de caja", "view": 1, "edit": 1},
