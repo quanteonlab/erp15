@@ -444,6 +444,25 @@ def run():
 
 		check("save_employee: create in group ventas; generic Employee create / group patch refused", in_request(employee_workflow))
 
+		def react_surfaces():
+			# g015: React verifies the same token here and reuses the preview store.
+			sess = mcp_api.mcp_react_session(token, "templates", 0)
+			assert sess["actor"] == "Administrator" and "ECommerce Print Template" in sess["matrix"], sess
+			_expect_raise(frappe.ValidationError, mcp_api.mcp_react_session, token, "billing", 0)
+			_expect_raise(frappe.AuthenticationError, mcp_api.mcp_react_session, "mcp_bad_token", "print", 0)
+			payload = {"template_id": "X", "ops": [{"op": "remove_element", "id": "a"}]}
+			pid = mcp_api.mcp_preview_remember(token, "templates", payload)["preview_id"]
+			_expect_raise(frappe.ValidationError, mcp_api.mcp_preview_consume, token, "sections", payload, pid)  # other surface
+			_expect_raise(frappe.ValidationError, mcp_api.mcp_preview_consume, token, "templates", {**payload, "ops": []}, pid)
+			pid = mcp_api.mcp_preview_remember(token, "templates", payload)["preview_id"]
+			assert mcp_api.mcp_preview_consume(token, "templates", payload, pid)["ok"]
+			_expect_raise(frappe.ValidationError, mcp_api.mcp_preview_consume, token, "templates", payload, pid)  # single use
+			for dt in ("ECommerce Print Template", "ECommerce Floor Map"):
+				msg = _expect_raise(frappe.PermissionError, mcp_api.mcp_create_record, token, dt, {"template_name": "x"}, 0)
+				assert "tools" in msg, msg
+
+		check("react surfaces: session + namespaced single-use previews; generic writes refused", in_request(react_surfaces))
+
 		def document_triage():
 			import base64
 

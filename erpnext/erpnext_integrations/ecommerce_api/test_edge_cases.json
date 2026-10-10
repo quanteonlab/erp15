@@ -5583,6 +5583,55 @@
         "driver": "undefined"
       },
       "expect": "fail"
+    },
+    {
+      "id": "mcp_react_session_null_token",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_react_session",
+      "args": {
+        "mcp_token": null,
+        "surface": "print",
+        "write": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "g015: React surfaces must be authenticated by the gateway"
+    },
+    {
+      "id": "mcp_react_session_bad_surface",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_react_session",
+      "args": {
+        "mcp_token": "mcp_x_y",
+        "surface": "undefined",
+        "write": "null"
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "g015: unknown surface refused"
+    },
+    {
+      "id": "mcp_preview_consume_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_preview_consume",
+      "args": {
+        "mcp_token": "mcp_x_y",
+        "surface": "templates",
+        "payload": "null",
+        "preview_id": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "g015: consume needs a valid token, payload and preview_id"
+    },
+    {
+      "id": "mcp_preview_remember_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.mcp_api.mcp_preview_remember",
+      "args": {
+        "mcp_token": null,
+        "surface": null,
+        "payload": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "g015"
     }
   ]
 }
