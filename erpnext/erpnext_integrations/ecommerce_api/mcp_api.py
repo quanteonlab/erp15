@@ -350,6 +350,13 @@ def _matrix() -> dict:
 
 
 def _can_view(matrix: dict, doctype: str) -> None:
+	from erpnext.erpnext_integrations.ecommerce_api.mcp_keys_api import PSEUDO_DOCTYPES
+
+	if doctype in PSEUDO_DOCTYPES:
+		frappe.throw(
+			_("{0} is a capability switch, not a record type — use the {1} tools").format(doctype, PSEUDO_DOCTYPES[doctype]),
+			frappe.PermissionError,
+		)
 	if doctype not in KNOWN_DOCTYPES:
 		frappe.throw(_("DocType {0} is not exposed over MCP").format(doctype), frappe.PermissionError)
 	if not (matrix.get(doctype) or {}).get("view"):
@@ -2119,7 +2126,7 @@ def export_playbook_feedback(since=None) -> list[dict]:
 # here and keeps using this preview store, so the contract stays server-side.
 # ---------------------------------------------------------------------------
 
-REACT_SURFACES = {"print", "templates", "sections"}
+REACT_SURFACES = {"print", "templates", "sections", "labels", "migrate"}
 
 
 def _react_surface(surface) -> str:

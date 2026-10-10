@@ -82,11 +82,17 @@ MCP_DOCTYPE_MATRIX = [
 	# print / layout — edited only through the React-hosted MCP surfaces (g015)
 	{"doctype": "ECommerce Print Template", "group": "print", "label_en": "Print templates", "label_es": "Plantillas de impresión", "view": 1, "edit": 1},
 	{"doctype": "ECommerce Floor Map", "group": "print", "label_en": "Floor maps & sections", "label_es": "Mapas y sectores", "view": 1, "edit": 1},
+	# Pseudo rows (not DocTypes): React-hosted capabilities an admin can revoke separately.
+	# Staff badges carry a working scanner-login barcode — own switch (view = may print).
+	{"doctype": "Staff Credential", "group": "print", "label_en": "Staff credentials (login badges)", "label_es": "Credenciales del personal (login)", "view": 1, "edit": 0},
+	# Migrar: view = export catalog CSV, edit = import CSV / images (writes Items, prices, promos).
+	{"doctype": "Catalog Migration", "group": "catalog", "label_en": "Catalog import / export (Migrar)", "label_es": "Importar / exportar catálogo (Migrar)", "view": 1, "edit": 1},
 	# org
 	{"doctype": "Company", "group": "org", "label_en": "Company", "label_es": "Empresa", "view": 1, "edit": 0},
 ]
 
 EDIT_LOCKED_DOCTYPES = {
+	"Staff Credential",
 	"Purchase Invoice",
 	"Sales Invoice",
 	"Payment Entry",
@@ -96,6 +102,8 @@ EDIT_LOCKED_DOCTYPES = {
 	"Company",
 }
 KNOWN_DOCTYPES = {row["doctype"] for row in MCP_DOCTYPE_MATRIX}
+# Matrix rows that gate React-hosted capabilities rather than a real DocType.
+PSEUDO_DOCTYPES = {"Staff Credential": "print_labels / render_print_pdf", "Catalog Migration": "export_catalog_csv / preview_catalog_import"}
 MATRIX_GROUPS = list(dict.fromkeys(row["group"] for row in MCP_DOCTYPE_MATRIX))
 
 

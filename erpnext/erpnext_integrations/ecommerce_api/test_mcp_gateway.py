@@ -463,6 +463,16 @@ def run():
 
 		check("react surfaces: session + namespaced single-use previews; generic writes refused", in_request(react_surfaces))
 
+		def capability_switches():
+			# Staff Credential / Catalog Migration are matrix switches for React surfaces, not DocTypes.
+			for sfc in ("labels", "migrate"):
+				assert "Staff Credential" in mcp_api.mcp_react_session(token, sfc, 0)["matrix"]
+			for dt in ("Staff Credential", "Catalog Migration"):
+				msg = _expect_raise(frappe.PermissionError, mcp_api.mcp_list_records, token, dt)
+				assert "capability switch" in msg, msg
+
+		check("capability switches: labels/migrate sessions; pseudo rows refused by generic tools", in_request(capability_switches))
+
 		def document_triage():
 			import base64
 
