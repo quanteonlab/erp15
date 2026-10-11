@@ -2980,6 +2980,12 @@ def suite_5_12_modules_read():
         out2 = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "classic"}})
         settings2 = (out2 or {}).get("settings") or {}
         assert (settings2.get("catalogDisplay") or {}).get("catalogTemplate") == "classic"
+        # Unset / null → site default Nova Mobile (leave smoke site on the default).
+        out_default = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": None}})
+        settings_default = (out_default or {}).get("settings") or {}
+        assert (settings_default.get("catalogDisplay") or {}).get("catalogTemplate") == "nova_mobile", (
+            settings_default.get("catalogDisplay")
+        )
 
     def check_tags():
         from erpnext.erpnext_integrations.ecommerce_api import tags_api as ta

@@ -891,6 +891,14 @@
       "bug": "duplicate_lead with empty lead must controlled error (not 500)"
     },
     {
+      "id": "get_shop_ui_settings_guest_ok",
+      "source": "regression",
+      "bug": "get_shop_ui_settings must be readable site-wide (allow_guest) so every user/guest gets the same catalogTemplate",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.get_shop_ui_settings",
+      "args": {},
+      "expect": "ok"
+    },
+    {
       "id": "save_shop_ui_catalog_template_commerce",
       "source": "regression",
       "bug": "save_shop_ui_settings must keep catalogDisplay.catalogTemplate (commerce) so Settings UI does not snap back to classic",
@@ -907,12 +915,26 @@
     {
       "id": "save_shop_ui_catalog_template_nova_mobile",
       "source": "regression",
-      "bug": "save_shop_ui_settings must keep catalogDisplay.catalogTemplate (nova_mobile); backend used to coerce unknown templates to classic so Settings UI could not switch to Nova Mobile",
+      "bug": "save_shop_ui_settings must keep catalogDisplay.catalogTemplate (nova_mobile); default for unset/unknown is nova_mobile (site-wide)",
       "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
       "args": {
         "settings": {
           "catalogDisplay": {
             "catalogTemplate": "nova_mobile"
+          }
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_catalog_template_null_defaults_nova",
+      "source": "regression",
+      "bug": "null/unknown catalogTemplate must normalize to nova_mobile (default plantilla) not classic",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {
+        "settings": {
+          "catalogDisplay": {
+            "catalogTemplate": null
           }
         }
       },

@@ -1,7 +1,8 @@
-"""Global shop UI settings (POS look, stock warnings, …).
+"""Site-wide shop UI settings (POS look, catalog template, stock warnings, …).
 
-Stored in Table Extra Schema (no migrate). Readable by any authenticated
-API caller; writes require tools.settings (acting-user check when header set).
+Stored in Table Extra Schema (no migrate). One blob for the whole site — every
+user and guest sees the same catalogTemplate / display prefs.
+Readable with allow_guest; writes require tools.settings (acting-user check).
 """
 
 from __future__ import annotations
@@ -181,9 +182,10 @@ def _normalize_header_preset(val) -> str:
 
 def _normalize_catalog_template(val) -> str:
 	# coming_soon kept for legacy saved settings; UI no longer offers it.
+	# Default for new / unset sites: Nova Mobile (not classic).
 	if val in ("commerce", "nova_mobile", "coming_soon", "classic"):
 		return val
-	return "classic"
+	return "nova_mobile"
 
 
 def _normalize_pedidos_default_seller_scope(val) -> str:
@@ -200,6 +202,30 @@ def _normalize_pedidos_default_seller_scope(val) -> str:
 	return "assigned"
 
 
+def _normalize_qty_stepper_labels(val) -> str:
+	if val in ("with_step", "symbol"):
+		return val
+	return "symbol"
+
+
+def _normalize_card_click_mode(val) -> str:
+	if val in ("controls_only", "toggle", "add_only", "increment"):
+		return val
+	return "controls_only"
+
+
+def _normalize_cart_fab_side(val) -> str:
+	if val in ("right", "left"):
+		return val
+	return "left"
+
+
+def _normalize_catalog_promo_conflict(val) -> str:
+	if val in ("best_price", "priority", "highest_threshold"):
+		return val
+	return "best_price"
+
+
 def _normalize_catalog_display(raw) -> dict:
 	src = raw if isinstance(raw, dict) else {}
 	return {
@@ -209,11 +235,20 @@ def _normalize_catalog_display(raw) -> dict:
 		"showCardBorder": _as_bool(src.get("showCardBorder"), True),
 		"cardBorderRadius": _as_int(src.get("cardBorderRadius"), 8, 0, 32),
 		"noImageTilesAtEnd": _as_bool(src.get("noImageTilesAtEnd"), True),
+		# Site-wide for every user/guest (/catalog + /ops/orders).
 		"catalogTemplate": _normalize_catalog_template(src.get("catalogTemplate")),
 		"showPaymentMethodPrices": _as_bool(src.get("showPaymentMethodPrices"), False),
 		# Commerce catalog: qty-gated Oferta/BOGO badges vs unit red/strike.
 		"showQtyPromoBadges": _as_bool(src.get("showQtyPromoBadges"), True),
 		"showUnitPromoStrike": _as_bool(src.get("showUnitPromoStrike"), True),
+		"showCardBrandCode": _as_bool(src.get("showCardBrandCode"), False),
+		"showPriceCents": _as_bool(src.get("showPriceCents"), False),
+		"qtyStepperLabels": _normalize_qty_stepper_labels(src.get("qtyStepperLabels")),
+		"cardClickMode": _normalize_card_click_mode(src.get("cardClickMode")),
+		"cartFabSide": _normalize_cart_fab_side(src.get("cartFabSide")),
+		"catalogPromoConflictMode": _normalize_catalog_promo_conflict(
+			src.get("catalogPromoConflictMode")
+		),
 		# Pedidos table + Orden FAB: lookback days for assigned clients (default 30).
 		"ordenPedidosDays": _as_int(src.get("ordenPedidosDays"), 30, 1, 365),
 		# Tablas → Pedidos default toggle for salesmen: assigned | mine | all ("").
@@ -369,18 +404,24 @@ def _can_manage_settings() -> bool:
 	return _can_app("tools.settings")
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def get_shop_ui_settings():
-	"""Return global shop UI settings. Missing store → empty dict (client uses defaults)."""
+	"""Return site-wide shop UI settings (same for every user/guest).
+
+	Missing store → empty dict (client uses defaults).
+	"""
 	raw = _load_raw()
 	if not raw:
 		return {"ok": True, "settings": {}, "source": "default"}
 	return {"ok": True, "settings": _normalize_bundle(raw), "source": "server"}
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def save_shop_ui_settings(settings=None):
-	"""Merge and persist global shop UI settings (POS look, stock warnings, …)."""
+	"""Merge and persist site-wide shop UI settings (POS look, catalog template, …).
+
+	Writes require tools.settings (acting-user check when header set).
+	"""
 	if not _can_manage_settings():
 		frappe.throw(_("Not permitted ({0})").format("tools.settings"))
 	if isinstance(settings, str):

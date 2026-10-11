@@ -4415,7 +4415,7 @@ def add_doc_comment(doctype=None, name=None, content=None):
     return _impl(doctype=doctype, name=name, content=content)
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def get_shop_ui_settings():
     from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
         get_shop_ui_settings as _impl,
@@ -4424,7 +4424,7 @@ def get_shop_ui_settings():
     return _impl()
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def save_shop_ui_settings(settings=None):
     from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
         save_shop_ui_settings as _impl,

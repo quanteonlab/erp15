@@ -222,6 +222,7 @@ def get_products(
 	_attach_barcodes(items)
 	_attach_receiving_meta(items, price_list)
 	_attach_item_group_meta(items)
+	_attach_item_tags(items)
 
 	# Alias native shelf_life as sell-by (plazo comercial) + weight band for frontends.
 	for item in items:
@@ -237,6 +238,21 @@ def get_products(
 		"total_count": total_count,
 		"has_more": (start + page_length) < total_count,
 	}
+
+
+def _attach_item_tags(items):
+	"""Attach Item tags (promo:hot, promo:top2026, …) for catalog badges."""
+	from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
+
+	codes = []
+	for item in items:
+		code = cstr(item.get("item_code") or item.get("name") or "").strip()
+		if code:
+			codes.append(code)
+	tag_map = tags_map_for_docs("Item", codes) if codes else {}
+	for item in items:
+		code = cstr(item.get("item_code") or item.get("name") or "").strip()
+		item["tags"] = list(tag_map.get(code) or [])
 
 
 def _attach_item_group_meta(items):
