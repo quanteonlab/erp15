@@ -13002,6 +13002,25 @@ def dismiss_catalog_import_review(name, note=None):
 	return cir.dismiss_import_review(name, note=note)
 
 
+@frappe.whitelist()
+def dismiss_open_catalog_import_reviews(session=None, note=None, names=None):
+	"""
+	Fast bulk dismiss of open Catalog Import Review rows (one SQL UPDATE).
+
+	Pass ``names`` to dismiss a selection, or omit to dismiss every open row
+	(optionally scoped with ``session``).
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api import catalog_import as cir
+	import json as _json
+
+	if isinstance(names, str) and names.strip().startswith("["):
+		try:
+			names = _json.loads(names)
+		except Exception:
+			pass
+	return cir.dismiss_open_import_reviews(session=session, note=note, names=names)
+
+
 @frappe.whitelist(allow_guest=True)
 def list_creation_reviews(kind="customer", status="Pending", limit=100, start=0):
 	"""List non-admin Customer / guest-preorder creations awaiting admin review."""

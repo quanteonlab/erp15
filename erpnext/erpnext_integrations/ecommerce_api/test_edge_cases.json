@@ -838,6 +838,30 @@
       "expect": "error"
     },
     {
+      "id": "dismiss_open_catalog_import_reviews_empty_names",
+      "source": "regression",
+      "bug": "dismiss_open_catalog_import_reviews with empty names list must return dismissed=0, not wipe all open",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.dismiss_open_catalog_import_reviews",
+      "args": {
+        "session": null,
+        "note": "",
+        "names": []
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "dismiss_open_catalog_import_reviews_bad_names_type",
+      "source": "regression",
+      "bug": "dismiss_open_catalog_import_reviews with non-list names must controlled error (never dismiss-all)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.dismiss_open_catalog_import_reviews",
+      "args": {
+        "session": null,
+        "note": null,
+        "names": 1
+      },
+      "expect": "error"
+    },
+    {
       "id": "resolve_catalog_import_review_missing",
       "source": "regression",
       "bug": "resolve_catalog_import_review with blank name must controlled error",
@@ -5654,6 +5678,26 @@
       "expect": "fail",
       "source": "regression",
       "bug": "g015"
+    },
+    {
+      "id": "pm_delete_products_bulk_null_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.delete_products_bulk",
+      "args": {
+        "item_codes": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "linked Item delete cannot hard-delete; empty/null item_codes must not TypeError (UI offers disable/archive instead)"
+    },
+    {
+      "id": "pm_delete_products_bulk_empty_string",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.delete_products_bulk",
+      "args": {
+        "item_codes": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "delete_products_bulk dirty empty string"
     }
   ]
 }

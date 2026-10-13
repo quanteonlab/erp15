@@ -6,7 +6,7 @@ from __future__ import unicode_literals
 import json
 
 import frappe
-from frappe.utils import cint, flt, now_datetime
+from frappe.utils import cint, cstr, flt, now_datetime
 
 
 REASON_MISSING_ITEM_CODE = "missing_item_code"
@@ -196,6 +196,80 @@ def dismiss_import_review(name, note=None):
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
 	return {"ok": 1, "name": doc.name, "status": doc.status}
+
+
+def dismiss_open_import_reviews(session=None, note=None, names=None):
+	"""
+	Fast bulk dismiss via one UPDATE (no per-row Document.save).
+
+	- names: dismiss only those still open (list / JSON string / comma string)
+	- else: dismiss every open row (optionally filtered by session)
+	"""
+	session = (session or "").strip() or None
+	note = note if note is not None else ""
+
+	names_provided = names is not None and names != ""
+	name_list = []
+	if names_provided:
+		if isinstance(names, str):
+			raw = names.strip()
+			if raw.startswith("["):
+				try:
+					parsed = json.loads(raw)
+					names = parsed if isinstance(parsed, list) else []
+				except Exception:
+					names = [p.strip() for p in raw.split(",") if p.strip()]
+			else:
+				names = [p.strip() for p in raw.split(",") if p.strip()]
+		if isinstance(names, (list, tuple)):
+			name_list = [cstr(n).strip() for n in names if cstr(n).strip()]
+		else:
+			# Wrong type — do not fall through to "dismiss all"
+			frappe.throw("names must be a list of Catalog Import Review names")
+		if not name_list:
+			return {"ok": 1, "dismissed": 0}
+
+	now = now_datetime()
+	user = frappe.session.user if frappe.session else None
+	resolution = _json_dumps({"action": "dismiss", "note": note or "", "bulk": 1})
+
+	filters = {"status": "open"}
+	if names_provided:
+		filters["name"] = ("in", name_list)
+	elif session:
+		filters["session"] = session
+
+	# Count first so we can return 0 without a write when nothing matches.
+	to_dismiss = frappe.get_all(
+		"Catalog Import Review",
+		filters=filters,
+		pluck="name",
+		ignore_permissions=True,
+	)
+	if not to_dismiss:
+		return {"ok": 1, "dismissed": 0}
+
+	# Chunk IN-lists to stay under MySQL packet limits on huge queues.
+	chunk = 500
+	for i in range(0, len(to_dismiss), chunk):
+		batch = to_dismiss[i : i + chunk]
+		frappe.db.sql(
+			"""
+			UPDATE `tabCatalog Import Review`
+			SET
+				status = %s,
+				resolved_by = %s,
+				resolved_at = %s,
+				resolution_json = %s,
+				modified = %s,
+				modified_by = %s
+			WHERE status = 'open' AND name IN ({placeholders})
+			""".format(placeholders=", ".join(["%s"] * len(batch))),
+			("dismissed", user, now, resolution, now, user, *batch),
+		)
+
+	frappe.db.commit()
+	return {"ok": 1, "dismissed": len(to_dismiss)}
 
 
 def resolve_import_review(name, action="apply", overrides=None, steal_barcode=0):

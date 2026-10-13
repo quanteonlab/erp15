@@ -64,6 +64,7 @@ _SKIP_CATALOG_EXACT = {
 	"import_catalog_image_batch",
 	"resolve_catalog_import_review",
 	"dismiss_catalog_import_review",
+	"dismiss_open_catalog_import_reviews",
 }
 
 

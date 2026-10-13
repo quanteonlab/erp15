@@ -3069,21 +3069,60 @@ def apply_interest_adjustment_bulk(item_codes, percent, price_list=None, price_l
 # ---------------------------------------------------------------------------
 
 
+def _clean_delete_error(exc) -> str:
+    """Plain-text delete error for UI (strip Frappe HTML / truncate)."""
+    try:
+        from frappe.utils import strip_html
+
+        msg = strip_html(str(exc) or "")
+    except Exception:
+        msg = str(exc) or ""
+    msg = " ".join(msg.split())
+    return msg[:500] if msg else "Delete failed"
+
+
+def _is_linked_delete_error(msg: str) -> bool:
+    lower = (msg or "").lower()
+    return (
+        "vinculado" in lower
+        or "linked with" in lower
+        or "is linked" in lower
+        or "cannot be deleted" in lower
+        or "no se puede eliminar" in lower
+    )
+
+
 @frappe.whitelist()
 def delete_products_bulk(item_codes):
     if isinstance(item_codes, str):
-        item_codes = json.loads(item_codes)
+        item_codes = json.loads(item_codes) if item_codes else []
+    if item_codes in (None, "", "null", "undefined"):
+        item_codes = []
+    if not isinstance(item_codes, (list, tuple)):
+        frappe.throw(_("item_codes must be a list"))
 
     frappe.has_permission("Item", "delete", throw=True)
 
     deleted = []
     failed = []
     for code in item_codes:
+        if not code or code in ("null", "undefined"):
+            failed.append(
+                {"item_code": str(code), "error": "Missing item code", "reason": "error"}
+            )
+            continue
         try:
-            frappe.delete_doc("Item", code, force=True, ignore_permissions=False)
+            frappe.delete_doc("Item", code, force=True, ignore_permissions=True)
             deleted.append(code)
         except Exception as e:
-            failed.append({"item_code": code, "error": str(e)})
+            err = _clean_delete_error(e)
+            failed.append(
+                {
+                    "item_code": code,
+                    "error": err,
+                    "reason": "linked" if _is_linked_delete_error(err) else "error",
+                }
+            )
 
     frappe.db.commit()
     return {"ok": True, "deleted": deleted, "failed": failed}

@@ -2265,6 +2265,9 @@ def suite_5_12_modules_read():
         from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
         rows = ecommerce_api.list_catalog_import_reviews(status="open", limit=5, start=0)
         assert isinstance(rows, list)
+        # Bulk dismiss with empty names must no-op (never wipe the open queue).
+        empty_bulk = ecommerce_api.dismiss_open_catalog_import_reviews(names=[])
+        assert isinstance(empty_bulk, dict) and empty_bulk.get("dismissed") == 0
         # Minimal permissive import: header + blank-ish invalid row → review_created >= 1
         csv_text = (
             "sku,barcode,name,u1,title,pack,uom,a,b,group,c,d,price\n"
