@@ -315,6 +315,31 @@
       "bug": "merge preview with null/empty leads must return controlled error, not TypeError"
     },
     {
+      "id": "merge_leads_null_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.merge_leads",
+      "args": {
+        "leads": null,
+        "resolutions": null,
+        "survivor": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "merge_leads with null leads must be controlled ValidationError (Converted donors previously bounced back via set_status)"
+    },
+    {
+      "id": "merge_leads_empty_string_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.merge_leads",
+      "args": {
+        "leads": "",
+        "resolutions": "{}",
+        "survivor": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "merge_leads empty string leads must not TypeError"
+    },
+
+    {
       "id": "archive_leads_empty_list",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.archive_leads",
       "args": {
@@ -1710,6 +1735,7 @@
       "args": {
         "guest_phone": null,
         "guest_address": "",
+        "guest_email": null,
         "page_length": null
       },
       "expect": "ok"
@@ -1721,10 +1747,70 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.match_customers_for_consulta",
       "args": {
         "guest_phone": "   ",
-        "guest_address": "   "
+        "guest_address": "   ",
+        "guest_email": "   "
       },
       "expect": "ok"
     },
+    {
+      "id": "match_customers_for_consulta_blank_email_no_match",
+      "source": "regression",
+      "bug": "empty/placeholder guest_email must never match Customer.email_id; controlled empty list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.match_customers_for_consulta",
+      "args": {
+        "guest_phone": null,
+        "guest_address": null,
+        "guest_email": "null"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "find_customer_by_email_null_safe",
+      "source": "regression",
+      "bug": "_find_customer_by_email null/empty must return None without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._find_customer_by_email",
+      "args": {
+        "email": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "find_customer_by_email_blank_safe",
+      "source": "regression",
+      "bug": "blank/placeholder guest_email must never match a Customer; returns None",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._find_customer_by_email",
+      "args": {
+        "email": "   "
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "resolve_consulta_customer_blank_email_bucket",
+      "source": "regression",
+      "bug": "blank guest_email must fall through to Consumidor Final without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._resolve_consulta_customer",
+      "args": {
+        "explicit": null,
+        "guest_phone": null,
+        "guest_address": null,
+        "guest_email": "",
+        "guest_name": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "find_customer_by_email_prefer_name_null_safe",
+      "source": "regression",
+      "bug": "prefer_name/prefer_address null must not TypeError when email empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._find_customer_by_email",
+      "args": {
+        "email": null,
+        "prefer_name": null,
+        "prefer_address": null
+      },
+      "expect": "ok"
+    },
+
     {
       "id": "issue_client_access_pin_null_phone",
       "source": "regression",
@@ -4614,12 +4700,54 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.suggest_guest_preorder_change",
       "args": {
         "preorder_name": null,
-        "change": {"details": {"guest_notes": "x"}}
+        "change": {
+          "details": {
+            "guest_notes": "x"
+          }
+        }
       },
       "expect": "error",
       "source": "regression",
       "bug": "suggest_guest_preorder_change with null name must be controlled ValidationError, never TypeError"
     },
+    {
+      "id": "suggest_customer_change_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.suggest_customer_change",
+      "args": {
+        "customer_name": null,
+        "change": {
+          "phone": "111"
+        }
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "suggest_customer_change with null name must be controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "suggest_customer_change_empty_change",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.suggest_customer_change",
+      "args": {
+        "customer_name": "DOES-NOT-EXIST",
+        "change": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "null change / missing Customer must not AttributeError — controlled error"
+    },
+    {
+      "id": "suggest_customer_change_empty_string_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.suggest_customer_change",
+      "args": {
+        "customer_name": "",
+        "change": {
+          "address_line1": "Calle 1"
+        }
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "empty customer_name must be controlled ValidationError"
+    },
+
     {
       "id": "suggest_guest_preorder_change_empty_change",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.suggest_guest_preorder_change",
@@ -4663,7 +4791,6 @@
       "source": "regression",
       "bug": "confirm_creation_review empty name must ValidationError before self-suggestion guard"
     },
-
     {
       "id": "add_lead_checklist_item_null_lead",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.add_lead_checklist_item",
@@ -4967,7 +5094,6 @@
       "source": "regression",
       "bug": "seller_scope=mis_clientes alias + null page_length must not 500; same as assigned"
     },
-
     {
       "id": "save_employee_email_empty_string_ok",
       "source": "regression",
@@ -5056,7 +5182,10 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.save_employee_group_permissions",
       "args": {
         "name": null,
-        "permissions": ["ops.preventa", "tools.catalog_pdf"]
+        "permissions": [
+          "ops.preventa",
+          "tools.catalog_pdf"
+        ]
       },
       "expect": "fail"
     },
@@ -5370,8 +5499,14 @@
         "title": "__edge_archivo_tag__",
         "kind": "other_document",
         "related_refs": [
-          { "link_doctype": "Tag", "link_name": "contrato papel kiosco" },
-          { "link_doctype": "Employee", "link_name": "not-a-real-employee" }
+          {
+            "link_doctype": "Tag",
+            "link_name": "contrato papel kiosco"
+          },
+          {
+            "link_doctype": "Employee",
+            "link_name": "not-a-real-employee"
+          }
         ]
       },
       "expect": "ok",
@@ -5698,6 +5833,91 @@
       "expect": "ok",
       "source": "regression",
       "bug": "delete_products_bulk dirty empty string"
+    },
+    {
+      "id": "get_preorder_invoice_state_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_preorder_invoice_state",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "get_preorder_invoice_state null name is controlled error (not 500)"
+    },
+    {
+      "id": "get_preorder_invoice_state_empty_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_preorder_invoice_state",
+      "args": {
+        "preorder_name": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "get_preorder_invoice_state empty name is controlled error"
+    },
+    {
+      "id": "issue_preorder_invoice_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.issue_preorder_invoice",
+      "args": {
+        "preorder_name": null,
+        "mode": "negro"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "issue_preorder_invoice null name is controlled error"
+    },
+    {
+      "id": "mark_preorder_invoiced_external_empty_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.mark_preorder_invoiced_external",
+      "args": {
+        "preorder_name": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "mark_preorder_invoiced_external empty name is controlled error"
+    },
+    {
+      "id": "reprint_preorder_invoice_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.reprint_preorder_invoice",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "reprint_preorder_invoice null name is controlled error"
+    },
+    {
+      "id": "ensure_archivo_month_binder_bad_year_month",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.ensure_archivo_month_binder",
+      "args": {
+        "year_month": "not-a-month",
+        "company": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "ensure_archivo_month_binder bad year_month is controlled error (i053)"
+    },
+    {
+      "id": "create_preorder_credit_note_null_customer",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_preorder_credit_note",
+      "args": {
+        "customer": null,
+        "amount": 10
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "create_preorder_credit_note null customer is controlled error"
+    },
+    {
+      "id": "create_preorder_credit_note_empty_payload",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_preorder_credit_note",
+      "args": {
+        "customer": "Consumidor Final",
+        "items": [],
+        "amount": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "create_preorder_credit_note with no items and no amount is controlled error"
     }
   ]
 }

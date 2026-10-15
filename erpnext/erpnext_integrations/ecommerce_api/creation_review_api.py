@@ -202,7 +202,22 @@ def mark_seller_amend_for_review(name: str, actor=None, reason: str = "seller_am
 # ── Seller suggestions (queue without applying until Revisar confirm) ─────────
 
 SUGGESTION_KV_SCOPE = "guest_preorder.suggestion"
+CUSTOMER_SUGGESTION_KV_SCOPE = "customer.suggestion"
 REASON_SELLER_SUGGESTION = "seller_suggestion"
+
+_CUSTOMER_SUGGESTION_FIELDS = (
+	"phone",
+	"mobile_no",
+	"tax_id",
+	"tax_category",
+	"address_line1",
+	"preferred_hours",
+	"zone",
+	"client_access_pin",
+	"client_phone_e164",
+	"customer_name",
+	"territory",
+)
 
 
 def _normalize_suggestion_change(change) -> dict:
@@ -535,6 +550,165 @@ def apply_pending_suggestion(preorder_name: str) -> dict | None:
 	return sug
 
 
+def _normalize_customer_suggestion_change(change) -> dict:
+	"""Accept JSON string / dict; keep only Customer fields sellers may suggest."""
+	import json as _json
+
+	if change is None or change == "":
+		return {}
+	if isinstance(change, str):
+		raw = change.strip()
+		if not raw or raw.lower() in ("null", "undefined", "none"):
+			return {}
+		try:
+			change = _json.loads(raw)
+		except Exception:
+			frappe.throw(_("Invalid suggestion change JSON"), frappe.ValidationError)
+	if not isinstance(change, dict):
+		frappe.throw(_("change must be an object"), frappe.ValidationError)
+
+	out = {}
+	for key in _CUSTOMER_SUGGESTION_FIELDS:
+		if key not in change:
+			continue
+		val = change.get(key)
+		if val is None:
+			continue
+		s = cstr(val).strip()
+		if s.lower() in ("null", "undefined"):
+			continue
+		out[key] = s
+	# Alias phone → mobile_no for update_customer
+	if "phone" in out and "mobile_no" not in out:
+		out["mobile_no"] = out["phone"]
+	return out
+
+
+def _customer_suggestion_summary(change: dict) -> str:
+	parts = []
+	for key in (
+		"customer_name",
+		"phone",
+		"mobile_no",
+		"tax_id",
+		"tax_category",
+		"address_line1",
+		"preferred_hours",
+		"zone",
+		"client_access_pin",
+		"client_phone_e164",
+		"territory",
+	):
+		if key in (change or {}):
+			parts.append(key)
+	return ",".join(parts) if parts else "suggestion"
+
+
+def get_pending_customer_suggestion(customer_name: str) -> dict | None:
+	"""Return stored Customer suggestion payload or None."""
+	name = cstr(customer_name or "").strip()
+	if not name:
+		return None
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	_doc, data = kv_get(CUSTOMER_SUGGESTION_KV_SCOPE, name)
+	if not isinstance(data, dict):
+		return None
+	change = data.get("change")
+	if not isinstance(change, dict) or not change:
+		return None
+	if cstr(data.get("status") or "pending").lower() == "rejected":
+		clear_pending_customer_suggestion(name)
+		frappe.db.commit()
+		return None
+	return data
+
+
+def clear_pending_customer_suggestion(customer_name: str) -> bool:
+	"""Delete the suggestion KV row for a Customer."""
+	name = cstr(customer_name or "").strip()
+	if not name:
+		return False
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	docname, _ = kv_get(CUSTOMER_SUGGESTION_KV_SCOPE, name)
+	if not docname:
+		return False
+	frappe.delete_doc("Table Extra Data", docname, ignore_permissions=True)
+	return True
+
+
+def suggest_customer_change(customer_name=None, change=None):
+	"""Queue a seller Customer patch without mutating the live Customer.
+
+	Stores the patch in Table Extra Data and parks the Customer in Revisar
+	(``custom_creation_review=Pending``). Admin confirm applies the patch.
+	"""
+	name = cstr(customer_name or "").strip()
+	if not name:
+		frappe.throw(_("customer_name is required"), frappe.ValidationError)
+	if not frappe.db.exists("Customer", name):
+		frappe.throw(_("Customer {0} not found").format(name), frappe.DoesNotExistError)
+
+	norm = _normalize_customer_suggestion_change(change)
+	if not norm:
+		frappe.throw(_("Suggestion change is empty"), frappe.ValidationError)
+
+	actor = _acting_or_session_user()
+	prev = get_pending_customer_suggestion(name) or {}
+	prev_change = prev.get("change") if isinstance(prev.get("change"), dict) else {}
+	merged = dict(prev_change)
+	merged.update(norm)
+
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	summary = _customer_suggestion_summary(merged)
+	payload = {
+		"change": merged,
+		"actor": actor,
+		"reason": REASON_SELLER_SUGGESTION,
+		"summary": summary,
+		"status": "pending",
+		"modified": str(frappe.utils.now_datetime()),
+	}
+	kv_set(CUSTOMER_SUGGESTION_KV_SCOPE, name, payload)
+
+	ensure_creation_review_custom_fields()
+	if frappe.db.has_column("Customer", FIELDNAME):
+		frappe.db.set_value("Customer", name, FIELDNAME, STATUS_PENDING, update_modified=False)
+
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"name": name,
+		"review_status": STATUS_PENDING,
+		"suggestion": payload,
+	}
+
+
+def apply_pending_customer_suggestion(customer_name: str) -> dict | None:
+	"""Apply a queued Customer suggestion (admin Revisar confirm)."""
+	name = cstr(customer_name or "").strip()
+	sug = get_pending_customer_suggestion(name)
+	if not sug:
+		return None
+	change = sug.get("change") if isinstance(sug.get("change"), dict) else {}
+	if not change:
+		clear_pending_customer_suggestion(name)
+		return None
+
+	from erpnext.erpnext_integrations.ecommerce_api import api as guest_api
+
+	frappe.flags.applying_creation_review_suggestion = True
+	try:
+		guest_api.update_customer(name, **change)
+	finally:
+		frappe.flags.applying_creation_review_suggestion = False
+
+	clear_pending_customer_suggestion(name)
+	return sug
+
+
 def _owner_full_name(owner: str) -> str:
 	owner = cstr(owner or "").strip()
 	if not owner:
@@ -640,8 +814,27 @@ def list_creation_reviews(kind="customer", status="Pending", limit=100, start=0)
 					"creation": str(r.creation) if r.creation else None,
 					"modified": str(r.modified) if r.modified else None,
 					"review_status": getattr(r, FIELDNAME, None) or status_filter,
+					"has_suggestion": False,
+					"suggestion_summary": None,
+					"suggestion_actor": None,
 				}
 			)
+		# Batch-attach pending seller suggestions for Revisar UI.
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get_many
+
+			names = [r["name"] for r in out if r.get("name")]
+			sug_map = kv_get_many(CUSTOMER_SUGGESTION_KV_SCOPE, names) if names else {}
+			for row in out:
+				data = sug_map.get(row["name"]) or {}
+				change = data.get("change") if isinstance(data, dict) else None
+				status = cstr(data.get("status") or "pending").lower() if isinstance(data, dict) else ""
+				if isinstance(change, dict) and change and status != "rejected":
+					row["has_suggestion"] = True
+					row["suggestion_summary"] = data.get("summary") or _customer_suggestion_summary(change)
+					row["suggestion_actor"] = cstr(data.get("actor") or "") or None
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "list_creation_reviews customer suggestion attach")
 		return out
 
 	# Orders = guest preorders only
@@ -751,7 +944,7 @@ def list_creation_reviews(kind="customer", status="Pending", limit=100, start=0)
 def confirm_creation_review(kind=None, name=None):
 	"""Mark a pending creation as Confirmed (leave the Revisión queue).
 
-	For orders: applies any queued seller suggestion first, then confirms.
+	For orders/customers: applies any queued seller suggestion first, then confirms.
 	"""
 	ensure_creation_review_custom_fields()
 	kind = _normalize_kind(kind)
@@ -774,6 +967,9 @@ def confirm_creation_review(kind=None, name=None):
 			frappe.throw(_("Not a Guest Preorder"), frappe.ValidationError)
 		_assert_can_decide_seller_suggestion(get_pending_suggestion(name))
 		applied = apply_pending_suggestion(name)
+	elif kind == "customer":
+		_assert_can_decide_seller_suggestion(get_pending_customer_suggestion(name))
+		applied = apply_pending_customer_suggestion(name)
 
 	frappe.db.set_value(doctype, name, FIELDNAME, STATUS_CONFIRMED)
 	frappe.db.commit()
@@ -797,6 +993,28 @@ def delete_creation_review(kind=None, name=None):
 	if kind == "customer":
 		if not frappe.db.exists("Customer", name):
 			frappe.throw(_("Customer {0} not found").format(name), frappe.DoesNotExistError)
+
+		# Seller suggestion reject: keep Customer body, discard queued patch.
+		sug = get_pending_customer_suggestion(name)
+		if (
+			isinstance(sug, dict)
+			and isinstance(sug.get("change"), dict)
+			and sug.get("change")
+			and cstr(sug.get("reason") or "") == REASON_SELLER_SUGGESTION
+			and cstr(sug.get("status") or "pending").lower() != "rejected"
+		):
+			_assert_can_decide_seller_suggestion(sug)
+			clear_pending_customer_suggestion(name)
+			if frappe.db.has_column("Customer", FIELDNAME):
+				frappe.db.set_value("Customer", name, FIELDNAME, STATUS_CONFIRMED)
+			frappe.db.commit()
+			return {
+				"ok": True,
+				"kind": kind,
+				"name": name,
+				"action": "suggestion_rejected",
+				"suggestion": None,
+			}
 
 		# Linked transactional docs → disable instead of hard-delete.
 		linked = False

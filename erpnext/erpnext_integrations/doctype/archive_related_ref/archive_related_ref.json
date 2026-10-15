@@ -16,7 +16,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Link DocType",
-   "options": "Tag\nItem\nEmployee\nSupplier\nCustomer\nAsset\nPurchase Invoice\nPayment Entry\nJournal Entry\nPurchase Order",
+   "options": "Tag\nItem\nEmployee\nSupplier\nCustomer\nAsset\nPurchase Invoice\nPayment Entry\nJournal Entry\nPurchase Order\nSales Order\nSales Invoice\nCompany Archive Entry",
    "reqd": 1
   },
   {

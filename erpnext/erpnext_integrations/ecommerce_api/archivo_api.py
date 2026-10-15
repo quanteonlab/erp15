@@ -34,6 +34,9 @@ RELATED_DOCTYPES = frozenset(
 		"Payment Entry",
 		"Journal Entry",
 		"Purchase Order",
+		"Sales Order",
+		"Sales Invoice",
+		"Company Archive Entry",
 	}
 )
 # Soft related_refs may also harden these Contabilizar link fields when the name exists in ERP.
@@ -86,6 +89,9 @@ SYSTEM_KINDS = [
 	{"code": "other_document", "label_es": "Otro documento", "label_en": "Other document", "sync_template": "paper"},
 	# i051 — Enqueue Bulk lands here until a person or the MCP assistant classifies it.
 	{"code": "inbox_unsorted", "label_es": "Sin clasificar (cola)", "label_en": "Unsorted (queue)", "sync_template": "none"},
+	# i053 — one placeholder folder per (company, YYYY-MM) for auto-created docs.
+	{"code": "month_binder", "label_es": "Carpeta del mes", "label_en": "Month binder", "sync_template": "paper"},
+	{"code": "sales_invoice", "label_es": "Factura de venta", "label_en": "Sales invoice", "sync_template": "paper"},
 ]
 
 # i051 — Documentos inbox. Queue = enqueued files nobody classified yet;
@@ -927,6 +933,196 @@ def attach_archivo_file(name=None, file_name=None, content_b64=None, is_private=
 		"file_name": file_doc.file_name,
 		"attachment_count": _attachment_count(name),
 	}
+
+
+def _year_month_key(raw=None) -> str:
+	"""Normalize to YYYY-MM; empty/null → current month."""
+	s = _as_str(raw)
+	if not s or s.lower() in ("null", "undefined", "none"):
+		d = getdate(nowdate())
+		return f"{d.year:04d}-{d.month:02d}"
+	s = s.strip()
+	# Accept YYYY-MM or YYYY-MM-DD / datetime-ish.
+	if len(s) >= 7 and s[4] == "-":
+		ym = s[:7]
+		try:
+			y, m = ym.split("-", 1)
+			yi, mi = int(y), int(m)
+			if 1 <= mi <= 12 and yi >= 1970:
+				return f"{yi:04d}-{mi:02d}"
+		except Exception:
+			pass
+	try:
+		d = getdate(s)
+		return f"{d.year:04d}-{d.month:02d}"
+	except Exception:
+		frappe.throw(_("Invalid year_month: {0}").format(raw))
+
+
+def _month_binder_title(year_month: str) -> str:
+	try:
+		y, m = year_month.split("-", 1)
+		# Spanish month labels keep Documentos copy consistent with the pivot.
+		months = (
+			"",
+			"Ene",
+			"Feb",
+			"Mar",
+			"Abr",
+			"May",
+			"Jun",
+			"Jul",
+			"Ago",
+			"Sep",
+			"Oct",
+			"Nov",
+			"Dic",
+		)
+		mi = int(m)
+		label = months[mi] if 1 <= mi <= 12 else m
+		return f"Documentos · {label} {y}"
+	except Exception:
+		return f"Documentos · {year_month}"
+
+
+@frappe.whitelist(allow_guest=True)
+def ensure_archivo_month_binder(company=None, year_month=None):
+	"""Get or create the i053 monthly binder for (company, YYYY-MM)."""
+	_require_app_permission()
+	_require_doctype()
+	company = _as_str(company) or resolve_company()
+	if not company:
+		frappe.throw(_("company is required"))
+	ym = _year_month_key(year_month)
+	posting = f"{ym}-01"
+	existing = frappe.get_all(
+		DOCTYPE,
+		filters={
+			"company": company,
+			"kind": "month_binder",
+			"posting_date": posting,
+			"workflow_status": ["!=", "void"],
+		},
+		fields=["name"],
+		order_by="creation asc",
+		limit_page_length=1,
+		ignore_permissions=True,
+	)
+	if existing:
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc(DOCTYPE, existing[0].name)
+		frappe.flags.ignore_permissions = False
+		return {"binder": _row_dict(doc), "created": 0}
+
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc(
+		{
+			"doctype": DOCTYPE,
+			"title": _month_binder_title(ym)[:140],
+			"kind": "month_binder",
+			"sync_template": "paper",
+			"posting_date": posting,
+			"company": company,
+			"workflow_status": "filed",
+			"erp_sync_status": "local_only",
+			"amount": None,
+			"currency": _default_currency(company),
+			"notes": f"month_binder:{ym}",
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	frappe.flags.ignore_permissions = False
+	return {"binder": _row_dict(doc), "created": 1}
+
+
+def _link_entry_to_month_binder(entry_name, year_month=None, company=None):
+	"""Attach related_refs note=month_binder on a child Archivo row (idempotent)."""
+	entry_name = _as_str(entry_name)
+	if not entry_name or not frappe.db.exists(DOCTYPE, entry_name):
+		return None
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc(DOCTYPE, entry_name)
+	co = _as_str(company) or _as_str(doc.company) or resolve_company()
+	ym = _year_month_key(year_month or doc.posting_date)
+	ensured = ensure_archivo_month_binder(company=co, year_month=ym)
+	binder_name = (ensured.get("binder") or {}).get("name")
+	if not binder_name:
+		frappe.flags.ignore_permissions = False
+		return None
+	refs = []
+	for r in doc.get("related_refs") or []:
+		dt = r.link_doctype if hasattr(r, "link_doctype") else r.get("link_doctype")
+		nm = r.link_name if hasattr(r, "link_name") else r.get("link_name")
+		note = r.note if hasattr(r, "note") else r.get("note")
+		refs.append(
+			{
+				"link_doctype": _as_str(dt) or "Tag",
+				"link_name": _as_str(nm),
+				"note": _as_str(note),
+			}
+		)
+	already = any(
+		r.get("link_doctype") == DOCTYPE
+		and r.get("link_name") == binder_name
+		and (r.get("note") or "") == "month_binder"
+		for r in refs
+	)
+	if not already:
+		refs.append(
+			{
+				"link_doctype": DOCTYPE,
+				"link_name": binder_name,
+				"note": "month_binder",
+			}
+		)
+		doc.set("related_refs", _normalize_related_refs(refs))
+		doc.save(ignore_permissions=True)
+		frappe.db.commit()
+	frappe.flags.ignore_permissions = False
+	return binder_name
+
+
+@frappe.whitelist(allow_guest=True)
+def list_archivo_month_binder_children(name=None):
+	"""Rows that reference this binder via related_refs (note=month_binder)."""
+	_require_app_permission()
+	_require_doctype()
+	name = _as_str(name)
+	if not name:
+		frappe.throw(_("name is required"))
+	if not frappe.db.exists(DOCTYPE, name):
+		frappe.throw(_("Archivo entry {0} not found").format(name))
+	# Child table scan — fine for month-scale volumes (i053 Option A).
+	parent_names = frappe.db.sql(
+		"""
+		select distinct parent
+		from `tabArchive Related Ref`
+		where link_doctype=%s and link_name=%s and ifnull(note,'')=%s
+		""",
+		(DOCTYPE, name, "month_binder"),
+		as_dict=False,
+	)
+	names = [r[0] for r in (parent_names or []) if r and r[0]]
+	if not names:
+		return {"rows": []}
+	rows = frappe.get_all(
+		DOCTYPE,
+		filters={"name": ["in", names], "workflow_status": ["!=", "void"]},
+		fields=[
+			"name",
+			"title",
+			"kind",
+			"posting_date",
+			"amount",
+			"currency",
+			"workflow_status",
+			"company",
+		],
+		order_by="posting_date desc, creation desc",
+		ignore_permissions=True,
+	)
+	return {"rows": rows or []}
 
 
 @frappe.whitelist(allow_guest=True)

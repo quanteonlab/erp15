@@ -483,8 +483,13 @@ def get_my_board(owner_user=None):
 
 	lead_rows = frappe.get_all(
 		"Lead",
-		# Keep Converted leads on the board (Cliente column). Only hide DNC.
-		filters={"lead_owner": owner_user, "status": ["!=", "Do Not Contact"]},
+		# Keep Converted leads on the board (Cliente column). Hide DNC / disabled
+		# (merged donors are force-archived with both flags).
+		filters={
+			"lead_owner": owner_user,
+			"status": ["!=", "Do Not Contact"],
+			"disabled": 0,
+		},
 		fields=[
 			"name", "lead_name", "company_name", "mobile_no", "whatsapp_no", "phone", "email_id",
 			"city", "state", "country", "custom_address_line1", "custom_pincode",
@@ -987,6 +992,24 @@ def duplicate_lead(lead=None):
 	return {"ok": True, "name": doc.name, "from": src.name}
 
 
+def _archive_lead_row(name: str) -> None:
+	"""Force-hide a Lead from the Preventa board.
+
+	Must use ``db.set_value`` — Lead.validate → StatusUpdater.set_status will
+	overwrite ``Do Not Contact`` back to ``Converted`` whenever a Customer is
+	linked (``has_customer``), so ``doc.save()`` cannot archive converted leads.
+	"""
+	name = cstr(name or "").strip()
+	if not name or not frappe.db.exists("Lead", name):
+		return
+	frappe.db.set_value(
+		"Lead",
+		name,
+		{"status": "Do Not Contact", "disabled": 1},
+		update_modified=True,
+	)
+
+
 @frappe.whitelist(allow_guest=True)
 def archive_leads(leads=None):
 	"""Hide leads from the board by setting status to Do Not Contact."""
@@ -1003,9 +1026,7 @@ def archive_leads(leads=None):
 		doc = frappe.get_doc("Lead", name)
 		frappe.flags.ignore_permissions = False
 		_require_owner_or_crm(doc.lead_owner)
-		doc.status = "Do Not Contact"
-		doc.flags.ignore_permissions = True
-		doc.save(ignore_permissions=True)
+		_archive_lead_row(name)
 		archived.append(name)
 	frappe.db.commit()
 	return {"ok": True, "archived": archived}
@@ -1074,18 +1095,40 @@ def _build_merge_plan(lead_names: list):
 				}
 			)
 
-	return {
-		"survivor": survivor.name,
-		"donors": [d.name for d in donors],
-		"leads": [
+	# Pipeline stage labels from the survivor owner's board (or settings default).
+	owner_user = cstr(survivor.lead_owner or _acting_user() or "").strip()
+	cols = _load_board_columns(owner_user) if owner_user else []
+	stage_label_by_key = {
+		cstr(c.get("key")): cstr(c.get("label") or c.get("key") or "")
+		for c in (cols or [])
+		if c.get("key")
+	}
+	settings = _load_preventa_settings()
+	default_stage = _default_new_stage_key(settings)
+
+	leads_out = []
+	for d in docs:
+		stage_key = cstr(getattr(d, "custom_preventa_stage", None) or "").strip() or default_stage
+		if cstr(getattr(d, "status", None) or "") == "Converted":
+			won = _won_stage_key(owner_user, settings) if owner_user else None
+			won_keys = {c.get("key") for c in (cols or []) if c.get("is_won")}
+			if won and (not stage_key or (won_keys and stage_key not in won_keys)):
+				stage_key = won
+		leads_out.append(
 			{
 				"name": d.name,
 				"lead_name": d.lead_name,
 				"company_name": d.company_name,
 				"modified": str(d.modified),
+				"stage": stage_key,
+				"stage_label": stage_label_by_key.get(stage_key) or stage_key,
 			}
-			for d in docs
-		],
+		)
+
+	return {
+		"survivor": survivor.name,
+		"donors": [d.name for d in donors],
+		"leads": leads_out,
 		"proposed": proposed,
 		"conflicts": conflicts,
 		"_docs": docs,
@@ -1108,13 +1151,122 @@ def preview_merge_leads(leads=None):
 	}
 
 
+def _furthest_preventa_stage(owner_user: str, stage_keys: list[str]) -> str | None:
+	"""Pick the rightmost board column among the given stage keys."""
+	cols = _load_board_columns(owner_user) or []
+	order = {cstr(c.get("key")): i for i, c in enumerate(cols) if c.get("key")}
+	best = None
+	best_i = -1
+	for sk in stage_keys or []:
+		key = cstr(sk or "").strip()
+		if not key:
+			continue
+		i = order.get(key, -1)
+		if i > best_i:
+			best_i = i
+			best = key
+	return best
+
+
+def _repoint_preventa_child_rows(survivor: str, donor_names: list[str]) -> None:
+	"""Move consultas / events / seller links from donors onto the survivor."""
+	if not survivor or not donor_names:
+		return
+	placeholders = ",".join(["%s"] * len(donor_names))
+	params = tuple([survivor] + list(donor_names))
+	if frappe.db.exists("DocType", "Preventa Lead Consulta"):
+		frappe.db.sql(
+			f"""
+			UPDATE `tabPreventa Lead Consulta`
+			SET lead = %s
+			WHERE lead IN ({placeholders})
+			""",
+			params,
+		)
+	if frappe.db.exists("DocType", "Preventa Event"):
+		frappe.db.sql(
+			f"""
+			UPDATE `tabPreventa Event`
+			SET lead = %s
+			WHERE lead IN ({placeholders})
+			""",
+			params,
+		)
+	if frappe.db.has_column("Seller Link", "lead"):
+		frappe.db.sql(
+			f"""
+			UPDATE `tabSeller Link`
+			SET lead = %s
+			WHERE lead IN ({placeholders})
+			""",
+			params,
+		)
+
+
+def _merge_donor_customers_and_orders(survivor_lead: str, donor_names: list[str]) -> str | None:
+	"""Bring donor Customers + their open Sales Orders under the survivor Lead.
+
+	Returns the survivor Customer name (if any) after the merge.
+	"""
+	survivor_lead = cstr(survivor_lead or "").strip()
+	if not survivor_lead:
+		return None
+	surv_cust = frappe.db.get_value("Customer", {"lead_name": survivor_lead}, "name")
+	for donor in donor_names or []:
+		donor = cstr(donor or "").strip()
+		if not donor:
+			continue
+		donor_cust = frappe.db.get_value("Customer", {"lead_name": donor}, "name")
+		if not donor_cust:
+			continue
+		if not surv_cust:
+			frappe.db.set_value("Customer", donor_cust, "lead_name", survivor_lead, update_modified=False)
+			surv_cust = donor_cust
+			continue
+		if donor_cust == surv_cust:
+			continue
+		cust_name = frappe.db.get_value("Customer", surv_cust, "customer_name")
+		# Re-point open transactional docs from donor customer → survivor customer.
+		for dt, link_field in (
+			("Sales Order", "customer"),
+			("Sales Invoice", "customer"),
+			("Delivery Note", "customer"),
+			("Quotation", "party_name"),
+			("Opportunity", "party_name"),
+		):
+			if not frappe.db.exists("DocType", dt) or not frappe.db.has_column(dt, link_field):
+				continue
+			filters: dict = {link_field: donor_cust}
+			if dt == "Quotation" and frappe.db.has_column(dt, "quotation_to"):
+				filters["quotation_to"] = "Customer"
+			if dt == "Opportunity" and frappe.db.has_column(dt, "opportunity_from"):
+				filters["opportunity_from"] = "Customer"
+			if frappe.db.has_column(dt, "docstatus"):
+				filters["docstatus"] = ["<", 2]
+			rows = frappe.get_all(dt, filters=filters, pluck="name", ignore_permissions=True)
+			for name in rows or []:
+				patch = {link_field: surv_cust}
+				if frappe.db.has_column(dt, "customer_name") and cust_name:
+					patch["customer_name"] = cust_name
+				frappe.db.set_value(dt, name, patch, update_modified=False)
+		# Detach / disable the donor Customer so it no longer owns a board card.
+		frappe.db.set_value(
+			"Customer",
+			donor_cust,
+			{"lead_name": "", "disabled": 1},
+			update_modified=False,
+		)
+	return surv_cust
+
+
 @frappe.whitelist(allow_guest=True)
 def merge_leads(leads=None, resolutions=None, survivor=None):
 	"""Merge duplicate leads into the newest (or explicit) survivor.
 
 	Per-field default: value from the most recently modified lead that has it.
 	`resolutions` overrides conflicted (or any) fields with the user's text.
-	Donors are archived (Do Not Contact); notes/tags/consultas move to survivor.
+	Donors are archived (Do Not Contact); notes/tags/consultas/orders/stage
+	progress move onto the survivor.
 	"""
 	if isinstance(leads, str):
 		leads = frappe.parse_json(leads)
@@ -1144,7 +1296,15 @@ def merge_leads(leads=None, resolutions=None, survivor=None):
 	for fid, attr in LEAD_FIELD_MAP.items():
 		survivor_doc.set(attr, final_values.get(fid) or None)
 
-	# Merge tags
+	# Progress: keep the furthest board stage among survivor + donors.
+	owner_user = cstr(survivor_doc.lead_owner or _acting_user() or "").strip()
+	stage_keys = [cstr(getattr(d, "custom_preventa_stage", None) or "") for d in docs]
+	furthest = _furthest_preventa_stage(owner_user, stage_keys) if owner_user else None
+	if furthest and furthest != cstr(getattr(survivor_doc, "custom_preventa_stage", None) or ""):
+		survivor_doc.custom_preventa_stage = furthest
+		survivor_doc.custom_preventa_stage_since = now_datetime()
+
+	# Merge tags (progress / label chips)
 	all_names = [survivor_doc.name] + [d.name for d in donors]
 	tags_map = tags_map_for_docs("Lead", all_names)
 	merged_tags = []
@@ -1178,29 +1338,26 @@ def merge_leads(leads=None, resolutions=None, survivor=None):
 	if merged_tags:
 		set_tags_for_doc("Lead", survivor_doc.name, tags=merged_tags, commit=False)
 
-	# Re-point consultas
 	donor_names = [d.name for d in donors]
-	if donor_names and frappe.db.exists("DocType", "Preventa Lead Consulta"):
-		frappe.db.sql(
-			"""
-			UPDATE `tabPreventa Lead Consulta`
-			SET lead = %s
-			WHERE lead IN ({placeholders})
-			""".format(placeholders=",".join(["%s"] * len(donor_names))),
-			tuple([survivor_doc.name] + donor_names),
-		)
+	_repoint_preventa_child_rows(survivor_doc.name, donor_names)
+	_merge_donor_customers_and_orders(survivor_doc.name, donor_names)
 
-	for donor in donors:
-		donor.status = "Do Not Contact"
-		donor.flags.ignore_permissions = True
-		donor.save(ignore_permissions=True)
+	# Archive donors without going through Lead.validate / set_status
+	# (Converted + Customer would otherwise snap status back to Converted).
+	for name in donor_names:
+		_archive_lead_row(name)
 
 	frappe.db.commit()
 	try:
 		_log_preventa_event(
 			"merge",
 			lead=survivor_doc.name,
-			payload={"donors": donor_names, "resolutions": list(resolutions.keys())},
+			payload={
+				"donors": donor_names,
+				"resolutions": list(resolutions.keys()),
+				"stage": furthest,
+				"tags": merged_tags,
+			},
 		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Preventa merge event failed")
@@ -1210,6 +1367,8 @@ def merge_leads(leads=None, resolutions=None, survivor=None):
 		"survivor": survivor_doc.name,
 		"archived": donor_names,
 		"conflicts_resolved": len(resolutions),
+		"stage": furthest or cstr(getattr(survivor_doc, "custom_preventa_stage", None) or "") or None,
+		"tags": merged_tags,
 	}
 
 
@@ -1863,10 +2022,9 @@ def sync_lead_from_guest_preorder(so_name, guest_name=None, guest_phone=None, gu
 			tail = phone_digits[-8:]
 			for fieldname in ("mobile_no", "whatsapp_no", "phone"):
 				match_or_filters.append([fieldname, "like", f"%{tail}"])
-		if email_n:
-			match_or_filters.append(["email_id", "=", email_n])
 
 		lead_name = None
+		found = None
 		if match_or_filters:
 			found = frappe.get_all(
 				"Lead",
@@ -1877,8 +2035,25 @@ def sync_lead_from_guest_preorder(so_name, guest_name=None, guest_phone=None, gu
 				limit_page_length=1,
 				ignore_permissions=True,
 			)
-			if found:
-				lead_name = found[0].name
+		# Email is a unique identifier (case-insensitive). Prefer an open lead,
+		# then a Converted one — attach the consulta instead of spawning a duplicate.
+		if not found and email_n:
+			found = frappe.db.sql(
+				"""
+				SELECT name FROM `tabLead`
+				WHERE IFNULL(status, '') NOT IN ('Do Not Contact')
+				  AND email_id IS NOT NULL AND TRIM(email_id) != ''
+				  AND LOWER(TRIM(email_id)) = %s
+				ORDER BY
+					CASE WHEN status = 'Converted' THEN 1 ELSE 0 END ASC,
+					modified DESC
+				LIMIT 1
+				""",
+				(email_n,),
+				as_dict=True,
+			)
+		if found:
+			lead_name = found[0].name
 
 		if lead_name:
 			frappe.flags.ignore_permissions = True

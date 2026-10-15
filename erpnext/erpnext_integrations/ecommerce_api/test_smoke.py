@@ -561,6 +561,130 @@ def suite_5_9_master_data():
                     frappe.delete_doc("Customer", cname, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_consulta_email_match():
+        """Non-empty guest_email auto-links to the Customer with that email (unique id)."""
+        email = f"smoke.email.{frappe.generate_hash(length=8)}@example.com"
+        cust = None
+        so_name = None
+        try:
+            cust = api.create_customer(
+                customer_name=f"Smoke Email Cust {frappe.generate_hash(length=6)}",
+                email=email,
+            )
+            cust_name = cust.get("name") if isinstance(cust, dict) else cust
+            assert cust_name and frappe.db.exists("Customer", cust_name)
+            empty = api.match_customers_for_consulta(guest_email="")
+            assert isinstance(empty, dict) and empty.get("customers") == []
+            hits = api.match_customers_for_consulta(guest_email=email.upper())
+            assert any(c.get("name") == cust_name for c in (hits.get("customers") or [])), hits
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke email match consulta",
+                guest_email=email,
+                guest_name="Smoke Email Guest",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            assert frappe.db.get_value("Sales Order", so_name, "customer") == cust_name
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            if cust:
+                cname = cust.get("name") if isinstance(cust, dict) else cust
+                if cname and frappe.db.exists("Customer", cname):
+                    frappe.delete_doc("Customer", cname, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_consulta_location_match():
+        """Exact primary address_line1 (local) auto-links; blank address never matches."""
+        addr = f"Calle Smoke {frappe.generate_hash(length=6)} 100"
+        cust = None
+        so_name = None
+        try:
+            cust = api.create_customer(
+                customer_name=f"Smoke Loc Cust {frappe.generate_hash(length=6)}",
+                address_line1=addr,
+            )
+            cust_name = cust.get("name") if isinstance(cust, dict) else cust
+            assert cust_name and frappe.db.exists("Customer", cust_name)
+            empty = api.match_customers_for_consulta(guest_address="")
+            assert isinstance(empty, dict) and empty.get("customers") == []
+            hits = api.match_customers_for_consulta(guest_address=addr)
+            assert any(c.get("name") == cust_name for c in (hits.get("customers") or [])), hits
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke location match consulta",
+                guest_address=addr,
+                guest_name="Smoke Loc Guest",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            assert frappe.db.get_value("Sales Order", so_name, "customer") == cust_name
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            if cust:
+                cname = cust.get("name") if isinstance(cust, dict) else cust
+                if cname and frappe.db.exists("Customer", cname):
+                    for a in frappe.get_all(
+                        "Dynamic Link",
+                        filters={
+                            "link_doctype": "Customer",
+                            "link_name": cname,
+                            "parenttype": "Address",
+                        },
+                        pluck="parent",
+                        ignore_permissions=True,
+                    ):
+                        frappe.delete_doc("Address", a, ignore_permissions=True, force=True)
+                    frappe.delete_doc("Customer", cname, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_consulta_email_duplicate_disambiguate():
+        """Duplicate email_id must still auto-link (prefer name hint), never Consumidor Final."""
+        h = frappe.generate_hash(length=6)
+        email = f"smoke.dup.{h}@example.com"
+        cust_a = cust_b = so_name = None
+        try:
+            cust_a = api.create_customer(
+                customer_name=f"Smoke Dup A {h}",
+                email=email,
+            )
+            cust_b = api.create_customer(
+                customer_name=f"Smoke Dup Agustin {h}",
+                email=email,
+            )
+            a = cust_a.get("name") if isinstance(cust_a, dict) else cust_a
+            b = cust_b.get("name") if isinstance(cust_b, dict) else cust_b
+            assert a and b and a != b
+            hits = api.match_customers_for_consulta(guest_email=email)
+            names = {c.get("name") for c in (hits.get("customers") or [])}
+            assert a in names and b in names, hits
+            # Name hint prefers the Agustin-like customer
+            picked = api._find_customer_by_email(email, prefer_name=f"Smoke Dup Agustin {h}")
+            assert picked == b, (picked, b)
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke dup email consulta",
+                guest_email=email,
+                guest_name=f"Smoke Dup Agustin {h}",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            so_cust = frappe.db.get_value("Sales Order", so_name, "customer")
+            assert so_cust == b, (so_cust, b)
+            assert not api._is_bucket_customer(
+                so_cust, frappe.db.get_value("Customer", so_cust, "customer_name")
+            )
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            for c in (cust_a, cust_b):
+                cname = c.get("name") if isinstance(c, dict) else c
+                if cname and frappe.db.exists("Customer", cname):
+                    frappe.delete_doc("Customer", cname, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_empty_items_consulta_update():
         """Draft Consulta with no Items must accept header/notes save (no HTTP 417 Items)."""
         so_name = None
@@ -1286,6 +1410,13 @@ def suite_5_9_master_data():
     _run("5.9.10 get_items_for_label_print", check_labels, "S3")
     _run("5.9.11 get_guest_preorders_list", check_guest_preorders_list, "S3")
     _run("5.9.12 consulta phone→customer match", check_consulta_phone_match, "S2")
+    _run("5.9.12b consulta email→customer match", check_consulta_email_match, "S2")
+    _run("5.9.12c consulta location→customer match", check_consulta_location_match, "S2")
+    _run(
+        "5.9.12d consulta duplicate email disambiguates",
+        check_consulta_email_duplicate_disambiguate,
+        "S2",
+    )
     _run("5.9.13 empty-items Consulta header update", check_empty_items_consulta_update, "S2")
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
     _run("5.9.14a WEIGHT bills rate×kg", check_weight_line_bills_rate_times_kg, "S2")

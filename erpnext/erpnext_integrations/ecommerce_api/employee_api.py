@@ -271,6 +271,16 @@ APP_PERMISSIONS = [
 		"desc_zh": "预售：仅可对自己被分配的客户成交/转化。",
 	},
 	{
+		"id": "sales.past_prices",
+		"group": "ventas_scope",
+		"label_en": "Past sales prices",
+		"label_es": "Precios de ventas pasadas",
+		"label_zh": "历史销售价格",
+		"desc_en": "On past orders (Orden / Preventa): see and edit measured weight, unit/kg price, line importe and order totals. Without this, sales can still order and see current list prices.",
+		"desc_es": "En pedidos pasados (Orden / Preventa): ver y editar peso medido, precio unitario/kg, importe de línea y totales. Sin esto, ventas igual puede pedir y ver precios de lista actuales.",
+		"desc_zh": "在历史订单（下单/预售）中查看并编辑实秤重量、单价/公斤价、行金额与合计。无此权限仍可下单并查看当前牌价。",
+	},
+	{
 		"id": "tables.compras",
 		"group": "tablas",
 		"label_en": "Purchases",
@@ -519,6 +529,8 @@ PERMISSION_TO_ROLES = {
 	"sales.see_assigned": ["Sales User"],
 	"sales.commit_all": ["Sales User"],
 	"sales.commit_assigned": ["Sales User"],
+	# Sensitive — not on Sales User / ventas starter; managers only by default role map.
+	"sales.past_prices": ["Sales Manager", "Accounts User", "Stock Manager"],
 	"ops.buying": ["Purchase User", "Purchase Manager", "Stock User"],
 	"log.reports": ["Accounts User"],
 	"log.accounting": ["Accounts User"],
@@ -911,6 +923,8 @@ _COARSE_FLAG = {
 	"sales.see_assigned": "pos",
 	"sales.commit_all": "pos",
 	"sales.commit_assigned": "pos",
+	# Coarse receiving/managers only — ventas (pos-only) does not inherit past prices.
+	"sales.past_prices": "receiving",
 	"tables.orders": "pos",
 	"tables.orders.own": "pos",
 	"tables.orders.all": "pos",

@@ -2446,13 +2446,153 @@ def _find_customer_by_local(address) -> str | None:
 	return uniq[0] if len(uniq) == 1 else None
 
 
-def _resolve_consulta_customer(explicit=None, guest_phone=None, guest_address=None) -> str:
-	"""Prefer explicit Customer, else phone / local match, else Consumidor Final."""
+def _normalize_customer_email(value) -> str:
+	"""Lowercase trim; empty / placeholder strings never match."""
+	raw = cstr(value or "").strip().lower()
+	if not raw or raw in ("null", "undefined", "none", "-"):
+		return ""
+	if "@" not in raw:
+		return ""
+	return raw
+
+
+def _list_customers_by_email(email) -> list[str]:
+	"""All non-bucket Customers sharing this email (Customer.email_id, then Contact).
+
+	Ordered by ``modified`` DESC. Empty / placeholder emails return [].
+	"""
+	email_n = _normalize_customer_email(email)
+	if not email_n:
+		return []
+
+	uniq: list[str] = []
+
+	def _add(name, customer_name=None):
+		if not name or name in uniq:
+			return
+		cname = customer_name or frappe.db.get_value("Customer", name, "customer_name")
+		if _is_bucket_customer(name, cname):
+			return
+		if frappe.db.get_value("Customer", name, "disabled"):
+			return
+		uniq.append(name)
+
+	rows = frappe.db.sql(
+		"""
+		SELECT name, customer_name
+		FROM `tabCustomer`
+		WHERE IFNULL(disabled, 0) = 0
+		  AND email_id IS NOT NULL AND TRIM(email_id) != ''
+		  AND LOWER(TRIM(email_id)) = %s
+		ORDER BY modified DESC
+		LIMIT 20
+		""",
+		(email_n,),
+		as_dict=True,
+	)
+	for r in rows or []:
+		_add(r.name, r.customer_name)
+
+	# Contact Email → Customer Dynamic Link
+	rows = frappe.db.sql(
+		"""
+		SELECT dl.link_name AS customer
+		FROM `tabContact Email` ce
+		INNER JOIN `tabDynamic Link` dl
+			ON dl.parent = ce.parent AND dl.parenttype = 'Contact'
+		WHERE dl.link_doctype = 'Customer'
+		  AND ce.email_id IS NOT NULL AND TRIM(ce.email_id) != ''
+		  AND LOWER(TRIM(ce.email_id)) = %s
+		LIMIT 20
+		""",
+		(email_n,),
+		as_dict=True,
+	)
+	for r in rows or []:
+		_add(r.get("customer"))
+	return uniq
+
+
+def _pick_customer_among(candidates, prefer_name=None, prefer_address=None) -> str | None:
+	"""Choose one Customer from an ordered candidate list (already newest-first).
+
+	Email/phone/local may hit duplicates in messy data — prefer a name or address
+	hint when provided, else the first (most recently modified) candidate.
+	"""
+	if not candidates:
+		return None
+	if len(candidates) == 1:
+		return candidates[0]
+
+	name_hint = cstr(prefer_name or "").strip().lower()
+	# Ignore bucket-ish guest labels when scoring by name.
+	if name_hint and name_hint not in (
+		"consumidor final",
+		"guest",
+		"cliente",
+		"consulta",
+	):
+		# Prefer exact customer_name, then startswith, then contains.
+		exact, starts, contains = [], [], []
+		for name in candidates:
+			cname = cstr(frappe.db.get_value("Customer", name, "customer_name") or "").strip().lower()
+			if not cname:
+				continue
+			if cname == name_hint:
+				exact.append(name)
+			elif cname.startswith(name_hint) or name_hint.startswith(cname):
+				starts.append(name)
+			elif name_hint in cname or cname in name_hint:
+				contains.append(name)
+		for group in (exact, starts, contains):
+			if group:
+				return group[0]
+
+	addr_hint = cstr(prefer_address or "").strip().lower()
+	if len(addr_hint) >= 5:
+		local = _find_customer_by_local(prefer_address)
+		if local and local in candidates:
+			return local
+
+	return candidates[0]
+
+
+def _find_customer_by_email(email, prefer_name=None, prefer_address=None) -> str | None:
+	"""Match an existing non-bucket Customer by email (unique identifier).
+
+	Looks at ``Customer.email_id`` first, then Contact emails. Empty emails never
+	match. If several Customers share the email, pick by name/address hint or the
+	most recently modified — never fall back to Consumidor Final just because of
+	duplicate email rows.
+	"""
+	return _pick_customer_among(
+		_list_customers_by_email(email),
+		prefer_name=prefer_name,
+		prefer_address=prefer_address,
+	)
+
+
+def _resolve_consulta_customer(
+	explicit=None,
+	guest_phone=None,
+	guest_address=None,
+	guest_email=None,
+	guest_name=None,
+) -> str:
+	"""Prefer explicit Customer, else email / phone / local match, else Consumidor Final.
+
+	Email is treated as a unique identifier and checked before phone/address.
+	"""
 	explicit = ("" if explicit is None else str(explicit)).strip()
 	if explicit:
 		if not frappe.db.exists("Customer", explicit):
 			frappe.throw(_("Customer {0} not found").format(explicit))
 		return explicit
+	matched = _find_customer_by_email(
+		guest_email, prefer_name=guest_name, prefer_address=guest_address
+	)
+	if matched:
+		return matched
 	matched = _find_customer_by_phone(guest_phone)
 	if matched:
 		return matched
@@ -2513,11 +2653,13 @@ def _resync_so_party_links(so):
 
 
 @frappe.whitelist(allow_guest=True)
-def match_customers_for_consulta(guest_phone=None, guest_address=None, page_length=10):
-	"""Suggest existing Customers for a consulta (phone first, then local/address).
+def match_customers_for_consulta(
+	guest_phone=None, guest_address=None, guest_email=None, page_length=10
+):
+	"""Suggest existing Customers for a consulta (email, then phone, then local).
 
-	Empty phone/address never match empty Customer fields. Used by staff UI to
-	auto-suggest or manually confirm a link.
+	Empty email/phone/address never match empty Customer fields. Used by staff UI
+	to auto-suggest or manually confirm a link. Email is preferred (unique id).
 	"""
 	limit = max(1, min(cint(page_length) or 10, 40))
 	out = []
@@ -2545,10 +2687,15 @@ def match_customers_for_consulta(guest_phone=None, guest_address=None, page_leng
 			}
 		)
 
+	for email_hit in _list_customers_by_email(guest_email):
+		_append(email_hit, "email")
+		if len(out) >= limit:
+			break
+
 	phone_hit = _find_customer_by_phone(guest_phone)
 	if phone_hit:
 		_append(phone_hit, "phone")
-	else:
+	elif len(out) < limit:
 		digits = _normalize_phone_digits(guest_phone)
 		if len(digits) >= 6:
 			tail = digits[-8:]
@@ -5184,11 +5331,13 @@ def create_guest_preorder(
 	if not company:
 		frappe.throw(_("No Company configured"))
 
-	# Explicit customer wins; otherwise match by phone / local (non-empty only).
+	# Explicit customer wins; otherwise match by email / phone / local (non-empty only).
 	customer = _resolve_consulta_customer(
 		explicit=customer,
 		guest_phone=guest_phone,
 		guest_address=guest_address,
+		guest_email=guest_email,
+		guest_name=guest_name,
 	)
 	company_currency = frappe.db.get_value("Company", company, "default_currency") or "ARS"
 	price_list_currency = (
@@ -5918,6 +6067,9 @@ def get_guest_preorders_list(
 				order_tag = part.split(":", 1)[1].strip()
 				break
 		o["order_tag"] = order_tag or None
+		list_tags = _parse_remarks_tags(tag_raw)
+		o["is_credit_note"] = cstr(list_tags.get("credit_note") or "") in ("1", "true", "yes")
+		o["credit_of"] = cstr(list_tags.get("credit_of") or "").strip() or None
 		# Keep raw tags under a stable key so seller_ref / review_reason survive pop.
 		o["_tag_raw"] = tag_raw
 		o.pop(tag_fn, None)
@@ -5994,6 +6146,7 @@ def get_guest_preorders_list(
 		_apply_tms_display_status(o)
 
 	_attach_factura_a_fields(filtered)
+	_attach_billing_fields(filtered)
 	# Ecommerce system tags (PRINTED, L_*, SRV-*) for pipeline icons.
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
@@ -6172,6 +6325,10 @@ def get_guest_preorder(preorder_name):
 		payload["delivery_note"] = lg.get("delivery_note")
 	_apply_tms_display_status(payload)
 	_attach_factura_a_fields([payload])
+	_attach_billing_fields([payload])
+	payload["is_credit_note"] = cstr(tags.get("credit_note") or "") in ("1", "true", "yes")
+	payload["credit_of"] = cstr(tags.get("credit_of") or "").strip() or None
+	payload["credit_reason"] = cstr(tags.get("credit_reason") or "").strip() or None
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
 
@@ -7154,22 +7311,37 @@ def update_guest_preorder_details(preorder_name, data=None):
 			_update_guest_preorder_tag(so, tag_key, str(data.get(data_key) or "").strip())
 			guest_tags_touched = True
 
-	# Auto-relate when still on a bucket customer and phone/local now match someone.
+	# Auto-relate when still on a bucket customer and email/phone/local now match someone.
 	if not data.get("customer"):
 		cname = frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer
 		if _is_bucket_customer(so.customer, cname):
+			tags_now = _parse_remarks_tags(_guest_preorder_tag_text(so))
 			phone = (
 				str(data.get("guest_phone")).strip()
 				if "guest_phone" in data
-				else (_parse_remarks_tags(_guest_preorder_tag_text(so)).get("guest_phone") or "")
+				else (tags_now.get("guest_phone") or "")
 			)
 			address = (
 				str(data.get("guest_address")).strip()
 				if "guest_address" in data
-				else (_parse_remarks_tags(_guest_preorder_tag_text(so)).get("guest_address") or "")
+				else (tags_now.get("guest_address") or "")
+			)
+			email = (
+				str(data.get("guest_email")).strip()
+				if "guest_email" in data
+				else (tags_now.get("guest_email") or "")
+			)
+			gname = (
+				str(data.get("guest_name")).strip()
+				if "guest_name" in data
+				else (tags_now.get("guest_name") or "")
 			)
 			matched = _resolve_consulta_customer(
-				explicit=None, guest_phone=phone, guest_address=address
+				explicit=None,
+				guest_phone=phone,
+				guest_address=address,
+				guest_email=email,
+				guest_name=gname,
 			)
 			if matched and matched != so.customer and not _is_bucket_customer(
 				matched, frappe.db.get_value("Customer", matched, "customer_name")
@@ -9382,6 +9554,759 @@ def update_tracking_info(delivery_note, tracking_number, carrier=None):
 # ========================================
 # INVOICE APIs
 # ========================================
+
+PREORDER_BILLING_SCOPE = "preorder_billing"
+
+
+@frappe.whitelist(allow_guest=True)
+@idempotent_request
+def create_preorder_credit_note(
+	customer=None,
+	items=None,
+	amount=None,
+	reason=None,
+	reason_code=None,
+	return_against=None,
+	source_preorder=None,
+	company=None,
+):
+	"""Pedidos Nota de crédito.
+
+	- **With item lines** → guest Pedido tagged ``credit_note=1`` in **Orden**
+	  (armado / delivery pipeline — returns that still move stock).
+	- **Money only** (no items, ``amount`` > 0) → Sales Invoice credit note
+	  via ``POS-CAJA`` (financial NC, no logistics Pedido).
+	"""
+	import json
+
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+	if isinstance(items, str):
+		try:
+			items = json.loads(items) if items.strip() else []
+		except Exception:
+			items = []
+	if items is None:
+		items = []
+	if not isinstance(items, list):
+		frappe.throw(_("items must be a list"))
+
+	cust = cstr(customer or "").strip()
+	if not cust or cust.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("customer is required"))
+	if not frappe.db.exists("Customer", cust):
+		frappe.throw(_("Customer {0} not found").format(cust))
+
+	src = cstr(source_preorder or "").strip() or None
+	if src and not frappe.db.exists("Sales Order", src):
+		frappe.throw(_("Sales Order {0} not found").format(src))
+
+	against = cstr(return_against or "").strip() or None
+	if against and not frappe.db.exists("Sales Invoice", against):
+		frappe.throw(_("Invoice {0} not found").format(against))
+
+	reason_key = cstr(reason_code or "").strip() or "other"
+	reason_text = cstr(reason or "").strip()
+	company = resolve_company(company)
+
+	clean = []
+	for raw in items:
+		if not isinstance(raw, dict):
+			continue
+		code = cstr(raw.get("item_code") or "").strip()
+		qty = abs(flt(raw.get("qty")))
+		if not code or qty <= 0:
+			continue
+		if not frappe.db.exists("Item", code):
+			alts = _item_codes_for_barcode(code)
+			if alts:
+				code = alts[0]
+			else:
+				frappe.throw(_("Item {0} not found").format(code))
+		clean.append(
+			{
+				"item_code": code,
+				"item_name": cstr(raw.get("item_name") or code),
+				"qty": qty,
+				"rate": abs(flt(raw.get("rate"))),
+			}
+		)
+
+	money_amt = abs(flt(amount)) if amount not in (None, "", "null", "undefined") else 0
+
+	# ── Money-only → fiscal SI credit note (no Pedido) ───────────────────────
+	if not clean and money_amt > 0:
+		from erpnext.erpnext_integrations.ecommerce_api.crm_party_api import (
+			create_party_credit_note,
+		)
+
+		_ensure_pos_caja_item()
+		# POS-CAJA is not on the source invoice — always unlinked SI return.
+		res = create_party_credit_note(
+			customer=cust,
+			return_against=None,
+			items=[
+				{
+					"item_code": POS_CAJA_ITEM_CODE,
+					"item_name": _("Nota de crédito"),
+					"qty": 1,
+					"rate": money_amt,
+				}
+			],
+			reason=(
+				f"{reason_text} | against:{against}" if against and reason_text else reason_text
+				or (f"against:{against}" if against else "")
+			),
+			reason_code=reason_key,
+			company=company,
+		)
+		return {
+			"ok": True,
+			"kind": "invoice",
+			"invoice_id": res.get("invoice_id"),
+			"preorder_name": None,
+			"grand_total": res.get("grand_total"),
+			"customer": cust,
+			"source_preorder": src,
+		}
+
+	if not clean:
+		frappe.throw(_("Add items or a money amount for the credit note"))
+
+	# ── Items → Pedido (Orden) tagged as credit note ─────────────────────────
+	notes = reason_text or _("Nota de crédito")
+	created = create_guest_preorder(
+		items=clean,
+		customer=cust,
+		guest_notes=notes,
+		company=company,
+		order_tag="credito",
+		initial_status="Orden",
+		is_delivery=1,
+	)
+	so_name = (created or {}).get("preorder_name") or (created or {}).get("name")
+	if not so_name:
+		frappe.throw(_("Could not create credit-note order"))
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	frappe.flags.ignore_permissions = False
+	_update_guest_preorder_tag(so, "credit_note", "1")
+	_update_guest_preorder_tag(so, "credit_reason", reason_key)
+	if src:
+		_update_guest_preorder_tag(so, "credit_of", src)
+	if against:
+		_update_guest_preorder_tag(so, "return_against", against)
+	_save_guest_preorder_so(so)
+	frappe.db.commit()
+
+	detail = None
+	try:
+		detail = get_guest_preorder(so_name)
+	except Exception:
+		detail = created
+
+	return {
+		"ok": True,
+		"kind": "preorder",
+		"preorder_name": so_name,
+		"invoice_id": None,
+		"grand_total": (detail or {}).get("estimated_total")
+		if isinstance(detail, dict)
+		else (created or {}).get("estimated_total"),
+		"customer": cust,
+		"source_preorder": src,
+		"detail": detail if isinstance(detail, dict) else None,
+	}
+
+
+def _sales_invoice_for_sales_order(sales_order):
+	"""Latest non-cancelled Sales Invoice linked to this Sales Order."""
+	so = cstr(sales_order or "").strip()
+	if not so:
+		return None
+	return frappe.db.get_value(
+		"Sales Invoice Item",
+		{"sales_order": so, "docstatus": ["!=", 2]},
+		"parent",
+	)
+
+
+def _billing_record_for(preorder_name):
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	_name, data = kv_get(PREORDER_BILLING_SCOPE, cstr(preorder_name or "").strip())
+	return data if isinstance(data, dict) else {}
+
+
+def _set_billing_record(preorder_name, data):
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	kv_set(PREORDER_BILLING_SCOPE, cstr(preorder_name or "").strip(), data or {})
+
+
+def _attach_billing_fields(rows):
+	"""Attach invoiced chip + billing snapshot onto list/detail payloads."""
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get_many
+
+	if not rows:
+		return
+	names = []
+	for r in rows:
+		if not isinstance(r, dict):
+			continue
+		n = cstr(r.get("name") or r.get("preorder_name") or "").strip()
+		if n:
+			names.append(n)
+	by_key = kv_get_many(PREORDER_BILLING_SCOPE, names) if names else {}
+	for r in rows:
+		if not isinstance(r, dict):
+			continue
+		n = cstr(r.get("name") or r.get("preorder_name") or "").strip()
+		rec = by_key.get(n) if n else None
+		if not isinstance(rec, dict):
+			rec = {}
+		# Also treat linked SI / Factura A issued as invoiced for the chip.
+		si = cstr(rec.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(n)
+		invoiced = bool(rec.get("invoiced")) or bool(si) or (
+			cstr(r.get("factura_a_status") or "").strip().lower() == "issued"
+		)
+		r["invoiced"] = invoiced
+		r["billing"] = {
+			"invoiced": invoiced,
+			"source": rec.get("source") or ("silkos" if si else None),
+			"mode": rec.get("mode"),
+			"sales_invoice": si or rec.get("sales_invoice"),
+			"template_id": rec.get("template_id"),
+			"template_name": rec.get("template_name"),
+			"archivo_entry": rec.get("archivo_entry"),
+			"file_url": rec.get("file_url"),
+			"file_name": rec.get("file_name"),
+			"issued_at": rec.get("issued_at"),
+			"cae": rec.get("cae"),
+			"note": rec.get("note"),
+		} if invoiced or rec else None
+
+
+def _default_invoice_templates(company=None):
+	"""Pick sensible blanco / negro Ecommerce Print Template defaults."""
+	from erpnext.erpnext_integrations.ecommerce_api.print_templates_api import list_print_templates
+
+	try:
+		raw = list_print_templates(source_doctype="Sales Invoice", company=company) or {}
+	except Exception:
+		raw = {}
+	templates = raw.get("templates") if isinstance(raw, dict) else []
+	if not isinstance(templates, list):
+		templates = []
+
+	def _tid(t):
+		return t.get("id") or t.get("template_id") or t.get("name")
+
+	def _tname(t):
+		return t.get("templateName") or t.get("template_name") or t.get("name") or _tid(t)
+
+	def _pick(*needles):
+		needles_l = [n.lower() for n in needles]
+		for t in templates:
+			if not isinstance(t, dict):
+				continue
+			name = cstr(_tname(t) or "").lower()
+			if any(n in name for n in needles_l):
+				return {"template_id": _tid(t), "template_name": _tname(t)}
+		if templates and isinstance(templates[0], dict):
+			t0 = templates[0]
+			return {"template_id": _tid(t0), "template_name": _tname(t0)}
+		return None
+
+	return {
+		"blanco": _pick("factura a", "sales invoice", "classic · factura", "factura"),
+		"negro": _pick(
+			"documento no válido",
+			"no valid",
+			"no válido",
+			"borrador",
+		),
+		"templates": [
+			{
+				"template_id": _tid(t),
+				"template_name": _tname(t),
+				"is_default": cint(t.get("isDefault") or t.get("is_default") or 0),
+				"paper_kind": t.get("paperKind") or t.get("paper_kind"),
+			}
+			for t in templates
+			if isinstance(t, dict)
+		],
+	}
+
+
+def _file_archivo_sales_doc(
+	*,
+	title,
+	company,
+	sales_order=None,
+	sales_invoice=None,
+	file_b64=None,
+	file_name=None,
+	note=None,
+	kind="sales_invoice",
+):
+	"""Create an Archivo paper row, optional attach, link SO/SI + month binder."""
+	from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+	# Prefer real DocTypes (after Archive Related Ref options migrate); Tag fallback
+	# keeps Documentos filing working on sites that have not migrated yet.
+	refs = []
+	if sales_order:
+		refs.append({"link_doctype": "Sales Order", "link_name": sales_order, "note": "pedido"})
+	if sales_invoice:
+		refs.append(
+			{"link_doctype": "Sales Invoice", "link_name": sales_invoice, "note": "factura"}
+		)
+	try:
+		entry = archivo_api.create_archivo_entry(
+			title=title,
+			kind=kind,
+			sync_template="paper",
+			posting_date=nowdate(),
+			workflow_status="filed",
+			notes=note,
+			related_refs=refs,
+			company=company,
+		)
+	except Exception:
+		soft = []
+		if sales_order:
+			soft.append({"link_doctype": "Tag", "link_name": sales_order, "note": "pedido"})
+		if sales_invoice:
+			soft.append({"link_doctype": "Tag", "link_name": sales_invoice, "note": "factura"})
+		entry = archivo_api.create_archivo_entry(
+			title=title,
+			kind=kind,
+			sync_template="paper",
+			posting_date=nowdate(),
+			workflow_status="filed",
+			notes=note,
+			related_refs=soft,
+			company=company,
+		)
+	entry_name = (entry or {}).get("name")
+	file_meta = {}
+	if entry_name and file_b64:
+		file_meta = archivo_api.attach_archivo_file(
+			name=entry_name,
+			file_name=file_name or "factura.pdf",
+			content_b64=file_b64,
+			is_private=1,
+		) or {}
+	binder = None
+	if entry_name:
+		try:
+			binder = archivo_api._link_entry_to_month_binder(
+				entry_name, year_month=nowdate(), company=company
+			)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "month binder link failed")
+	return {
+		"archivo_entry": entry_name,
+		"file_url": file_meta.get("file_url"),
+		"file_name": file_meta.get("file_name") or file_name,
+		"month_binder": binder,
+	}
+
+
+def _submit_sales_invoice_from_preorder(so, mode="negro"):
+	"""Build + submit SI from SO (prefer DN when present)."""
+	dn = _delivery_note_for_sales_order(so.name)
+	if dn:
+		from erpnext.stock.doctype.delivery_note.delivery_note import make_sales_invoice
+
+		si = make_sales_invoice(dn)
+	else:
+		from erpnext.selling.doctype.sales_order.sales_order import make_sales_invoice
+
+		si = make_sales_invoice(so.name)
+
+	mode_u = cstr(mode or "negro").strip().lower()
+	sale_mode = "WHITE" if mode_u == "blanco" else "BLACK"
+	is_borrador = 1 if sale_mode == "BLACK" else 0
+	# Stamp mode into remarks for reprint / audits (POS convention).
+	prev = cstr(getattr(si, "remarks", None) or "")
+	tag = f"sale_mode:{sale_mode} | is_borrador:{is_borrador}"
+	si.remarks = f"{prev} | {tag}".strip(" |") if prev else tag
+	if hasattr(si, "is_pos"):
+		si.is_pos = 0
+	si.insert(ignore_permissions=True)
+	si.flags.ignore_permissions = True
+	si.submit()
+	frappe.db.commit()
+	return si
+
+
+def _maybe_afip_cae_for_si(si, afip_opts=None):
+	"""Optional AFIP CAE for blanco invoices. Soft-fail → warning, not 500."""
+	opts = afip_opts if isinstance(afip_opts, dict) else {}
+	if opts.get("skip") in (1, "1", True, "true", "yes"):
+		return {"skipped": True}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api import afip_api
+
+		cfg = afip_api.get_afip_print_config() or {}
+		if not cfg.get("ready"):
+			return {
+				"skipped": True,
+				"warning": _("AFIP is not ready — invoice saved without CAE."),
+			}
+		invoice_type = cint(opts.get("invoice_type") or cfg.get("default_invoice_type") or 1)
+		doc_type = cint(opts.get("doc_type") or 99)
+		doc_number = cint(opts.get("doc_number") or 0)
+		total = flt(si.grand_total)
+		neto = flt(getattr(si, "net_total", None) or total)
+		iva = max(0, flt(total) - flt(neto))
+		cae = afip_api.solicitar_cae(
+			invoice_type=invoice_type,
+			doc_type=doc_type,
+			doc_number=doc_number,
+			importe_total=total,
+			importe_neto=neto,
+			importe_iva=iva,
+		)
+		return {"cae": cae}
+	except Exception as e:
+		frappe.log_error(frappe.get_traceback(), f"AFIP CAE failed for {si.name}")
+		try:
+			frappe.clear_messages()
+		except Exception:
+			pass
+		return {"warning": _("AFIP CAE failed: {0}").format(cstr(e))}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_preorder_invoice_state(preorder_name=None):
+	"""Options + saved billing state for the Pedidos Facturación modal."""
+	preorder_name = cstr(preorder_name or "").strip()
+	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("preorder_name is required"))
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", preorder_name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+
+	rec = _billing_record_for(preorder_name)
+	si = cstr(rec.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(preorder_name)
+	invoiced = bool(rec.get("invoiced")) or bool(si)
+
+	afip_ready = False
+	afip_warning = None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api import afip_api
+
+		cfg = afip_api.get_afip_print_config() or {}
+		afip_ready = bool(cfg.get("ready"))
+		if not afip_ready:
+			afip_warning = cfg.get("message") or cfg.get("hint")
+	except Exception:
+		afip_ready = False
+
+	defaults = _default_invoice_templates(getattr(so, "company", None))
+	requires_fa = False
+	fa_status = None
+	if frappe.db.has_column("Sales Order", "custom_requires_factura_a"):
+		requires_fa = bool(cint(getattr(so, "custom_requires_factura_a", 0) or 0))
+		fa_status = cstr(getattr(so, "custom_factura_a_status", None) or "").strip() or None
+
+	suggested_mode = "blanco" if requires_fa else "negro"
+	blockers = []
+	if cint(so.docstatus) != 1:
+		blockers.append(_("Confirm the order before invoicing."))
+	if invoiced:
+		blockers.append(_("Already invoiced — use reprint."))
+
+	return {
+		"preorder_name": preorder_name,
+		"invoiced": invoiced,
+		"billing": {
+			"invoiced": invoiced,
+			"source": rec.get("source") or ("silkos" if si else None),
+			"mode": rec.get("mode"),
+			"sales_invoice": si,
+			"template_id": rec.get("template_id"),
+			"template_name": rec.get("template_name"),
+			"archivo_entry": rec.get("archivo_entry"),
+			"file_url": rec.get("file_url"),
+			"file_name": rec.get("file_name"),
+			"issued_at": rec.get("issued_at"),
+			"cae": rec.get("cae"),
+			"note": rec.get("note"),
+		},
+		"requires_factura_a": requires_fa,
+		"factura_a_status": fa_status,
+		"suggested_mode": suggested_mode,
+		"afip_ready": afip_ready,
+		"afip_warning": afip_warning,
+		"default_templates": {"blanco": defaults.get("blanco"), "negro": defaults.get("negro")},
+		"templates": defaults.get("templates") or [],
+		"can_issue": not invoiced and cint(so.docstatus) == 1,
+		"blockers": blockers,
+		"delivery_note": _delivery_note_for_sales_order(preorder_name),
+		"estimated_total": _guest_preorder_estimated_total(so),
+		"currency": so.currency,
+		"customer": so.customer,
+		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+@idempotent_request
+def issue_preorder_invoice(
+	preorder_name=None,
+	mode=None,
+	template_id=None,
+	use_afip=None,
+	afip=None,
+	note=None,
+):
+	"""Create+submit SI once (blanco/negro), optional AFIP CAE, file into Documentos binder."""
+	preorder_name = cstr(preorder_name or "").strip()
+	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("preorder_name is required"))
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", preorder_name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+	if cint(so.docstatus) != 1:
+		frappe.throw(_("Confirm the order before invoicing."))
+
+	existing = _billing_record_for(preorder_name)
+	si_existing = cstr(existing.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(
+		preorder_name
+	)
+	if existing.get("invoiced") or si_existing:
+		frappe.throw(_("Already invoiced — use reprint."))
+
+	mode_u = cstr(mode or "").strip().lower()
+	if mode_u not in ("blanco", "negro"):
+		# Default: Factura A preference → blanco, else negro.
+		if frappe.db.has_column("Sales Order", "custom_requires_factura_a") and cint(
+			getattr(so, "custom_requires_factura_a", 0) or 0
+		):
+			mode_u = "blanco"
+		else:
+			mode_u = "negro"
+
+	si = _submit_sales_invoice_from_preorder(so, mode=mode_u)
+
+	afip_opts = afip if isinstance(afip, dict) else {}
+	if isinstance(afip, str) and afip.strip() not in ("", "null", "undefined"):
+		try:
+			afip_opts = frappe.parse_json(afip) or {}
+		except Exception:
+			afip_opts = {}
+	want_afip = mode_u == "blanco" and (
+		use_afip in (None, "", "null", "undefined")
+		or str(use_afip).strip().lower() in ("1", "true", "yes", "y", "on")
+	)
+	if mode_u == "negro":
+		want_afip = False
+		afip_opts = {**afip_opts, "skip": 1}
+	elif not want_afip:
+		afip_opts = {**afip_opts, "skip": 1}
+
+	afip_result = _maybe_afip_cae_for_si(si, afip_opts) if mode_u == "blanco" else {"skipped": True}
+	cae = None
+	if isinstance(afip_result.get("cae"), dict):
+		cae = afip_result["cae"].get("cae")
+	elif afip_result.get("cae"):
+		cae = afip_result.get("cae")
+
+	tmpl_id = cstr(template_id or "").strip() or None
+	tmpl_name = None
+	defaults = _default_invoice_templates(getattr(so, "company", None))
+	if not tmpl_id:
+		pick = (defaults.get(mode_u) or {}) if isinstance(defaults, dict) else {}
+		tmpl_id = pick.get("template_id")
+		tmpl_name = pick.get("template_name")
+	elif frappe.db.exists("ECommerce Print Template", tmpl_id):
+		tmpl_name = frappe.db.get_value("ECommerce Print Template", tmpl_id, "template_name")
+
+	archivo_meta = {}
+	try:
+		archivo_meta = _file_archivo_sales_doc(
+			title=_("Factura {0}").format(si.name),
+			company=si.company,
+			sales_order=preorder_name,
+			sales_invoice=si.name,
+			note=cstr(note or "").strip() or f"mode:{mode_u}",
+			kind="sales_invoice",
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"archivo file failed for {si.name}")
+
+	# Mark Factura A checklist issued when blanco or already required.
+	if frappe.db.has_column("Sales Order", "custom_factura_a_status"):
+		if mode_u == "blanco" or cint(getattr(so, "custom_requires_factura_a", 0) or 0):
+			frappe.db.set_value(
+				"Sales Order",
+				preorder_name,
+				{
+					"custom_requires_factura_a": 1,
+					"custom_factura_a_status": "issued",
+				},
+				update_modified=False,
+			)
+
+	from frappe.utils import now_datetime
+
+	rec = {
+		"invoiced": True,
+		"source": "silkos",
+		"mode": mode_u,
+		"sales_invoice": si.name,
+		"template_id": tmpl_id,
+		"template_name": tmpl_name,
+		"archivo_entry": archivo_meta.get("archivo_entry"),
+		"file_url": archivo_meta.get("file_url"),
+		"file_name": archivo_meta.get("file_name"),
+		"month_binder": archivo_meta.get("month_binder"),
+		"issued_at": str(now_datetime()),
+		"cae": cae,
+		"note": cstr(note or "").strip() or None,
+		"afip_warning": afip_result.get("warning"),
+	}
+	_set_billing_record(preorder_name, rec)
+	frappe.db.commit()
+
+	detail = get_guest_preorder(preorder_name)
+	return {
+		"ok": True,
+		"billing": rec,
+		"sales_invoice": si.name,
+		"detail": detail,
+		"afip_warning": afip_result.get("warning"),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+@idempotent_request
+def mark_preorder_invoiced_external(
+	preorder_name=None,
+	file_b64=None,
+	file_name=None,
+	note=None,
+	sales_invoice=None,
+):
+	"""Mark once as invoiced externally; optional PDF/photo → Documentos month binder."""
+	preorder_name = cstr(preorder_name or "").strip()
+	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("preorder_name is required"))
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", preorder_name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_visible(so)
+
+	existing = _billing_record_for(preorder_name)
+	si_existing = cstr(existing.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(
+		preorder_name
+	)
+	if existing.get("invoiced") or si_existing:
+		frappe.throw(_("Already invoiced — use reprint."))
+
+	si_link = cstr(sales_invoice or "").strip() or None
+	if si_link and not frappe.db.exists("Sales Invoice", si_link):
+		frappe.throw(_("Sales Invoice {0} not found").format(si_link))
+
+	archivo_meta = {}
+	try:
+		archivo_meta = _file_archivo_sales_doc(
+			title=_("Factura externa · {0}").format(preorder_name),
+			company=so.company,
+			sales_order=preorder_name,
+			sales_invoice=si_link,
+			file_b64=file_b64,
+			file_name=file_name or "factura_externa.pdf",
+			note=cstr(note or "").strip() or "external",
+			kind="sales_invoice",
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"external invoice archivo failed for {preorder_name}")
+		# Still allow mark-as-invoiced without archivo if attach fails? Prefer controlled error when file given.
+		if file_b64:
+			frappe.throw(_("Could not save the attached invoice file."))
+
+	if frappe.db.has_column("Sales Order", "custom_factura_a_status"):
+		frappe.db.set_value(
+			"Sales Order",
+			preorder_name,
+			{"custom_factura_a_status": "issued"},
+			update_modified=False,
+		)
+
+	from frappe.utils import now_datetime
+
+	rec = {
+		"invoiced": True,
+		"source": "external",
+		"mode": None,
+		"sales_invoice": si_link,
+		"template_id": None,
+		"template_name": None,
+		"archivo_entry": archivo_meta.get("archivo_entry"),
+		"file_url": archivo_meta.get("file_url"),
+		"file_name": archivo_meta.get("file_name") or file_name,
+		"month_binder": archivo_meta.get("month_binder"),
+		"issued_at": str(now_datetime()),
+		"cae": None,
+		"note": cstr(note or "").strip() or None,
+	}
+	_set_billing_record(preorder_name, rec)
+	frappe.db.commit()
+	detail = get_guest_preorder(preorder_name)
+	return {"ok": True, "billing": rec, "detail": detail}
+
+
+@frappe.whitelist(allow_guest=True)
+def reprint_preorder_invoice(preorder_name=None):
+	"""Return the saved invoice target for re-print (SI+template or external file)."""
+	preorder_name = cstr(preorder_name or "").strip()
+	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("preorder_name is required"))
+	state = get_preorder_invoice_state(preorder_name)
+	if not state.get("invoiced"):
+		frappe.throw(_("Order is not invoiced yet."))
+	billing = state.get("billing") or {}
+	source = cstr(billing.get("source") or "").strip() or "silkos"
+	out = {
+		"ok": True,
+		"source": source,
+		"billing": billing,
+		"sales_invoice": billing.get("sales_invoice"),
+		"template_id": billing.get("template_id"),
+		"file_url": billing.get("file_url"),
+		"file_name": billing.get("file_name"),
+		"archivo_entry": billing.get("archivo_entry"),
+	}
+	# Prefer external attachment when present.
+	if source == "external" or billing.get("file_url"):
+		out["kind"] = "file" if billing.get("file_url") else "external"
+		return out
+	out["kind"] = "silkos"
+	return out
+
 
 @frappe.whitelist(allow_guest=True)
 def create_invoice(sales_order=None, delivery_note=None):
@@ -13059,6 +13984,14 @@ def suggest_guest_preorder_change(preorder_name=None, change=None):
 	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
 
 	return cr.suggest_guest_preorder_change(preorder_name=preorder_name, change=change)
+
+
+@frappe.whitelist(allow_guest=True)
+def suggest_customer_change(customer_name=None, change=None):
+	"""Seller suggestion-only: queue a Customer patch for Revisar without applying it."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.suggest_customer_change(customer_name=customer_name, change=change)
 
 
 @frappe.whitelist(allow_guest=True)
