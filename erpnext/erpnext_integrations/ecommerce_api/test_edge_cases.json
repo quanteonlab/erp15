@@ -1653,6 +1653,19 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_cashier_administrator_ignored",
+      "source": "regression",
+      "bug": "create_guest_preorder cashier_id Administrator must not stamp API-key user as cashier (seller attribution)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge cashier Administrator ignored",
+        "cashier_id": "Administrator",
+        "seller_ref_user": ""
+      },
+      "expect": "ok"
+    },
+    {
       "id": "create_guest_preorder_initial_status_null",
       "source": "regression",
       "bug": "create_guest_preorder initial_status null/\"\" must stay Consulta (no promote); dirty value must not TypeError",
@@ -1807,6 +1820,26 @@
         "email": null,
         "prefer_name": null,
         "prefer_address": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "normalize_invoice_mode_null_safe",
+      "source": "regression",
+      "bug": "null/blank invoice mode must not TypeError; maps blanco→factura_a",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._normalize_invoice_mode",
+      "args": {
+        "mode": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "default_invoice_templates_mode_pools",
+      "source": "regression",
+      "bug": "invoice template pools for negro/factura_a/b/c must return controlled dict",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._default_invoice_templates",
+      "args": {
+        "company": null
       },
       "expect": "ok"
     },
@@ -5007,6 +5040,18 @@
       "bug": "Flutter may send search_term as literal 'null'; treat as empty typeahead for assigned-client list"
     },
     {
+      "id": "search_customers_address_term_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
+      "args": {
+        "search_term": "Bocayuca",
+        "page_length": 8,
+        "ensure_buckets": 0
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Orden client picker must match by address (primary_address / Address.address_line1), not only name"
+    },
+    {
       "id": "get_guest_preorders_list_seller_scope_null",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
       "args": {
@@ -5918,6 +5963,74 @@
       "expect": "error",
       "source": "regression",
       "bug": "create_preorder_credit_note with no items and no amount is controlled error"
+    },
+    {
+      "id": "cancel_my_review_request_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.cancel_my_review_request",
+      "args": {
+        "kind": "order",
+        "name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "cancel_my_review_request null name is controlled error (i054)"
+    },
+    {
+      "id": "dismiss_my_review_outcome_empty_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.dismiss_my_review_outcome",
+      "args": {
+        "kind": "customer",
+        "name": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "dismiss_my_review_outcome empty name is controlled error (i054)"
+    },
+    {
+      "id": "list_my_review_requests_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_my_review_requests",
+      "args": {},
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_my_review_requests returns pending/approved lists (i054)"
+    },
+    {
+      "id": "count_preventa_attention_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.count_preventa_attention",
+      "args": {},
+      "expect": "ok",
+      "source": "regression",
+      "bug": "count_preventa_attention returns count for acting user (i054)"
+    },
+    {
+      "id": "mark_lead_attention_seen_null_lead",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.mark_lead_attention_seen",
+      "args": {
+        "lead": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "mark_lead_attention_seen null lead is controlled error (i054)"
+    },
+    {
+      "id": "mark_pending_order_seen_null_so",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.mark_pending_order_seen",
+      "args": {
+        "sales_order": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "mark_pending_order_seen null sales_order is controlled error (i054 pending-order hot)"
+    },
+    {
+      "id": "mark_pending_order_seen_empty_so",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.mark_pending_order_seen",
+      "args": {
+        "sales_order": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "mark_pending_order_seen empty sales_order is controlled error (i054 pending-order hot)"
     }
   ]
 }

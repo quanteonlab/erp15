@@ -226,6 +226,25 @@ def _normalize_catalog_promo_conflict(val) -> str:
 	return "best_price"
 
 
+def _as_string_list(val, max_items: int = 500, max_len: int = 140) -> list:
+	"""Deduped trimmed strings (e.g. Item Group names to hide in catalog)."""
+	if not isinstance(val, (list, tuple)):
+		return []
+	out = []
+	seen = set()
+	for raw in val:
+		if not isinstance(raw, str):
+			continue
+		s = raw.strip()[:max_len]
+		if not s or s in seen:
+			continue
+		seen.add(s)
+		out.append(s)
+		if len(out) >= max_items:
+			break
+	return out
+
+
 def _normalize_catalog_display(raw) -> dict:
 	src = raw if isinstance(raw, dict) else {}
 	return {
@@ -258,6 +277,11 @@ def _normalize_catalog_display(raw) -> dict:
 		# When True, PoD/payment that fully settles a Delivery order auto-moves to Completado.
 		# Default False — ops closes Completado manually (or jumps with UI warning).
 		"autoCompleteOnFullPayment": _as_bool(src.get("autoCompleteOnFullPayment"), False),
+		# Site-wide default depósito for catalog stock counts + Products table Stock column.
+		# Empty = no default (catalog sums all bins; Products Stock stays read-only until picked).
+		"defaultWarehouse": str(src.get("defaultWarehouse") or "").strip()[:140],
+		# Item Group names hidden from catalog category rails. Empty = show all.
+		"hiddenCatalogCategories": _as_string_list(src.get("hiddenCatalogCategories")),
 		"headerPreset": _normalize_header_preset(src.get("headerPreset")),
 		"headerSearchBackgroundColor": _as_hex(src.get("headerSearchBackgroundColor"), ""),
 		"headerSearchTextColor": _as_hex(src.get("headerSearchTextColor"), ""),
@@ -265,6 +289,56 @@ def _normalize_catalog_display(raw) -> dict:
 		"headerNavTextColor": _as_hex(src.get("headerNavTextColor"), ""),
 		"headerFont": _normalize_header_font(src.get("headerFont")),
 	}
+
+
+def _company_custom_default_warehouse(company=None) -> str:
+	"""Company.custom_default_warehouse when the custom field exists."""
+	company = (
+		str(company or "").strip()
+		or frappe.defaults.get_user_default("Company")
+		or frappe.db.get_single_value("Global Defaults", "default_company")
+		or ""
+	)
+	if not company or not frappe.db.has_column("Company", "custom_default_warehouse"):
+		return ""
+	return str(frappe.db.get_value("Company", company, "custom_default_warehouse") or "").strip()
+
+
+def _sync_company_default_warehouse(warehouse: str) -> None:
+	"""Keep Company.custom_default_warehouse aligned with catalog display default."""
+	company = (
+		frappe.defaults.get_user_default("Company")
+		or frappe.db.get_single_value("Global Defaults", "default_company")
+	)
+	if not company or not frappe.db.has_column("Company", "custom_default_warehouse"):
+		return
+	wh = str(warehouse or "").strip() or None
+	current = str(frappe.db.get_value("Company", company, "custom_default_warehouse") or "").strip() or None
+	if current == wh:
+		return
+	frappe.db.set_value(
+		"Company",
+		company,
+		"custom_default_warehouse",
+		wh,
+		update_modified=False,
+	)
+
+
+def resolve_default_warehouse(explicit=None) -> str | None:
+	"""Warehouse for catalog/stock counts: explicit → shop_ui → company default."""
+	wh = str(explicit or "").strip()
+	if wh and frappe.db.exists("Warehouse", wh):
+		return wh
+	raw = _load_raw()
+	cd = raw.get("catalogDisplay") if isinstance(raw, dict) else {}
+	wh = str((cd or {}).get("defaultWarehouse") or "").strip()
+	if wh and frappe.db.exists("Warehouse", wh):
+		return wh
+	wh = _company_custom_default_warehouse()
+	if wh and frappe.db.exists("Warehouse", wh):
+		return wh
+	return None
 
 
 def _normalize_companies(raw) -> dict:
@@ -409,11 +483,23 @@ def get_shop_ui_settings():
 	"""Return site-wide shop UI settings (same for every user/guest).
 
 	Missing store → empty dict (client uses defaults).
+	Seeds catalogDisplay.defaultWarehouse from Company when unset (not persisted).
 	"""
 	raw = _load_raw()
 	if not raw:
-		return {"ok": True, "settings": {}, "source": "default"}
-	return {"ok": True, "settings": _normalize_bundle(raw), "source": "server"}
+		seeded = _company_custom_default_warehouse()
+		settings = (
+			{"catalogDisplay": {"defaultWarehouse": seeded}} if seeded else {}
+		)
+		return {"ok": True, "settings": settings, "source": "default"}
+	settings = _normalize_bundle(raw)
+	cd = dict(settings.get("catalogDisplay") or {})
+	if not cd.get("defaultWarehouse"):
+		seeded = _company_custom_default_warehouse()
+		if seeded:
+			cd["defaultWarehouse"] = seeded
+			settings["catalogDisplay"] = cd
+	return {"ok": True, "settings": settings, "source": "server"}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -461,6 +547,13 @@ def save_shop_ui_settings(settings=None):
 		},
 	}
 	_save_raw(merged)
+	# Keep Company depot in sync so TMS / remito defaults match catalog stock.
+	try:
+		_sync_company_default_warehouse(
+			(merged.get("catalogDisplay") or {}).get("defaultWarehouse") or ""
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "shop_ui sync default warehouse")
 	return {"ok": True, "settings": merged, "source": "server"}
 
 

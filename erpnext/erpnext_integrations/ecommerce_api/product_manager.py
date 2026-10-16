@@ -534,6 +534,21 @@ def get_pm_context(company=None):
         limit=200,
         ignore_permissions=True,
     )
+    default_warehouse = None
+    try:
+        from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+            resolve_default_warehouse,
+        )
+
+        default_warehouse = resolve_default_warehouse()
+    except Exception:
+        default_warehouse = None
+    if not default_warehouse and default_company and frappe.db.has_column(
+        "Company", "custom_default_warehouse"
+    ):
+        default_warehouse = (
+            frappe.db.get_value("Company", default_company, "custom_default_warehouse") or None
+        )
     buying_price_lists = frappe.get_all(
         "Price List",
         filters={"buying": 1},
@@ -560,6 +575,7 @@ def get_pm_context(company=None):
         "price_lists": price_lists or [],
         "buying_price_lists": buying_price_lists or [],
         "warehouses": warehouses or [],
+        "default_warehouse": default_warehouse or "",
         "pos_profiles": pos_profiles or [],
     }
 

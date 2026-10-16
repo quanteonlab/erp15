@@ -246,9 +246,9 @@ APP_PERMISSIONS = [
 		"label_en": "See assigned clients",
 		"label_es": "Ver clientes asignados",
 		"label_zh": "查看已分配客户",
-		"desc_en": "Client pickers / Orden Pedidos: only customers assigned to this salesman (does not open Tablas → CRM).",
-		"desc_es": "Selectores / Pedidos en Orden: solo clientes asignados (no abre Tablas → CRM).",
-		"desc_zh": "选客 / 下单订单：仅已分配客户（不会打开表格→客户页）。",
+		"desc_en": "Empty client list = assigned only; typed search in Orden still finds any matching client (assigned first).",
+		"desc_es": "Lista vacía = solo asignados; al escribir en Orden encuentra cualquier cliente (asignados primero).",
+		"desc_zh": "空列表仅已分配；在下单中输入仍可搜到任意匹配客户（已分配优先）。",
 	},
 	{
 		"id": "sales.commit_all",
@@ -279,6 +279,16 @@ APP_PERMISSIONS = [
 		"desc_en": "On past orders (Orden / Preventa): see and edit measured weight, unit/kg price, line importe and order totals. Without this, sales can still order and see current list prices.",
 		"desc_es": "En pedidos pasados (Orden / Preventa): ver y editar peso medido, precio unitario/kg, importe de línea y totales. Sin esto, ventas igual puede pedir y ver precios de lista actuales.",
 		"desc_zh": "在历史订单（下单/预售）中查看并编辑实秤重量、单价/公斤价、行金额与合计。无此权限仍可下单并查看当前牌价。",
+	},
+	{
+		"id": "sales.order_ops_detail",
+		"group": "ventas_scope",
+		"label_en": "Detailed order ops info",
+		"label_es": "Info operativa detallada del pedido",
+		"label_zh": "订单运营明细",
+		"desc_en": "Order info panel: cashier, salesman, warehouse, vehicle code, MAT, and related ops rows. Without this, sales still see planned delivery date (blue when auto) and when it last changed.",
+		"desc_es": "Panel info del pedido: cajero, vendedor, depósito, código auto, MAT y filas operativas. Sin esto, ventas igual ve la entrega planeada (azul si es automática) y cuándo cambió.",
+		"desc_zh": "订单信息面板：收银员、销售员、仓库、车牌、MAT 等运营字段。无此权限仍可看计划交货日（自动时为蓝色）及最近变更时间。",
 	},
 	{
 		"id": "tables.compras",
@@ -531,6 +541,7 @@ PERMISSION_TO_ROLES = {
 	"sales.commit_assigned": ["Sales User"],
 	# Sensitive — not on Sales User / ventas starter; managers only by default role map.
 	"sales.past_prices": ["Sales Manager", "Accounts User", "Stock Manager"],
+	"sales.order_ops_detail": ["Sales Manager", "Stock Manager", "Stock User"],
 	"ops.buying": ["Purchase User", "Purchase Manager", "Stock User"],
 	"log.reports": ["Accounts User"],
 	"log.accounting": ["Accounts User"],
@@ -923,8 +934,9 @@ _COARSE_FLAG = {
 	"sales.see_assigned": "pos",
 	"sales.commit_all": "pos",
 	"sales.commit_assigned": "pos",
-	# Coarse receiving/managers only — ventas (pos-only) does not inherit past prices.
+	# Coarse receiving/managers only — ventas (pos-only) does not inherit past prices / ops detail.
 	"sales.past_prices": "receiving",
+	"sales.order_ops_detail": "receiving",
 	"tables.orders": "pos",
 	"tables.orders.own": "pos",
 	"tables.orders.all": "pos",

@@ -203,6 +203,8 @@ def mark_seller_amend_for_review(name: str, actor=None, reason: str = "seller_am
 
 SUGGESTION_KV_SCOPE = "guest_preorder.suggestion"
 CUSTOMER_SUGGESTION_KV_SCOPE = "customer.suggestion"
+# Per-actor one-shot “your request was approved” rows for the notification bell.
+MY_OUTCOME_KV_SCOPE = "review.my_outcome"
 REASON_SELLER_SUGGESTION = "seller_suggestion"
 
 _CUSTOMER_SUGGESTION_FIELDS = (
@@ -972,6 +974,40 @@ def confirm_creation_review(kind=None, name=None):
 		applied = apply_pending_customer_suggestion(name)
 
 	frappe.db.set_value(doctype, name, FIELDNAME, STATUS_CONFIRMED)
+	# Notify the suggestion actor once (bell → dismiss after seen).
+	try:
+		actor = ""
+		summary = ""
+		if isinstance(applied, dict):
+			actor = cstr(applied.get("actor") or "").strip()
+			summary = cstr(applied.get("summary") or "").strip()
+		if not actor:
+			# Creation without suggestion payload — use review_actor / owner when present.
+			if kind == "order":
+				from erpnext.erpnext_integrations.ecommerce_api.api import (
+					_parse_remarks_tags,
+					_guest_preorder_tag_text,
+				)
+
+				tags = _parse_remarks_tags(_guest_preorder_tag_text(frappe.get_doc("Sales Order", name)))
+				actor = cstr(tags.get("review_actor") or tags.get("seller_ref") or "").strip()
+			else:
+				actor = cstr(frappe.db.get_value("Customer", name, "owner") or "").strip()
+		if actor:
+			_record_my_outcome(
+				kind=kind,
+				name=name,
+				actor=actor,
+				status="approved",
+				summary=summary
+				or (
+					frappe.db.get_value("Customer", name, "customer_name")
+					if kind == "customer"
+					else name
+				),
+			)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "record my review outcome")
 	frappe.db.commit()
 	return {
 		"ok": True,
@@ -1134,3 +1170,231 @@ def count_pending_creation_reviews():
 			)
 	out["total"] = out["customers"] + out["orders"]
 	return out
+
+
+def _record_my_outcome(kind: str, name: str, actor: str, status: str, summary: str) -> None:
+	"""Persist a one-shot outcome for the requester’s notification bell."""
+	actor = cstr(actor or "").strip()
+	name = cstr(name or "").strip()
+	kind = cstr(kind or "").strip()
+	if not actor or not name or not kind:
+		return
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	row_key = f"{kind}:{name}:{actor}"
+	title = name
+	if kind == "customer":
+		title = cstr(frappe.db.get_value("Customer", name, "customer_name") or name)
+	elif kind == "order":
+		title = cstr(frappe.db.get_value("Sales Order", name, "customer_name") or name)
+	kv_set(
+		MY_OUTCOME_KV_SCOPE,
+		row_key,
+		{
+			"kind": kind,
+			"name": name,
+			"actor": actor,
+			"status": cstr(status or "approved"),
+			"summary": cstr(summary or "")[:240],
+			"title": title[:140],
+			"at": str(frappe.utils.now_datetime()),
+		},
+	)
+	# Re-amber the Preventa "Órdenes pendientes" tile for the requester.
+	if kind == "order" and cstr(status or "").lower() == "approved":
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.preventa_api import (
+				clear_order_attention_seen,
+			)
+
+			clear_order_attention_seen(actor, name)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "clear_order_attention_seen failed")
+
+
+def _iter_suggestion_kv(scope: str, actor: str) -> list[dict]:
+	"""Pending suggestion rows in ``scope`` owned by ``actor``."""
+	actor = cstr(actor or "").strip()
+	if not actor or not scope:
+		return []
+	rows = frappe.get_all(
+		"Table Extra Data",
+		filters={"scope": scope},
+		fields=["row_key", "data_json"],
+		limit_page_length=500,
+		ignore_permissions=True,
+	)
+	import json
+
+	out = []
+	for row in rows or []:
+		raw = row.get("data_json")
+		try:
+			data = json.loads(raw) if raw else {}
+		except Exception:
+			data = {}
+		if not isinstance(data, dict):
+			continue
+		if cstr(data.get("actor") or "").strip() != actor:
+			continue
+		if cstr(data.get("status") or "pending").lower() == "rejected":
+			continue
+		change = data.get("change")
+		if not isinstance(change, dict) or not change:
+			continue
+		out.append(
+			{
+				"row_key": cstr(row.get("row_key") or ""),
+				"data": data,
+			}
+		)
+	return out
+
+
+@frappe.whitelist(allow_guest=True)
+def list_my_review_requests():
+	"""Bell inbox: my pending suggestions + one-shot approved outcomes.
+
+	Reusable later for other operators (drivers, repositor, …) with the same shape.
+	"""
+	actor = _acting_or_session_user()
+	if not actor or actor in ("Guest", "guest"):
+		return {"pending": [], "approved": []}
+
+	pending = []
+	for item in _iter_suggestion_kv(CUSTOMER_SUGGESTION_KV_SCOPE, actor):
+		name = item["row_key"]
+		data = item["data"]
+		title = cstr(frappe.db.get_value("Customer", name, "customer_name") or name)
+		pending.append(
+			{
+				"id": f"customer:{name}",
+				"kind": "customer",
+				"name": name,
+				"title": title,
+				"summary": cstr(data.get("summary") or "")[:240],
+				"status": "pending",
+				"modified": cstr(data.get("modified") or ""),
+			}
+		)
+	for item in _iter_suggestion_kv(SUGGESTION_KV_SCOPE, actor):
+		name = item["row_key"]
+		data = item["data"]
+		title = cstr(frappe.db.get_value("Sales Order", name, "customer_name") or name)
+		pending.append(
+			{
+				"id": f"order:{name}",
+				"kind": "order",
+				"name": name,
+				"title": title,
+				"summary": cstr(data.get("summary") or "")[:240],
+				"status": "pending",
+				"modified": cstr(data.get("modified") or ""),
+			}
+		)
+
+	approved = []
+	outcome_rows = frappe.get_all(
+		"Table Extra Data",
+		filters={"scope": MY_OUTCOME_KV_SCOPE},
+		fields=["name", "row_key", "data_json"],
+		limit_page_length=200,
+		ignore_permissions=True,
+	)
+	import json
+
+	for row in outcome_rows or []:
+		raw = row.get("data_json")
+		try:
+			data = json.loads(raw) if raw else {}
+		except Exception:
+			data = {}
+		if not isinstance(data, dict):
+			continue
+		if cstr(data.get("actor") or "").strip() != actor:
+			continue
+		if cstr(data.get("status") or "").lower() != "approved":
+			continue
+		kind = cstr(data.get("kind") or "")
+		name = cstr(data.get("name") or "")
+		if not kind or not name:
+			continue
+		approved.append(
+			{
+				"id": f"{kind}:{name}",
+				"kind": kind,
+				"name": name,
+				"title": cstr(data.get("title") or name),
+				"summary": cstr(data.get("summary") or "")[:240],
+				"status": "approved",
+				"modified": cstr(data.get("at") or ""),
+				"outcome_key": cstr(row.get("row_key") or ""),
+			}
+		)
+
+	pending.sort(key=lambda r: r.get("modified") or "", reverse=True)
+	approved.sort(key=lambda r: r.get("modified") or "", reverse=True)
+	return {"pending": pending, "approved": approved}
+
+
+@frappe.whitelist(allow_guest=True)
+def cancel_my_review_request(kind=None, name=None):
+	"""Requester cancels their own pending suggestion (does not delete the live doc)."""
+	kind = _normalize_kind(kind)
+	name = cstr(name or "").strip()
+	if not name:
+		frappe.throw(_("name is required"), frappe.ValidationError)
+	actor = _acting_or_session_user()
+
+	if kind == "customer":
+		sug = get_pending_customer_suggestion(name)
+		if not sug:
+			frappe.throw(_("No pending suggestion"), frappe.ValidationError)
+		if cstr(sug.get("actor") or "").strip() != actor and not is_creation_review_admin(actor):
+			frappe.throw(_("Not permitted"), frappe.PermissionError)
+		clear_pending_customer_suggestion(name)
+		# If parked only for this suggestion, clear Pending flag.
+		if frappe.db.has_column("Customer", FIELDNAME):
+			if frappe.db.get_value("Customer", name, FIELDNAME) == STATUS_PENDING:
+				frappe.db.set_value("Customer", name, FIELDNAME, "", update_modified=False)
+	else:
+		sug = get_pending_suggestion(name)
+		if not sug:
+			frappe.throw(_("No pending suggestion"), frappe.ValidationError)
+		if cstr(sug.get("actor") or "").strip() != actor and not is_creation_review_admin(actor):
+			frappe.throw(_("Not permitted"), frappe.PermissionError)
+		clear_pending_suggestion(name)
+		if frappe.db.has_column("Sales Order", FIELDNAME):
+			if frappe.db.get_value("Sales Order", name, FIELDNAME) == STATUS_PENDING:
+				# Keep Pending if the SO itself was created as a review draft.
+				from erpnext.erpnext_integrations.ecommerce_api.api import (
+					_parse_remarks_tags,
+					_guest_preorder_tag_text,
+				)
+
+				tags = _parse_remarks_tags(
+					_guest_preorder_tag_text(frappe.get_doc("Sales Order", name))
+				)
+				if cstr(tags.get("review_reason") or "") == REASON_SELLER_SUGGESTION:
+					frappe.db.set_value("Sales Order", name, FIELDNAME, "", update_modified=False)
+
+	frappe.db.commit()
+	return {"ok": True, "kind": kind, "name": name, "action": "cancelled"}
+
+
+@frappe.whitelist(allow_guest=True)
+def dismiss_my_review_outcome(kind=None, name=None):
+	"""Dismiss a one-shot approved notice after the requester has seen it."""
+	kind = _normalize_kind(kind)
+	name = cstr(name or "").strip()
+	actor = _acting_or_session_user()
+	if not name or not actor:
+		frappe.throw(_("name is required"), frappe.ValidationError)
+	row_key = f"{kind}:{name}:{actor}"
+	docname = frappe.db.get_value(
+		"Table Extra Data", {"scope": MY_OUTCOME_KV_SCOPE, "row_key": row_key}, "name"
+	)
+	if docname:
+		frappe.delete_doc("Table Extra Data", docname, ignore_permissions=True)
+		frappe.db.commit()
+	return {"ok": True, "kind": kind, "name": name, "action": "dismissed"}

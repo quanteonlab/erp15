@@ -1113,6 +1113,40 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 				or data.get("customer_address_display")
 				or ""
 			)
+		# AFIP Factura A/B/C print fields (empty until CAE is stamped).
+		if source_doctype == "Sales Invoice":
+			if not data.get("company_address"):
+				try:
+					co = cstr(data.get("company") or "").strip()
+					addr = (
+						frappe.db.get_value("Company", co, "address_html")
+						if co and frappe.db.exists("Company", co)
+						else None
+					)
+					data["company_address"] = cstr(addr or "").strip()
+				except Exception:
+					data["company_address"] = ""
+			data.setdefault("cae", cstr(data.get("cae") or "").strip())
+			data.setdefault("cae_vto", cstr(data.get("cae_vto") or "").strip())
+			data.setdefault("factura_letter", cstr(data.get("factura_letter") or "").strip())
+			data.setdefault("factura_cod", cstr(data.get("factura_cod") or "").strip())
+			# Line % Alic. fallback when item tax rate is missing.
+			for r in rows:
+				if not isinstance(r, dict):
+					continue
+				if r.get("tax_rate") in (None, ""):
+					r["tax_rate"] = r.get("item_tax_rate") or ""
+				if r.get("discount_amount") in (None, ""):
+					try:
+						r["discount_amount"] = round(
+							flt(r.get("price_list_rate") or r.get("rate") or 0)
+							* flt(r.get("qty") or 0)
+							* flt(r.get("discount_percentage") or 0)
+							/ 100.0,
+							2,
+						) if flt(r.get("discount_percentage") or 0) else ""
+					except Exception:
+						r["discount_amount"] = ""
 	elif source_doctype == "Purchase Receipt":
 		meta = _party_print_meta("Supplier", data.get("supplier"))
 		for k, v in meta.items():
@@ -3494,6 +3528,600 @@ def _ar_entregas_checklist_a4_elements(
 
 
 
+def _ar_factura_abc_a4_elements(
+	*,
+	letter: str = "A",
+	cod: str = "01",
+	id_prefix: str = "starter-fa",
+	show_alic: bool = True,
+):
+	"""AFIP-style Factura A/B/C A4 matching commercial paper (letter box + CAE footer).
+
+	``letter`` is A/B/C; ``cod`` is the AFIP tipo (01 / 06 / 11). Factura A shows
+	% Alic.; B/C keep the same chrome with a simpler line table.
+	"""
+	p = id_prefix
+	letter_u = cstr(letter or "A").strip().upper()[:1] or "A"
+	cod_u = cstr(cod or "01").strip().zfill(2)[-2:]
+	cols = [
+		{"fieldPath": "item_code", "label": "Código", "width": 22},
+		{"fieldPath": "item_name", "label": "Descripción", "width": 58 if show_alic else 70},
+		{"fieldPath": "qty", "label": "Cantidad", "width": 18},
+	]
+	if show_alic:
+		cols.append({"fieldPath": "tax_rate", "label": "% Alic", "width": 14})
+	cols.extend(
+		[
+			{"fieldPath": "discount_percentage", "label": "% Desc", "width": 14},
+			{"fieldPath": "discount_amount", "label": "Desc", "width": 16},
+			{"fieldPath": "rate", "label": "Precio unitario", "width": 24},
+			{"fieldPath": "amount", "label": "Precio total", "width": 24},
+		]
+	)
+	y_items, y_obs, y_cae = 88, 228, 262
+	h_items = y_obs - y_items - 2
+	els = [
+		# Logo placeholder
+		{
+			"id": f"{p}-logo",
+			"kind": "shape",
+			"x": 10,
+			"y": 6,
+			"width": 42,
+			"height": 22,
+			"shapeType": "rect",
+			"color": "#e5e7eb",
+			"filled": True,
+		},
+		{
+			"id": f"{p}-logo-hint",
+			"kind": "text",
+			"x": 10,
+			"y": 14,
+			"width": 42,
+			"height": 6,
+			"staticText": "LOGO",
+			"fontSize": 9,
+			"align": "center",
+			"textColor": "#9ca3af",
+		},
+		# Comprobante electrónico + letter box
+		{
+			"id": f"{p}-elec",
+			"kind": "text",
+			"x": 78,
+			"y": 4,
+			"width": 54,
+			"height": 4,
+			"staticText": "Comprobante electrónico",
+			"fontSize": 7,
+			"align": "center",
+			"textColor": "#374151",
+		},
+		{
+			"id": f"{p}-letter-box",
+			"kind": "shape",
+			"x": 90,
+			"y": 9,
+			"width": 30,
+			"height": 22,
+			"shapeType": "rect",
+			"color": "#111827",
+			"filled": False,
+		},
+		{
+			"id": f"{p}-letter",
+			"kind": "text",
+			"x": 90,
+			"y": 10,
+			"width": 30,
+			"height": 14,
+			"staticText": letter_u,
+			"fontSize": 28,
+			"bold": True,
+			"align": "center",
+			"textColor": "#111827",
+		},
+		{
+			"id": f"{p}-cod",
+			"kind": "text",
+			"x": 90,
+			"y": 24,
+			"width": 30,
+			"height": 5,
+			"staticText": f"Cod. {cod_u}",
+			"fontSize": 8,
+			"bold": True,
+			"align": "center",
+			"textColor": "#111827",
+		},
+		{
+			"id": f"{p}-original",
+			"kind": "text",
+			"x": 78,
+			"y": 32,
+			"width": 54,
+			"height": 4,
+			"staticText": "ORIGINAL",
+			"fontSize": 8,
+			"bold": True,
+			"align": "center",
+			"textColor": "#111827",
+		},
+		# Title + meta (right)
+		{
+			"id": f"{p}-title",
+			"kind": "text",
+			"x": 140,
+			"y": 6,
+			"width": 60,
+			"height": 8,
+			"staticText": "FACTURA",
+			"fontSize": 18,
+			"bold": True,
+			"align": "left",
+			"textColor": "#111827",
+		},
+		{
+			"id": f"{p}-fecha-l",
+			"kind": "text",
+			"x": 140,
+			"y": 16,
+			"width": 18,
+			"height": 4,
+			"staticText": "Fecha:",
+			"fontSize": 8,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-fecha",
+			"kind": "field",
+			"x": 158,
+			"y": 16,
+			"width": 42,
+			"height": 4,
+			"fieldPath": "posting_date",
+			"label": "Fecha",
+			"fontSize": 8,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-nro",
+			"kind": "field",
+			"x": 140,
+			"y": 21,
+			"width": 60,
+			"height": 5,
+			"fieldPath": "name",
+			"label": "N°",
+			"fontSize": 10,
+			"bold": True,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-facturado-l",
+			"kind": "text",
+			"x": 140,
+			"y": 27,
+			"width": 22,
+			"height": 4,
+			"staticText": "Facturado:",
+			"fontSize": 8,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-facturado",
+			"kind": "field",
+			"x": 162,
+			"y": 27,
+			"width": 38,
+			"height": 4,
+			"fieldPath": "owner",
+			"label": "Facturado",
+			"fontSize": 8,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-vend-l",
+			"kind": "text",
+			"x": 140,
+			"y": 32,
+			"width": 22,
+			"height": 4,
+			"staticText": "Vendedor:",
+			"fontSize": 8,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-vend",
+			"kind": "field",
+			"x": 162,
+			"y": 32,
+			"width": 38,
+			"height": 4,
+			"fieldPath": "vendedor",
+			"label": "Vendedor",
+			"fontSize": 8,
+			"align": "left",
+		},
+		# Seller band
+		{
+			"id": f"{p}-seller-box",
+			"kind": "shape",
+			"x": 10,
+			"y": 38,
+			"width": 190,
+			"height": 16,
+			"shapeType": "rect",
+			"color": "#111827",
+			"filled": False,
+		},
+		{
+			"id": f"{p}-company",
+			"kind": "field",
+			"x": 12,
+			"y": 39,
+			"width": 186,
+			"height": 5,
+			"fieldPath": "company",
+			"label": "Empresa",
+			"fontSize": 10,
+			"bold": True,
+			"align": "left",
+		},
+		{
+			"id": f"{p}-company-addr",
+			"kind": "field",
+			"x": 12,
+			"y": 45,
+			"width": 186,
+			"height": 7,
+			"fieldPath": "company_address",
+			"label": "Domicilio fiscal",
+			"fontSize": 8,
+			"align": "left",
+		},
+		# Cliente box
+		{
+			"id": f"{p}-cli-box",
+			"kind": "shape",
+			"x": 10,
+			"y": 56,
+			"width": 190,
+			"height": 28,
+			"shapeType": "rect",
+			"color": "#111827",
+			"filled": False,
+		},
+		{
+			"id": f"{p}-cli-l",
+			"kind": "text",
+			"x": 12,
+			"y": 58,
+			"width": 22,
+			"height": 4,
+			"staticText": "Cliente:",
+			"fontSize": 8,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-cli",
+			"kind": "field",
+			"x": 34,
+			"y": 58,
+			"width": 90,
+			"height": 4,
+			"fieldPath": "customer_name",
+			"label": "Cliente",
+			"fontSize": 9,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-dom-l",
+			"kind": "text",
+			"x": 12,
+			"y": 64,
+			"width": 22,
+			"height": 4,
+			"staticText": "Domicilio:",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-dom",
+			"kind": "field",
+			"x": 34,
+			"y": 64,
+			"width": 90,
+			"height": 4,
+			"fieldPath": "customer_address",
+			"label": "Domicilio",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-iva-l",
+			"kind": "text",
+			"x": 12,
+			"y": 70,
+			"width": 22,
+			"height": 4,
+			"staticText": "IVA:",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-iva",
+			"kind": "field",
+			"x": 34,
+			"y": 70,
+			"width": 90,
+			"height": 4,
+			"fieldPath": "tax_category",
+			"label": "IVA",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-cuit-l",
+			"kind": "text",
+			"x": 12,
+			"y": 76,
+			"width": 22,
+			"height": 4,
+			"staticText": "CUIT:",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-cuit",
+			"kind": "field",
+			"x": 34,
+			"y": 76,
+			"width": 90,
+			"height": 4,
+			"fieldPath": "tax_id",
+			"label": "CUIT",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-cond-l",
+			"kind": "text",
+			"x": 128,
+			"y": 58,
+			"width": 28,
+			"height": 4,
+			"staticText": "Cond. Venta:",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-cond",
+			"kind": "field",
+			"x": 156,
+			"y": 58,
+			"width": 42,
+			"height": 4,
+			"fieldPath": "payment_terms_template",
+			"label": "Cond. Venta",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-pedido-l",
+			"kind": "text",
+			"x": 128,
+			"y": 70,
+			"width": 28,
+			"height": 4,
+			"staticText": "Pedido:",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-pedido",
+			"kind": "field",
+			"x": 156,
+			"y": 70,
+			"width": 42,
+			"height": 4,
+			"fieldPath": "pedido_ref",
+			"label": "Pedido",
+			"fontSize": 8,
+		},
+		# Items
+		{
+			"id": f"{p}-items-v2",
+			"kind": "line-items",
+			"x": 10,
+			"y": y_items,
+			"width": 190,
+			"height": h_items,
+			"childTableFieldname": "items",
+			"headerBg": "#e5e7eb",
+			"headerColor": "#111827",
+			"fontSize": 8,
+			"columns": cols,
+		},
+		# Observaciones + totals
+		{
+			"id": f"{p}-obs-box",
+			"kind": "shape",
+			"x": 10,
+			"y": y_obs,
+			"width": 110,
+			"height": 30,
+			"shapeType": "rect",
+			"color": "#111827",
+			"filled": False,
+		},
+		{
+			"id": f"{p}-obs-l",
+			"kind": "text",
+			"x": 12,
+			"y": y_obs + 1,
+			"width": 30,
+			"height": 4,
+			"staticText": "Observ:",
+			"fontSize": 8,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-obs",
+			"kind": "field",
+			"x": 12,
+			"y": y_obs + 6,
+			"width": 106,
+			"height": 12,
+			"fieldPath": "remarks",
+			"label": "Observ",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-son",
+			"kind": "field",
+			"x": 12,
+			"y": y_obs + 22,
+			"width": 106,
+			"height": 5,
+			"fieldPath": "in_words",
+			"label": "Son Pesos",
+			"fontSize": 8,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-tot-box",
+			"kind": "shape",
+			"x": 122,
+			"y": y_obs,
+			"width": 78,
+			"height": 30,
+			"shapeType": "rect",
+			"color": "#111827",
+			"filled": False,
+		},
+		{
+			"id": f"{p}-neto-l",
+			"kind": "text",
+			"x": 124,
+			"y": y_obs + 2,
+			"width": 30,
+			"height": 4,
+			"staticText": "Neto:",
+			"fontSize": 8,
+		},
+		{
+			"id": f"{p}-neto",
+			"kind": "field",
+			"x": 154,
+			"y": y_obs + 2,
+			"width": 44,
+			"height": 4,
+			"fieldPath": "net_total",
+			"label": "Neto",
+			"fontSize": 8,
+			"align": "right",
+		},
+		{
+			"id": f"{p}-total-l",
+			"kind": "text",
+			"x": 124,
+			"y": y_obs + 20,
+			"width": 30,
+			"height": 6,
+			"staticText": "Total:",
+			"fontSize": 11,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-total",
+			"kind": "field",
+			"x": 154,
+			"y": y_obs + 20,
+			"width": 44,
+			"height": 6,
+			"fieldPath": "grand_total",
+			"label": "Total",
+			"fontSize": 11,
+			"bold": True,
+			"align": "right",
+		},
+		# CAE footer
+		{
+			"id": f"{p}-afip",
+			"kind": "text",
+			"x": 10,
+			"y": y_cae,
+			"width": 70,
+			"height": 4,
+			"staticText": "Comprobante Autorizado",
+			"fontSize": 8,
+			"bold": True,
+			"textColor": "#1d4ed8",
+		},
+		{
+			"id": f"{p}-barcode",
+			"kind": "barcode",
+			"x": 10,
+			"y": y_cae + 6,
+			"width": 90,
+			"height": 16,
+			"fieldPath": "cae",
+			"barcodeType": "code128",
+		},
+		{
+			"id": f"{p}-cae-l",
+			"kind": "text",
+			"x": 120,
+			"y": y_cae + 4,
+			"width": 28,
+			"height": 4,
+			"staticText": "Nro. CAE:",
+			"fontSize": 8,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-cae",
+			"kind": "field",
+			"x": 148,
+			"y": y_cae + 4,
+			"width": 52,
+			"height": 4,
+			"fieldPath": "cae",
+			"label": "CAE",
+			"fontSize": 9,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-cae-vto-l",
+			"kind": "text",
+			"x": 120,
+			"y": y_cae + 12,
+			"width": 28,
+			"height": 4,
+			"staticText": "Vto. CAE:",
+			"fontSize": 8,
+			"bold": True,
+		},
+		{
+			"id": f"{p}-cae-vto",
+			"kind": "field",
+			"x": 148,
+			"y": y_cae + 12,
+			"width": 52,
+			"height": 4,
+			"fieldPath": "cae_vto",
+			 "label": "Vto CAE",
+			"fontSize": 9,
+		},
+		# Version marker for ensure_starter resync
+		{
+			"id": f"{p}-marker-v2",
+			"kind": "shape",
+			"x": 0,
+			"y": 0,
+			"width": 0.1,
+			"height": 0.1,
+			"shapeType": "rect",
+			"color": "transparent",
+			"filled": False,
+		},
+	]
+	return els
+
+
 # Classic paper-form column sets (páginas 1–3 from client photos).
 _CLASSIC_SISTEMA_COLUMNS = [
 	{"fieldPath": "item_code", "label": "Código", "width": 22},
@@ -3594,6 +4222,49 @@ _STARTER_TEMPLATES = [
 		"skip_locale_expand": True,
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _classic_entregas_armado_a4_elements(id_prefix="starter-clsent"),
+	},
+	# ── Sales Invoice · AFIP Factura A / B / C (letter-box commercial A4) ─
+	{
+		"template_name": "Factura A (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-fa-a-marker-v2",
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_factura_abc_a4_elements(
+			letter="A", cod="01", id_prefix="starter-fa-a", show_alic=True
+		),
+	},
+	{
+		"template_name": "Factura B (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-fa-b-marker-v2",
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_factura_abc_a4_elements(
+			letter="B", cod="06", id_prefix="starter-fa-b", show_alic=False
+		),
+	},
+	{
+		"template_name": "Factura C (A4)",
+		"source_doctype": "Sales Invoice",
+		"paper_kind": "A4",
+		"is_default": False,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-fa-c-marker-v2",
+		"skip_locale_expand": True,
+		"margin_mm": [8, 8, 8, 8],
+		"elements": _ar_factura_abc_a4_elements(
+			letter="C", cod="11", id_prefix="starter-fa-c", show_alic=False
+		),
 	},
 	# ── Sales Invoice · AR commercial A4 (gifted core, compact Armado header) ─
 	{

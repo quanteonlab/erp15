@@ -361,6 +361,166 @@ def _touch_lastseen(owner_user: str) -> None:
 	frappe.db.commit()
 
 
+def _attention_seen_scope(owner_user: str) -> str:
+	"""Per-seller map of lead → when they last reviewed the card (amber clear)."""
+	return f"preventa.attention_seen.{owner_user}"
+
+
+def _get_attention_seen_map(owner_user: str) -> dict:
+	"""``{lead_name: datetime}`` for leads the seller has reviewed."""
+	scope = _attention_seen_scope(owner_user)
+	if not frappe.db.exists("Table Extra Schema", scope):
+		return {}
+	raw = frappe.db.get_value("Table Extra Schema", scope, "columns_json")
+	data = frappe.parse_json(raw) if raw else {}
+	if not isinstance(data, dict):
+		return {}
+	leads = data.get("leads") if isinstance(data.get("leads"), dict) else data
+	out = {}
+	if not isinstance(leads, dict):
+		return out
+	for lead, ts in leads.items():
+		dt = _as_dt(ts)
+		if lead and dt:
+			out[cstr(lead)] = dt
+	return out
+
+
+def _set_attention_seen(owner_user: str, lead: str, when=None) -> None:
+	owner_user = cstr(owner_user or "").strip()
+	lead = cstr(lead or "").strip()
+	if not owner_user or not lead:
+		return
+	when = when or now_datetime()
+	scope = _attention_seen_scope(owner_user)
+	seen = _get_attention_seen_map(owner_user)
+	seen[lead] = _as_dt(when) or now_datetime()
+	# Persist ISO strings for stable JSON round-trip.
+	payload_leads = {k: str(v) for k, v in seen.items() if k and v}
+	payload = frappe.as_json({"leads": payload_leads})
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", scope):
+		doc = frappe.get_doc("Table Extra Schema", scope)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		frappe.get_doc({"doctype": "Table Extra Schema", "scope": scope, "columns_json": payload}).insert(
+			ignore_permissions=True
+		)
+	frappe.db.commit()
+
+
+def _order_attention_seen_scope(owner_user: str) -> str:
+	"""Per-seller map of Sales Order → when they last opened the pending-order tile."""
+	return f"preventa.order_attention_seen.{owner_user}"
+
+
+def _get_order_attention_seen_map(owner_user: str) -> dict:
+	"""``{sales_order: datetime}`` for pending-order tiles the seller has opened."""
+	scope = _order_attention_seen_scope(owner_user)
+	if not frappe.db.exists("Table Extra Schema", scope):
+		return {}
+	raw = frappe.db.get_value("Table Extra Schema", scope, "columns_json")
+	data = frappe.parse_json(raw) if raw else {}
+	if not isinstance(data, dict):
+		return {}
+	orders = data.get("orders") if isinstance(data.get("orders"), dict) else data
+	out = {}
+	if not isinstance(orders, dict):
+		return out
+	for so_name, ts in orders.items():
+		dt = _as_dt(ts)
+		if so_name and dt:
+			out[cstr(so_name)] = dt
+	return out
+
+
+def _persist_order_attention_seen_map(owner_user: str, seen: dict) -> None:
+	owner_user = cstr(owner_user or "").strip()
+	if not owner_user:
+		return
+	scope = _order_attention_seen_scope(owner_user)
+	payload_orders = {k: str(v) for k, v in (seen or {}).items() if k and v}
+	payload = frappe.as_json({"orders": payload_orders})
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", scope):
+		doc = frappe.get_doc("Table Extra Schema", scope)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		frappe.get_doc({"doctype": "Table Extra Schema", "scope": scope, "columns_json": payload}).insert(
+			ignore_permissions=True
+		)
+	frappe.db.commit()
+
+
+def _set_order_attention_seen(owner_user: str, sales_order: str, when=None) -> None:
+	owner_user = cstr(owner_user or "").strip()
+	sales_order = cstr(sales_order or "").strip()
+	if not owner_user or not sales_order:
+		return
+	when = when or now_datetime()
+	seen = _get_order_attention_seen_map(owner_user)
+	seen[sales_order] = _as_dt(when) or now_datetime()
+	_persist_order_attention_seen_map(owner_user, seen)
+
+
+def clear_order_attention_seen(owner_user: str, sales_order: str) -> None:
+	"""Forget seen state so the pending-order tile goes amber again (e.g. after approve)."""
+	owner_user = cstr(owner_user or "").strip()
+	sales_order = cstr(sales_order or "").strip()
+	if not owner_user or not sales_order:
+		return
+	seen = _get_order_attention_seen_map(owner_user)
+	if sales_order not in seen:
+		return
+	del seen[sales_order]
+	_persist_order_attention_seen_map(owner_user, seen)
+
+
+def _approved_order_outcomes_for_actor(actor: str, so_names: list) -> dict:
+	"""``{sales_order: datetime}`` of approved suggestion outcomes for ``actor``."""
+	actor = cstr(actor or "").strip()
+	names = {cstr(n) for n in (so_names or []) if cstr(n)}
+	if not actor or not names:
+		return {}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			MY_OUTCOME_KV_SCOPE,
+		)
+		import json
+	except Exception:
+		return {}
+	out = {}
+	for row in frappe.get_all(
+		"Table Extra Data",
+		filters={"scope": MY_OUTCOME_KV_SCOPE},
+		fields=["row_key", "data_json"],
+		limit_page_length=500,
+		ignore_permissions=True,
+	) or []:
+		raw = row.get("data_json")
+		try:
+			data = json.loads(raw) if raw else {}
+		except Exception:
+			data = {}
+		if not isinstance(data, dict):
+			continue
+		if cstr(data.get("actor") or "").strip() != actor:
+			continue
+		if cstr(data.get("status") or "").lower() != "approved":
+			continue
+		if cstr(data.get("kind") or "") != "order":
+			continue
+		name = cstr(data.get("name") or "").strip()
+		if name not in names:
+			continue
+		dt = _as_dt(data.get("at"))
+		if dt and (name not in out or dt > out[name]):
+			out[name] = dt
+	return out
+
+
 # ---------------------------------------------------------------------------
 # Ownership / permission helpers
 # ---------------------------------------------------------------------------
@@ -514,7 +674,12 @@ def get_my_board(owner_user=None):
 			if crow.lead_name and crow.lead_name not in customer_by_lead:
 				customer_by_lead[crow.lead_name] = crow.name
 
+	attention_by_lead = _activity_attention_by_lead(
+		names, customer_by_lead, owner_user, consulta_by_lead
+	)
+
 	leads_out = []
+	attention_hot_count = 0
 	for r in lead_rows:
 		fields_out = {}
 		for fid, vis in layout.items():
@@ -529,6 +694,11 @@ def get_my_board(owner_user=None):
 		linked = _as_dt(agg.get("last_linked"))
 		if linked and (not last_activity or linked > last_activity):
 			last_activity = linked
+		att = attention_by_lead.get(r.name) or {"hot": False, "reasons": []}
+		# Prefer attention activity timestamp for float-to-top sorting.
+		att_at = _as_dt(att.get("activity_at"))
+		if att_at and (not last_activity or att_at > last_activity):
+			last_activity = att_at
 		unread = bool(prior_seen and last_activity and last_activity > prior_seen)
 		stage = r.custom_preventa_stage or _default_new_stage_key(settings)
 		# Converted leads without a won stage still belong in Cliente.
@@ -537,6 +707,8 @@ def get_my_board(owner_user=None):
 			won_keys = {c.get("key") for c in columns if c.get("is_won")}
 			if not stage or (won_keys and stage not in won_keys and stage != won):
 				stage = won
+		if att.get("hot"):
+			attention_hot_count += 1
 		leads_out.append(
 			{
 				"name": r.name,
@@ -554,6 +726,10 @@ def get_my_board(owner_user=None):
 				"consulta_count": agg["cnt"],
 				"last_activity": last_activity,
 				"unread": unread,
+				"attention": {
+					"hot": bool(att.get("hot")),
+					"reasons": list(att.get("reasons") or []),
+				},
 			}
 		)
 
@@ -565,6 +741,7 @@ def get_my_board(owner_user=None):
 		"columns": columns,
 		"leads": leads_out,
 		"owner_user": owner_user,
+		"attention_hot_count": attention_hot_count,
 		"stage_rules": {
 			"soft": bool(settings.get("soft_stage_rules", True)),
 			"requirements": reqs,
@@ -591,6 +768,198 @@ def _consulta_aggregate(lead_names: list) -> dict:
 		if not prev or (linked_on and linked_on > prev):
 			agg["last_linked"] = row.linked_on
 	return out
+
+
+def _activity_attention_by_lead(
+	lead_names: list,
+	customer_by_lead: dict,
+	owner_user: str,
+	consulta_by_lead: dict | None = None,
+) -> dict:
+	"""Amber / red-badge attention = unseen client activity for the seller.
+
+	Hot when there is activity after the seller last reviewed the card:
+	- new / updated consulta linked to the lead
+	- admin approved one of their suggestions (my_outcome)
+	- client-driven Preventa Event (e.g. link_open)
+
+	Pending Revisar alone does **not** keep the card yellow — opening the
+	drawer clears amber until something new happens.
+	"""
+	if not lead_names:
+		return {}
+	out = {
+		n: {"hot": False, "reasons": [], "activity_at": None} for n in lead_names
+	}
+	consulta_by_lead = consulta_by_lead or _consulta_aggregate(lead_names)
+	seen_map = _get_attention_seen_map(owner_user)
+
+	# Latest activity timestamp candidates per lead.
+	activity: dict = {n: [] for n in lead_names}  # list of (dt, reason)
+
+	for lead, agg in (consulta_by_lead or {}).items():
+		if lead not in activity:
+			continue
+		linked = _as_dt(agg.get("last_linked"))
+		if linked:
+			activity[lead].append((linked, "consulta_new"))
+
+	# Client-driven events (ignore seller-side noise like stage moves).
+	if frappe.db.exists("DocType", "Preventa Event"):
+		client_types = ("link_open", "consulta", "consulta_submit", "cart_submit", "guest_consulta")
+		try:
+			ev_rows = frappe.get_all(
+				"Preventa Event",
+				filters={"lead": ["in", lead_names], "event_type": ["in", list(client_types)]},
+				fields=["lead", "created_on", "event_type"],
+				ignore_permissions=True,
+				limit_page_length=2000,
+			)
+		except Exception:
+			ev_rows = []
+		for row in ev_rows or []:
+			lead = row.get("lead")
+			dt = _as_dt(row.get("created_on"))
+			if lead in activity and dt:
+				activity[lead].append((dt, "client_activity"))
+
+	# Admin approved seller suggestions → flash amber until card reviewed.
+	lead_by_customer = {c: lead for lead, c in (customer_by_lead or {}).items() if c}
+	so_to_lead = {}
+	if frappe.db.exists("DocType", "Preventa Lead Consulta"):
+		for row in frappe.get_all(
+			"Preventa Lead Consulta",
+			filters={"lead": ["in", lead_names]},
+			fields=["lead", "sales_order"],
+			ignore_permissions=True,
+		) or []:
+			if row.sales_order:
+				so_to_lead[row.sales_order] = row.lead
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			MY_OUTCOME_KV_SCOPE,
+		)
+		import json
+
+		outcome_rows = frappe.get_all(
+			"Table Extra Data",
+			filters={"scope": MY_OUTCOME_KV_SCOPE},
+			fields=["row_key", "data_json"],
+			limit_page_length=500,
+			ignore_permissions=True,
+		)
+		actor = cstr(owner_user or "").strip()
+		for row in outcome_rows or []:
+			raw = row.get("data_json")
+			try:
+				data = json.loads(raw) if raw else {}
+			except Exception:
+				data = {}
+			if not isinstance(data, dict):
+				continue
+			if cstr(data.get("actor") or "").strip() != actor:
+				continue
+			if cstr(data.get("status") or "").lower() != "approved":
+				continue
+			kind = cstr(data.get("kind") or "")
+			name = cstr(data.get("name") or "")
+			dt = _as_dt(data.get("at"))
+			if not dt or not name:
+				continue
+			lead = None
+			if kind == "customer":
+				lead = lead_by_customer.get(name)
+			elif kind == "order":
+				lead = so_to_lead.get(name)
+			if lead and lead in activity:
+				activity[lead].append((dt, "suggestion_approved"))
+	except Exception:
+		pass
+
+	for lead, events in activity.items():
+		if not events:
+			continue
+		# Newest activity wins for timestamp; collect reasons newer than seen.
+		events.sort(key=lambda x: x[0], reverse=True)
+		newest_dt = events[0][0]
+		seen = seen_map.get(lead)
+		reasons = []
+		for dt, reason in events:
+			if not seen or dt > seen:
+				if reason not in reasons:
+					reasons.append(reason)
+		hot = bool(reasons)
+		out[lead] = {
+			"hot": hot,
+			"reasons": reasons,
+			"activity_at": newest_dt if hot else newest_dt,
+		}
+	return out
+
+
+@frappe.whitelist(allow_guest=True)
+def mark_lead_attention_seen(lead=None, owner_user=None):
+	"""Clear amber on a Preventa card after the seller reviewed it in the drawer."""
+	lead = cstr(lead or "").strip()
+	if not lead:
+		frappe.throw(_("lead is required"), frappe.ValidationError)
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Lead", lead)
+	frappe.flags.ignore_permissions = False
+	_require_owner_or_crm(doc.lead_owner)
+	owner_user = (owner_user or doc.lead_owner or _acting_user() or "").strip()
+	_set_attention_seen(owner_user, lead)
+	return {"ok": True, "lead": lead, "action": "attention_seen"}
+
+
+@frappe.whitelist(allow_guest=True)
+def mark_pending_order_seen(sales_order=None, owner_user=None):
+	"""Clear amber on an Órdenes pendientes tile after the seller opens it."""
+	sales_order = cstr(sales_order or "").strip()
+	if not sales_order:
+		frappe.throw(_("sales_order is required"), frappe.ValidationError)
+	owner_user = (owner_user or _acting_user() or "").strip()
+	if not owner_user:
+		frappe.throw(_("Login required"), frappe.AuthenticationError)
+	_require_self_or_crm(owner_user)
+	_set_order_attention_seen(owner_user, sales_order)
+	return {"ok": True, "sales_order": sales_order, "action": "order_attention_seen"}
+
+
+@frappe.whitelist(allow_guest=True)
+def count_preventa_attention(owner_user=None):
+	"""Lightweight red-badge count for Operaciones → Preventa (unseen activity)."""
+	owner_user = (owner_user or _acting_user() or "").strip()
+	if not owner_user:
+		return {"count": 0}
+	_require_self_or_crm(owner_user)
+	lead_rows = frappe.get_all(
+		"Lead",
+		filters={
+			"lead_owner": owner_user,
+			"status": ["!=", "Do Not Contact"],
+			"disabled": 0,
+		},
+		fields=["name"],
+		limit_page_length=500,
+		ignore_permissions=True,
+	)
+	names = [r.name for r in lead_rows]
+	customer_by_lead = {}
+	if names:
+		for crow in frappe.get_all(
+			"Customer",
+			filters={"lead_name": ["in", names]},
+			fields=["name", "lead_name"],
+			ignore_permissions=True,
+		):
+			if crow.lead_name and crow.lead_name not in customer_by_lead:
+				customer_by_lead[crow.lead_name] = crow.name
+	consulta_by_lead = _consulta_aggregate(names)
+	att = _activity_attention_by_lead(names, customer_by_lead, owner_user, consulta_by_lead)
+	count = sum(1 for v in att.values() if v.get("hot"))
+	return {"count": count}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1901,20 +2270,10 @@ def get_lead_timeline(lead):
 	notes = [{"note": n.note, "added_by": n.added_by, "added_on": n.added_on} for n in (doc.notes or [])]
 	checklist = _load_lead_checklist(doc.name)
 
-	consultas = frappe.get_all(
-		"Preventa Lead Consulta",
-		filters={"lead": lead},
-		fields=["sales_order", "source", "linked_on"],
-		order_by="linked_on desc",
-		ignore_permissions=True,
-	)
-	for c in consultas:
-		c["items"] = frappe.get_all(
-			"Sales Order Item",
-			filters={"parent": c.sales_order},
-			fields=["item_code", "item_name", "qty", "rate"],
-			ignore_permissions=True,
-		)
+	customer = frappe.db.get_value("Customer", {"lead_name": lead}, "name")
+	# Órdenes pendientes: Consulta / Orden / Preparado(armado) / Delivery — not Completado/Archivado.
+	viewer = cstr(_acting_user() or doc.lead_owner or "").strip()
+	consultas = _pending_orders_for_lead(lead, customer, owner_user=viewer)
 
 	events = frappe.get_all(
 		"Preventa Event",
@@ -1930,8 +2289,6 @@ def get_lead_timeline(lead):
 		m = _missing_requirement_groups(doc, groups)
 		if m:
 			missing_by_stage[stage_key] = m
-
-	customer = frappe.db.get_value("Customer", {"lead_name": lead}, "name")
 
 	return {
 		"lead": {
@@ -1954,6 +2311,123 @@ def get_lead_timeline(lead):
 		"tags": tags_map_for_docs("Lead", [lead]).get(lead, []),
 		"missing_by_stage": missing_by_stage,
 	}
+
+
+def _pending_orders_for_lead(lead: str, customer: str | None = None, owner_user: str | None = None) -> list:
+	"""Guest preorders still in flight (not Completado / Archivado).
+
+	Sources: Preventa Lead Consulta links + Customer-linked SOs when converted.
+	Each row includes ``attention.hot`` for unseen new links / approved suggestions.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
+
+	lead = cstr(lead or "").strip()
+	owner_user = cstr(owner_user or _acting_user() or "").strip()
+	so_meta: dict = {}  # name -> {source, linked_on}
+
+	if lead and frappe.db.exists("DocType", "Preventa Lead Consulta"):
+		for row in frappe.get_all(
+			"Preventa Lead Consulta",
+			filters={"lead": lead},
+			fields=["sales_order", "source", "linked_on"],
+			order_by="linked_on desc",
+			ignore_permissions=True,
+		) or []:
+			name = cstr(row.sales_order or "").strip()
+			if name and name not in so_meta:
+				so_meta[name] = {
+					"source": row.source,
+					"linked_on": row.linked_on,
+				}
+
+	customer = cstr(customer or "").strip()
+	if customer:
+		from erpnext.erpnext_integrations.ecommerce_api.api import GUEST_PREORDER_REMARKS_TAG
+
+		tag = GUEST_PREORDER_REMARKS_TAG
+		for row in frappe.get_all(
+			"Sales Order",
+			filters={"customer": customer, "docstatus": ["<", 2]},
+			or_filters=[["remarks", "like", f"%{tag}%"], ["terms", "like", f"%{tag}%"]],
+			fields=["name", "creation", "modified"],
+			order_by="modified desc",
+			limit_page_length=80,
+			ignore_permissions=True,
+		) or []:
+			name = cstr(row.name or "").strip()
+			if not name or name in so_meta:
+				continue
+			so_meta[name] = {
+				"source": "customer",
+				"linked_on": row.modified or row.creation,
+			}
+
+	if not so_meta:
+		return []
+
+	so_rows = frappe.get_all(
+		"Sales Order",
+		filters={"name": ["in", list(so_meta.keys())]},
+		fields=["name", "docstatus", "status", "grand_total", "advance_paid", "modified", "creation"],
+		ignore_permissions=True,
+	)
+	seen_map = _get_order_attention_seen_map(owner_user) if owner_user else {}
+	approved_at = _approved_order_outcomes_for_actor(owner_user, list(so_meta.keys()))
+
+	pending = []
+	for row in so_rows or []:
+		disp = _display_status_from_row(
+			row.docstatus, row.status, row.grand_total, row.advance_paid
+		)
+		disp_s = cstr(disp or "")
+		if disp_s.startswith("Completado") or disp_s == "Archivado":
+			continue
+		meta = so_meta.get(row.name) or {}
+		items = frappe.get_all(
+			"Sales Order Item",
+			filters={"parent": row.name},
+			fields=["item_code", "item_name", "qty", "rate"],
+			ignore_permissions=True,
+		)
+		# Hot signals: new link / never opened, or admin approved a suggestion.
+		# Do not use SO.modified (seller's own edits would re-yellow the tile).
+		events = []
+		linked = _as_dt(meta.get("linked_on")) or _as_dt(row.creation)
+		if linked:
+			events.append((linked, "order_new"))
+		appr = approved_at.get(row.name)
+		if appr:
+			events.append((appr, "suggestion_approved"))
+		seen = seen_map.get(row.name)
+		reasons = []
+		for dt, reason in events:
+			if not seen or dt > seen:
+				if reason not in reasons:
+					reasons.append(reason)
+		pending.append(
+			{
+				"sales_order": row.name,
+				"source": meta.get("source"),
+				"linked_on": meta.get("linked_on") or row.modified,
+				"display_status": disp_s,
+				"items": items,
+				"attention": {"hot": bool(reasons), "reasons": reasons},
+			}
+		)
+
+	# Hot first, then newest linked_on.
+	pending.sort(
+		key=lambda r: (
+			0 if (r.get("attention") or {}).get("hot") else 1,
+			cstr(r.get("linked_on") or ""),
+		),
+	)
+	# Secondary: among same hot flag, newest linked_on first (reverse date within groups).
+	hot = [r for r in pending if (r.get("attention") or {}).get("hot")]
+	cold = [r for r in pending if not (r.get("attention") or {}).get("hot")]
+	hot.sort(key=lambda r: cstr(r.get("linked_on") or ""), reverse=True)
+	cold.sort(key=lambda r: cstr(r.get("linked_on") or ""), reverse=True)
+	return hot + cold
 
 
 @frappe.whitelist(allow_guest=True)

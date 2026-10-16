@@ -91,6 +91,7 @@ def get_products(
 	price_list=None,
 	in_stock_only=0,
 	include_disabled=0,
+	warehouse=None,
 ):
 	"""
 	Get list of products with pagination and filtering
@@ -105,6 +106,7 @@ def get_products(
 		item_group (str): Filter by item group
 		price_list (str): Price list to fetch prices from
 		include_disabled (int): When 1, also return inactive (disabled) Items
+		warehouse (str): Warehouse for stock_qty (defaults to shop_ui / company depot)
 
 	Returns:
 		dict: {
@@ -205,10 +207,22 @@ def get_products(
 		item["price_list_rate"] = get_item_price(item.item_code, price_list)
 		item["price_list"] = price_list
 
-	# Add stock information
+	# Stock: prefer explicit warehouse, else shop_ui / company default depósito.
+	stock_wh = None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+			resolve_default_warehouse,
+		)
+
+		stock_wh = resolve_default_warehouse(warehouse)
+	except Exception:
+		stock_wh = cstr(warehouse or "").strip() or None
+
 	for item in items:
 		if item.get("is_stock_item"):
-			item["stock_qty"] = get_stock_balance(item.item_code)
+			item["stock_qty"] = get_stock_balance(item.item_code, stock_wh)
+			if stock_wh:
+				item["warehouse"] = stock_wh
 
 	# Filter to in-stock items only (stock items with qty > 0; services pass through)
 	if cint(in_stock_only):
@@ -1884,21 +1898,26 @@ def apply_cart_promotions(items, price_list=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def get_promotions_for_item(item_code, price_list=None):
+def get_promotions_for_item(item_code, price_list=None, include_inactive=0):
 	"""
 	Return all promotions relevant to a specific item:
-	  - pricing_rules: active Pricing Rules targeting this item (by code, group, or brand)
+	  - pricing_rules: Pricing Rules targeting this item (by code, group, or brand)
 	  - bundles: Product Bundles that contain this item as a component
 
 	Used by the POS Promotion Panel when a cashier taps the "Promos" chip on a product card.
+	Admin product workspace passes include_inactive=1 to show disabled / out-of-vigencia rows.
 	"""
-	pricing_rules = _get_pricing_rules_for_item(item_code, price_list=price_list)
-	bundles = _get_bundles_containing_item(item_code, price_list=price_list)
+	pricing_rules = _get_pricing_rules_for_item(
+		item_code, price_list=price_list, include_inactive=cint(include_inactive)
+	)
+	bundles = _get_bundles_containing_item(
+		item_code, price_list=price_list, include_inactive=cint(include_inactive)
+	)
 	return {"pricing_rules": pricing_rules, "bundles": bundles}
 
 
-def _get_pricing_rules_for_item(item_code, price_list=None):
-	"""Return active Pricing Rules that apply to this item (direct, group, brand, or all)."""
+def _get_pricing_rules_for_item(item_code, price_list=None, include_inactive=0):
+	"""Return Pricing Rules that apply to this item (direct, group, brand, or all)."""
 	item = frappe.db.get_value("Item", item_code, ["item_group", "brand"], as_dict=True)
 	if not item:
 		return []
@@ -1906,9 +1925,13 @@ def _get_pricing_rules_for_item(item_code, price_list=None):
 	item_group = item.get("item_group") or ""
 	brand = item.get("brand") or ""
 
-	all_rules = get_active_promotions(price_list=price_list)
-	matching = []
+	if cint(include_inactive):
+		# Admin: all selling rules (disabled / scheduled / expired included).
+		all_rules = list_pricing_rules(include_disabled=1, price_list=price_list).get("rules") or []
+	else:
+		all_rules = get_active_promotions(price_list=price_list)
 
+	matching = []
 	for rule in all_rules:
 		if _rule_applies_to_item(rule, item_code, item_group, brand):
 			matching.append(rule)
@@ -1916,7 +1939,7 @@ def _get_pricing_rules_for_item(item_code, price_list=None):
 	return matching
 
 
-def _get_bundles_containing_item(item_code, price_list=None):
+def _get_bundles_containing_item(item_code, price_list=None, include_inactive=0):
 	"""Return Product Bundles that have this item as a component, with full component list and price."""
 	bundle_rows = frappe.get_all(
 		"Product Bundle Item",
@@ -1929,26 +1952,35 @@ def _get_bundles_containing_item(item_code, price_list=None):
 
 	bundle_skus = list({r["parent"] for r in bundle_rows})
 	result = []
+	include_inactive = cint(include_inactive)
 
 	for bundle_sku in bundle_skus:
 		try:
 			row = _serialize_product_bundle(bundle_sku, price_list)
 		except Exception:
 			continue
-		if cint(row.get("disabled")) or cint(row.get("item_disabled")):
-			continue
-		if not _bundle_in_vigencia(row):
-			continue
+		if not include_inactive:
+			if cint(row.get("disabled")) or cint(row.get("item_disabled")):
+				continue
+			if not _bundle_in_vigencia(row):
+				continue
+			components_chk = row.get("components") or []
+			if any(cint(c.get("disabled")) for c in components_chk):
+				continue
 		if not _price_list_applies(row.get("for_price_list"), price_list):
 			continue
 		components = row.get("components") or []
-		if any(cint(c.get("disabled")) for c in components):
-			continue
 		result.append({
+			"name": row.get("name") or row["new_item_code"],
 			"bundle_item_code": row["new_item_code"],
 			"bundle_name": row.get("bundle_name") or row["new_item_code"],
 			"bundle_price": flt(row.get("bundle_price") or 0),
 			"components": components,
+			"disabled": cint(row.get("disabled") or 0),
+			"valid_from": row.get("valid_from"),
+			"valid_upto": row.get("valid_upto"),
+			"for_price_list": row.get("for_price_list"),
+			"estimated_discount_pct": row.get("estimated_discount_pct"),
 		})
 
 	return result
@@ -3174,8 +3206,45 @@ def ensure_crm_party_buckets():
 
 
 @frappe.whitelist(allow_guest=True)
+def _customer_names_matching_address(term: str, limit: int = 40) -> list[str]:
+	"""Customer names whose Address.address_line1 matches ``term`` (Orden typeahead)."""
+	term = cstr(term or "").strip()
+	if len(term) < 2:
+		return []
+	like = f"%{term}%"
+	try:
+		rows = frappe.db.sql(
+			"""
+			SELECT DISTINCT dl.link_name AS customer
+			FROM `tabAddress` a
+			INNER JOIN `tabDynamic Link` dl
+				ON dl.parent = a.name AND dl.parenttype = 'Address'
+			WHERE dl.link_doctype = 'Customer'
+			  AND a.address_line1 IS NOT NULL
+			  AND TRIM(a.address_line1) != ''
+			  AND LOWER(a.address_line1) LIKE LOWER(%s)
+			LIMIT %s
+			""",
+			(like, cint(limit) or 40),
+			as_dict=True,
+		)
+	except Exception:
+		return []
+	out = []
+	for r in rows or []:
+		name = cstr(r.get("customer") or "").strip()
+		if name and name not in out:
+			out.append(name)
+	return out
+
+
 def search_customers(search_term="", page_length=20, ensure_buckets=0):
-	"""Typeahead / CRM list for Customer (name + customer_name + mobile)."""
+	"""Typeahead / CRM list for Customer (name + phone + tax id + address).
+
+	``sales.see_assigned``: empty browse = assigned only; typed search expands to
+	all matches (assigned first) so Orden can pick an existing client without
+	creating a duplicate.
+	"""
 	if cint(ensure_buckets):
 		ensure_crm_party_buckets()
 	try:
@@ -3209,6 +3278,7 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 			["customer_name", "like", like],
 			["mobile_no", "like", like],
 			["tax_id", "like", like],
+			["primary_address", "like", like],
 		]
 
 	base_fields = [
@@ -3240,36 +3310,62 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	assigned_names = list(_assigned_customer_names(uid)) if uid else []
 	assigned_set = set(assigned_names)
 
-	def _fetch(extra_filters=None, page_len=None):
+	def _fetch(extra_filters=None, page_len=None, use_or=True):
 		flt = {"disabled": 0}
 		if extra_filters:
 			flt.update(extra_filters)
 		return frappe.get_all(
 			"Customer",
 			filters=flt,
-			or_filters=or_filters,
+			or_filters=or_filters if use_or else None,
 			fields=base_fields,
 			order_by="customer_name asc",
 			limit_page_length=page_len if page_len is not None else limit,
 			ignore_permissions=True,
 		)
 
+	def _merge_address_hits(rows):
+		"""Pull in Address.address_line1 matches not covered by Customer.primary_address."""
+		if not term:
+			return rows
+		addr_names = _customer_names_matching_address(term, limit=max(limit, 40))
+		if not addr_names:
+			return rows
+		have = {cstr(r.name) for r in (rows or [])}
+		missing = [n for n in addr_names if n not in have]
+		if not missing:
+			return rows
+		extra = _fetch({"name": ["in", missing]}, page_len=len(missing), use_or=False)
+		return list(rows or []) + list(extra or [])
+
+	def _rank_assigned_first(rows):
+		if not assigned_set or not rows:
+			return list(rows or [])
+		hot = [r for r in rows if r.name in assigned_set]
+		cold = [r for r in rows if r.name not in assigned_set]
+		return hot + cold
+
 	# Query inside the assigned set (do not filter after a global page limit —
 	# otherwise seller-assigned clients outside the alphabetical first page never appear).
 	if scope == "none":
 		rows = []
-	elif scope == "assigned":
-		rows = _fetch({"name": ["in", assigned_names]}) if assigned_names else []
+	elif scope == "assigned" and not term:
+		# Empty browse: assigned clients only.
+		rows = _fetch({"name": ["in", assigned_names]}, use_or=False) if assigned_names else []
+	elif scope == "assigned" and term:
+		# Typed search: find any matching client (Orden must not force duplicates),
+		# but keep assigned matches at the top.
+		rows = _rank_assigned_first(_merge_address_hits(_fetch()))[:limit]
 	elif not term and assigned_names:
 		# Prefer the acting seller's assigned clients at the top of an empty typeahead.
-		assigned_rows = _fetch({"name": ["in", assigned_names]})
+		assigned_rows = _fetch({"name": ["in", assigned_names]}, use_or=False)
 		remaining = max(0, limit - len(assigned_rows))
 		other_rows = (
 			_fetch({"name": ["not in", assigned_names]}, page_len=remaining) if remaining else []
 		)
 		rows = list(assigned_rows) + list(other_rows)
 	else:
-		rows = _fetch()
+		rows = _rank_assigned_first(_merge_address_hits(_fetch()))[:limit]
 
 	# RM Zona = Address.custom_zone (committed Planificación de entregas codes), not Territory.
 	cust_names = [r.name for r in rows]
@@ -4486,6 +4582,30 @@ def _delivery_date_forced_from_tags(so_or_dict) -> bool:
 	)
 
 
+def _delivery_date_changed_at_from_tags(so_or_dict) -> str | None:
+	raw = (_parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("delivery_changed") or "").strip()
+	return raw or None
+
+
+def _stamp_delivery_date_changed(so, *, persist: bool = False) -> str:
+	"""Record when planned delivery date was last set (auto or forced)."""
+	from frappe.utils import now_datetime
+
+	stamp = cstr(now_datetime())[:19]
+	_update_guest_preorder_tag(so, "delivery_changed", stamp)
+	if persist and getattr(so, "name", None):
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn:
+			frappe.db.set_value(
+				"Sales Order",
+				so.name,
+				tag_fn,
+				getattr(so, tag_fn, None),
+				update_modified=False,
+			)
+	return stamp
+
+
 def _weekday_base_label(raw) -> str:
 	"""Normalize ``Mon``, ``Mon(1 Man)``, ``Lunes`` → ``Mon``..``Sun``."""
 	s = cstr(raw or "").strip()
@@ -4748,6 +4868,7 @@ def _apply_orden_default_delivery_date(so):
 	except Exception:
 		pass
 	_update_guest_preorder_tag(so, "delivery_forced", None)
+	_stamp_delivery_date_changed(so, persist=True)
 	return str(due_d)
 
 
@@ -5175,7 +5296,8 @@ def _update_guest_preorder_tag(so, key: str, value: str | None) -> None:
 
 def _resolve_order_cashier(cashier_id=None) -> str | None:
 	cid = str(cashier_id or "").strip()
-	if cid:
+	# API-key / desk admin must not stamp as cashier (hides the real seller).
+	if cid and cid not in ("Guest", "Administrator", "null", "undefined", "none"):
 		return cid
 	from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import _acting_user
 
@@ -5184,6 +5306,17 @@ def _resolve_order_cashier(cashier_id=None) -> str | None:
 		return None
 	emp_name = frappe.db.get_value("Employee", {"user_id": user}, "employee_name")
 	return (emp_name or user).strip() or None
+
+
+def _resolve_order_seller_ref(seller_ref_user=None, acting: str | None = None) -> str | None:
+	"""Prefer explicit salesman link; else stamp the logged-in seller (not Administrator)."""
+	ref = cstr(seller_ref_user or "").strip()
+	if ref and ref.lower() not in ("null", "undefined", "none", "guest", "administrator"):
+		return ref
+	uid = cstr(acting or "").strip()
+	if uid and uid not in ("Guest", "Administrator"):
+		return uid
+	return None
 
 
 def _orders_visibility_mode() -> str:
@@ -5413,9 +5546,9 @@ def create_guest_preorder(
 	cashier = _resolve_order_cashier(cashier_id)
 	if cashier:
 		remarks_parts.append(f"cashier:{_sanitize_guest_tag(cashier)}")
-	# Salesman / referrer from the public /s/{slug} link cookie (catalog attribution).
-	seller_ref = cstr(seller_ref_user or "").strip()
-	if seller_ref and seller_ref.lower() not in ("null", "undefined", "none"):
+	# Salesman: /s/{slug} cookie, or the acting seller when they place the order themselves.
+	seller_ref = _resolve_order_seller_ref(seller_ref_user, acting)
+	if seller_ref:
 		remarks_parts.append(f"seller_ref:{_sanitize_guest_tag(seller_ref)}")
 	# Preferred salida warehouse (TMS depot) — default company/only warehouse.
 	default_wh = _default_company_warehouse(company)
@@ -5554,9 +5687,9 @@ def create_guest_preorder(
 		so = frappe.get_doc("Sales Order", so_name)
 		frappe.flags.ignore_permissions = False
 
-	# Link the customer to the acting seller so Orden → Pedidos (assigned clients) lists it.
+	# Link the customer to the seller so Pedidos → Mis clientes lists it.
 	if (want_orden or tag_slug == "orden") and so.customer:
-		assign_uid = cstr(acting or seller_ref or "").strip()
+		assign_uid = cstr(seller_ref or acting or "").strip()
 		if assign_uid and assign_uid not in ("Guest", "Administrator"):
 			try:
 				from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
@@ -5753,12 +5886,16 @@ def _requeue_seller_amend_review(preorder_name: str, reason: str = "seller_amend
 		return False
 
 
-def _can_live_mutate_guest_preorder() -> bool:
+def _can_live_mutate_guest_preorder(so=None) -> bool:
 	"""Admins and Pedidos-table staff may mutate SO body live; sellers suggestion-only.
 
 	Create-time promote (Consulta→Orden inside ``create_guest_preorder``) is allowed
 	for sellers — they may place new orders; only post-create edits/pipeline moves
 	are suggestion-only.
+
+	Exception: while the SO is still in **Consulta**, sellers with ops.orden /
+	ops.preventa (create-order rights) may edit items/details live — same as
+	editing a draft they just created.
 	"""
 	if frappe.flags.get("applying_creation_review_suggestion"):
 		return True
@@ -5771,16 +5908,31 @@ def _can_live_mutate_guest_preorder() -> bool:
 
 	if is_creation_review_admin():
 		return True
-	return bool(
+	if (
 		_can_app("tables.orders")
 		or _can_app("tables.orders.all")
 		or _can_app("tables.orders.own")
-	)
+	):
+		return True
+	if so is not None and _is_guest_preorder_sales_order(so):
+		if _display_status(so) == "Consulta" and (
+			_can_app("ops.orden") or _can_app("ops.preventa")
+		):
+			return True
+	return False
 
 
-def _require_guest_preorder_live_mutate(pipeline_source=None):
-	"""Block non-admin / non-Pedidos sellers from live SO edits (use suggest API)."""
-	if _can_live_mutate_guest_preorder():
+def _require_guest_preorder_live_mutate(pipeline_source=None, preorder_name=None, so=None):
+	"""Block non-admin / non-Pedidos sellers from live SO edits (use suggest API).
+
+	Sellers with create-order rights may still live-edit while status is Consulta.
+	"""
+	doc = so
+	if doc is None and preorder_name and frappe.db.exists("Sales Order", preorder_name):
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Sales Order", preorder_name)
+		frappe.flags.ignore_permissions = False
+	if _can_live_mutate_guest_preorder(doc):
 		return
 	# TMS / kiosk / armado transitions are PIN-gated upstream.
 	if pipeline_source:
@@ -5825,18 +5977,12 @@ def _guest_preorder_matches_seller_scope(
 	order_owner = cstr(tags.get("order_owner") or "").strip()
 	if seller_scope == "mine":
 		return seller == uid
-	if seller_scope == "orden_here":
-		# Operaciones → Orden FAB: orders this seller placed here, OR for assigned clients.
+	if seller_scope in ("orden_here", "assigned"):
+		# Pedidos Mis clientes + Orden FAB: orders this seller placed, OR assigned clients.
 		cust = cstr(order.get("customer") or "").strip()
 		placed_here = seller == uid or order_owner == uid
 		assigned_ok = bool(cust and assigned_customers and cust in assigned_customers)
 		if not (placed_here or assigned_ok):
-			return False
-		return _guest_preorder_within_cutoff(order, cutoff_date)
-	if seller_scope == "assigned":
-		# Pedidos table Mis clientes: guest preorders for assigned clients in window.
-		cust = cstr(order.get("customer") or "").strip()
-		if not cust or not assigned_customers or cust not in assigned_customers:
 			return False
 		return _guest_preorder_within_cutoff(order, cutoff_date)
 	return True
@@ -5865,9 +6011,9 @@ def get_guest_preorders_list(
 
 	``seller_scope``:
 	  - ``mine`` — only SOs tagged ``seller_ref:<acting user>`` (seller link)
-	  - ``assigned`` — Pedidos for this seller's assigned clients (windowed)
-	  - ``orden_here`` — Operaciones → Orden FAB: orders this seller placed
-	    (``order_owner`` / ``seller_ref``) **or** for assigned clients (windowed)
+	  - ``assigned`` — Pedidos Mis clientes: orders this seller placed
+	    (``order_owner`` / ``seller_ref``) **or** assigned clients (windowed)
+	  - ``orden_here`` — Operaciones → Orden FAB: same as ``assigned``
 	"""
 	tag_fn = _guest_preorder_tag_fieldname()
 	if not tag_fn:
@@ -5940,28 +6086,17 @@ def get_guest_preorders_list(
 			out["window_days"] = window_days
 		return out
 
-	# Mis clientes with no assignments → empty (still report the window).
-	# orden_here still lists orders this seller placed even without assignments.
-	if seller_scope == "assigned" and not assigned_customers:
-		return {"preorders": [], "total_count": 0, "window_days": window_days or 30}
-
 	filters = {tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]}
 	if seller_scope == "mine" and acting_uid:
 		# Prefer rows that also carry this seller_ref (tag order is not guaranteed).
 		filters[tag_fn] = ["like", f"%seller_ref:{acting_uid}%"]
-	elif seller_scope == "assigned":
-		filters["customer"] = ["in", list(assigned_customers)]
-		if cutoff_date is not None:
-			filters["transaction_date"] = [">=", str(cutoff_date)]
-	elif seller_scope == "orden_here":
+	elif seller_scope in ("assigned", "orden_here"):
 		# Do not restrict SQL to assigned customers — also need order_owner / seller_ref rows.
 		if cutoff_date is not None:
 			filters["transaction_date"] = [">=", str(cutoff_date)]
 
 	# Explicit customer filter (CRM party Pedidos tab / click-from-order).
 	if customer_filter:
-		if seller_scope == "assigned" and assigned_customers and customer_filter not in assigned_customers:
-			return {"preorders": [], "total_count": 0, "window_days": window_days or 30}
 		filters["customer"] = customer_filter
 
 	if status:
@@ -6265,6 +6400,8 @@ def get_guest_preorder(preorder_name):
 		"transaction_date": so.transaction_date,
 		"delivery_date": so.delivery_date,
 		"delivery_date_forced": _delivery_date_forced_from_tags(so),
+		"delivery_date_changed_at": _delivery_date_changed_at_from_tags(so)
+		or (cstr(getattr(so, "modified", None) or "")[:19] or None),
 		"address": geo.get("address") or tags.get("guest_address") or None,
 		"territory": geo.get("territory"),
 		"zone": geo.get("zone"),
@@ -6326,6 +6463,8 @@ def get_guest_preorder(preorder_name):
 	_apply_tms_display_status(payload)
 	_attach_factura_a_fields([payload])
 	_attach_billing_fields([payload])
+	# Cliente Pending badge (r:actor) — same fields as Pedidos list column.
+	_attach_creation_review_fields([payload])
 	payload["is_credit_note"] = cstr(tags.get("credit_note") or "") in ("1", "true", "yes")
 	payload["credit_of"] = cstr(tags.get("credit_of") or "").strip() or None
 	payload["credit_reason"] = cstr(tags.get("credit_reason") or "").strip() or None
@@ -7208,7 +7347,6 @@ def update_guest_preorder_details(preorder_name, data=None):
 	if isinstance(data, str):
 		data = frappe.parse_json(data) or {}
 	data = frappe._dict(data or {})
-	_require_guest_preorder_live_mutate()
 
 	if not preorder_name or not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
@@ -7216,6 +7354,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_live_mutate(preorder_name=preorder_name, so=so)
 	_require_guest_preorder_visible(so)
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot edit a cancelled order"))
@@ -7246,9 +7385,11 @@ def update_guest_preorder_details(preorder_name, data=None):
 				so.delivery_date = getdate(auto_due)
 				for row in so.items or []:
 					row.delivery_date = so.delivery_date
+				_stamp_delivery_date_changed(so)
 			_update_guest_preorder_tag(so, "delivery_forced", None)
 			force_flag = False
 
+	delivery_touched = False
 	if data.get("delivery_date") is not None and str(data.get("delivery_date") or "").strip() != "":
 		so.delivery_date = getdate(data.get("delivery_date"))
 		# ERPNext requires delivery ≥ order date; a stale date (e.g. replayed from
@@ -7257,6 +7398,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 			so.delivery_date = getdate(so.transaction_date)
 		for row in so.items or []:
 			row.delivery_date = so.delivery_date
+		delivery_touched = True
 		if force_flag is None:
 			# Explicit date edit without flag → treat as forced.
 			force_flag = True
@@ -7284,8 +7426,12 @@ def update_guest_preorder_details(preorder_name, data=None):
 			so.delivery_date = getdate(auto_due)
 			for row in so.items or []:
 				row.delivery_date = so.delivery_date
+			delivery_touched = True
 	elif force_flag is True:
 		_update_guest_preorder_tag(so, "delivery_forced", "1")
+
+	if delivery_touched:
+		_stamp_delivery_date_changed(so)
 
 	if data.get("customer"):
 		customer = str(data.get("customer")).strip()
@@ -7469,14 +7615,13 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 	"""
 	import json as _json
 
-	_require_guest_preorder_live_mutate()
-
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_live_mutate(preorder_name=preorder_name, so=so)
 	_require_guest_preorder_visible(so)
 
 	if so.docstatus == 2:
@@ -7603,14 +7748,13 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	"""Update item rates/qty and global discount on a draft preorder (docstatus=0 only)."""
 	import json as _json
 
-	_require_guest_preorder_live_mutate()
-
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_live_mutate(preorder_name=preorder_name, so=so)
 	_require_guest_preorder_visible(so)
 
 	if so.docstatus != 0:
@@ -7651,13 +7795,13 @@ def reprice_guest_preorder_from_price_list(preorder_name, price_list=None):
 	WEIGHT lines keep list $/Kg (PRECIO POR 1 KG). Nos/CAJA get list $/unit.
 	Does not touch measured total_weight — only money columns.
 	"""
-	_require_guest_preorder_live_mutate()
 	if not frappe.db.exists("Sales Order", preorder_name):
 		frappe.throw(_("Sales Order {0} not found").format(preorder_name))
 
 	so = frappe.get_doc("Sales Order", preorder_name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_live_mutate(preorder_name=preorder_name, so=so)
 	_require_guest_preorder_visible(so)
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot edit a cancelled order"))
@@ -8907,7 +9051,6 @@ def update_guest_preorder_logistics(
 	Vehicle / driver options for the UI should come from the selected MAT
 	(and planner context); changing them updates the trip assignment.
 	"""
-	_require_guest_preorder_live_mutate()
 	name = cstr(preorder_name or "").strip()
 	if not name or not frappe.db.exists("Sales Order", name):
 		frappe.throw(_("Sales Order {0} not found").format(name or "?"))
@@ -8915,6 +9058,7 @@ def update_guest_preorder_logistics(
 	so = frappe.get_doc("Sales Order", name)
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
+	_require_guest_preorder_live_mutate(preorder_name=name, so=so)
 	_require_guest_preorder_visible(so)
 	if so.docstatus == 2:
 		frappe.throw(_("Cannot edit a cancelled order"))
@@ -9788,8 +9932,41 @@ def _attach_billing_fields(rows):
 		} if invoiced or rec else None
 
 
+def _normalize_invoice_mode(mode) -> str:
+	"""Canonical invoice mode: negro | factura_a | factura_b | factura_c.
+
+	Legacy ``blanco`` maps to ``factura_a``. Empty / unknown → ''.
+	"""
+	m = cstr(mode or "").strip().lower()
+	if m in ("blanco", "white", "factura_a", "factura-a", "factura a", "a", "fa"):
+		return "factura_a"
+	if m in ("factura_b", "factura-b", "factura b", "b", "fb"):
+		return "factura_b"
+	if m in ("factura_c", "factura-c", "factura c", "c", "fc"):
+		return "factura_c"
+	if m in ("negro", "black", "borrador", "draft"):
+		return "negro"
+	return ""
+
+
+def _afip_invoice_type_for_mode(mode) -> int:
+	"""AFIP tipo de comprobante for Factura A/B/C (1 / 6 / 11)."""
+	m = _normalize_invoice_mode(mode)
+	if m == "factura_a":
+		return 1
+	if m == "factura_b":
+		return 6
+	if m == "factura_c":
+		return 11
+	return 0
+
+
 def _default_invoice_templates(company=None):
-	"""Pick sensible blanco / negro Ecommerce Print Template defaults."""
+	"""Mode-scoped Ecommerce Print Template pools + defaults.
+
+	Each fiscal letter (A/B/C) and Borrador (negro) has its own pool so the
+	Facturar modal only offers matching print layouts.
+	"""
 	from erpnext.erpnext_integrations.ecommerce_api.print_templates_api import list_print_templates
 
 	try:
@@ -9806,37 +9983,78 @@ def _default_invoice_templates(company=None):
 	def _tname(t):
 		return t.get("templateName") or t.get("template_name") or t.get("name") or _tid(t)
 
-	def _pick(*needles):
+	def _row(t):
+		return {
+			"template_id": _tid(t),
+			"template_name": _tname(t),
+			"is_default": cint(t.get("isDefault") or t.get("is_default") or 0),
+			"paper_kind": t.get("paperKind") or t.get("paper_kind"),
+		}
+
+	def _name(t):
+		return cstr(_tname(t) or "").lower()
+
+	pools = {"negro": [], "factura_a": [], "factura_b": [], "factura_c": []}
+	for t in templates:
+		if not isinstance(t, dict):
+			continue
+		name = _name(t)
+		row = _row(t)
+		if "factura a" in name or name.startswith("factura a"):
+			pools["factura_a"].append(row)
+		elif "factura b" in name or name.startswith("factura b"):
+			pools["factura_b"].append(row)
+		elif "factura c" in name or name.startswith("factura c"):
+			pools["factura_c"].append(row)
+		elif any(
+			n in name
+			for n in (
+				"documento no válido",
+				"documento no valido",
+				"no valid",
+				"no válido",
+				"no valido",
+				"borrador",
+			)
+		):
+			pools["negro"].append(row)
+
+	def _pick(pool, *needles):
 		needles_l = [n.lower() for n in needles]
-		for t in templates:
-			if not isinstance(t, dict):
-				continue
-			name = cstr(_tname(t) or "").lower()
+		for t in pool:
+			name = cstr(t.get("template_name") or "").lower()
 			if any(n in name for n in needles_l):
-				return {"template_id": _tid(t), "template_name": _tname(t)}
-		if templates and isinstance(templates[0], dict):
-			t0 = templates[0]
-			return {"template_id": _tid(t0), "template_name": _tname(t0)}
+				return {
+					"template_id": t.get("template_id"),
+					"template_name": t.get("template_name"),
+				}
+		if pool:
+			return {
+				"template_id": pool[0].get("template_id"),
+				"template_name": pool[0].get("template_name"),
+			}
 		return None
 
-	return {
-		"blanco": _pick("factura a", "sales invoice", "classic · factura", "factura"),
+	defaults = {
 		"negro": _pick(
+			pools["negro"],
 			"documento no válido",
+			"documento no valido",
 			"no valid",
-			"no válido",
 			"borrador",
 		),
-		"templates": [
-			{
-				"template_id": _tid(t),
-				"template_name": _tname(t),
-				"is_default": cint(t.get("isDefault") or t.get("is_default") or 0),
-				"paper_kind": t.get("paperKind") or t.get("paper_kind"),
-			}
-			for t in templates
-			if isinstance(t, dict)
-		],
+		"factura_a": _pick(pools["factura_a"], "factura a (a4)", "factura a"),
+		"factura_b": _pick(pools["factura_b"], "factura b (a4)", "factura b"),
+		"factura_c": _pick(pools["factura_c"], "factura c (a4)", "factura c"),
+	}
+	# Legacy alias used by older clients.
+	defaults["blanco"] = defaults["factura_a"]
+
+	all_rows = [_row(t) for t in templates if isinstance(t, dict)]
+	return {
+		**defaults,
+		"templates_by_mode": pools,
+		"templates": all_rows,
 	}
 
 
@@ -9927,12 +10145,12 @@ def _submit_sales_invoice_from_preorder(so, mode="negro"):
 
 		si = make_sales_invoice(so.name)
 
-	mode_u = cstr(mode or "negro").strip().lower()
-	sale_mode = "WHITE" if mode_u == "blanco" else "BLACK"
+	mode_u = _normalize_invoice_mode(mode) or "negro"
+	sale_mode = "BLACK" if mode_u == "negro" else "WHITE"
 	is_borrador = 1 if sale_mode == "BLACK" else 0
 	# Stamp mode into remarks for reprint / audits (POS convention).
 	prev = cstr(getattr(si, "remarks", None) or "")
-	tag = f"sale_mode:{sale_mode} | is_borrador:{is_borrador}"
+	tag = f"sale_mode:{sale_mode} | invoice_mode:{mode_u} | is_borrador:{is_borrador}"
 	si.remarks = f"{prev} | {tag}".strip(" |") if prev else tag
 	if hasattr(si, "is_pos"):
 		si.is_pos = 0
@@ -9943,8 +10161,8 @@ def _submit_sales_invoice_from_preorder(so, mode="negro"):
 	return si
 
 
-def _maybe_afip_cae_for_si(si, afip_opts=None):
-	"""Optional AFIP CAE for blanco invoices. Soft-fail → warning, not 500."""
+def _maybe_afip_cae_for_si(si, afip_opts=None, mode=None):
+	"""Optional AFIP CAE for Factura A/B/C. Soft-fail → warning, not 500."""
 	opts = afip_opts if isinstance(afip_opts, dict) else {}
 	if opts.get("skip") in (1, "1", True, "true", "yes"):
 		return {"skipped": True}
@@ -9957,7 +10175,10 @@ def _maybe_afip_cae_for_si(si, afip_opts=None):
 				"skipped": True,
 				"warning": _("AFIP is not ready — invoice saved without CAE."),
 			}
-		invoice_type = cint(opts.get("invoice_type") or cfg.get("default_invoice_type") or 1)
+		mode_type = _afip_invoice_type_for_mode(mode)
+		invoice_type = cint(
+			opts.get("invoice_type") or mode_type or cfg.get("default_invoice_type") or 1
+		)
 		doc_type = cint(opts.get("doc_type") or 99)
 		doc_number = cint(opts.get("doc_number") or 0)
 		total = flt(si.grand_total)
@@ -10013,6 +10234,16 @@ def get_preorder_invoice_state(preorder_name=None):
 	except Exception:
 		afip_ready = False
 
+	# Ensure Factura A/B/C + Borrador starter print templates exist for this site.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.print_templates_api import (
+			ensure_starter_print_templates,
+		)
+
+		ensure_starter_print_templates()
+	except Exception:
+		pass
+
 	defaults = _default_invoice_templates(getattr(so, "company", None))
 	requires_fa = False
 	fa_status = None
@@ -10020,20 +10251,21 @@ def get_preorder_invoice_state(preorder_name=None):
 		requires_fa = bool(cint(getattr(so, "custom_requires_factura_a", 0) or 0))
 		fa_status = cstr(getattr(so, "custom_factura_a_status", None) or "").strip() or None
 
-	suggested_mode = "blanco" if requires_fa else "negro"
+	suggested_mode = "factura_a" if requires_fa else "negro"
 	blockers = []
 	if cint(so.docstatus) != 1:
 		blockers.append(_("Confirm the order before invoicing."))
 	if invoiced:
 		blockers.append(_("Already invoiced — use reprint."))
 
+	billing_mode = _normalize_invoice_mode(rec.get("mode")) or rec.get("mode")
 	return {
 		"preorder_name": preorder_name,
 		"invoiced": invoiced,
 		"billing": {
 			"invoiced": invoiced,
 			"source": rec.get("source") or ("silkos" if si else None),
-			"mode": rec.get("mode"),
+			"mode": billing_mode,
 			"sales_invoice": si,
 			"template_id": rec.get("template_id"),
 			"template_name": rec.get("template_name"),
@@ -10049,7 +10281,15 @@ def get_preorder_invoice_state(preorder_name=None):
 		"suggested_mode": suggested_mode,
 		"afip_ready": afip_ready,
 		"afip_warning": afip_warning,
-		"default_templates": {"blanco": defaults.get("blanco"), "negro": defaults.get("negro")},
+		"default_templates": {
+			"negro": defaults.get("negro"),
+			"factura_a": defaults.get("factura_a"),
+			"factura_b": defaults.get("factura_b"),
+			"factura_c": defaults.get("factura_c"),
+			# Legacy aliases
+			"blanco": defaults.get("blanco") or defaults.get("factura_a"),
+		},
+		"templates_by_mode": defaults.get("templates_by_mode") or {},
 		"templates": defaults.get("templates") or [],
 		"can_issue": not invoiced and cint(so.docstatus) == 1,
 		"blockers": blockers,
@@ -10071,7 +10311,7 @@ def issue_preorder_invoice(
 	afip=None,
 	note=None,
 ):
-	"""Create+submit SI once (blanco/negro), optional AFIP CAE, file into Documentos binder."""
+	"""Create+submit SI once (Borrador / Factura A|B|C), optional AFIP CAE, file into Documentos."""
 	preorder_name = cstr(preorder_name or "").strip()
 	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
 		frappe.throw(_("preorder_name is required"))
@@ -10094,13 +10334,13 @@ def issue_preorder_invoice(
 	if existing.get("invoiced") or si_existing:
 		frappe.throw(_("Already invoiced — use reprint."))
 
-	mode_u = cstr(mode or "").strip().lower()
-	if mode_u not in ("blanco", "negro"):
-		# Default: Factura A preference → blanco, else negro.
+	mode_u = _normalize_invoice_mode(mode)
+	if not mode_u:
+		# Default: Factura A preference → factura_a, else borrador.
 		if frappe.db.has_column("Sales Order", "custom_requires_factura_a") and cint(
 			getattr(so, "custom_requires_factura_a", 0) or 0
 		):
-			mode_u = "blanco"
+			mode_u = "factura_a"
 		else:
 			mode_u = "negro"
 
@@ -10112,17 +10352,22 @@ def issue_preorder_invoice(
 			afip_opts = frappe.parse_json(afip) or {}
 		except Exception:
 			afip_opts = {}
-	want_afip = mode_u == "blanco" and (
+	fiscal = mode_u in ("factura_a", "factura_b", "factura_c")
+	want_afip = fiscal and (
 		use_afip in (None, "", "null", "undefined")
 		or str(use_afip).strip().lower() in ("1", "true", "yes", "y", "on")
 	)
-	if mode_u == "negro":
+	if not fiscal:
 		want_afip = False
 		afip_opts = {**afip_opts, "skip": 1}
 	elif not want_afip:
 		afip_opts = {**afip_opts, "skip": 1}
+	else:
+		afip_opts = {**afip_opts, "invoice_type": _afip_invoice_type_for_mode(mode_u)}
 
-	afip_result = _maybe_afip_cae_for_si(si, afip_opts) if mode_u == "blanco" else {"skipped": True}
+	afip_result = (
+		_maybe_afip_cae_for_si(si, afip_opts, mode=mode_u) if fiscal else {"skipped": True}
+	)
 	cae = None
 	if isinstance(afip_result.get("cae"), dict):
 		cae = afip_result["cae"].get("cae")
@@ -10152,9 +10397,9 @@ def issue_preorder_invoice(
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"archivo file failed for {si.name}")
 
-	# Mark Factura A checklist issued when blanco or already required.
+	# Mark Factura A checklist issued when Factura A or already required.
 	if frappe.db.has_column("Sales Order", "custom_factura_a_status"):
-		if mode_u == "blanco" or cint(getattr(so, "custom_requires_factura_a", 0) or 0):
+		if mode_u == "factura_a" or cint(getattr(so, "custom_requires_factura_a", 0) or 0):
 			frappe.db.set_value(
 				"Sales Order",
 				preorder_name,
@@ -13992,6 +14237,30 @@ def suggest_customer_change(customer_name=None, change=None):
 	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
 
 	return cr.suggest_customer_change(customer_name=customer_name, change=change)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_my_review_requests():
+	"""Bell inbox: my pending suggestions + one-shot approved outcomes."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.list_my_review_requests()
+
+
+@frappe.whitelist(allow_guest=True)
+def cancel_my_review_request(kind=None, name=None):
+	"""Requester cancels their own pending suggestion."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.cancel_my_review_request(kind=kind, name=name)
+
+
+@frappe.whitelist(allow_guest=True)
+def dismiss_my_review_outcome(kind=None, name=None):
+	"""Dismiss a one-shot approved notice after the requester has seen it."""
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	return cr.dismiss_my_review_outcome(kind=kind, name=name)
 
 
 @frappe.whitelist(allow_guest=True)

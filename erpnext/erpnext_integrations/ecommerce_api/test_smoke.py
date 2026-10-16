@@ -1903,6 +1903,16 @@ def suite_5_12_modules_read():
             sales2 = next(g for g in (again.get("groups") or []) if g.get("name") == sales["name"])
             assert "ops.orden" in (sales2.get("permissions") or []), sales2.get("permissions")
             assert any(p.get("id") == "ops.orden" for p in (perms.get("permissions") or [])), perms
+            # Ops detail / past prices stay off ventas unless admin grants them.
+            assert any(
+                p.get("id") == "sales.order_ops_detail" for p in (perms.get("permissions") or [])
+            ), perms
+            assert "sales.order_ops_detail" not in (sales2.get("permissions") or []), sales2.get(
+                "permissions"
+            )
+            assert "sales.past_prices" not in (sales2.get("permissions") or []), sales2.get(
+                "permissions"
+            )
         # Detaching ops.catalog from ventas must stick (Orden is separate).
         if sales and "ops.catalog" in (sales.get("permissions") or []):
             original = list(sales.get("permissions") or [])
@@ -3120,6 +3130,22 @@ def suite_5_12_modules_read():
         assert (settings_default.get("catalogDisplay") or {}).get("catalogTemplate") == "nova_mobile", (
             settings_default.get("catalogDisplay")
         )
+        # defaultWarehouse round-trip (catalog stock depósito)
+        prev_wh = ((s.get("settings") or {}).get("catalogDisplay") or {}).get("defaultWarehouse") or ""
+        whs = frappe.get_all(
+            "Warehouse",
+            filters={"disabled": 0, "is_group": 0},
+            pluck="name",
+            limit=1,
+            ignore_permissions=True,
+        )
+        if whs:
+            out_wh = sui.save_shop_ui_settings({"catalogDisplay": {"defaultWarehouse": whs[0]}})
+            assert (((out_wh or {}).get("settings") or {}).get("catalogDisplay") or {}).get(
+                "defaultWarehouse"
+            ) == whs[0]
+            assert sui.resolve_default_warehouse() == whs[0]
+            sui.save_shop_ui_settings({"catalogDisplay": {"defaultWarehouse": prev_wh}})
 
     def check_tags():
         from erpnext.erpnext_integrations.ecommerce_api import tags_api as ta
@@ -3776,6 +3802,71 @@ def suite_5_15_creation_review():
                 frappe.delete_doc("Customer", cust_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_my_suggestions_inbox():
+        """i054: seller sees pending suggestion in bell inbox and can cancel it."""
+        staff = _ensure_smoke_creation_review_staff()
+        so_name = None
+        prev = frappe.session.user
+        try:
+            frappe.set_user("Administrator")
+            out = api.create_guest_preorder(
+                items=[],
+                guest_notes="smoke my-suggestions base",
+                guest_name="Smoke My Suggestions Guest",
+                guest_phone="5491100005566",
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            frappe.db.set_value("Sales Order", so_name, "owner", staff)
+            frappe.db.commit()
+
+            frappe.set_user(staff)
+            sug = api.suggest_guest_preorder_change(
+                preorder_name=so_name,
+                change={"details": {"guest_notes": "inbox suggestion"}},
+            )
+            assert sug.get("ok"), sug
+            inbox = api.list_my_review_requests()
+            assert isinstance(inbox, dict)
+            pending_ids = {r.get("id") for r in (inbox.get("pending") or [])}
+            assert f"order:{so_name}" in pending_ids, inbox
+
+            cancelled = api.cancel_my_review_request(kind="order", name=so_name)
+            assert cancelled.get("ok") and cancelled.get("action") == "cancelled", cancelled
+            inbox2 = api.list_my_review_requests()
+            pending_ids2 = {r.get("id") for r in (inbox2.get("pending") or [])}
+            assert f"order:{so_name}" not in pending_ids2, inbox2
+            assert not api.get_guest_preorder(so_name).get("pending_suggestion")
+        finally:
+            frappe.set_user(prev)
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                cr.clear_pending_suggestion(so_name)
+                frappe.db.sql("delete from `tabSales Order Item` where parent=%s", so_name)
+                frappe.db.sql("delete from `tabSales Order` where name=%s", so_name)
+            frappe.db.commit()
+
+    def check_preventa_attention_count():
+        """i054: attention count + mark_seen clears amber until new activity."""
+        from erpnext.erpnext_integrations.ecommerce_api import preventa_api as pa
+
+        owner = frappe.session.user or "Administrator"
+        out = pa.count_preventa_attention(owner_user=owner)
+        assert isinstance(out, dict) and "count" in out
+        assert cint(out["count"]) >= 0
+
+        lead = frappe.db.get_value(
+            "Lead",
+            {"lead_owner": owner, "disabled": 0, "status": ["!=", "Do Not Contact"]},
+            "name",
+        )
+        if lead:
+            marked = pa.mark_lead_attention_seen(lead=lead, owner_user=owner)
+            assert marked.get("ok") and marked.get("action") == "attention_seen", marked
+            board = pa.get_my_board(owner_user=owner)
+            row = next((r for r in (board.get("leads") or []) if r.get("name") == lead), None)
+            if row is not None:
+                assert not (row.get("attention") or {}).get("hot"), row.get("attention")
+
     def check_seller_can_create_orden():
         """Suggestion-only sellers may create Orden; later pipeline stays blocked."""
         from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
@@ -3833,6 +3924,16 @@ def suite_5_15_creation_review():
         "5.15.5 seller create Orden allowed; later pipeline suggestion-only",
         check_seller_can_create_orden,
         "S2",
+    )
+    _run(
+        "5.15.6 my suggestions inbox + cancel (i054)",
+        check_my_suggestions_inbox,
+        "S2",
+    )
+    _run(
+        "5.15.7 preventa attention count shape (i054)",
+        check_preventa_attention_count,
+        "S3",
     )
 
 
