@@ -3205,7 +3205,6 @@ def ensure_crm_party_buckets():
 	}
 
 
-@frappe.whitelist(allow_guest=True)
 def _customer_names_matching_address(term: str, limit: int = 40) -> list[str]:
 	"""Customer names whose Address.address_line1 matches ``term`` (Orden typeahead)."""
 	term = cstr(term or "").strip()
@@ -3238,6 +3237,7 @@ def _customer_names_matching_address(term: str, limit: int = 40) -> list[str]:
 	return out
 
 
+@frappe.whitelist(allow_guest=True)
 def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	"""Typeahead / CRM list for Customer (name + phone + tax id + address).
 
@@ -6922,7 +6922,6 @@ def _erp_status_for_display(display_status):
 	}.get(base)
 
 
-@frappe.whitelist(allow_guest=True)
 def _attach_factura_a_fields(rows):
 	"""Attach Sales Order Factura A / delivery payment differential fields onto list/detail rows."""
 	names = [cstr(r.get("name")).strip() for r in (rows or []) if r.get("name")]
@@ -8672,7 +8671,6 @@ def _set_dn_warehouse(dn_name, warehouse):
 	)
 
 
-@frappe.whitelist(allow_guest=True)
 def _mat_day_centroid(trip_name):
 	"""Average lat/lng of stops on a trip (for nearest-MAT scoring)."""
 	rows = frappe.get_all(
@@ -8965,29 +8963,75 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 	}
 
 
+def _mat_trailing_int(name: str):
+	"""Last numeric segment of a MAT name (MAT-DT-2026-00011 → 11)."""
+	m = re.search(r"(\d+)$", cstr(name or ""))
+	return int(m.group(1)) if m else None
+
+
+@frappe.whitelist(allow_guest=True)
 def list_available_mats(search=None, limit=50, include_completed=0):
 	"""Searchable Delivery Trips (MAT-DT-…) for Pedidos assignment.
 
 	Returns open MAT plans (Draft / Scheduled / In Transit) with driver + vehicle.
+	Search matches trip name, trailing trip number (``001`` → ``…-00001``),
+	driver, vehicle id, and license plate.
 	"""
 	limit = max(1, min(cint(limit) or 50, 200))
 	q = cstr(search or "").strip()
-	# Available = Draft/Scheduled. Search also surfaces In Transit MATs by name.
+	if q.lower() in ("null", "undefined", "none"):
+		q = ""
+	digit_q = q.isdigit()
+	# Available = Draft/Scheduled. Any typed search also surfaces In Transit.
 	if cint(include_completed):
-		statuses = ["Draft", "Scheduled", "In Transit", "", "Completed"]
+		statuses = ["Draft", "Scheduled", "In Transit", "Completed"]
 	elif q:
-		statuses = ["Draft", "Scheduled", "In Transit", ""]
+		statuses = ["Draft", "Scheduled", "In Transit"]
 	else:
-		statuses = ["Draft", "Scheduled", ""]
+		statuses = ["Draft", "Scheduled"]
 	filters = {"docstatus": ["!=", 2], "status": ["in", statuses]}
-	or_filters = None
+
+	# Resolve vehicles whose plate/name match so short codes like "001" find the MAT.
+	plate_hit_vehicles: list[str] = []
 	if q:
+		like = f"%{q}%"
+		by_plate = frappe.get_all(
+			"Vehicle",
+			filters={"license_plate": ["like", like]},
+			pluck="name",
+			limit_page_length=40,
+			ignore_permissions=True,
+		) or []
+		by_name = frappe.get_all(
+			"Vehicle",
+			filters={"name": ["like", like]},
+			pluck="name",
+			limit_page_length=40,
+			ignore_permissions=True,
+		) or []
+		plate_hit_vehicles = list(dict.fromkeys([*by_plate, *by_name]))
+
+	or_filters = None
+	if q and not digit_q:
+		like = f"%{q}%"
 		or_filters = [
-			["name", "like", f"%{q}%"],
-			["driver_name", "like", f"%{q}%"],
-			["driver", "like", f"%{q}%"],
-			["vehicle", "like", f"%{q}%"],
+			["name", "like", like],
+			["driver_name", "like", like],
+			["driver", "like", like],
+			["vehicle", "like", like],
 		]
+		for vn in plate_hit_vehicles[:20]:
+			or_filters.append(["vehicle", "=", vn])
+	# Digit queries: no SQL name filter — scan open MATs and match trailing
+	# number in Python (001 → …-00001, 11 → …-00011).
+
+	# Digit queries scan a wider open-MAT window so "001" can equal …-00001.
+	if digit_q:
+		fetch_limit = max(limit * 10, 200)
+	elif q:
+		fetch_limit = limit * 3
+	else:
+		fetch_limit = limit
 	rows = frappe.get_all(
 		"Delivery Trip",
 		filters=filters,
@@ -9002,12 +9046,13 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 			"departure_time",
 			"custom_pickup_warehouse",
 			"company",
+			"modified",
 		],
 		order_by="modified desc",
-		limit_page_length=limit,
+		limit_page_length=fetch_limit,
 		ignore_permissions=True,
 	)
-	veh_names = [r.vehicle for r in rows if r.vehicle]
+	veh_names = list({r.vehicle for r in rows if r.vehicle} | set(plate_hit_vehicles))
 	plate_map = {}
 	if veh_names:
 		for v in frappe.get_all(
@@ -9017,8 +9062,46 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 			ignore_permissions=True,
 		):
 			plate_map[v.name] = v.license_plate or v.name
-	out = []
+
+	ql = q.lower()
+	qn = int(q) if digit_q else None
+	ranked = []
 	for r in rows:
+		plate = (plate_map.get(r.vehicle) if r.vehicle else None) or ""
+		name_l = cstr(r.name).lower()
+		plate_l = cstr(plate).lower()
+		score = 0
+		if not ql:
+			ranked.append((0, r, plate))
+			continue
+		trail = _mat_trailing_int(r.name)
+		plate_trail = _mat_trailing_int(plate_l)
+		if name_l == ql:
+			score = 100
+		elif digit_q and trail is not None and trail == qn:
+			score = 95
+		elif name_l.endswith(ql) or name_l.endswith("-" + ql):
+			score = 90
+		elif plate_l == ql or (digit_q and plate_trail is not None and plate_trail == qn):
+			score = 85
+		elif not digit_q and ql in plate_l:
+			score = 70
+		elif not digit_q and ql in name_l:
+			score = 60
+		elif ql in cstr(r.driver_name or "").lower() or ql in cstr(r.driver or "").lower():
+			score = 40
+		elif not digit_q and r.vehicle and r.vehicle in plate_hit_vehicles:
+			score = 50
+		else:
+			# Digit scan window includes non-matches — drop them.
+			if digit_q:
+				continue
+			score = 10
+		ranked.append((score, r, plate))
+	ranked.sort(key=lambda x: (-x[0], cstr(getattr(x[1], "modified", "") or "")))
+
+	out = []
+	for _score, r, plate in ranked[:limit]:
 		out.append(
 			{
 				"name": r.name,
@@ -9027,7 +9110,7 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 				"driver": r.driver,
 				"driver_name": r.driver_name,
 				"vehicle": r.vehicle,
-				"vehicle_plate": plate_map.get(r.vehicle) if r.vehicle else None,
+				"vehicle_plate": plate or (plate_map.get(r.vehicle) if r.vehicle else None),
 				"warehouse": getattr(r, "custom_pickup_warehouse", None),
 				"departure_time": str(r.departure_time) if r.departure_time else None,
 				"company": r.company,
@@ -9563,6 +9646,7 @@ def _attach_planner_gate_fields(payload, gate):
 	return payload
 
 
+@frappe.whitelist(allow_guest=True)
 def sync_orden_planner_remitos(company=None):
 	"""Ensure Orden/Preparado guest preorders with an address have a remito.
 

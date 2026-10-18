@@ -4062,11 +4062,12 @@
     {
       "id": "search_customers_null_term",
       "source": "regression",
-      "bug": "search_customers with null search_term must not TypeError (RM list / assigned scope)",
+      "bug": "search_customers must stay @frappe.whitelist (403 not whitelisted broke Consumidor Final / admin party picker); null search_term must not TypeError",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
       "args": {
         "search_term": null,
-        "page_length": null
+        "page_length": null,
+        "ensure_buckets": 1
       },
       "expect": "no_500"
     },
@@ -4386,12 +4387,35 @@
     {
       "id": "list_available_mats_null",
       "source": "regression",
-      "bug": "list_available_mats with null search/limit never TypeError",
+      "bug": "list_available_mats must stay @frappe.whitelist (Assign MAT modal); null search/limit never TypeError",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_available_mats",
       "args": {
         "search": null,
         "limit": null,
         "include_completed": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_available_mats_digit_suffix",
+      "source": "regression",
+      "bug": "MAT existente search for short digits like 001 must not 500; plate/suffix match returns controlled rows",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_available_mats",
+      "args": {
+        "search": "001",
+        "limit": 40,
+        "include_completed": 0
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_available_mats_empty_search",
+      "source": "regression",
+      "bug": "list_available_mats with empty string search stays ok (Draft/Scheduled list)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_available_mats",
+      "args": {
+        "search": "",
+        "limit": 10
       },
       "expect": "ok"
     },
