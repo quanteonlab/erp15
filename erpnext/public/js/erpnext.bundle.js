@@ -39,5 +39,6 @@ import "./purchase_trends_filters.js";
 import "./workspace_subnav.js";
 import "./grid_quick_delete.js";
 import "./desk_declutter.js";
+import "./file_uploader_public_default.js";
 
 // import { sum } from 'frappe/public/utils/util.js'
