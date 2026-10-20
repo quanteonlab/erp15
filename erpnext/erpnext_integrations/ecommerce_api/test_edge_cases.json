@@ -2787,6 +2787,16 @@
       "expect": "fail"
     },
     {
+      "id": "tms_driver_get_my_trips_dirty_date",
+      "source": "regression",
+      "bug": "driver_get_my_trips with null/garbage date falls back to today, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_get_my_trips",
+      "args": {
+        "date": "null"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_driver_get_trip_delivery_summary_null",
       "source": "regression",
       "bug": "driver_get_trip_delivery_summary with null/empty trip_name must controlled ValidationError not TypeError/500",
@@ -3624,6 +3634,17 @@
         "departure_time": null
       },
       "expect": "fail"
+    },
+    {
+      "id": "tms_update_trip_assignment_scheduled_driver",
+      "source": "regression",
+      "bug": "Published Scheduled MAT can still change driver before In Transit (Entregas PIN ownership)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_trip_assignment",
+      "args": {
+        "trip_name": "MAT-DT-2026-00012",
+        "driver": "HR-DRI-2026-00006"
+      },
+      "expect": "ok"
     },
     {
       "id": "tms_update_trip_assignment_empty_departure",
@@ -6055,6 +6076,164 @@
       "expect": "error",
       "source": "regression",
       "bug": "mark_pending_order_seen empty sales_order is controlled error (i054 pending-order hot)"
+    },
+    {
+      "id": "set_client_delivery_warehouse_null_customer",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.set_client_delivery_warehouse",
+      "args": {
+        "customer": null,
+        "warehouse": "Stores - BN"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_client_delivery_warehouse null customer is controlled error (i055)"
+    },
+    {
+      "id": "set_client_delivery_warehouse_empty_customer",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.set_client_delivery_warehouse",
+      "args": {
+        "customer": "",
+        "warehouse": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_client_delivery_warehouse empty customer is controlled error (i055)"
+    },
+    {
+      "id": "set_client_delivery_warehouse_unknown_wh",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.set_client_delivery_warehouse",
+      "args": {
+        "customer": "Consumidor Final",
+        "warehouse": "NOPE-WAREHOUSE-i055"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_client_delivery_warehouse unknown warehouse is controlled error (i055)"
+    },
+    {
+      "id": "list_client_warehouse_outliers_null_max_km",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_client_warehouse_outliers",
+      "args": {
+        "max_km": null,
+        "mode": "outside",
+        "warehouse": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_client_warehouse_outliers null max_km defaults to 15 (i055)"
+    },
+    {
+      "id": "list_client_warehouse_outliers_bad_mode",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_client_warehouse_outliers",
+      "args": {
+        "mode": "nope",
+        "max_km": 10
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "list_client_warehouse_outliers bad mode is controlled error (i055)"
+    },
+    {
+      "id": "list_client_warehouse_outliers_negative_max_km",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_client_warehouse_outliers",
+      "args": {
+        "mode": "outside",
+        "max_km": -1
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_client_warehouse_outliers negative max_km clamps to 0 (i055)"
+    },
+    {
+      "id": "suggest_nearest_warehouse_null_customer",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.suggest_nearest_warehouse",
+      "args": {
+        "customer": null,
+        "lat": null,
+        "lng": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "suggest_nearest_warehouse without geo returns missing_geo reason (i055)"
+    },
+    {
+      "id": "backfill_client_warehouses_null_dry_run",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.backfill_client_warehouses",
+      "args": {
+        "dry_run": null,
+        "limit": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "backfill_client_warehouses null dry_run defaults to dry-run (i055)"
+    },
+    {
+      "id": "list_delivery_clients_includes_warehouse_key",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_delivery_clients",
+      "args": {
+        "limit": 3,
+        "only_geocoded": 1
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_delivery_clients returns warehouse key on rows after i055 field ensure"
+    },
+    {
+      "id": "remediate_far_delivery_geocodes_null_max_km",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.remediate_far_delivery_geocodes",
+      "args": {
+        "max_km": null,
+        "dry_run": 1,
+        "limit": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "remediate_far_delivery_geocodes null max_km defaults to 80 (far-pin fix)"
+    },
+    {
+      "id": "remediate_far_delivery_geocodes_empty_dry_run",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.remediate_far_delivery_geocodes",
+      "args": {
+        "max_km": "80",
+        "dry_run": "",
+        "limit": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "remediate_far_delivery_geocodes empty dry_run defaults to dry-run"
+    },
+    {
+      "id": "remediate_far_delivery_geocodes_negative_max_km",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.remediate_far_delivery_geocodes",
+      "args": {
+        "max_km": -1,
+        "dry_run": 1,
+        "limit": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "remediate_far_delivery_geocodes negative max_km clamps to 0"
+    },
+    {
+      "id": "geocode_address_null_force",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.geocode_address",
+      "args": {
+        "address_name": null,
+        "force": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "geocode_address null address_name is controlled error (force param safe)"
+    },
+    {
+      "id": "get_driver_detail_null_driver",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_driver_detail",
+      "args": {
+        "driver": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "get_driver_detail null driver is controlled error (ops_pin serialize path)"
     }
   ]
 }

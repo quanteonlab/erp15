@@ -46,6 +46,29 @@ def _default_address(link_doctype, link_name):
 	return rows[0] if rows else None
 
 
+def _ensure_customer_delivery_warehouse_field():
+	"""Idempotent — Customer.custom_delivery_warehouse (i055)."""
+	if frappe.db.has_column("Customer", "custom_delivery_warehouse"):
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+	create_custom_fields(
+		{
+			"Customer": [
+				{
+					"fieldname": "custom_delivery_warehouse",
+					"fieldtype": "Link",
+					"options": "Warehouse",
+					"label": "Delivery Warehouse",
+					"insert_after": "territory",
+				},
+			]
+		},
+		update=True,
+	)
+	frappe.clear_cache(doctype="Customer")
+
+
 def _resolve_pickup_address(company, driver_doc=None, pickup_warehouse=None):
 	"""Depot/pickup address resolution for a trip, in priority order:
 
@@ -77,8 +100,91 @@ def _resolve_pickup_address(company, driver_doc=None, pickup_warehouse=None):
 	return _default_address("Company", company), None
 
 
+def _unanimous_client_warehouse_for_dns(delivery_note_names) -> str | None:
+	"""If every DN customer with a warehouse set agrees, return that warehouse.
+
+	Blanks do not vote. Mixed non-empty values → None (caller uses company default).
+	"""
+	_ensure_customer_delivery_warehouse_field()
+	names = [cstr(n).strip() for n in (delivery_note_names or []) if cstr(n).strip()]
+	if not names or not frappe.db.has_column("Customer", "custom_delivery_warehouse"):
+		return None
+	customers = frappe.get_all(
+		"Delivery Note",
+		filters={"name": ["in", names]},
+		pluck="customer",
+		ignore_permissions=True,
+	) or []
+	custs = {cstr(c).strip() for c in customers if cstr(c).strip()}
+	if not custs:
+		return None
+	votes = set()
+	for cust in custs:
+		wh = cstr(
+			frappe.db.get_value("Customer", cust, "custom_delivery_warehouse") or ""
+		).strip()
+		if wh:
+			votes.add(wh)
+	if len(votes) == 1:
+		return next(iter(votes))
+	return None
+
+
+def _request_ops_pin() -> str:
+	"""6-digit ops PIN from JSON/form ``ops_pin`` or ``X-ERP-Ops-Pin`` header."""
+	raw = ""
+	try:
+		raw = cstr(frappe.form_dict.get("ops_pin") or "").strip()
+	except Exception:
+		raw = ""
+	if not raw:
+		try:
+			raw = cstr(frappe.get_request_header("X-ERP-Ops-Pin") or "").strip()
+		except Exception:
+			raw = ""
+	if not raw.isdigit() or len(raw) != 6:
+		return ""
+	return raw
+
+
+def _driver_from_employee(employee: str | None):
+	emp = cstr(employee or "").strip()
+	if not emp:
+		return None
+	return frappe.db.get_value(
+		"Driver",
+		{"employee": emp},
+		["name", "full_name", "cell_number", "address", "employee"],
+		as_dict=True,
+	)
+
+
 def _get_current_driver():
+	"""Resolve the Driver for this request.
+
+	Prefer kiosk ``ops_pin`` (Entregas QR / PIN gate) so a desk admin session on
+	the same browser does not steal the route list. Fall back to acting user.
+	"""
 	from erpnext.erpnext_integrations.ecommerce_api.company_context import acting_user, is_desk_admin
+
+	ops_pin = _request_ops_pin()
+	if ops_pin:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import resolve_ops_pin
+
+		identity = resolve_ops_pin(pin=ops_pin) or {}
+		if not identity.get("authorized") or identity.get("kind") != "employee":
+			frappe.throw(_("Invalid delivery PIN"), frappe.AuthenticationError)
+		perms = identity.get("permissions") or []
+		if "ops.delivery" not in perms and "*" not in perms:
+			frappe.throw(_("This PIN cannot access deliveries"), frappe.PermissionError)
+		emp = cstr(identity.get("employee") or "").strip()
+		driver = _driver_from_employee(emp)
+		if driver:
+			_ensure_driver_group_membership(emp)
+			return driver
+		# Employee with delivery perm but no Driver doc yet — create one.
+		user_id = cstr(identity.get("user_id") or "").strip() or "Guest"
+		return _ensure_driver_for_employee(emp, user_id)
 
 	user = acting_user()
 	if not user or user == "Guest":
@@ -86,12 +192,7 @@ def _get_current_driver():
 
 	employee = frappe.db.get_value("Employee", {"user_id": user}, "name")
 	if employee:
-		driver = frappe.db.get_value(
-			"Driver",
-			{"employee": employee},
-			["name", "full_name", "cell_number", "address"],
-			as_dict=True,
-		)
+		driver = _driver_from_employee(employee)
 		if driver:
 			return driver
 		if is_desk_admin(user):
@@ -112,6 +213,39 @@ def _driver_display_name(user: str) -> str:
 	return local.replace(".", " ").title() or user
 
 
+def _ensure_driver_group_membership(employee: str | None) -> bool:
+	"""Attach Employee to starter group ``driver`` so ops.delivery PIN unlock works.
+
+	Returns True when the group is resolved and the employee is (now) a member.
+	"""
+	emp = cstr(employee or "").strip()
+	if not emp or not frappe.db.exists("Employee", emp):
+		return False
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import _set_employee_groups
+
+		group_name = _ensure_driver_staff_group()
+		if not group_name:
+			return False
+		current = (
+			frappe.get_all(
+				"Employee Group Table",
+				filters={"employee": emp},
+				pluck="parent",
+				ignore_permissions=True,
+			)
+			or []
+		)
+		if group_name in current:
+			return True
+		_set_employee_groups(emp, list({*current, group_name}))
+		frappe.db.commit()
+		return True
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "ensure_driver_group_membership")
+		return False
+
+
 def _ensure_driver_for_employee(employee: str, user: str) -> dict:
 	full_name = frappe.db.get_value("Employee", employee, "employee_name") or _driver_display_name(user)
 	driver = frappe.get_doc(
@@ -123,6 +257,7 @@ def _ensure_driver_for_employee(employee: str, user: str) -> dict:
 		}
 	)
 	driver.insert(ignore_permissions=True)
+	_ensure_driver_group_membership(employee)
 	frappe.db.commit()
 	return frappe.db.get_value(
 		"Driver",
@@ -1873,14 +2008,23 @@ def claim_orders_to_trip(
 
 
 @frappe.whitelist(allow_guest=True)
-def geocode_address(address_name):
+def geocode_address(address_name, force=0):
+	"""Geocode an Address. ``force=1`` ignores cached lat/lng and overwrites."""
+	name = cstr(address_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Address is required"), frappe.ValidationError)
 	address = frappe.db.get_value(
-		"Address", address_name, ["custom_latitude", "custom_longitude"], as_dict=True
+		"Address", name, ["custom_latitude", "custom_longitude"], as_dict=True
 	)
 	if not address:
-		frappe.throw(_("Address {0} not found").format(address_name), frappe.DoesNotExistError)
+		frappe.throw(_("Address {0} not found").format(name), frappe.DoesNotExistError)
 
-	if address.custom_latitude and address.custom_longitude:
+	do_force = cint(force) == 1
+	if (
+		not do_force
+		and address.custom_latitude
+		and address.custom_longitude
+	):
 		return {"lat": address.custom_latitude, "lng": address.custom_longitude, "cached": True}
 
 	api_key = frappe.db.get_single_value("Google Settings", "api_key")
@@ -1888,13 +2032,13 @@ def geocode_address(address_name):
 		frappe.throw(_("Enter API key in Google Settings."))
 
 	frappe.flags.ignore_permissions = True
-	address_doc = frappe.get_doc("Address", address_name)
+	address_doc = frappe.get_doc("Address", name)
 	frappe.flags.ignore_permissions = False
 
 	address_display = get_address_display(address_doc.as_dict())
 	address_str = sanitize_address(address_display)
 	if not address_str:
-		frappe.throw(_("Address {0} has no address lines to geocode").format(address_name))
+		frappe.throw(_("Address {0} has no address lines to geocode").format(name))
 
 	import googlemaps
 
@@ -1905,12 +2049,12 @@ def geocode_address(address_name):
 		frappe.throw(_(str(e)))
 
 	if not results:
-		frappe.throw(_("Could not geocode address {0}").format(address_name))
+		frappe.throw(_("Could not geocode address {0}").format(name))
 
 	location = results[0]["geometry"]["location"]
 	frappe.db.set_value(
 		"Address",
-		address_name,
+		name,
 		{
 			"custom_latitude": location["lat"],
 			"custom_longitude": location["lng"],
@@ -1918,16 +2062,42 @@ def geocode_address(address_name):
 		},
 		update_modified=False,
 	)
+	# Keep Delivery Stop pins in sync (map prefers stop.lat over Address).
+	_sync_delivery_stop_geo(name, location["lat"], location["lng"])
 	# i044 flow B: first geocode of a client address → nearest under-cap zone.
-	assigned = _auto_assign_zone_if_missing(address_name)
+	assigned = _auto_assign_zone_if_missing(name)
 	frappe.db.commit()
 
 	return {
 		"lat": location["lat"],
 		"lng": location["lng"],
 		"cached": False,
+		"forced": do_force,
 		"zone": (assigned or {}).get("zone"),
 	}
+
+
+def _sync_delivery_stop_geo(address_name, lat, lng):
+	"""Write lat/lng onto Delivery Stops that still point at this Address."""
+	addr = cstr(address_name or "").strip()
+	if not addr:
+		return 0
+	try:
+		lat_f = flt(lat)
+		lng_f = flt(lng)
+	except Exception:
+		return 0
+	if not frappe.db.has_table("Delivery Stop"):
+		return 0
+	frappe.db.sql(
+		"""
+		UPDATE `tabDelivery Stop`
+		SET lat = %s, lng = %s
+		WHERE IFNULL(address, '') = %s
+		""",
+		(lat_f, lng_f, addr),
+	)
+	return 1
 
 
 def _nominatim_headers():
@@ -2602,6 +2772,13 @@ def create_trip(
 	driver_doc = None
 	if driver:
 		driver_doc = frappe.db.get_value("Driver", driver, ["full_name", "address"], as_dict=True)
+
+	# i055: when UI did not pick a depot, use unanimous client delivery warehouse.
+	pickup_wh = cstr(pickup_warehouse or "").strip()
+	if not pickup_wh or pickup_wh.lower() in ("null", "undefined", "none"):
+		derived = _unanimous_client_warehouse_for_dns(delivery_note_names)
+		if derived:
+			pickup_warehouse = derived
 
 	driver_address, resolved_warehouse = _resolve_pickup_address(company, driver_doc, pickup_warehouse)
 
@@ -3522,11 +3699,12 @@ def reorder_trip_stops(trip_name, delivery_note_names=None):
 def update_trip_assignment(
 	trip_name, driver=None, vehicle=None, pickup_warehouse=None, departure_time=None
 ):
-	"""Update draft MAT assignment (driver / vehicle / warehouse) and/or departure time.
+	"""Update MAT assignment (driver / vehicle / warehouse) and/or departure time.
 
 	``departure_time`` accepts ``YYYY-MM-DD`` (defaults to 08:00) or a full datetime.
-	Driver / vehicle / warehouse changes remain Draft-only; departure can also be set
-	on Scheduled trips that have not started.
+	Driver / vehicle / warehouse can change on Draft **or** Scheduled (published but
+	not started) trips — so a published plan can still be handed to another driver
+	before they open Entregas. In Transit / Completed / Cancelled stay locked.
 	"""
 	has_assign = bool(cstr(driver or "").strip() or cstr(vehicle or "").strip() or cstr(pickup_warehouse or "").strip())
 	# departure_time=None → omit; "" → controlled error below
@@ -3543,12 +3721,12 @@ def update_trip_assignment(
 		frappe.throw(_("Cannot edit a cancelled MAT."))
 	if status == "Completed":
 		frappe.throw(_("Cannot edit a completed MAT."))
-	if status == "In Transit" and has_assign:
+	if has_assign and status == "In Transit":
 		frappe.throw(_("Cannot reassign driver/vehicle while the MAT is In Transit."))
-
-	if has_assign and trip.docstatus != 0:
+	# Draft (docstatus 0) or Scheduled after publish — not In Transit yet.
+	if has_assign and status not in ("", "Draft", "Scheduled") and trip.docstatus != 0:
 		frappe.throw(
-			_("Only a Draft trip can be reassigned. Cancel a published trip and create a new one instead.")
+			_("Only a Draft or Scheduled trip can be reassigned (not {0}).").format(status or "—")
 		)
 
 	if driver or pickup_warehouse:
@@ -3584,6 +3762,8 @@ def update_trip_assignment(
 		except Exception:
 			frappe.throw(_("Invalid departure time: {0}").format(departure_time))
 
+	if trip.docstatus == 1:
+		trip.flags.ignore_validate_update_after_submit = True
 	_save_trip_doc(trip)
 
 	return get_trip_map_data(trip_name)
@@ -3829,7 +4009,7 @@ def _set_vehicle_plate_for_employee(employee, license_plate):
 	return veh_name
 
 
-def _serialize_driver(driver_name):
+def _serialize_driver(driver_name, *, ensure_ops_pin=True):
 	frappe.flags.ignore_permissions = True
 	d = frappe.get_doc("Driver", driver_name)
 	frappe.flags.ignore_permissions = False
@@ -3838,6 +4018,19 @@ def _serialize_driver(driver_name):
 	user_enabled = None
 	if user_id and frappe.db.exists("User", user_id):
 		user_enabled = cint(frappe.db.get_value("User", user_id, "enabled"))
+	ops_pin = None
+	if emp and ensure_ops_pin:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+				_issue_ops_pin_for_employee,
+			)
+
+			# PIN unlock of /logistics/driver needs ops.delivery via group ``driver``.
+			_ensure_driver_group_membership(emp)
+			ops_pin = _issue_ops_pin_for_employee(emp, rotate=False)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "serialize_driver ops_pin")
+			ops_pin = None
 	return {
 		"name": d.name,
 		"full_name": d.full_name,
@@ -3850,6 +4043,7 @@ def _serialize_driver(driver_name):
 		"has_user": bool(user_id and frappe.db.exists("User", user_id)),
 		"user_enabled": user_enabled,
 		"status": d.status,
+		"ops_pin": ops_pin,
 	}
 
 
@@ -4498,16 +4692,21 @@ def list_delivery_clients(limit=2000, only_geocoded=1):
 	else:
 		geo_only = cint(only_geocoded) != 0
 
+	_ensure_customer_delivery_warehouse_field()
 	has_zone = frappe.db.has_column("Address", "custom_zone")
 	has_lat = frappe.db.has_column("Address", "custom_latitude")
 	has_lng = frappe.db.has_column("Address", "custom_longitude")
 	has_freq = frappe.db.has_column("Address", "custom_delivery_frequency")
+	has_wh = frappe.db.has_column("Customer", "custom_delivery_warehouse")
 	if not has_lat or not has_lng:
 		return {"clients": [], "total": 0, "geocoded": 0}
 
 	zone_sel = "addr.custom_zone AS zone" if has_zone else "NULL AS zone"
 	freq_sel = (
 		"addr.custom_delivery_frequency AS frequency" if has_freq else "NULL AS frequency"
+	)
+	wh_sel = (
+		"c.custom_delivery_warehouse AS warehouse" if has_wh else "NULL AS warehouse"
 	)
 	geo_clause = (
 		"AND IFNULL(addr.custom_latitude, 0) != 0 AND IFNULL(addr.custom_longitude, 0) != 0"
@@ -4527,6 +4726,7 @@ def list_delivery_clients(limit=2000, only_geocoded=1):
 			addr.custom_longitude AS lng,
 			{zone_sel},
 			{freq_sel},
+			{wh_sel},
 			IFNULL(addr.is_shipping_address, 0) AS is_shipping,
 			IFNULL(addr.is_primary_address, 0) AS is_primary
 		FROM `tabCustomer` c
@@ -4558,6 +4758,7 @@ def list_delivery_clients(limit=2000, only_geocoded=1):
 		if name:
 			zone_by_key[name] = z
 
+	wh_geo = _warehouse_pin_latlng_map()
 	clients = []
 	geocoded = 0
 	for row in rows:
@@ -4582,6 +4783,11 @@ def list_delivery_clients(limit=2000, only_geocoded=1):
 			if hit:
 				visit_days = list(hit.get("visit_days") or [])
 				zone_color = hit.get("color")
+		warehouse = cstr(row.get("warehouse") or "").strip() or None
+		distance_km = None
+		if is_geo and warehouse and warehouse in wh_geo:
+			wlat, wlng = wh_geo[warehouse]
+			distance_km = round(_haversine_km(lat, lng, wlat, wlng), 3)
 		clients.append(
 			{
 				"id": cstr(row.get("address_name") or ""),
@@ -4604,10 +4810,427 @@ def list_delivery_clients(limit=2000, only_geocoded=1):
 				"visit_days": visit_days,
 				"frequency": cint(row.get("frequency")) if row.get("frequency") not in (None, "") else 1,
 				"is_shipping": cint(row.get("is_shipping")) == 1,
+				"warehouse": warehouse,
+				"distance_km": distance_km,
 			}
 		)
 
 	return {"clients": clients, "total": len(clients), "geocoded": geocoded}
+
+
+def _warehouse_pin_latlng_map() -> dict:
+	"""``{warehouse_name: (lat, lng)}`` from map pins (ensured)."""
+	try:
+		store = _load_tms_map_store()
+		pins, _changed = _ensure_warehouse_pins(list(store.get("pins") or []))
+		if _changed:
+			store["pins"] = pins
+			_save_tms_map_store(store)
+	except Exception:
+		pins = []
+	out = {}
+	for p in pins or []:
+		if not isinstance(p, dict) or cstr(p.get("kind") or "") != "warehouse":
+			continue
+		ref = cstr(p.get("ref_name") or "").strip()
+		if not ref:
+			continue
+		try:
+			lat = flt(p.get("lat"))
+			lng = flt(p.get("lng"))
+		except Exception:
+			continue
+		if lat or lng:
+			out[ref] = (lat, lng)
+	return out
+
+
+def _nearest_warehouse_for_latlng(lat, lng) -> dict | None:
+	"""Nearest warehouse pin by haversine, or None."""
+	try:
+		lat = flt(lat)
+		lng = flt(lng)
+	except Exception:
+		return None
+	if not (lat or lng):
+		return None
+	best = None
+	best_km = None
+	for wh, (wlat, wlng) in _warehouse_pin_latlng_map().items():
+		km = _haversine_km(lat, lng, wlat, wlng)
+		if best_km is None or km < best_km:
+			best_km = km
+			best = wh
+	if not best:
+		return None
+	return {"warehouse": best, "distance_km": round(best_km, 3)}
+
+
+def _validate_delivery_warehouse(warehouse: str | None) -> str | None:
+	"""Return cleaned warehouse name, or None to clear. Throws on unknown/group."""
+	wh = cstr(warehouse or "").strip()
+	if not wh or wh.lower() in ("null", "undefined", "none", "-"):
+		return None
+	if not frappe.db.exists("Warehouse", wh):
+		frappe.throw(_("Warehouse {0} not found").format(wh), frappe.ValidationError)
+	is_group = cint(frappe.db.get_value("Warehouse", wh, "is_group") or 0)
+	disabled = cint(frappe.db.get_value("Warehouse", wh, "disabled") or 0)
+	if is_group or disabled:
+		frappe.throw(_("Warehouse {0} is not a usable depot").format(wh), frappe.ValidationError)
+	return wh
+
+
+@frappe.whitelist(allow_guest=True)
+def set_client_delivery_warehouse(customer=None, warehouse=None):
+	"""Set or clear Customer.custom_delivery_warehouse (Rutas Clients dbl-click)."""
+	_ensure_customer_delivery_warehouse_field()
+	customer = cstr(customer or "").strip()
+	if not customer or customer.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Customer is required"), frappe.ValidationError)
+	if not frappe.db.exists("Customer", customer):
+		frappe.throw(_("Customer {0} not found").format(customer), frappe.DoesNotExistError)
+	wh = _validate_delivery_warehouse(warehouse)
+	frappe.db.set_value("Customer", customer, "custom_delivery_warehouse", wh)
+	frappe.db.commit()
+	return {"ok": True, "customer": customer, "warehouse": wh}
+
+
+@frappe.whitelist(allow_guest=True)
+def suggest_nearest_warehouse(customer=None, lat=None, lng=None):
+	"""Preview nearest warehouse pin for a customer or lat/lng (no write)."""
+	_ensure_customer_delivery_warehouse_field()
+	clat = lng_v = None
+	cust = cstr(customer or "").strip()
+	if cust and cust.lower() not in ("null", "undefined", "none"):
+		if not frappe.db.exists("Customer", cust):
+			frappe.throw(_("Customer {0} not found").format(cust), frappe.DoesNotExistError)
+		# Prefer shipping address geo from delivery-clients join shape.
+		rows = frappe.db.sql(
+			"""
+			SELECT addr.custom_latitude AS lat, addr.custom_longitude AS lng
+			FROM `tabDynamic Link` dl
+			INNER JOIN `tabAddress` addr ON addr.name = dl.parent
+			WHERE dl.link_doctype = 'Customer' AND dl.link_name = %s
+			  AND IFNULL(addr.disabled, 0) = 0
+			ORDER BY IFNULL(addr.is_shipping_address, 0) DESC, addr.modified DESC
+			LIMIT 1
+			""",
+			(cust,),
+			as_dict=True,
+		)
+		if rows:
+			clat = flt(rows[0].get("lat"))
+			lng_v = flt(rows[0].get("lng"))
+	else:
+		try:
+			clat = flt(lat)
+			lng_v = flt(lng)
+		except Exception:
+			clat = lng_v = 0
+	if not (clat or lng_v):
+		return {"warehouse": None, "distance_km": None, "reason": "missing_geo"}
+	hit = _nearest_warehouse_for_latlng(clat, lng_v)
+	if not hit:
+		return {"warehouse": None, "distance_km": None, "reason": "no_warehouse_pins"}
+	return {**hit, "reason": None}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_client_warehouse_outliers(
+	warehouse=None,
+	max_km=15,
+	mode="outside",
+	limit=2000,
+):
+	"""Filter delivery clients by warehouse distance / missing fields (haversine km).
+
+	``mode``: outside | inside | missing_wh | missing_geo
+	``warehouse``: null = use each client's assigned warehouse; or a specific W.
+	"""
+	_ensure_customer_delivery_warehouse_field()
+	mode_s = cstr(mode or "outside").strip().lower()
+	if mode_s in ("", "null", "undefined", "none"):
+		mode_s = "outside"
+	if mode_s not in ("outside", "inside", "missing_wh", "missing_geo"):
+		frappe.throw(
+			_("mode must be outside, inside, missing_wh, or missing_geo"),
+			frappe.ValidationError,
+		)
+	raw_km = max_km
+	if raw_km is None or (
+		isinstance(raw_km, str) and raw_km.strip().lower() in ("", "null", "undefined", "none")
+	):
+		max_km_v = 15.0
+	else:
+		try:
+			max_km_v = flt(raw_km)
+		except Exception:
+			max_km_v = 15.0
+	if max_km_v < 0:
+		max_km_v = 0.0
+
+	vs_wh = cstr(warehouse or "").strip()
+	if vs_wh.lower() in ("", "null", "undefined", "none", "*", "any"):
+		vs_wh = ""
+
+	# Include ungeocoded when looking for missing geo / warehouse.
+	geo_only = 0 if mode_s in ("missing_geo", "missing_wh") else 1
+	payload = list_delivery_clients(limit=limit, only_geocoded=geo_only)
+	clients = list(payload.get("clients") or [])
+	wh_geo = _warehouse_pin_latlng_map()
+
+	out = []
+	for c in clients:
+		clat = c.get("lat")
+		clng = c.get("lng")
+		is_geo = bool(c.get("geocoded") and clat is not None and clng is not None)
+		assigned = cstr(c.get("warehouse") or "").strip() or None
+		ref_wh = vs_wh or assigned
+		distance_km = None
+		if is_geo and ref_wh and ref_wh in wh_geo:
+			wlat, wlng = wh_geo[ref_wh]
+			distance_km = round(_haversine_km(flt(clat), flt(clng), wlat, wlng), 3)
+
+		row = {**c, "distance_km": distance_km, "vs_warehouse": ref_wh or None}
+
+		if mode_s == "missing_geo":
+			if not is_geo:
+				out.append(row)
+			continue
+		if mode_s == "missing_wh":
+			if not assigned:
+				out.append(row)
+			continue
+		if not is_geo or distance_km is None:
+			continue
+		if mode_s == "outside" and distance_km > max_km_v:
+			out.append(row)
+		elif mode_s == "inside" and distance_km <= max_km_v:
+			out.append(row)
+
+	return {
+		"clients": out,
+		"total": len(out),
+		"max_km": max_km_v,
+		"mode": mode_s,
+		"warehouse": vs_wh or None,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def backfill_client_warehouses(dry_run=1, limit=2000):
+	"""Set nearest warehouse pin for geocoded clients missing a warehouse."""
+	_ensure_customer_delivery_warehouse_field()
+	if dry_run is None or (
+		isinstance(dry_run, str) and dry_run.strip().lower() in ("", "null", "undefined", "none")
+	):
+		do_dry = True
+	else:
+		do_dry = cint(dry_run) != 0
+
+	payload = list_delivery_clients(limit=limit, only_geocoded=1)
+	seen = set()
+	planned = []
+	for c in payload.get("clients") or []:
+		cust = cstr(c.get("customer") or "").strip()
+		if not cust or cust in seen:
+			continue
+		seen.add(cust)
+		if cstr(c.get("warehouse") or "").strip():
+			continue
+		if not c.get("geocoded"):
+			continue
+		hit = _nearest_warehouse_for_latlng(c.get("lat"), c.get("lng"))
+		if not hit:
+			continue
+		planned.append(
+			{
+				"customer": cust,
+				"customer_name": c.get("customer_name"),
+				"warehouse": hit["warehouse"],
+				"distance_km": hit["distance_km"],
+			}
+		)
+
+	applied = 0
+	if not do_dry:
+		for row in planned:
+			frappe.db.set_value(
+				"Customer", row["customer"], "custom_delivery_warehouse", row["warehouse"]
+			)
+			applied += 1
+		if applied:
+			frappe.db.commit()
+
+	return {
+		"ok": True,
+		"dry_run": do_dry,
+		"planned": len(planned),
+		"applied": applied,
+		"rows": planned[:200],
+	}
+
+
+def _coerce_max_km(max_km, default=80.0):
+	raw = max_km
+	if raw is None or (
+		isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none")
+	):
+		return float(default)
+	try:
+		v = flt(raw)
+	except Exception:
+		return float(default)
+	if v < 0:
+		v = 0.0
+	return float(v)
+
+
+def _resolve_remediate_warehouse(warehouse=None, company=None):
+	"""Warehouse pin used as the 'near depot' reference for far-geo remediation."""
+	wh_geo = _warehouse_pin_latlng_map()
+	vs = cstr(warehouse or "").strip()
+	if vs.lower() in ("", "null", "undefined", "none", "*", "any"):
+		vs = ""
+	if vs and vs in wh_geo:
+		return vs, wh_geo[vs]
+	co = cstr(company or "").strip()
+	if co and frappe.db.has_column("Company", "custom_default_warehouse"):
+		default_wh = cstr(frappe.db.get_value("Company", co, "custom_default_warehouse") or "").strip()
+		if default_wh and default_wh in wh_geo:
+			return default_wh, wh_geo[default_wh]
+	# Fall back to any warehouse pin (stable by name).
+	if wh_geo:
+		ref = sorted(wh_geo.keys())[0]
+		return ref, wh_geo[ref]
+	return None, None
+
+
+@frappe.whitelist(allow_guest=True)
+def remediate_far_delivery_geocodes(
+	max_km=80,
+	warehouse=None,
+	dry_run=1,
+	limit=80,
+	date=None,
+	company=None,
+):
+	"""Force re-geocode pending-order addresses farther than ``max_km`` from a warehouse.
+
+	Catches bad cached pins (e.g. wrong continent). Uses haversine straight-line km
+	vs company default warehouse pin (or ``warehouse``). ``dry_run=1`` only lists.
+	"""
+	max_km_v = _coerce_max_km(max_km, 80.0)
+	if dry_run is None or (
+		isinstance(dry_run, str) and dry_run.strip().lower() in ("", "null", "undefined", "none")
+	):
+		do_dry = True
+	else:
+		do_dry = cint(dry_run) != 0
+
+	lim = cint(limit) if limit is not None else 80
+	if lim < 1:
+		lim = 1
+	if lim > 200:
+		lim = 200
+
+	co = cstr(company or "").strip()
+	if co.lower() in ("", "null", "undefined", "none"):
+		co = None
+	ref_wh, ref_ll = _resolve_remediate_warehouse(warehouse, co)
+	if not ref_wh or not ref_ll:
+		frappe.throw(
+			_("No warehouse map pin available — set a depot pin before remediating."),
+			frappe.ValidationError,
+		)
+	wlat, wlng = ref_ll
+
+	# Match Rutas week board (Mon–Sun of ``date``) so visible map pins are covered.
+	payload = get_pending_deliveries(date=date, company=co, horizon_days=7)
+	rows = list((payload or {}).get("deliveries") or [])
+
+	seen_addr = set()
+	candidates = []
+	for r in rows:
+		if not isinstance(r, dict):
+			continue
+		addr = cstr(r.get("address_name") or "").strip()
+		if not addr or addr in seen_addr:
+			continue
+		lat = r.get("lat")
+		lng = r.get("lng")
+		if lat is None or lng is None:
+			continue
+		try:
+			clat, clng = flt(lat), flt(lng)
+		except Exception:
+			continue
+		if not (clat or clng):
+			continue
+		km = round(_haversine_km(clat, clng, wlat, wlng), 3)
+		if km <= max_km_v:
+			continue
+		seen_addr.add(addr)
+		candidates.append(
+			{
+				"address_name": addr,
+				"customer": r.get("customer"),
+				"customer_name": r.get("customer_name") or r.get("customer"),
+				"delivery_note": r.get("delivery_note") or r.get("name"),
+				"old_lat": clat,
+				"old_lng": clng,
+				"distance_km": km,
+				"address": r.get("address"),
+			}
+		)
+		if len(candidates) >= lim:
+			break
+
+	fixed = []
+	errors = []
+	still_far = []
+	if not do_dry:
+		for c in candidates:
+			addr = c["address_name"]
+			try:
+				geo = geocode_address(addr, force=1)
+				nlat, nlng = flt(geo.get("lat")), flt(geo.get("lng"))
+				new_km = round(_haversine_km(nlat, nlng, wlat, wlng), 3)
+				row = {
+					**c,
+					"new_lat": nlat,
+					"new_lng": nlng,
+					"new_distance_km": new_km,
+					"ok": new_km <= max_km_v,
+				}
+				if new_km <= max_km_v:
+					fixed.append(row)
+				else:
+					still_far.append(row)
+			except Exception as e:
+				errors.append(
+					{
+						"address_name": addr,
+						"customer": c.get("customer"),
+						"error": cstr(e),
+					}
+				)
+		if fixed or still_far:
+			frappe.db.commit()
+
+	return {
+		"ok": True,
+		"dry_run": do_dry,
+		"max_km": max_km_v,
+		"warehouse": ref_wh,
+		"candidates": len(candidates),
+		"fixed": len(fixed),
+		"still_far": len(still_far),
+		"errors": len(errors),
+		"rows": (candidates if do_dry else fixed + still_far)[:100],
+		"error_rows": errors[:50],
+	}
+
 
 @frappe.whitelist(allow_guest=True)
 def save_tms_zone(zone=None):
@@ -8370,6 +8993,24 @@ def create_customer_at_location(
 		link_name=cust_name,
 		address_type="Shipping",
 	)
+	# i055: default delivery warehouse = nearest map pin (else company default).
+	assigned_wh = None
+	try:
+		_ensure_customer_delivery_warehouse_field()
+		hit = _nearest_warehouse_for_latlng(lat, lng)
+		if hit and hit.get("warehouse"):
+			assigned_wh = hit["warehouse"]
+		else:
+			company = frappe.defaults.get_user_default("Company")
+			if company and frappe.db.has_column("Company", "custom_default_warehouse"):
+				assigned_wh = cstr(
+					frappe.db.get_value("Company", company, "custom_default_warehouse") or ""
+				).strip() or None
+		if assigned_wh:
+			frappe.db.set_value("Customer", cust_name, "custom_delivery_warehouse", assigned_wh)
+			frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "create_customer_at_location warehouse default")
 	store = _load_tms_map_store()
 	pin = {
 		"id": _new_map_id("cust"),
@@ -8386,7 +9027,13 @@ def create_customer_at_location(
 	}
 	store["pins"] = list(store.get("pins") or []) + [pin]
 	_save_tms_map_store(store)
-	return {"customer": cust_name, "address": addr.name, "pin": pin, "pins": store["pins"]}
+	return {
+		"customer": cust_name,
+		"address": addr.name,
+		"pin": pin,
+		"pins": store["pins"],
+		"warehouse": assigned_wh,
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -9216,21 +9863,54 @@ def seed_tms_demo(reset=False):
 
 @frappe.whitelist()
 def driver_get_my_trips(date=None):
+	"""List this driver's trips for ``date`` (default today), plus open In Transit.
+
+	Pass ``date=YYYY-MM-DD`` to jump to a plan day (incl. future). ``ops_pin`` in
+	the body selects the kiosk driver when the desk session is someone else.
+	"""
 	driver = _get_current_driver()
 
-	filters = {"driver": driver.name, "docstatus": ["!=", 2]}
-	if date:
-		day = getdate(date)
-		filters["departure_time"] = ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]]
+	raw_date = date
+	if isinstance(raw_date, str) and raw_date.strip().lower() in ("", "null", "undefined", "none"):
+		raw_date = None
+	try:
+		day = getdate(raw_date) if raw_date else getdate()
+	except Exception:
+		day = getdate()
 
-	trips = frappe.get_all(
+	day_trips = frappe.get_all(
 		"Delivery Trip",
-		filters=filters,
+		filters={
+			"driver": driver.name,
+			"docstatus": ["!=", 2],
+			"departure_time": ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]],
+		},
 		fields=["name", "status", "departure_time", "vehicle", "total_distance"],
 		order_by="departure_time asc",
 		ignore_permissions=True,
 	)
-	return {"driver": driver, "trips": trips}
+	# Keep active routes visible when browsing another day.
+	open_trips = frappe.get_all(
+		"Delivery Trip",
+		filters={
+			"driver": driver.name,
+			"docstatus": ["!=", 2],
+			"status": "In Transit",
+		},
+		fields=["name", "status", "departure_time", "vehicle", "total_distance"],
+		order_by="departure_time asc",
+		ignore_permissions=True,
+	)
+	by_name = {t.name: t for t in (day_trips or [])}
+	for t in open_trips or []:
+		by_name.setdefault(t.name, t)
+	trips = sorted(by_name.values(), key=lambda r: str(r.get("departure_time") or ""))
+	return {
+		"driver": driver,
+		"trips": trips,
+		"date": str(day),
+		"today": str(getdate()),
+	}
 
 
 @frappe.whitelist()

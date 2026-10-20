@@ -3034,13 +3034,27 @@ def resolve_ops_pin(pin=None):
 		return _unauthorized_ops_pin(reason="stale")
 
 	user_id = (emp.user_id or "").strip() or None
+	# Field drivers often have an ops PIN but were never attached to group ``driver``
+	# (group is only set when creating a User). Lazy-fix so ?pin= unlocks Entregas.
+	perms = _permission_ids_for_employee(emp.name)
+	if "ops.delivery" not in perms and "*" not in perms:
+		if frappe.db.exists("Driver", {"employee": emp.name}):
+			try:
+				from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+					_ensure_driver_group_membership,
+				)
+
+				if _ensure_driver_group_membership(emp.name):
+					perms = _permission_ids_for_employee(emp.name)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "resolve_ops_pin driver group")
 	return {
 		"authorized": True,
 		"kind": "employee",
 		"employee": emp.name,
 		"employee_name": emp.employee_name,
 		"user_id": user_id,
-		"permissions": _permission_ids_for_employee(emp.name),
+		"permissions": perms,
 		"pin_configured": True,
 		"reason": None,
 	}
