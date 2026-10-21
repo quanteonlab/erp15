@@ -608,7 +608,7 @@ def _set_po_override(name: str, value: str | None):
 	)
 
 
-def _natural_pipeline_for_doc(doc) -> str:
+def _natural_pipeline_for_doc(doc, include_overdue=0) -> str:
 	today = getdate(nowdate())
 	sched = getdate(doc.schedule_date) if getattr(doc, "schedule_date", None) else None
 	days_to_eta = (sched - today).days if sched else None
@@ -619,6 +619,7 @@ def _natural_pipeline_for_doc(doc) -> str:
 		flt(doc.per_billed),
 		days_to_eta,
 		override=None,
+		include_overdue=include_overdue,
 	)
 
 
@@ -745,10 +746,11 @@ def _try_receive_remaining(po_name: str) -> str | None:
 		return None
 
 
-def _apply_pipeline_documents(doc, target: str) -> list[str]:
+def _apply_pipeline_documents(doc, target: str, include_overdue=0) -> list[str]:
 	"""Best-effort ERP mutations for a forced pipeline target. Returns notes."""
 	notes: list[str] = []
 	name = doc.name
+	include_overdue = cint(include_overdue)
 
 	if target == "to_receive":
 		if cint(doc.docstatus) == 0:
@@ -759,7 +761,9 @@ def _apply_pipeline_documents(doc, target: str) -> list[str]:
 			return notes
 		# Already submitted — clear override so natural label can show to_receive if applicable
 		_set_po_override(name, None)
-		natural = _natural_pipeline_for_doc(frappe.get_doc("Purchase Order", name))
+		natural = _natural_pipeline_for_doc(
+			frappe.get_doc("Purchase Order", name), include_overdue=include_overdue
+		)
 		if natural != "to_receive":
 			_set_po_override(name, "to_receive")
 			notes.append(_("Override set to To Receive (receiving progress remains)"))
@@ -816,7 +820,7 @@ def _apply_pipeline_documents(doc, target: str) -> list[str]:
 				notes.append(_("Could not create receipt — badge overridden to Partial"))
 				return notes
 		doc = frappe.get_doc("Purchase Order", name)
-		natural = _natural_pipeline_for_doc(doc)
+		natural = _natural_pipeline_for_doc(doc, include_overdue=include_overdue)
 		if natural != target:
 			_set_po_override(name, target)
 			notes.append(
@@ -844,7 +848,7 @@ def _apply_pipeline_documents(doc, target: str) -> list[str]:
 			)
 		notes.append(_("ETA set to {0}").format(past))
 		doc = frappe.get_doc("Purchase Order", name)
-		natural = _natural_pipeline_for_doc(doc)
+		natural = _natural_pipeline_for_doc(doc, include_overdue=1)
 		if natural != "overdue":
 			_set_po_override(name, "overdue")
 			notes.append(_("Badge overridden to Overdue"))
@@ -858,7 +862,9 @@ def _apply_pipeline_documents(doc, target: str) -> list[str]:
 
 
 @frappe.whitelist(allow_guest=True)
-def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolve=None):
+def set_purchase_order_pipeline(
+	name=None, target_pipeline=None, force=0, resolve=None, include_overdue=0
+):
 	"""
 	Attempt a pipeline move for Tables → Compras status bar.
 
@@ -881,6 +887,8 @@ def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolv
 		frappe.throw(_("target_pipeline is required"))
 	if target not in _PIPELINE_IDS:
 		frappe.throw(_("Unknown pipeline step: {0}").format(target))
+	if target == "overdue" and not cint(include_overdue):
+		frappe.throw(_("Overdue is disabled. Enable it in Compras pipeline settings."))
 	if target == "cancelled" and not do_force:
 		frappe.throw(_("Cancelled documents cannot be selected from the pipeline bar."))
 	if not frappe.db.exists("Purchase Order", name):
@@ -892,6 +900,7 @@ def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolv
 	doc = frappe.get_doc("Purchase Order", name)
 	frappe.flags.ignore_permissions = False
 
+	include_overdue = cint(include_overdue)
 	current = _pipeline_label(
 		cint(doc.docstatus),
 		doc.status or "",
@@ -899,10 +908,11 @@ def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolv
 		flt(doc.per_billed),
 		None,
 		override=_po_override_value(name),
+		include_overdue=include_overdue,
 	)
 
 	if target == current and not do_force:
-		return get_purchase_order_detail(name)
+		return get_purchase_order_detail(name, include_overdue=include_overdue)
 
 	conflict = _pipeline_conflict(doc, current, target)
 
@@ -919,7 +929,7 @@ def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolv
 			)
 		_set_po_override(name, None)
 		frappe.db.commit()
-		return get_purchase_order_detail(name)
+		return get_purchase_order_detail(name, include_overdue=include_overdue)
 
 	# Clean cancel → draft when no conflict signal
 	if not do_force and target == "draft" and cint(doc.docstatus) == 1 and not conflict:
@@ -965,23 +975,27 @@ def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolv
 						},
 					],
 				},
-				"order": get_purchase_order_detail(name)["order"],
+				"order": get_purchase_order_detail(name, include_overdue=include_overdue)["order"],
 			}
 		_set_po_override(name, None)
 		frappe.db.commit()
-		return get_purchase_order_detail(name)
+		return get_purchase_order_detail(name, include_overdue=include_overdue)
 
 	if conflict and not do_force:
 		return {
 			"ok": False,
 			"conflict": conflict,
-			"order": get_purchase_order_detail(name)["order"],
+			"order": get_purchase_order_detail(name, include_overdue=include_overdue)["order"],
 		}
 
 	# Forced path
 	notes: list[str] = []
 	if resolve == "documents":
-		notes = _apply_pipeline_documents(frappe.get_doc("Purchase Order", name), target)
+		notes = _apply_pipeline_documents(
+			frappe.get_doc("Purchase Order", name),
+			target,
+			include_overdue=include_overdue,
+		)
 	else:
 		# override (default)
 		if target == "to_receive" and cint(doc.docstatus) == 0:
@@ -993,11 +1007,14 @@ def set_purchase_order_pipeline(name=None, target_pipeline=None, force=0, resolv
 			_set_po_override(name, "draft")
 			notes.append(_("Badge overridden to Draft (document still submitted)"))
 		else:
-			_set_po_override(name, None if target == _natural_pipeline_for_doc(doc) else target)
+			_set_po_override(
+				name,
+				None if target == _natural_pipeline_for_doc(doc, include_overdue=include_overdue) else target,
+			)
 			notes.append(_("Badge set to {0}").format(target))
 
 	frappe.db.commit()
-	detail = get_purchase_order_detail(name)
+	detail = get_purchase_order_detail(name, include_overdue=include_overdue)
 	detail["ok"] = True
 	detail["notes"] = notes
 	detail["forced"] = 1
@@ -1118,9 +1135,16 @@ def _pipeline_label(
 	per_billed: float,
 	days_to_eta,
 	override=None,
+	include_overdue=0,
 ) -> str:
-	"""Coarse buying pipeline for filters / badges. Optional override wins for Compras UI."""
+	"""Coarse buying pipeline for filters / badges. Optional override wins for Compras UI.
+
+	``overdue`` (Vencido) is off by default — past-ETA open POs stay on
+	to_receive / partial / to_bill. Pass include_overdue=1 to restore it.
+	"""
 	ov = _as_str(override).lower()
+	if ov == "overdue" and not cint(include_overdue):
+		ov = ""
 	if ov in _PIPELINE_IDS and ov != "cancelled":
 		return ov
 	st = (status or "").lower()
@@ -1130,7 +1154,12 @@ def _pipeline_label(
 		return "cancelled"
 	if "closed" in st or "complet" in st:
 		return "done"
-	if days_to_eta is not None and days_to_eta < 0 and flt(per_received) < 99.5:
+	if (
+		cint(include_overdue)
+		and days_to_eta is not None
+		and days_to_eta < 0
+		and flt(per_received) < 99.5
+	):
 		return "overdue"
 	if flt(per_received) >= 99.5 and flt(per_billed) >= 99.5:
 		return "done"
@@ -1141,10 +1170,11 @@ def _pipeline_label(
 	return "to_receive"
 
 
-def _enrich_po_rows(rows: list) -> list:
+def _enrich_po_rows(rows: list, include_overdue=0) -> list:
 	"""Attach line aggregates, brand mix, and ETA metrics for Tables → Compras."""
 	if not rows:
 		return []
+	include_overdue = cint(include_overdue)
 	names = [r.name for r in rows]
 	today = getdate(nowdate())
 
@@ -1232,10 +1262,22 @@ def _enrich_po_rows(rows: list) -> list:
 		open_bill_value = max(0.0, grand * (100.0 - min(per_bill, 100.0)) / 100.0)
 		ov = overrides.get(r.name)
 		pipeline_natural = _pipeline_label(
-			cint(r.docstatus), r.status or "", per_recv, per_bill, days_to_eta, override=None
+			cint(r.docstatus),
+			r.status or "",
+			per_recv,
+			per_bill,
+			days_to_eta,
+			override=None,
+			include_overdue=include_overdue,
 		)
 		pipeline = _pipeline_label(
-			cint(r.docstatus), r.status or "", per_recv, per_bill, days_to_eta, override=ov
+			cint(r.docstatus),
+			r.status or "",
+			per_recv,
+			per_bill,
+			days_to_eta,
+			override=ov,
+			include_overdue=include_overdue,
 		)
 
 		out.append(
@@ -1290,9 +1332,11 @@ def list_purchase_orders(
 	pipeline=None,
 	search=None,
 	include_cancelled=0,
+	include_overdue=0,
 ):
 	"""Purchase Orders for Logistics Buying + Tables → Compras."""
 	ensure_po_invoice_ref_field()
+	include_overdue = cint(include_overdue)
 	start = _as_int(start, 0, lo=0, hi=100000)
 	page_length = _as_int(page_length, 30, lo=1, hi=200)
 	filters: dict = {}
@@ -1365,7 +1409,7 @@ def list_purchase_orders(
 		if or_filters
 		else frappe.db.count("Purchase Order", filters)
 	)
-	enriched = _enrich_po_rows(rows)
+	enriched = _enrich_po_rows(rows, include_overdue=include_overdue)
 
 	pipe = _as_str(pipeline).lower()
 	if pipe and pipe not in ("all", "*", "any"):
@@ -1375,9 +1419,10 @@ def list_purchase_orders(
 
 
 @frappe.whitelist(allow_guest=True)
-def get_purchase_order_detail(name=None):
+def get_purchase_order_detail(name=None, include_overdue=0):
 	"""Single PO with lines for Tables → Compras detail panel."""
 	name = _as_str(name)
+	include_overdue = cint(include_overdue)
 	if not name:
 		frappe.throw(_("name is required"))
 	if not frappe.db.exists("Purchase Order", name):
@@ -1433,7 +1478,8 @@ def get_purchase_order_detail(name=None):
 					"custom_supplier_invoice_ref": getattr(doc, "custom_supplier_invoice_ref", None),
 				}
 			)
-		]
+		],
+		include_overdue=include_overdue,
 	)[0]
 	base["lines"] = lines
 	base["payments"] = _payments_for_purchase_order(doc.name, flt(doc.grand_total))

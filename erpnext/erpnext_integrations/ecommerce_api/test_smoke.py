@@ -3267,6 +3267,20 @@ def suite_5_12_modules_read():
         from erpnext.erpnext_integrations.ecommerce_api import buying_api as ba
         listed = ba.list_purchase_orders(page_length=5)
         assert listed.get("ok") and isinstance(listed.get("rows"), list), f"bad PO list: {listed}"
+        # Vencido is opt-in: past-ETA open POs stay on to_receive / partial / to_bill
+        assert ba._pipeline_label(1, "To Receive", 0, 0, -5, include_overdue=0) == "to_receive"
+        assert ba._pipeline_label(1, "To Receive", 0, 0, -5, include_overdue=1) == "overdue"
+        assert ba._pipeline_label(1, "To Receive", 50, 0, -5, include_overdue=0) == "partial"
+        assert ba._pipeline_label(1, "To Bill", 100, 0, -5, include_overdue=0) == "to_bill"
+        assert (
+            ba._pipeline_label(1, "To Receive", 0, 0, 3, override="overdue", include_overdue=0)
+            == "to_receive"
+        )
+        listed_no_ov = ba.list_purchase_orders(page_length=50, include_overdue=0)
+        assert listed_no_ov.get("ok"), listed_no_ov
+        assert all(
+            (r.get("pipeline") or "") != "overdue" for r in (listed_no_ov.get("rows") or [])
+        ), listed_no_ov
         # Controlled validation — empty create must not 500
         try:
             ba.create_purchase_order(supplier="", items=[])

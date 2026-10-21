@@ -1420,6 +1420,40 @@
       "expect": "no_500"
     },
     {
+      "id": "buying_list_po_include_overdue_dirty",
+      "source": "regression",
+      "bug": "include_overdue null/empty defaults off (no Vencido) and must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_purchase_orders",
+      "args": {
+        "page_length": 5,
+        "include_overdue": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_list_po_include_overdue_empty",
+      "source": "regression",
+      "bug": "include_overdue empty string defaults overdue off",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_purchase_orders",
+      "args": {
+        "page_length": 5,
+        "include_overdue": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "buying_set_pipeline_overdue_disabled",
+      "source": "regression",
+      "bug": "target overdue with include_overdue off is a controlled error, not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.set_purchase_order_pipeline",
+      "args": {
+        "name": "PUR-ORD-MISSING",
+        "target_pipeline": "overdue",
+        "include_overdue": 0
+      },
+      "expect": "fail"
+    },
+    {
       "id": "buying_get_po_detail_null",
       "source": "regression",
       "bug": "get_purchase_order_detail with null name is controlled",
