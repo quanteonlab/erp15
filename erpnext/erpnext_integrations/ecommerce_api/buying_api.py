@@ -1275,6 +1275,7 @@ def _enrich_po_rows(rows: list) -> list:
 				"pipeline_natural": pipeline_natural,
 				"pipeline_override": ov or None,
 				"remarks": None,
+				"supplier_invoice_ref": _as_str(getattr(r, "custom_supplier_invoice_ref", None)),
 			}
 		)
 	return out
@@ -1291,6 +1292,7 @@ def list_purchase_orders(
 	include_cancelled=0,
 ):
 	"""Purchase Orders for Logistics Buying + Tables → Compras."""
+	ensure_po_invoice_ref_field()
 	start = _as_int(start, 0, lo=0, hi=100000)
 	page_length = _as_int(page_length, 30, lo=1, hi=200)
 	filters: dict = {}
@@ -1314,6 +1316,8 @@ def list_purchase_orders(
 			["supplier", "like", f"%{q}%"],
 			["supplier_name", "like", f"%{q}%"],
 		]
+		if frappe.db.has_column("Purchase Order", "custom_supplier_invoice_ref"):
+			or_filters.append(["custom_supplier_invoice_ref", "like", f"%{q}%"])
 
 	rows = frappe.get_all(
 		"Purchase Order",
@@ -1337,7 +1341,12 @@ def list_purchase_orders(
 			"currency",
 			"per_received",
 			"per_billed",
-		],
+		]
+		+ (
+			["custom_supplier_invoice_ref"]
+			if frappe.db.has_column("Purchase Order", "custom_supplier_invoice_ref")
+			else []
+		),
 		order_by="modified desc",
 		limit_start=start,
 		limit_page_length=page_length,
@@ -1421,12 +1430,14 @@ def get_purchase_order_detail(name=None):
 					"per_received": doc.per_received,
 					"per_billed": doc.per_billed,
 					"remarks": _as_str(getattr(doc, "remarks", None)) or None,
+					"custom_supplier_invoice_ref": getattr(doc, "custom_supplier_invoice_ref", None),
 				}
 			)
 		]
 	)[0]
 	base["lines"] = lines
 	base["payments"] = _payments_for_purchase_order(doc.name, flt(doc.grand_total))
+	base["files"] = _po_file_rows(doc.name)
 	return {"ok": True, "order": base}
 
 
@@ -1838,4 +1849,209 @@ def update_purchase_order_payment(
 		pass
 
 	return detail
+
+
+# ---------------------------------------------------------------------------
+# i057 — supplier invoice reference + attachments on Purchase Order
+# ---------------------------------------------------------------------------
+
+_po_invoice_ref_ready = False
+
+
+def ensure_po_invoice_ref_field():
+	"""Idempotent custom field on Purchase Order. Also wired in hooks after_migrate."""
+	global _po_invoice_ref_ready
+	if _po_invoice_ref_ready or frappe.db.has_column("Purchase Order", "custom_supplier_invoice_ref"):
+		_po_invoice_ref_ready = True
+		return
+	try:
+		from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+		create_custom_fields(
+			{
+				"Purchase Order": [
+					{
+						"fieldname": "custom_supplier_invoice_ref",
+						"label": "Supplier Invoice Ref",
+						"fieldtype": "Data",
+						"insert_after": "supplier_name",
+						"translatable": 0,
+					}
+				]
+			},
+			update=True,
+			ignore_validate=True,
+		)
+		frappe.clear_cache(doctype="Purchase Order")
+		_po_invoice_ref_ready = True
+	except Exception:
+		frappe.log_error(title="ensure_po_invoice_ref_field")
+
+
+def _decode_upload_b64(raw) -> bytes:
+	import base64
+
+	text = _as_str(raw)
+	if "," in text and text.lower().startswith("data:"):
+		text = text.split(",", 1)[1]
+	if not text:
+		return b""
+	try:
+		return base64.b64decode(text, validate=False)
+	except Exception:
+		frappe.throw(_("Invalid base64 content"))
+
+
+def _po_file_rows(name: str) -> list[dict]:
+	name = _as_str(name)
+	if not name:
+		return []
+	return frappe.get_all(
+		"File",
+		filters={"attached_to_doctype": "Purchase Order", "attached_to_name": name},
+		fields=["name", "file_name", "file_url", "is_private", "creation"],
+		order_by="creation desc",
+		ignore_permissions=True,
+	)
+
+
+def _find_po_archivo_twin(po_name: str) -> str | None:
+	if not frappe.db.exists("DocType", "Company Archive Entry"):
+		return None
+	if not frappe.db.exists("DocType", "Archive Related Ref"):
+		return None
+	rows = frappe.db.sql(
+		"""
+		SELECT parent FROM `tabArchive Related Ref`
+		WHERE link_doctype = 'Purchase Order' AND link_name = %s
+		ORDER BY creation ASC
+		LIMIT 1
+		""",
+		(po_name,),
+	)
+	return rows[0][0] if rows else None
+
+
+def _ensure_po_archivo_twin(po_name: str, invoice_ref: str | None = None, notes: str | None = None):
+	"""Get-or-create a classified Documentos row for this PO (family compras)."""
+	if not frappe.db.exists("DocType", "Company Archive Entry"):
+		return None
+	existing = _find_po_archivo_twin(po_name)
+	from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+	if existing:
+		if invoice_ref:
+			try:
+				archivo_api.update_archivo_entry(existing, {"payment_reference": invoice_ref})
+			except Exception:
+				pass
+		return existing
+
+	frappe.flags.ignore_permissions = True
+	po = frappe.get_doc("Purchase Order", po_name)
+	frappe.flags.ignore_permissions = False
+	ref = _as_str(invoice_ref) or _as_str(getattr(po, "custom_supplier_invoice_ref", None))
+	title = _("Factura de compra · {0}").format(po_name)
+	if ref:
+		title = f"{title} · {ref}"
+	row = archivo_api.create_archivo_entry(
+		title=title[:140],
+		kind="supplier_invoice",
+		sync_template="paper",
+		posting_date=str(po.transaction_date or po.schedule_date or "") or None,
+		party_type="Supplier",
+		party=po.supplier,
+		workflow_status="filed",
+		payment_reference=ref or None,
+		notes=notes or None,
+		company=po.company,
+		related_refs=[{"link_doctype": "Purchase Order", "link_name": po_name, "note": "po"}],
+	)
+	name = row.get("name") if isinstance(row, dict) else None
+	if name:
+		try:
+			archivo_api._link_entry_to_month_binder(
+				name, year_month=po.transaction_date, company=po.company
+			)
+		except Exception:
+			frappe.log_error(title="ensure po archivo binder")
+	return name
+
+
+@frappe.whitelist(allow_guest=True)
+def set_purchase_order_invoice_ref(name=None, supplier_invoice_ref=None):
+	"""Set optional supplier invoice number on a PO (draft or submitted)."""
+	ensure_po_invoice_ref_field()
+	name = _as_str(name)
+	if not name:
+		frappe.throw(_("name is required"))
+	if not frappe.db.exists("Purchase Order", name):
+		frappe.throw(_("Purchase Order {0} not found").format(name))
+	ref = _as_str(supplier_invoice_ref)
+	frappe.db.set_value("Purchase Order", name, "custom_supplier_invoice_ref", ref or None)
+	twin = _find_po_archivo_twin(name)
+	if twin and ref:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api import archivo_api
+
+			archivo_api.update_archivo_entry(twin, {"payment_reference": ref})
+		except Exception:
+			pass
+	frappe.db.commit()
+	return get_purchase_order_detail(name)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_po_files(name=None):
+	name = _as_str(name)
+	if not name:
+		frappe.throw(_("name is required"))
+	if not frappe.db.exists("Purchase Order", name):
+		frappe.throw(_("Purchase Order {0} not found").format(name))
+	return {"ok": 1, "files": _po_file_rows(name)}
+
+
+@frappe.whitelist(allow_guest=True)
+def attach_po_file(name=None, file_name=None, content_b64=None, is_private=1, create_documentos=1):
+	"""Attach a file to the PO and (by default) a Documentos twin."""
+	from frappe.utils.file_manager import save_file
+
+	name = _as_str(name)
+	file_name = _as_str(file_name) or "attachment.bin"
+	if not name:
+		frappe.throw(_("name is required"))
+	if _as_str(content_b64) == "":
+		frappe.throw(_("name and content_b64 are required"))
+	if not frappe.db.exists("Purchase Order", name):
+		frappe.throw(_("Purchase Order {0} not found").format(name))
+	content = _decode_upload_b64(content_b64)
+	if not content:
+		frappe.throw(_("Empty file"))
+	try:
+		priv = 0 if cint(is_private) == 0 else 1
+	except Exception:
+		priv = 1
+	try:
+		do_twin = 0 if cint(create_documentos) == 0 else 1
+	except Exception:
+		do_twin = 1
+	frappe.flags.ignore_permissions = True
+	file_doc = save_file(file_name, content, "Purchase Order", name, is_private=priv)
+	archivo_name = None
+	if do_twin:
+		try:
+			archivo_name = _ensure_po_archivo_twin(name)
+			if archivo_name:
+				save_file(file_name, content, "Company Archive Entry", archivo_name, is_private=1)
+		except Exception:
+			frappe.log_error(title="attach_po_file documentos twin")
+	frappe.db.commit()
+	frappe.flags.ignore_permissions = False
+	return {
+		"ok": 1,
+		"file_url": file_doc.file_url,
+		"file_name": file_doc.file_name,
+		"archivo_name": archivo_name,
+		"files": _po_file_rows(name),
+	}
 

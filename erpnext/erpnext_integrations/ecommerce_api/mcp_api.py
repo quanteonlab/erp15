@@ -81,6 +81,8 @@ SENSITIVE_OUTPUT = {
 	"token",
 	"secret",
 	"email_password",
+	"content_b64",
+	"content_base64",
 }
 
 # Per-DocType extra blocked fields (money / stock / accounting / identity).
@@ -715,6 +717,11 @@ def mcp_get_record(mcp_token=None, doctype=None, name=None):
 			view = _pedido_view(doc)
 			if view:
 				out["pedido_view"] = view
+		if doctype == "Purchase Order":
+			from erpnext.erpnext_integrations.ecommerce_api.buying_api import _po_file_rows
+
+			out["supplier_invoice_ref"] = cstr(getattr(doc, "custom_supplier_invoice_ref", None) or "") or None
+			out["attachments"] = _sanitize_output(_json_safe(_po_file_rows(name)))
 		return out
 
 	return _impl(mcp_token, doctype, name)
@@ -1168,6 +1175,46 @@ def mcp_get_document_for_triage(mcp_token=None, name=None):
 	return _impl(mcp_token, name)
 
 
+@frappe.whitelist()
+def mcp_get_po_files_for_triage(mcp_token=None, name=None):
+	"""Purchase Order attachments (PDF text / image bytes) so the assistant can read a factura."""
+
+	@_guard("po_files_triage", doctype="Purchase Order", name=lambda: name)
+	def _impl(mcp_token, name):
+		from erpnext.erpnext_integrations.ecommerce_api.buying_api import _po_file_rows
+
+		ctx = _ctx(mcp_token)
+		frappe.local._mcp_ctx = ctx
+		_can_view(_matrix(), "Purchase Order")
+		name = cstr(name).strip()
+		if not name or not frappe.db.exists("Purchase Order", name):
+			frappe.throw(_("{0} {1} not found").format("Purchase Order", name), frappe.DoesNotExistError)
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Purchase Order", name)
+		frappe.flags.ignore_permissions = False
+		files = frappe.get_all(
+			"File",
+			filters={"attached_to_doctype": "Purchase Order", "attached_to_name": name},
+			fields=["name", "file_name", "file_url"],
+			order_by="creation asc",
+			limit_page_length=TRIAGE_MAX_FILES,
+			ignore_permissions=True,
+		)
+		return {
+			"purchase_order": name,
+			"supplier": doc.supplier,
+			"supplier_name": doc.supplier_name,
+			"supplier_invoice_ref": cstr(getattr(doc, "custom_supplier_invoice_ref", None) or "") or None,
+			"grand_total": flt(doc.grand_total),
+			"currency": doc.currency,
+			"files": [_triage_file(f) for f in files],
+			"attachment_count": len(_po_file_rows(name)),
+			"hint": "If empty, ask the user for the file and run_workflow('attach_purchase_invoice', …).",
+		}
+
+	return _impl(mcp_token, name)
+
+
 # ---------------------------------------------------------------------------
 # Writes (preview → confirm)
 # ---------------------------------------------------------------------------
@@ -1350,6 +1397,31 @@ def _workflow_catalog() -> list[dict]:
 				"Revisar → Documentos; nothing is paid or posted (Contabilizar) from here."
 			),
 			"args_schema": _CLASSIFY_SCHEMA,
+		},
+		{
+			"name": "attach_purchase_invoice",
+			"doctype": "Purchase Order",
+			"description": (
+				"Attach a supplier invoice file (PDF/PNG/…) to an existing Purchase Order and a "
+				"Documentos twin (family compras). Optional supplier_invoice_ref. Does NOT create "
+				"a Purchase Invoice — paper + PO metadata only. Preview first."
+			),
+			"args_schema": {
+				"type": "object",
+				"properties": {
+					"purchase_order": {"type": "string", "description": "PO name if known"},
+					"supplier": {"type": "string", "description": "Search open POs when PO is unknown"},
+					"supplier_invoice_ref": {"type": "string"},
+					"file_name": {"type": "string"},
+					"content_b64": {"type": "string", "description": "Base64 file (pdf / png / jpg / …)"},
+					"notes": {"type": "string"},
+					"create_documentos": {
+						"type": "integer",
+						"description": "1 (default) also attach a Documentos twin",
+					},
+				},
+				"required": ["file_name", "content_b64"],
+			},
 		},
 		{
 			"name": "create_order",
@@ -1778,6 +1850,8 @@ def _workflow_preview(name: str, args: dict) -> tuple[list[str], dict | None]:
 			"changes": diff,
 			"after_apply": "Stays a draft (Borrador) until a person confirms it in Revisar → Documentos.",
 		}
+	if name == "attach_purchase_invoice":
+		return _attach_purchase_invoice_preview(args)
 	return _workflow_preview_issues(name, args), None
 
 
@@ -1851,7 +1925,164 @@ def _run_save_employee(args: dict) -> dict:
 	}
 
 
+def _resolve_po_for_invoice(args: dict) -> tuple[list[str], str | None, list[dict]]:
+	"""Pick a Purchase Order for attach_purchase_invoice. Ambiguous → issues, no apply."""
+	from erpnext.erpnext_integrations.ecommerce_api.buying_api import _as_str
+
+	po = _as_str(args.get("purchase_order") or args.get("name"))
+	if po:
+		if frappe.db.exists("Purchase Order", po):
+			frappe.flags.ignore_permissions = True
+			doc = frappe.get_doc("Purchase Order", po)
+			frappe.flags.ignore_permissions = False
+			return (
+				[],
+				po,
+				[
+					{
+						"name": doc.name,
+						"supplier": doc.supplier,
+						"supplier_name": doc.supplier_name,
+						"grand_total": flt(doc.grand_total),
+						"status": doc.status,
+						"transaction_date": str(doc.transaction_date) if doc.transaction_date else None,
+					}
+				],
+			)
+		return [f"Purchase Order {po} not found"], None, []
+
+	supplier = _as_str(args.get("supplier"))
+	if not supplier:
+		return (
+			["purchase_order is required (or a supplier with exactly one open Purchase Order)"],
+			None,
+			[],
+		)
+	rows = frappe.get_all(
+		"Purchase Order",
+		filters={"supplier": supplier, "docstatus": ["<", 2], "status": ["!=", "Cancelled"]},
+		fields=["name", "supplier", "supplier_name", "grand_total", "status", "transaction_date"],
+		order_by="modified desc",
+		limit_page_length=8,
+		ignore_permissions=True,
+	)
+	if not rows:
+		alt = frappe.get_all(
+			"Purchase Order",
+			filters={"supplier_name": ["like", f"%{supplier}%"], "docstatus": ["<", 2]},
+			fields=["name", "supplier", "supplier_name", "grand_total", "status", "transaction_date"],
+			order_by="modified desc",
+			limit_page_length=8,
+			ignore_permissions=True,
+		)
+		rows = alt
+	cands = [
+		{
+			"name": r.name,
+			"supplier": r.supplier,
+			"supplier_name": r.supplier_name,
+			"grand_total": flt(r.grand_total),
+			"status": r.status,
+			"transaction_date": str(r.transaction_date) if r.transaction_date else None,
+		}
+		for r in rows
+	]
+	if len(cands) == 1:
+		return [], cands[0]["name"], cands
+	if not cands:
+		return [f"No open Purchase Order for supplier {supplier}"], None, []
+	return ["Multiple open Purchase Orders — pass purchase_order"], None, cands
+
+
+def _attach_file_meta(args: dict) -> tuple[list[str], dict]:
+	from erpnext.erpnext_integrations.ecommerce_api.buying_api import _as_str, _decode_upload_b64
+
+	issues = []
+	file_name = _as_str(args.get("file_name")) or "attachment.bin"
+	try:
+		content = _decode_upload_b64(args.get("content_b64"))
+	except Exception as e:
+		return [cstr(e)], {"file_name": file_name, "size_bytes": 0}
+	if not content:
+		issues.append("content_b64 is required")
+	import mimetypes
+
+	mime = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+	meta = {"file_name": file_name, "mime_type": mime, "size_bytes": len(content)}
+	if mime == "application/pdf" and content:
+		try:
+			text, pages = _pdf_text(content)
+			meta["pages"] = pages
+			meta["text"] = text[:TRIAGE_MAX_TEXT_CHARS]
+			meta["text_truncated"] = len(text) > TRIAGE_MAX_TEXT_CHARS
+		except Exception as e:
+			meta["text_error"] = str(e)[:200]
+	return issues, meta
+
+
+def _attach_purchase_invoice_preview(args: dict) -> tuple[list[str], dict | None]:
+	from erpnext.erpnext_integrations.ecommerce_api.buying_api import _as_str
+
+	po_issues, po_name, candidates = _resolve_po_for_invoice(args)
+	file_issues, file_meta = _attach_file_meta(args)
+	issues = po_issues + file_issues
+	needed = []
+	if not po_name:
+		needed.append("purchase_order")
+	if file_issues:
+		needed.append("content_b64")
+	current_ref = None
+	if po_name and frappe.db.has_column("Purchase Order", "custom_supplier_invoice_ref"):
+		current_ref = cstr(frappe.db.get_value("Purchase Order", po_name, "custom_supplier_invoice_ref") or "") or None
+	new_ref = _as_str(args.get("supplier_invoice_ref")) or None
+	return issues, {
+		"purchase_order": po_name,
+		"candidates": candidates,
+		"needed": needed,
+		"file": file_meta,
+		"supplier_invoice_ref": {"from": current_ref, "to": new_ref or current_ref},
+		"will_attach": "File on Purchase Order + Documentos twin (kind supplier_invoice, paper). No Purchase Invoice is created.",
+		"create_documentos": 0 if cstr(args.get("create_documentos")) in ("0", "false") else 1,
+	}
+
+
+def _run_attach_purchase_invoice(args: dict) -> dict:
+	from erpnext.erpnext_integrations.ecommerce_api.buying_api import (
+		_as_str,
+		attach_po_file,
+		set_purchase_order_invoice_ref,
+	)
+
+	issues, po_name, _cands = _resolve_po_for_invoice(args)
+	file_issues, _meta = _attach_file_meta(args)
+	issues = issues + file_issues
+	if issues or not po_name:
+		frappe.throw("; ".join(issues) or _("purchase_order is required"))
+	ref = _as_str(args.get("supplier_invoice_ref"))
+	if ref:
+		set_purchase_order_invoice_ref(name=po_name, supplier_invoice_ref=ref)
+	create_docs = 0 if cstr(args.get("create_documentos")) in ("0", "false") else 1
+	attached = attach_po_file(
+		name=po_name,
+		file_name=_as_str(args.get("file_name")) or "attachment.bin",
+		content_b64=args.get("content_b64"),
+		is_private=1,
+		create_documentos=create_docs,
+	)
+	return {
+		"purchase_order": po_name,
+		"supplier_invoice_ref": ref or None,
+		"file_url": attached.get("file_url"),
+		"file_name": attached.get("file_name"),
+		"archivo_name": attached.get("archivo_name"),
+		"files": attached.get("files") or [],
+		"hint": "Visible on Compras → Adjuntar / tab Factura and Documentos (familia compras).",
+	}
+
+
 def _run_workflow(name: str, args: dict):
+	if name == "attach_purchase_invoice":
+		return _run_attach_purchase_invoice(args)
 	if name == "create_driver":
 		return _run_create_driver(args)
 	if name == "save_employee":

@@ -6234,6 +6234,208 @@
       "expect": "error",
       "source": "regression",
       "bug": "get_driver_detail null driver is controlled error (ops_pin serialize path)"
+    },
+    {
+      "id": "treasury_list_ledger_dirty_dates",
+      "source": "regression",
+      "bug": "list_treasury_ledger with null/garbage dates falls back to this month, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.list_treasury_ledger",
+      "args": {
+        "from_date": "null",
+        "to_date": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "treasury_rename_null_code",
+      "source": "regression",
+      "bug": "rename_treasury_account null code is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.rename_treasury_account",
+      "args": {
+        "code": null,
+        "title": "X"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_transfer_same_account",
+      "source": "regression",
+      "bug": "transfer_treasury A→A is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.transfer_treasury",
+      "args": {
+        "from_code": "A",
+        "to_code": "A",
+        "amount": 10
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_transfer_null_amount",
+      "source": "regression",
+      "bug": "transfer_treasury null amount is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.transfer_treasury",
+      "args": {
+        "from_code": "A",
+        "to_code": "B",
+        "amount": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_reassign_null_key",
+      "source": "regression",
+      "bug": "reassign_treasury_row null source_key is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.reassign_treasury_row",
+      "args": {
+        "source_key": null,
+        "to_code": "B"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_reassign_transfer_key",
+      "source": "regression",
+      "bug": "reassign_treasury_row rejects xfer source_key",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.reassign_treasury_row",
+      "args": {
+        "source_key": "xfer:library:A:B:2026-10-20:100.0:A",
+        "to_code": "B"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_list_ledger_inverted_dates",
+      "source": "regression",
+      "bug": "list_treasury_ledger from>to swaps bounds and never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.list_treasury_ledger",
+      "args": {
+        "from_date": "2026-12-31",
+        "to_date": "2026-01-01"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "treasury_list_pos_day_dirty",
+      "source": "regression",
+      "bug": "list_treasury_pos_day null day/mop falls back to today+cash, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.list_treasury_pos_day",
+      "args": {
+        "day": "null",
+        "mop": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "treasury_split_pos_null_invoice",
+      "source": "regression",
+      "bug": "split_treasury_pos_sale null invoice is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.split_treasury_pos_sale",
+      "args": {
+        "invoice": null,
+        "to_code": "B"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_unsplit_pos_empty_invoice",
+      "source": "regression",
+      "bug": "unsplit_treasury_pos_sale empty invoice is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.unsplit_treasury_pos_sale",
+      "args": {
+        "invoice": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_split_pos_bad_code",
+      "source": "regression",
+      "bug": "split_treasury_pos_sale invalid to_code is controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.split_treasury_pos_sale",
+      "args": {
+        "invoice": "SI-NOPE",
+        "to_code": "Z"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "treasury_preview_auto_order_dirty",
+      "source": "regression",
+      "bug": "preview_treasury_auto_order null to_code/kinds/dates falls back, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.preview_treasury_auto_order",
+      "args": {
+        "to_code": null,
+        "from_date": "",
+        "to_date": "null",
+        "kinds": null,
+        "target_pct": "null"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "treasury_apply_auto_order_null_keys",
+      "source": "regression",
+      "bug": "apply_treasury_auto_order null source_keys is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.treasury_api.apply_treasury_auto_order",
+      "args": {
+        "to_code": "B",
+        "source_keys": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "list_po_files_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_po_files",
+      "args": {
+        "name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "list_po_files null name is a controlled error, not TypeError"
+    },
+    {
+      "id": "list_po_files_empty_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.list_po_files",
+      "args": {
+        "name": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "list_po_files empty name is a controlled error"
+    },
+    {
+      "id": "attach_po_file_null_payload",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.attach_po_file",
+      "args": {
+        "name": null,
+        "file_name": null,
+        "content_b64": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "attach_po_file null name/content_b64 is a controlled error, not TypeError"
+    },
+    {
+      "id": "attach_po_file_empty_b64",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.attach_po_file",
+      "args": {
+        "name": "PUR-NOPE",
+        "file_name": "x.pdf",
+        "content_b64": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "attach_po_file empty content_b64 is a controlled error"
+    },
+    {
+      "id": "set_po_invoice_ref_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.set_purchase_order_invoice_ref",
+      "args": {
+        "name": null,
+        "supplier_invoice_ref": "0001-00001234"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_purchase_order_invoice_ref null name is a controlled error"
     }
   ]
 }

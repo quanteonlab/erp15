@@ -1724,6 +1724,46 @@ def suite_5_11_pos_session():
     _run("5.11.8 list_cash_register_sessions", check_cash_sessions, "S3")
     _run("5.11.9 list_pos_profile_meta", check_pos_profile_meta, "S3")
 
+    def check_treasury():
+        from erpnext.erpnext_integrations.ecommerce_api import treasury_api as ta
+
+        if not frappe.db.exists("DocType", "Treasury Account"):
+            return
+        acc = ta.list_treasury_accounts()
+        assert isinstance(acc, dict) and len(acc.get("accounts") or []) == 2
+        led = ta.list_treasury_ledger(from_date="null", to_date="")
+        assert "a" in led and "b" in led and "rows" in led["a"]
+        keys_a = [r.get("source_key") for r in led["a"]["rows"]]
+        keys_b = [r.get("source_key") for r in led["b"]["rows"]]
+        assert len(keys_a) == len(set(keys_a)), "duplicate source_key on account A"
+        assert len(keys_b) == len(set(keys_b)), "duplicate source_key on account B"
+        flipped = ta.list_treasury_ledger(from_date="2026-12-31", to_date="2026-01-01")
+        assert flipped["from_date"] <= flipped["to_date"]
+        assert "ganancias" in led
+        pos_day = ta.list_treasury_pos_day(day="null", mop="")
+        assert isinstance(pos_day, dict) and "sales" in pos_day
+        preview = ta.preview_treasury_auto_order(to_code="null", kinds="")
+        assert isinstance(preview, dict) and "candidates" in preview and "projected" in preview
+        try:
+            ta.split_treasury_pos_sale(invoice=None, to_code="B")
+            raise AssertionError("split_treasury_pos_sale null invoice must fail")
+        except Exception:
+            pass
+        try:
+            ta.unsplit_treasury_pos_sale(invoice="")
+            raise AssertionError("unsplit_treasury_pos_sale empty invoice must fail")
+        except Exception:
+            pass
+        key = f"so:SMOKE-REASSIGN-{frappe.generate_hash(length=6)}:cash"
+        moved = ta.reassign_treasury_row(source_key=key, to_code="B")
+        assert moved.get("ok") and moved.get("to_code") == "B"
+        ov_name = moved.get("name")
+        if ov_name:
+            frappe.delete_doc("Treasury Ledger Entry", ov_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    _run("5.11.10 treasury accounts + ledger", check_treasury, "S3")
+
 
 # ── Suite 5.12 — Preventa / staff / devices / floors / print / TMS ────────────
 
@@ -3301,8 +3341,27 @@ def suite_5_12_modules_read():
                 "price_list_rate",
             )
             assert float(after or 0) == rate, f"buying rate not updated: before={before} after={after}"
+            # i057 — attach invoice + set ref on the draft PO
+            import base64 as _b64
+            tiny = _b64.b64encode(b"%PDF-1.1\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n").decode()
+            attached = ba.attach_po_file(
+                name=created["name"],
+                file_name="smoke-factura.pdf",
+                content_b64=tiny,
+                create_documentos=1,
+            )
+            assert attached.get("ok") and attached.get("files"), attached
+            listed_files = ba.list_po_files(name=created["name"])
+            assert listed_files.get("ok") and len(listed_files.get("files") or []) >= 1, listed_files
+            ba.set_purchase_order_invoice_ref(name=created["name"], supplier_invoice_ref="0001-SMOKE")
+            listed_after = ba.list_purchase_orders(search="0001-SMOKE", page_length=20)
+            names = [r.get("name") for r in (listed_after.get("rows") or [])]
+            assert created["name"] in names, listed_after
+            detail_ref = ba.get_purchase_order_detail(name=created["name"])
+            assert (detail_ref.get("order") or {}).get("supplier_invoice_ref") == "0001-SMOKE", detail_ref
             # cleanup draft PO (db.delete avoids MandatoryError on broken title templates)
             try:
+                frappe.db.delete("File", {"attached_to_doctype": "Purchase Order", "attached_to_name": created["name"]})
                 frappe.db.delete("Purchase Order Item", {"parent": created["name"]})
                 frappe.db.delete("Purchase Order", {"name": created["name"]})
                 frappe.db.commit()
