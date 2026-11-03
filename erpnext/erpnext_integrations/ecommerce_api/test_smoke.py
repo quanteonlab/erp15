@@ -503,6 +503,11 @@ def suite_5_9_master_data():
     def check_pricing_rules():
         rules = api.list_pricing_rules(include_disabled=1, price_list="Standard Selling")
         assert rules is not None
+        rows = rules.get("rules") if isinstance(rules, dict) else rules
+        if isinstance(rows, list) and rows:
+            first = rows[0]
+            if isinstance(first, dict) and first.get("payment_methods") is not None:
+                assert isinstance(first["payment_methods"], list), first
 
     def check_get_product():
         item = _get_test_item()

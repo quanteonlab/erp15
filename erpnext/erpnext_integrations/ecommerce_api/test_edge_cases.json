@@ -3339,6 +3339,24 @@
       "expect": "error"
     },
     {
+      "id": "save_pricing_rule_payment_methods_null",
+      "source": "regression",
+      "bug": "save_pricing_rule payment_methods null/\"null\" must default to Cash+Transfer+Card, not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.save_pricing_rule",
+      "args": {
+        "data": {
+          "title": "Edge pay methods null",
+          "apply_on": "Transaction",
+          "price_or_product_discount": "Price",
+          "rate_or_discount": "Discount Percentage",
+          "discount_percentage": 10,
+          "payment_methods": null,
+          "applicable_items": []
+        }
+      },
+      "expect": "ok"
+    },
+    {
       "id": "update_preorder_payment_null_name",
       "source": "regression",
       "bug": "update_preorder_payment with null payment_name is controlled error, not AttributeError",

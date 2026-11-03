@@ -836,6 +836,7 @@ def get_active_promotions(price_list=None):
 			for r in rules:
 				r.setdefault(key, [])
 
+	_attach_pricing_rule_payment_methods(rules)
 	return rules
 
 
@@ -935,6 +936,71 @@ def _parse_target_list(raw):
 
 _ALL_MARKERS = {"*", "ALL", "TODOS"}
 
+# POS payment methods a Pricing Rule can be limited to. Stored in
+# rule_description as [payment_methods=Cash,Transfer,Card] (same tag style as promo_style).
+_PROMO_PAYMENT_METHODS = ("Cash", "Transfer", "Card")
+_PROMO_PAYMENT_ALIASES = {
+	"cash": "Cash",
+	"efectivo": "Cash",
+	"transfer": "Transfer",
+	"transferencia": "Transfer",
+	"mobile money": "Transfer",
+	"card": "Card",
+	"tarjeta": "Card",
+}
+_PAYMENT_METHODS_TAG = re.compile(r"\[payment_methods=([^\]]*)\]", flags=re.I)
+
+
+def _normalize_payment_methods(raw):
+	"""Dirty-safe: null / \"\" / unknown → all three methods (default on)."""
+	if raw is None or raw == "" or raw == "null" or raw == "undefined":
+		return list(_PROMO_PAYMENT_METHODS)
+	if isinstance(raw, (int, float, bool)):
+		return list(_PROMO_PAYMENT_METHODS)
+	parts = []
+	if isinstance(raw, str):
+		parts = [p.strip() for p in raw.replace(";", ",").split(",")]
+	elif isinstance(raw, (list, tuple)):
+		parts = [cstr(x).strip() for x in raw]
+	else:
+		return list(_PROMO_PAYMENT_METHODS)
+	out = []
+	for part in parts:
+		if not part or part.lower() in ("null", "undefined"):
+			continue
+		key = _PROMO_PAYMENT_ALIASES.get(part.lower())
+		if key and key not in out:
+			out.append(key)
+	return out or list(_PROMO_PAYMENT_METHODS)
+
+
+def _payment_methods_from_description(desc):
+	match = _PAYMENT_METHODS_TAG.search(cstr(desc or ""))
+	if not match:
+		return list(_PROMO_PAYMENT_METHODS)
+	return _normalize_payment_methods(match.group(1))
+
+
+def _merge_payment_methods_description(desc, methods):
+	methods = _normalize_payment_methods(methods)
+	tag = "[payment_methods={}]".format(",".join(methods))
+	text = cstr(desc or "").strip()
+	if _PAYMENT_METHODS_TAG.search(text):
+		return _PAYMENT_METHODS_TAG.sub(tag, text).strip()
+	return "{} {}".format(text, tag).strip() if text else tag
+
+
+def _attach_pricing_rule_payment_methods(rules):
+	for row in rules or []:
+		if not isinstance(row, dict):
+			continue
+		explicit = row.get("payment_methods")
+		if explicit not in (None, "", []):
+			row["payment_methods"] = _normalize_payment_methods(explicit)
+		else:
+			row["payment_methods"] = _payment_methods_from_description(row.get("rule_description"))
+	return rules
+
 
 def _is_all_marker(value):
 	return str(value or "").strip().upper() in _ALL_MARKERS
@@ -995,6 +1061,7 @@ def list_pricing_rules(include_disabled=1, price_list=None):
 		rules = [r for r in rules if _price_list_applies(r.get("for_price_list"), price_list)]
 
 	_attach_pricing_rule_children(rules)
+	_attach_pricing_rule_payment_methods(rules)
 	return {"rules": rules, "total_count": len(rules)}
 
 
@@ -1006,6 +1073,7 @@ def get_pricing_rule(name):
 	fields = _pricing_rule_field_list()
 	row = frappe.db.get_value("Pricing Rule", name, fields, as_dict=True)
 	_attach_pricing_rule_children([row])
+	_attach_pricing_rule_payment_methods([row])
 	return row
 
 
@@ -1072,7 +1140,10 @@ def save_pricing_rule(data):
 	doc.max_amt = flt(data.get("max_amt") or 0)
 	doc.valid_from = data.get("valid_from") or None
 	doc.valid_upto = data.get("valid_upto") or None
-	doc.rule_description = data.get("rule_description") or None
+	pay_methods = _normalize_payment_methods(data.get("payment_methods"))
+	doc.rule_description = _merge_payment_methods_description(
+		data.get("rule_description"), pay_methods
+	)
 	doc.threshold_percentage = flt(data.get("threshold_percentage") or 0)
 	doc.same_item = cint(data.get("same_item") or 0)
 	doc.free_item = data.get("free_item") or None
@@ -1142,6 +1213,7 @@ def save_pricing_rule(data):
 
 	row = frappe.db.get_value("Pricing Rule", doc.name, _pricing_rule_field_list(), as_dict=True)
 	_attach_pricing_rule_children([row])
+	_attach_pricing_rule_payment_methods([row])
 	return {"ok": True, "name": doc.name, "rule": row}
 
 
