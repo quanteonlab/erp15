@@ -68,6 +68,17 @@ def _as_int(val, default: int, min_v: int = 0, max_v: int = 9999) -> int:
 	return max(min_v, min(max_v, n))
 
 
+def _as_money(val, default: float = 0.0, max_v: float = 10_000_000.0) -> float:
+	"""Non-negative amount with 2 decimals; anything unparseable (or NaN) becomes the default."""
+	try:
+		n = float(val)
+	except (TypeError, ValueError):
+		return default
+	if n != n:
+		return default
+	return round(max(0.0, min(max_v, n)), 2)
+
+
 def _normalize_order_tag(raw) -> str:
 	s = str(raw or "").strip().lower()
 	s = re.sub(r"\s+", "-", s)
@@ -183,9 +194,127 @@ def _normalize_header_preset(val) -> str:
 def _normalize_catalog_template(val) -> str:
 	# coming_soon kept for legacy saved settings; UI no longer offers it.
 	# Default for new / unset sites: Nova Mobile (not classic).
-	if val in ("commerce", "nova_mobile", "coming_soon", "classic"):
+	if val in ("commerce", "nova_mobile", "storefront", "coming_soon", "classic"):
 		return val
 	return "nova_mobile"
+
+
+def _normalize_storefront_radius(val) -> str:
+	if val in ("sharp", "round"):
+		return val
+	return "soft"
+
+
+def _normalize_storefront_font(val) -> str:
+	if val in ("system", "serif"):
+		return val
+	return "brand"
+
+
+STOREFRONT_SECTIONS = ("banners", "delivery", "categories", "coupons", "deals", "hot")
+# Whole features an admin can switch off: coupons (home row + code box in the bag), the barcode-scan icon,
+# the language switch, and the Home page itself (open straight on the product list).
+STOREFRONT_FEATURES = ("coupons", "scan", "language", "home")
+
+
+def _normalize_storefront_header_style(val) -> str:
+	if val in ("brand", "gradient"):
+		return val
+	return "light"
+
+
+def _normalize_storefront_disabled_features(val) -> list:
+	"""Features switched off. Unknown ids are dropped; anything new stays enabled by default."""
+	return [x for x in _as_string_list(val, max_items=len(STOREFRONT_FEATURES), max_len=20) if x in STOREFRONT_FEATURES]
+
+
+def _normalize_storefront_hidden_sections(val) -> list:
+	"""Home sections switched off. Unknown ids are dropped; new sections stay visible by default."""
+	return [x for x in _as_string_list(val, max_items=len(STOREFRONT_SECTIONS), max_len=20) if x in STOREFRONT_SECTIONS]
+
+
+STOREFRONT_BANNER_STYLES = ("brand", "dark", "light")
+STOREFRONT_BANNER_MAX = 8
+
+
+def _normalize_banner_link(val) -> str:
+	"""Where a banner goes. Only known shapes survive; anything else is dropped (no javascript:, no //host)."""
+	s = str(val or "").strip()[:200] if isinstance(val, str) else ""
+	if s in ("hot", "offers", "coupons"):
+		return s
+	if s.startswith(("cat:", "product:")) and s.split(":", 1)[1].strip():
+		return s
+	if s.startswith("/") and not s.startswith("//"):
+		return s
+	if s.startswith(("https://", "http://")):
+		return s
+	return ""
+
+
+def _normalize_iso_date(val) -> str:
+	"""YYYY-MM-DD or empty."""
+	s = val.strip() if isinstance(val, str) else ""
+	if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+		return ""
+	try:
+		import datetime
+
+		datetime.date.fromisoformat(s)
+	except ValueError:
+		return ""
+	return s
+
+
+def _i18n_text(val, max_len: int) -> dict:
+	src = val if isinstance(val, dict) else {}
+	return {
+		lang: (src.get(lang).strip()[:max_len] if isinstance(src.get(lang), str) else "")
+		for lang in ("zh", "es")
+	}
+
+
+def _normalize_storefront_banners(raw) -> list:
+	"""Promotion banners for the storefront home (max 8). A banner needs an image or a title to be shown."""
+	if not isinstance(raw, (list, tuple)):
+		return []
+	out = []
+	seen = set()
+	for row in raw:
+		if not isinstance(row, dict):
+			continue
+		bid = re.sub(r"[^A-Za-z0-9_-]", "", str(row.get("id") or ""))[:24] or frappe.generate_hash(length=8)
+		if bid in seen:
+			continue
+		image = _normalize_logo_url(row.get("image"))
+		title = _i18n_text(row.get("title"), 80)
+		if not image and not any(title.values()):
+			continue
+		seen.add(bid)
+		style = row.get("style")
+		out.append(
+			{
+				"id": bid,
+				"image": image,
+				"title": title,
+				"subtitle": _i18n_text(row.get("subtitle"), 140),
+				"cta": _i18n_text(row.get("cta"), 30),
+				"style": style if style in STOREFRONT_BANNER_STYLES else "brand",
+				"link": _normalize_banner_link(row.get("link")),
+				"validFrom": _normalize_iso_date(row.get("validFrom")),
+				"validUpto": _normalize_iso_date(row.get("validUpto")),
+			}
+		)
+		if len(out) >= STOREFRONT_BANNER_MAX:
+			break
+	return out
+
+
+def _normalize_logo_url(val) -> str:
+	"""Storefront logo: a local /files/ path or an http(s) URL (nothing else is rendered)."""
+	s = str(val or "").strip()[:500]
+	if s.startswith("/files/") or s.startswith("https://") or s.startswith("http://"):
+		return s
+	return ""
 
 
 def _normalize_pedidos_default_seller_scope(val) -> str:
@@ -288,6 +417,26 @@ def _normalize_catalog_display(raw) -> dict:
 		"headerNavBackgroundColor": _as_hex(src.get("headerNavBackgroundColor"), ""),
 		"headerNavTextColor": _as_hex(src.get("headerNavTextColor"), ""),
 		"headerFont": _normalize_header_font(src.get("headerFont")),
+		# Storefront template branding/theme. Empty title/logo/colors = follow the Company / built-in look.
+		"storefrontTitle": str(src.get("storefrontTitle") or "").strip()[:60],
+		"storefrontLogoUrl": _normalize_logo_url(src.get("storefrontLogoUrl")),
+		"storefrontAccentColor": _as_hex(src.get("storefrontAccentColor"), ""),
+		"storefrontBackgroundColor": _as_hex(src.get("storefrontBackgroundColor"), ""),
+		"storefrontSurfaceColor": _as_hex(src.get("storefrontSurfaceColor"), ""),
+		"storefrontTextColor": _as_hex(src.get("storefrontTextColor"), ""),
+		"storefrontAccent2Color": _as_hex(src.get("storefrontAccent2Color"), ""),
+		"storefrontPriceColor": _as_hex(src.get("storefrontPriceColor"), ""),
+		"storefrontHeaderStyle": _normalize_storefront_header_style(src.get("storefrontHeaderStyle")),
+		# Trending-search chips under the search box (home page); empty = row hidden.
+		"storefrontSearchHints": _as_string_list(src.get("storefrontSearchHints"), max_items=8, max_len=30),
+		"storefrontHiddenSections": _normalize_storefront_hidden_sections(src.get("storefrontHiddenSections")),
+		"storefrontDisabledFeatures": _normalize_storefront_disabled_features(src.get("storefrontDisabledFeatures")),
+		"storefrontBanners": _normalize_storefront_banners(src.get("storefrontBanners")),
+		# Delivery pricing for the storefront (promos live in delivery_promos.py). Off = delivery stays a plain flag.
+		"deliveryEnabled": _as_bool(src.get("deliveryEnabled"), False),
+		"deliveryBaseFee": _as_money(src.get("deliveryBaseFee")),
+		"storefrontRadius": _normalize_storefront_radius(src.get("storefrontRadius")),
+		"storefrontFont": _normalize_storefront_font(src.get("storefrontFont")),
 	}
 
 
@@ -478,12 +627,30 @@ def _can_manage_settings() -> bool:
 	return _can_app("tools.settings")
 
 
+def _storefront_brand() -> dict:
+	"""Public shop identity from the default Company (name + logo). Read-only, never persisted."""
+	company = (
+		frappe.defaults.get_user_default("Company")
+		or frappe.db.get_single_value("Global Defaults", "default_company")
+		or ""
+	)
+	if not company or not frappe.db.exists("Company", company):
+		return {"companyName": "", "companyLogo": ""}
+	name, logo = frappe.db.get_value("Company", company, ["company_name", "company_logo"]) or ("", "")
+	return {
+		"companyName": str(name or company).strip(),
+		"companyLogo": _normalize_logo_url(logo),
+	}
+
+
 @frappe.whitelist(allow_guest=True)
 def get_shop_ui_settings():
 	"""Return site-wide shop UI settings (same for every user/guest).
 
 	Missing store → empty dict (client uses defaults).
 	Seeds catalogDisplay.defaultWarehouse from Company when unset (not persisted).
+	Also returns a read-only `branding` {companyName, companyLogo} so the guest storefront
+	can title itself after the Company without a second request.
 	"""
 	raw = _load_raw()
 	if not raw:
@@ -491,7 +658,7 @@ def get_shop_ui_settings():
 		settings = (
 			{"catalogDisplay": {"defaultWarehouse": seeded}} if seeded else {}
 		)
-		return {"ok": True, "settings": settings, "source": "default"}
+		return {"ok": True, "settings": settings, "source": "default", "branding": _storefront_brand()}
 	settings = _normalize_bundle(raw)
 	cd = dict(settings.get("catalogDisplay") or {})
 	if not cd.get("defaultWarehouse"):
@@ -499,7 +666,7 @@ def get_shop_ui_settings():
 		if seeded:
 			cd["defaultWarehouse"] = seeded
 			settings["catalogDisplay"] = cd
-	return {"ok": True, "settings": settings, "source": "server"}
+	return {"ok": True, "settings": settings, "source": "server", "branding": _storefront_brand()}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -562,3 +729,39 @@ def require_valuation_rate() -> bool:
 	raw = _load_raw()
 	pos = (raw.get("posDisplay") or {}) if isinstance(raw, dict) else {}
 	return _as_bool(pos.get("requireValuationRate"), False)
+
+
+def _require_settings_staff() -> None:
+	"""Settings writes that take a file need a real acting staff user (not just the shared service key)."""
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _acting_username
+
+	if not _acting_username():
+		frappe.throw(_("Sign in as staff to do this"), frappe.PermissionError)
+	if not _can_manage_settings():
+		frappe.throw(_("Not permitted ({0})").format("tools.settings"), frappe.PermissionError)
+
+
+@frappe.whitelist()
+def upload_storefront_banner(filedata=None):
+	"""Store an uploaded promotion banner image as a public /files/ JPEG and return its URL.
+
+	filedata: data-URL or raw base64 (max ~12 MB). The URL is then saved by the client inside
+	catalogDisplay.storefrontBanners via save_shop_ui_settings.
+	"""
+	import base64
+
+	_require_settings_staff()
+	data = filedata.strip() if isinstance(filedata, str) else ""
+	if not data:
+		frappe.throw(_("Provide filedata"), frappe.ValidationError)
+	raw = data.split(",", 1)[1] if "," in data else data
+	if len(raw) > 16_000_000:  # ~12 MB decoded
+		frappe.throw(_("Image is too large (max 12 MB)"), frappe.ValidationError)
+	try:
+		image_bytes = base64.b64decode(raw, validate=False)
+	except Exception:
+		frappe.throw(_("Invalid image data"), frappe.ValidationError)
+
+	from erpnext.erpnext_integrations.ecommerce_api.image_cdn import materialize_storefront_banner_bytes
+
+	return {"ok": True, "url": materialize_storefront_banner_bytes(image_bytes, commit=True)}

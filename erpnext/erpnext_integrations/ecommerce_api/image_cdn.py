@@ -198,3 +198,52 @@ def materialize_company_logo_bytes(company_name: str, image_bytes: bytes, *, com
 	if commit:
 		frappe.db.commit()
 	return file_url
+
+
+def materialize_storefront_banner_bytes(image_bytes: bytes, *, commit: bool = True) -> str:
+	"""
+	Re-encode an uploaded promotion banner to a public JPEG (max edge 1920) and return its /files/ URL.
+
+	Not attached to any document (banners live in the shop_ui settings blob, which only stores the URL).
+	Each upload gets a fresh random name, so replacing a banner never serves a stale cached image.
+	"""
+	import io
+
+	from frappe.utils.file_manager import save_file
+	from PIL import Image
+
+	if not image_bytes:
+		frappe.throw("Image required")
+
+	try:
+		img = Image.open(io.BytesIO(image_bytes))
+		if getattr(img, "n_frames", 1) > 1:
+			img.seek(0)
+		img.load()
+	except Exception:
+		frappe.throw("That file is not a valid image")
+
+	if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+		rgba = img.convert("RGBA")
+		bg = Image.new("RGB", rgba.size, (255, 255, 255))
+		bg.paste(rgba, mask=rgba.split()[-1])
+		img = bg
+	else:
+		img = img.convert("RGB")
+
+	max_edge = 1920
+	w, h = img.size
+	if max(w, h) > max_edge:
+		scale = max_edge / float(max(w, h))
+		img = img.resize(
+			(max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+			getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS),
+		)
+	buf = io.BytesIO()
+	img.save(buf, format="JPEG", quality=85, optimize=True)
+
+	fname = f"storefront_banner_{frappe.generate_hash(length=10)}.jpg"
+	file_doc = save_file(fname, buf.getvalue(), None, None, is_private=0)
+	if commit:
+		frappe.db.commit()
+	return file_doc.file_url

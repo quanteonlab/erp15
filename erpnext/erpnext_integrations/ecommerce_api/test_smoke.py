@@ -96,12 +96,13 @@ def _get_defaults():
 def _compute_grand_total(item_code, item_name, qty, rate, warehouse, company, customer):
     """
     Create a transient (unsaved) Sales Invoice to compute grand_total with taxes.
-    This ensures create_pos_sale's total-mismatch guard is satisfied.
+    Mirrors create_pos_sale: ignore Pricing Rules so caja rates stay authoritative.
     """
     doc = frappe.get_doc({
         "doctype": "Sales Invoice",
         "customer": customer,
         "company": company,
+        "ignore_pricing_rule": 1,
         "posting_date": nowdate(),
         "due_date": nowdate(),
         "items": [{
@@ -112,6 +113,7 @@ def _compute_grand_total(item_code, item_name, qty, rate, warehouse, company, cu
             "warehouse": warehouse,
         }],
     })
+    doc.flags.ignore_pricing_rule = True
     doc.set_missing_values()
     doc.calculate_taxes_and_totals()
     return flt(doc.grand_total)
@@ -385,9 +387,323 @@ def suite_5_5_promotions():
                 "Open mode (no admin PIN) should authorize any PIN input"
             assert result.get("pin_configured") is False
 
+    def check_pos_sale_ignores_server_pricing_rule():
+        """Caja total wins: online Pricing Rule must not rewrite create_pos_sale rates."""
+        item = _get_test_item()
+        company, warehouse, customer = _get_defaults()
+        qty = 1
+        rate = 200.0
+        total = _compute_grand_total(
+            item["item_code"], item["item_name"], qty, rate, warehouse, company, customer
+        )
+        rule_title = f"I014-POS-IGN-{_uid()[:8]}"
+        rule = frappe.get_doc({
+            "doctype": "Pricing Rule",
+            "title": rule_title,
+            "apply_on": "Item Code",
+            "items": [{"item_code": item["item_code"]}],
+            "selling": 1,
+            "buying": 0,
+            "company": company,
+            "price_or_product_discount": "Price",
+            "rate_or_discount": "Discount Percentage",
+            "discount_percentage": 5,
+            "disable": 0,
+        })
+        rule.insert(ignore_permissions=True)
+        frappe.db.commit()
+        try:
+            sale_uuid = _uid()
+            result = api.create_pos_sale(
+                offline_order_uuid=sale_uuid,
+                receipt_number=f"I014-PR-{sale_uuid[:8].upper()}",
+                items=[{
+                    "item_code": item["item_code"],
+                    "item_name": item["item_name"],
+                    "qty": qty,
+                    "rate": rate,
+                    "amount": rate * qty,
+                }],
+                total_amount=total,
+                payment_method="Cash",
+                sale_mode="WHITE",
+                cashier_id="I014_TEST_CASHIER",
+            )
+            inv_name = result.get("invoice_id")
+            assert inv_name, f"No invoice_id: {result}"
+            _tag_record("Sales Invoice", inv_name)
+            inv_total = abs(flt(frappe.db.get_value("Sales Invoice", inv_name, "grand_total")))
+            assert abs(inv_total - abs(flt(total))) <= 1, (
+                f"Server Pricing Rule rewrote caja total: invoice={inv_total} caja={total}"
+            )
+        finally:
+            if frappe.db.exists("Pricing Rule", rule.name):
+                frappe.delete_doc("Pricing Rule", rule.name, ignore_permissions=True, force=True)
+                frappe.db.commit()
+
+    def check_coupon_lifecycle():
+        """Coupon = Pricing Rule + Coupon Code: create, list publicly, validate with a subtotal, cancel, delete."""
+        from erpnext.erpnext_integrations.ecommerce_api import coupons_api as cp
+
+        code = f"SMK{_uid()[:6].upper()}"
+        try:
+            out = cp.save_coupon(
+                {
+                    "code": code.lower(),  # normalised to upper case
+                    "kind": "percent",
+                    "value": 10,
+                    "min_amount": 1000,
+                    "max_uses": 0,  # unlimited → stored as a sentinel, never 0
+                    "public": 1,
+                    "label_es": "Smoke",
+                    "label_zh": "测试",
+                }
+            )
+            assert out["ok"] and out["coupon"]["code"] == code, out
+            assert out["coupon"]["max_uses"] == 0 and out["coupon"]["public"] == 1, out
+            assert frappe.db.get_value("Coupon Code", code, "maximum_use") == cp.UNLIMITED
+            rule_name = out["coupon"]["pricing_rule"]
+            assert frappe.db.get_value("Pricing Rule", rule_name, "coupon_code_based") == 1
+
+            # Coupon rules must never auto-apply or show in the Rules list.
+            assert rule_name not in [r["name"] for r in api.get_active_promotions()]
+            assert rule_name not in [r["name"] for r in api.list_pricing_rules().get("rules", [])]
+
+            assert code in [c["code"] for c in cp.list_public_coupons()]
+            assert code in [c["code"] for c in cp.list_coupons()["coupons"]]
+
+            low = api.validate_coupon_code(code, 500)
+            assert low["valid"] is False and low["reason"] == "min_amount", low
+            ok = api.validate_coupon_code(code, 2000)
+            assert ok["valid"] is True and abs(ok["discount"] - 200.0) < 0.01, ok
+            assert api.validate_coupon_code(code.lower(), 2000)["valid"] is True  # case-insensitive
+
+            # "Cancel": stops redemption, keeps the record.
+            cp.set_coupon_disabled(code, 1)
+            assert api.validate_coupon_code(code, 2000)["reason"] == "disabled"
+            assert code not in [c["code"] for c in cp.list_public_coupons()]
+            cp.set_coupon_disabled(code, 0)
+            assert api.validate_coupon_code(code, 2000)["valid"] is True
+
+            # Fixed amount, capped at the subtotal.
+            cp.save_coupon({"code": code, "kind": "amount", "value": 5000, "min_amount": 0, "public": 0})
+            capped = api.validate_coupon_code(code, 800)
+            assert capped["valid"] and capped["discount"] == 800.0, capped
+            assert code not in [c["code"] for c in cp.list_public_coupons()]  # private again
+
+            # Expired window
+            cp.save_coupon({"code": code, "kind": "percent", "value": 5, "valid_upto": "2020-01-01", "public": 1})
+            assert api.validate_coupon_code(code, 2000)["reason"] == "expired"
+
+            cp.delete_coupon(code)
+            assert not frappe.db.exists("Coupon Code", code)
+            assert not frappe.db.exists("Pricing Rule", rule_name)
+        finally:
+            if frappe.db.exists("Coupon Code", code):
+                frappe.db.set_value("Coupon Code", code, "used", 0)
+                pr = frappe.db.get_value("Coupon Code", code, "pricing_rule")
+                frappe.delete_doc("Coupon Code", code, ignore_permissions=True, force=True)
+                if pr and frappe.db.exists("Pricing Rule", pr):
+                    frappe.delete_doc("Pricing Rule", pr, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_coupon_used_cannot_be_deleted():
+        from erpnext.erpnext_integrations.ecommerce_api import coupons_api as cp
+
+        code = f"SMU{_uid()[:6].upper()}"
+        try:
+            cp.save_coupon({"code": code, "kind": "percent", "value": 5, "max_uses": 3})
+            frappe.db.set_value("Coupon Code", code, "used", 1)
+            try:
+                cp.delete_coupon(code)
+                assert False, "a used coupon must not be deletable"
+            except frappe.ValidationError:
+                pass
+            exhausted_ok = api.validate_coupon_code(code, 100)["valid"]
+            frappe.db.set_value("Coupon Code", code, "used", 3)
+            assert exhausted_ok is True and api.validate_coupon_code(code, 100)["reason"] == "exhausted"
+        finally:
+            if frappe.db.exists("Coupon Code", code):
+                pr = frappe.db.get_value("Coupon Code", code, "pricing_rule")
+                frappe.delete_doc("Coupon Code", code, ignore_permissions=True, force=True)
+                if pr and frappe.db.exists("Pricing Rule", pr):
+                    frappe.delete_doc("Pricing Rule", pr, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_guest_preorder_with_coupon():
+        """create_guest_preorder re-validates the coupon server-side and applies the discount to the draft SO."""
+        from erpnext.erpnext_integrations.ecommerce_api import coupons_api as cp
+
+        item = _get_test_item()
+        code = f"SMG{_uid()[:6].upper()}"
+        so_name = None
+        try:
+            cp.save_coupon({"code": code, "kind": "percent", "value": 10, "min_amount": 0, "max_uses": 5})
+            out = api.create_guest_preorder(
+                items=[{"item_code": item["item_code"], "qty": 3, "rate": 1000}],
+                guest_name="Smoke Coupon Guest",
+                coupon_code=code,
+            )
+            so_name = out.get("preorder_name")
+            assert so_name
+            assert out.get("coupon") == {"code": code, "discount": 300.0}, out
+            assert abs(flt(out.get("estimated_total")) - 2700.0) < 0.01, out
+            so = frappe.get_doc("Sales Order", so_name)
+            assert so.coupon_code == code and abs(flt(so.discount_amount) - 300.0) < 0.01
+            assert f"coupon:{code}" in (getattr(so, "remarks", None) or getattr(so, "terms", None) or "")
+
+            try:
+                api.create_guest_preorder(
+                    items=[{"item_code": item["item_code"], "qty": 1, "rate": 1000}],
+                    guest_name="Smoke Coupon Guest",
+                    coupon_code="NOPE_NOT_A_COUPON",
+                )
+                assert False, "an unknown coupon must reject the order"
+            except frappe.ValidationError:
+                pass
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            if frappe.db.exists("Coupon Code", code):
+                pr = frappe.db.get_value("Coupon Code", code, "pricing_rule")
+                frappe.delete_doc("Coupon Code", code, ignore_permissions=True, force=True)
+                if pr and frappe.db.exists("Pricing Rule", pr):
+                    frappe.delete_doc("Pricing Rule", pr, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_delivery_promos_lifecycle():
+        """Delivery pricing: base fee + 'free over X' / '% off' promos, quoted server-side."""
+        from erpnext.erpnext_integrations.ecommerce_api import delivery_promos as dp
+        from erpnext.erpnext_integrations.ecommerce_api import shop_ui_settings as sui
+
+        prev = ((sui.get_shop_ui_settings().get("settings") or {}).get("catalogDisplay") or {})
+        ids = []
+        try:
+            sui.save_shop_ui_settings({"catalogDisplay": {"deliveryEnabled": True, "deliveryBaseFee": 1000}})
+            off = dp.get_delivery_quote(5000)
+            assert off["enabled"] and off["fee"] == 1000 and off["free_from"] is None, off
+
+            free = dp.save_delivery_promo({"kind": "free_over", "threshold": 50000, "name": "Smoke free"})
+            half = dp.save_delivery_promo({"kind": "percent_off", "value": 50, "threshold": 20000, "label_es": "Mitad"})
+            ids = [free["id"], half["id"]]
+            assert dp.get_delivery_quote(10000)["fee"] == 1000
+            q = dp.get_delivery_quote(20000)
+            assert q["fee"] == 500 and q["promo_id"] == half["id"], q
+            q = dp.get_delivery_quote(49999)
+            assert q["fee"] == 500 and q["remaining_to_free"] == 1, q
+            q = dp.get_delivery_quote(50000)
+            assert q["fee"] == 0 and q["promo_id"] == free["id"] and q["remaining_to_free"] == 0, q
+
+            pub = dp.list_public_delivery_promos()
+            assert pub["enabled"] and {p["id"] for p in pub["promos"]} >= set(ids), pub
+
+            # "Cancel" one: it stops applying but stays listed for staff.
+            dp.set_delivery_promo_disabled(free["id"], 1)
+            assert dp.get_delivery_quote(50000)["fee"] == 500
+            assert free["id"] in [p["id"] for p in dp.list_delivery_promos()["promos"]]
+            assert free["id"] not in [p["id"] for p in dp.list_public_delivery_promos()["promos"]]
+
+            for bad in ({"kind": "free_over", "threshold": 0}, {"kind": "percent_off", "value": 150}, {"kind": "nope"}):
+                try:
+                    dp.save_delivery_promo(bad)
+                    assert False, f"should reject {bad}"
+                except frappe.ValidationError:
+                    pass
+
+            sui.save_shop_ui_settings({"catalogDisplay": {"deliveryEnabled": False}})
+            assert dp.get_delivery_quote(5000)["fee"] == 0 and not dp.list_public_delivery_promos()["promos"]
+        finally:
+            for pid in ids:
+                try:
+                    dp.delete_delivery_promo(pid)
+                except Exception:
+                    pass
+            sui.save_shop_ui_settings(
+                {
+                    "catalogDisplay": {
+                        "deliveryEnabled": bool(prev.get("deliveryEnabled")),
+                        "deliveryBaseFee": prev.get("deliveryBaseFee") or 0,
+                    }
+                }
+            )
+
+    def check_guest_preorder_with_delivery():
+        """is_delivery books the server-computed fee as a service Item line; free delivery adds no line."""
+        from erpnext.erpnext_integrations.ecommerce_api import delivery_promos as dp
+        from erpnext.erpnext_integrations.ecommerce_api import shop_ui_settings as sui
+
+        item = _get_test_item()
+        prev = ((sui.get_shop_ui_settings().get("settings") or {}).get("catalogDisplay") or {})
+        promo_id = None
+        so_names = []
+        try:
+            sui.save_shop_ui_settings({"catalogDisplay": {"deliveryEnabled": True, "deliveryBaseFee": 800}})
+            out = api.create_guest_preorder(
+                items=[{"item_code": item["item_code"], "qty": 1, "rate": 1000}],
+                guest_name="Smoke Delivery Guest",
+                is_delivery=1,
+            )
+            so_names.append(out["preorder_name"])
+            assert out.get("delivery", {}).get("fee") == 800, out
+            assert abs(flt(out["estimated_total"]) - 1800.0) < 0.01, out
+            so = frappe.get_doc("Sales Order", out["preorder_name"])
+            assert dp.DELIVERY_ITEM_CODE in [d.item_code for d in so.items]
+            assert "delivery_fee:800" in (getattr(so, "remarks", None) or getattr(so, "terms", None) or "")
+
+            # Pickup (no is_delivery) stays free of any fee.
+            out2 = api.create_guest_preorder(
+                items=[{"item_code": item["item_code"], "qty": 1, "rate": 1000}], guest_name="Smoke Pickup Guest"
+            )
+            so_names.append(out2["preorder_name"])
+            assert "delivery" not in out2 and abs(flt(out2["estimated_total"]) - 1000.0) < 0.01, out2
+
+            # Free delivery over 1000: no fee line, but the promo is recorded.
+            promo_id = dp.save_delivery_promo({"kind": "free_over", "threshold": 1000})["id"]
+            out3 = api.create_guest_preorder(
+                items=[{"item_code": item["item_code"], "qty": 1, "rate": 1000}],
+                guest_name="Smoke Free Delivery Guest",
+                is_delivery=1,
+            )
+            so_names.append(out3["preorder_name"])
+            assert out3["delivery"]["fee"] == 0 and out3["delivery"]["promo_id"] == promo_id, out3
+            so3 = frappe.get_doc("Sales Order", out3["preorder_name"])
+            assert dp.DELIVERY_ITEM_CODE not in [d.item_code for d in so3.items]
+
+            # The system item never shows up in catalogs.
+            codes = [p["item_code"] for p in (api.get_products(page_length=500).get("items") or [])]
+            assert dp.DELIVERY_ITEM_CODE not in codes
+        finally:
+            for n in so_names:
+                if frappe.db.exists("Sales Order", n):
+                    frappe.delete_doc("Sales Order", n, ignore_permissions=True, force=True)
+            if promo_id:
+                try:
+                    dp.delete_delivery_promo(promo_id)
+                except Exception:
+                    pass
+            sui.save_shop_ui_settings(
+                {
+                    "catalogDisplay": {
+                        "deliveryEnabled": bool(prev.get("deliveryEnabled")),
+                        "deliveryBaseFee": prev.get("deliveryBaseFee") or 0,
+                    }
+                }
+            )
+            frappe.db.commit()
+
     _run("5.5.1 Unknown coupon returns valid=False", check_unknown_coupon, "S3")
     _run("5.5.2 Empty coupon returns valid=False", check_empty_coupon, "S3")
     _run("5.5.3 Discount PIN open/closed mode consistent", check_discount_pin, "S3")
+    _run(
+        "5.5.4 create_pos_sale ignores online Pricing Rule (caja total wins)",
+        check_pos_sale_ignores_server_pricing_rule,
+        "S1",
+    )
+    _run("5.5.5 Coupon lifecycle (create / public list / validate / cancel / delete)", check_coupon_lifecycle, "S3")
+    _run("5.5.6 Used coupon cannot be deleted; exhausted coupon is refused", check_coupon_used_cannot_be_deleted, "S3")
+    _run("5.5.7 create_guest_preorder applies a coupon server-side", check_guest_preorder_with_coupon, "S1")
+    _run("5.5.8 Delivery promos: base fee, free-over / % off, cancel", check_delivery_promos_lifecycle, "S3")
+    _run("5.5.9 create_guest_preorder books the delivery fee as a service line", check_guest_preorder_with_delivery, "S1")
 
 
 # ── Suite 5.7 — Receiving Flow ────────────────────────────────────────────────
@@ -3165,6 +3481,81 @@ def suite_5_12_modules_read():
         settings_nova = (out_nova or {}).get("settings") or {}
         assert (settings_nova.get("catalogDisplay") or {}).get("catalogTemplate") == "nova_mobile", settings_nova.get(
             "catalogDisplay"
+        )
+        out_store = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "storefront"}})
+        settings_store = (out_store or {}).get("settings") or {}
+        assert (settings_store.get("catalogDisplay") or {}).get("catalogTemplate") == "storefront", settings_store.get(
+            "catalogDisplay"
+        )
+        # Storefront branding/theme round-trip + sanitising; get_shop_ui_settings exposes company branding.
+        out_theme = sui.save_shop_ui_settings(
+            {
+                "catalogDisplay": {
+                    "storefrontTitle": "  Smoke Shop  ",
+                    "storefrontAccentColor": "#1D4ED8",
+                    "storefrontBackgroundColor": "not-a-color",
+                    "storefrontLogoUrl": "javascript:alert(1)",
+                    "storefrontRadius": "round",
+                    "storefrontFont": "comic-sans",
+                    "storefrontHeaderStyle": "gradient",
+                    "storefrontAccent2Color": "#F58B2F",
+                    "storefrontPriceColor": "oops",
+                    "storefrontSearchHints": ["Queso", "queso-ok", "Queso", "x" * 80, 5, "  Jamon  "],
+                    "storefrontHiddenSections": ["coupons", "not-a-section", "hot", "coupons"],
+                    "storefrontDisabledFeatures": ["scan", "nope", "home", "scan", 7],
+                    "storefrontBanners": [
+                        {
+                            "id": "b1",
+                            "image": "/files/x.jpg",
+                            "title": {"zh": "你好", "es": "  Hola "},
+                            "style": "neon",
+                            "link": "javascript:alert(1)",
+                            "validFrom": "2026-11-01",
+                            "validUpto": "2026-13-45",
+                        },
+                        {"id": "b1", "title": {"zh": "duplicate id"}},
+                        {"title": {}},
+                        "junk",
+                    ],
+                }
+            }
+        )
+        theme_cd = ((out_theme or {}).get("settings") or {}).get("catalogDisplay") or {}
+        assert theme_cd.get("storefrontTitle") == "Smoke Shop", theme_cd
+        assert theme_cd.get("storefrontAccentColor") == "#1d4ed8", theme_cd
+        assert theme_cd.get("storefrontBackgroundColor") == "", theme_cd
+        assert theme_cd.get("storefrontLogoUrl") == "", theme_cd
+        assert theme_cd.get("storefrontRadius") == "round", theme_cd
+        assert theme_cd.get("storefrontFont") == "brand", theme_cd
+        assert theme_cd.get("storefrontHeaderStyle") == "gradient", theme_cd
+        assert theme_cd.get("storefrontAccent2Color") == "#f58b2f", theme_cd
+        assert theme_cd.get("storefrontPriceColor") == "", theme_cd
+        hints = theme_cd.get("storefrontSearchHints")
+        assert hints == ["Queso", "queso-ok", "x" * 30, "Jamon"], hints  # dedup, trim, 30-char cap, non-strings dropped
+        assert theme_cd.get("storefrontHiddenSections") == ["coupons", "hot"], theme_cd
+        assert theme_cd.get("storefrontDisabledFeatures") == ["scan", "home"], theme_cd
+        banners = theme_cd.get("storefrontBanners") or []
+        assert len(banners) == 1, banners  # duplicate id, empty and junk rows dropped
+        b = banners[0]
+        assert b["title"] == {"zh": "你好", "es": "Hola"}, b
+        assert b["style"] == "brand" and b["link"] == "" and b["validFrom"] == "2026-11-01" and b["validUpto"] == "", b
+        branding = (sui.get_shop_ui_settings() or {}).get("branding")
+        assert isinstance(branding, dict) and "companyName" in branding and "companyLogo" in branding, branding
+        sui.save_shop_ui_settings(
+            {
+                "catalogDisplay": {
+                    "storefrontTitle": "",
+                    "storefrontAccentColor": "",
+                    "storefrontAccent2Color": "",
+                    "storefrontHeaderStyle": "light",
+                    "storefrontSearchHints": [],
+                    "storefrontHiddenSections": [],
+                    "storefrontDisabledFeatures": [],
+                    "storefrontBanners": [],
+                    "storefrontRadius": "soft",
+                    "storefrontFont": "brand",
+                }
+            }
         )
         out2 = sui.save_shop_ui_settings({"catalogDisplay": {"catalogTemplate": "classic"}})
         settings2 = (out2 or {}).get("settings") or {}

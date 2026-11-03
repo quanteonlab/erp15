@@ -73,6 +73,7 @@ after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields.ensure_argentina_iva_conditions",
 	"erpnext.erpnext_integrations.ecommerce_api.api.ensure_guest_preorder_status_options",
 	"erpnext.erpnext_integrations.ecommerce_api.buying_api.ensure_po_invoice_ref_field",
+	"erpnext.erpnext_integrations.ecommerce_api.coupons_api.ensure_coupon_custom_fields",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"

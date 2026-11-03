@@ -242,6 +242,22 @@
       "note": "Partial/dirty cart lines from offline Flutter sync"
     },
     {
+      "id": "create_pos_sale_caja_total_authoritative",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_pos_sale",
+      "args": {
+        "offline_order_uuid": "edge-caja-auth",
+        "receipt_number": "EDGE-CAJA",
+        "items": null,
+        "total_amount": "15600",
+        "payment_method": "Cash",
+        "sale_mode": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "MAIN-4868… Flutter $15600 vs registers $14820 (5% online Pricing Rule). create_pos_sale must ignore_pricing_rule so caja total is money earned; online rules sync down to POS only. Happy-path covered by smoke 5.5.4.",
+      "note": "Dirty/null items still controlled; authority contract is smoke 5.5.4"
+    },
+    {
       "id": "validate_discount_pin_wrong_when_configured",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.validate_discount_pin",
       "args": {
@@ -973,6 +989,232 @@
           }
         }
       },
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_catalog_template_storefront",
+      "source": "regression",
+      "bug": "save_shop_ui_settings must keep catalogDisplay.catalogTemplate=storefront (new public shop template); an unknown value used to snap back to nova_mobile",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {
+        "settings": {
+          "catalogDisplay": {
+            "catalogTemplate": "storefront"
+          }
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_storefront_theme_dirty_values",
+      "source": "regression",
+      "bug": "storefront theme fields come from free-text inputs: non-string title, malformed hex, javascript: logo and unknown radius/font must normalize to defaults instead of crashing or being stored",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {
+        "settings": {
+          "catalogDisplay": {
+            "storefrontTitle": 12345,
+            "storefrontLogoUrl": "javascript:alert(1)",
+            "storefrontAccentColor": "#12",
+            "storefrontBackgroundColor": null,
+            "storefrontSurfaceColor": {"x": 1},
+            "storefrontTextColor": "red",
+            "storefrontRadius": ["round"],
+            "storefrontFont": 7
+          }
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_storefront_home_dirty_values",
+      "source": "regression",
+      "bug": "storefront home settings come from free text/arrays: a string instead of a list, nested lists, non-string hints and an unknown header style must normalize to defaults instead of crashing",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {
+        "settings": {
+          "catalogDisplay": {
+            "storefrontHeaderStyle": 5,
+            "storefrontAccent2Color": ["#fff"],
+            "storefrontPriceColor": {"c": "#fff"},
+            "storefrontSearchHints": "queso",
+            "storefrontHiddenSections": [["coupons"], null, 7]
+          }
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_storefront_banners_dirty_rows",
+      "source": "regression",
+      "bug": "storefrontBanners is an admin-edited array of objects: non-list, non-dict rows, nested/odd i18n values, a javascript: link and bad dates must be dropped or blanked instead of crashing or being stored",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {
+        "settings": {
+          "catalogDisplay": {
+            "storefrontBanners": [
+              null,
+              5,
+              "x",
+              {"id": 7, "title": "not a dict", "link": 9, "style": ["brand"]},
+              {"id": "ok", "title": {"zh": 123, "es": ["a"]}, "image": "javascript:1", "validFrom": 20261101},
+              {"id": "ok2", "title": {"zh": "t"}, "subtitle": null, "cta": 5, "link": "//evil.example", "validUpto": "2026-02-30"}
+            ]
+          }
+        }
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_storefront_banners_not_a_list",
+      "source": "regression",
+      "bug": "storefrontBanners sent as a string/object (stale client) must normalize to an empty list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {"settings": {"catalogDisplay": {"storefrontBanners": "oops"}}},
+      "expect": "ok"
+    },
+    {
+      "id": "upload_storefront_banner_dirty_filedata",
+      "source": "regression",
+      "bug": "upload_storefront_banner must refuse (controlled error) a missing/garbage payload and any caller without an acting staff user, never crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.upload_storefront_banner",
+      "args": {"filedata": "!!!not-base64!!!"},
+      "expect": "fail"
+    },
+    {
+      "id": "save_coupon_dirty_kind_and_value",
+      "source": "regression",
+      "bug": "save_coupon takes free-text admin input: a non-string code, list kind and non-numeric value must be a controlled ValidationError, never a TypeError or a half-created Pricing Rule",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.coupons_api.save_coupon",
+      "args": {"data": {"code": 123, "kind": ["percent"], "value": "abc"}},
+      "expect": "fail"
+    },
+    {
+      "id": "save_coupon_percent_over_100",
+      "source": "regression",
+      "bug": "a percentage coupon above 100% must be rejected before any Pricing Rule is created",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.coupons_api.save_coupon",
+      "args": {"data": {"code": "EDGE-BAD", "kind": "percent", "value": 150}},
+      "expect": "fail"
+    },
+    {
+      "id": "save_coupon_null_data",
+      "source": "regression",
+      "bug": "save_coupon(None) (stale offline-outbox replay) must be a controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.coupons_api.save_coupon",
+      "args": {"data": null},
+      "expect": "fail"
+    },
+    {
+      "id": "delete_coupon_unknown",
+      "source": "regression",
+      "bug": "deleting a coupon that does not exist (already deleted from another tab) must be a controlled DoesNotExistError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.coupons_api.delete_coupon",
+      "args": {"name": "EDGE-NOT-THERE"},
+      "expect": "fail"
+    },
+    {
+      "id": "set_coupon_disabled_null_name",
+      "source": "regression",
+      "bug": "cancelling a coupon with a null name must be a controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.coupons_api.set_coupon_disabled",
+      "args": {"name": null},
+      "expect": "fail"
+    },
+    {
+      "id": "validate_coupon_code_dirty_args",
+      "source": "regression",
+      "bug": "the guest coupon validator gets whatever a stale client sends (list code, non-numeric subtotal): it must answer valid=false, not crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.validate_coupon_code",
+      "args": {"coupon_code": ["a"], "subtotal": "abc"},
+      "expect": "ok"
+    },
+    {
+      "id": "create_guest_preorder_coupon_with_missing_item",
+      "source": "regression",
+      "bug": "a coupon_code on an order whose item no longer exists must fail as a controlled 'Item(s) not found', before any coupon logic runs",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {"items": [{"item_code": "__missing_edge_item__", "qty": 1, "rate": 10}], "coupon_code": "EDGE"},
+      "expect": "fail"
+    },
+    {
+      "id": "save_shop_ui_delivery_fields_dirty",
+      "source": "regression",
+      "bug": "deliveryBaseFee/deliveryEnabled come from a text box and a checkbox: NaN, negatives, huge numbers, lists and strings must normalize to a safe fee, never crash or store garbage",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {"settings": {"catalogDisplay": {"deliveryEnabled": "yes", "deliveryBaseFee": ["1000"]}}},
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_delivery_fee_negative_and_huge",
+      "source": "regression",
+      "bug": "a negative or astronomically large deliveryBaseFee must be clamped (0 .. 10,000,000)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {"settings": {"catalogDisplay": {"deliveryEnabled": false, "deliveryBaseFee": -50}}},
+      "expect": "ok"
+    },
+    {
+      "id": "get_delivery_quote_dirty_subtotal",
+      "source": "regression",
+      "bug": "the guest quote endpoint receives whatever a stale client sends as subtotal (string, null, list)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.delivery_promos.get_delivery_quote",
+      "args": {"subtotal": ["abc"]},
+      "expect": "ok"
+    },
+    {
+      "id": "get_delivery_quote_null_subtotal",
+      "source": "regression",
+      "bug": "get_delivery_quote(None) must quote on a 0 subtotal",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.delivery_promos.get_delivery_quote",
+      "args": {"subtotal": null},
+      "expect": "ok"
+    },
+    {
+      "id": "save_delivery_promo_bad_kind",
+      "source": "regression",
+      "bug": "save_delivery_promo with a non-string/unknown kind must be a controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.delivery_promos.save_delivery_promo",
+      "args": {"data": {"kind": ["free_over"], "threshold": "abc"}},
+      "expect": "fail"
+    },
+    {
+      "id": "save_delivery_promo_free_without_threshold",
+      "source": "regression",
+      "bug": "'free over' without an amount would make delivery free for every order; it must be rejected",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.delivery_promos.save_delivery_promo",
+      "args": {"data": {"kind": "free_over", "threshold": 0}},
+      "expect": "fail"
+    },
+    {
+      "id": "save_delivery_promo_null_data",
+      "source": "regression",
+      "bug": "save_delivery_promo(None) (stale outbox replay) must be a controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.delivery_promos.save_delivery_promo",
+      "args": {"data": null},
+      "expect": "fail"
+    },
+    {
+      "id": "delete_delivery_promo_unknown",
+      "source": "regression",
+      "bug": "deleting a promo that is already gone must be a controlled DoesNotExistError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.delivery_promos.delete_delivery_promo",
+      "args": {"id": "EDGE-NOT-THERE"},
+      "expect": "fail"
+    },
+    {
+      "id": "save_shop_ui_storefront_disabled_features_dirty",
+      "source": "regression",
+      "bug": "storefrontDisabledFeatures is an admin checkbox list: a bare string, nested lists, null/number items and unknown ids must normalize to a clean list (or empty), never crash",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {"settings": {"catalogDisplay": {"storefrontDisabledFeatures": [["scan"], null, 5, "bogus", "coupons"]}}},
+      "expect": "ok"
+    },
+    {
+      "id": "save_shop_ui_storefront_disabled_features_not_a_list",
+      "source": "regression",
+      "bug": "storefrontDisabledFeatures sent as a string (stale client) must normalize to an empty list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings.save_shop_ui_settings",
+      "args": {"settings": {"catalogDisplay": {"storefrontDisabledFeatures": "scan"}}},
       "expect": "ok"
     },
     {

@@ -160,6 +160,12 @@ def get_products(
 	if not filters:
 		filters = {}
 
+	# System service items (the delivery-fee line) are never part of any catalog.
+	if "item_code" not in filters and "name" not in filters:
+		from erpnext.erpnext_integrations.ecommerce_api.delivery_promos import DELIVERY_ITEM_CODE
+
+		filters["item_code"] = ["not in", [DELIVERY_ITEM_CODE]]
+
 	# Convert string parameters to int
 	start = cint(start)
 	page_length = cint(page_length)
@@ -782,9 +788,13 @@ def get_active_promotions(price_list=None):
 	if has_flash_field:
 		base_fields += ["flash_sale"]
 
+	rule_filters = {"disable": 0, "selling": 1}
+	if frappe.db.has_column("Pricing Rule", "coupon_code_based"):
+		# Coupon rules only apply when their code is redeemed — never automatically, never in the public catalog.
+		rule_filters["coupon_code_based"] = 0
 	rules = frappe.get_all(
 		"Pricing Rule",
-		filters={"disable": 0, "selling": 1},
+		filters=rule_filters,
 		fields=base_fields,
 		ignore_permissions=True,
 	)
@@ -1049,6 +1059,8 @@ def list_pricing_rules(include_disabled=1, price_list=None):
 	filters = {"selling": 1}
 	if not cint(include_disabled):
 		filters["disable"] = 0
+	if frappe.db.has_column("Pricing Rule", "coupon_code_based"):
+		filters["coupon_code_based"] = 0  # coupons have their own list (coupons_api.list_coupons)
 
 	rules = frappe.get_all(
 		"Pricing Rule",
@@ -2059,55 +2071,40 @@ def _get_bundles_containing_item(item_code, price_list=None, include_inactive=0)
 
 
 @frappe.whitelist(allow_guest=True)
-def validate_coupon_code(coupon_code):
+def validate_coupon_code(coupon_code, subtotal=None):
 	"""
 	Check whether a coupon code is valid and return its discount details.
-	Does NOT consume the coupon (that happens at invoice submit via apply_pricing_rule).
+	Does NOT consume the coupon (ERPNext counts the use when the Sales Order is submitted).
+
+	With ``subtotal`` it also checks the minimum order and returns the server-computed ``discount``.
+	``reason`` (unknown | disabled | not_started | expired | exhausted | min_amount) lets clients show a
+	localized message; ``message`` stays Spanish for the POS box.
 
 	Returns:
-		{valid, message, discount_percentage, discount_amount, free_item, coupon_name}
+		{valid, reason, message, discount_percentage, discount_amount, free_item, coupon_name, code, kind, value,
+		 min_amount, [discount]}
 	"""
-	if not coupon_code:
-		return {"valid": False, "message": "Ingresá un código de cupón"}
+	if not cstr(coupon_code).strip():
+		return {"valid": False, "reason": "empty", "message": "Ingresá un código de cupón"}
 
-	doc = frappe.db.get_value(
-		"Coupon Code",
-		{"coupon_code": coupon_code},
-		["name", "pricing_rule", "maximum_use", "used", "customer"],
-		as_dict=True,
+	from erpnext.erpnext_integrations.ecommerce_api.coupons_api import (
+		compute_coupon_discount,
+		throttle_coupon_attempts,
 	)
 
-	if not doc:
-		return {"valid": False, "message": "Cupón no encontrado"}
-
-	max_use = cint(doc.get("maximum_use") or 0)
-	used = cint(doc.get("used") or 0)
-	if max_use and used >= max_use:
-		return {"valid": False, "message": "Cupón agotado — ya se usó el máximo de veces"}
-
-	if not doc.get("pricing_rule"):
-		return {"valid": False, "message": "Cupón sin regla de descuento configurada"}
-
-	try:
-		rule = frappe.get_doc("Pricing Rule", doc["pricing_rule"])
-	except frappe.DoesNotExistError:
-		return {"valid": False, "message": "Regla de descuento no encontrada"}
-
-	# Check rule date validity
-	today = getdate(nowdate())
-	if rule.valid_from and getdate(rule.valid_from) > today:
-		return {"valid": False, "message": "Cupón todavía no está activo"}
-	if rule.valid_upto and getdate(rule.valid_upto) < today:
-		return {"valid": False, "message": "Cupón vencido"}
-
-	return {
-		"valid": True,
-		"coupon_name": doc["name"],
-		"discount_percentage": flt(rule.discount_percentage or 0),
-		"discount_amount": flt(rule.discount_amount or 0),
-		"free_item": rule.free_item or None,
-		"message": f"Cupón válido — {rule.title or rule.name}",
-	}
+	throttle_coupon_attempts()
+	res = compute_coupon_discount(coupon_code, None if subtotal in (None, "") else flt(subtotal))
+	if not res.get("valid"):
+		messages = {
+			"unknown": "Cupón no encontrado",
+			"disabled": "Cupón cancelado",
+			"not_started": "Cupón todavía no está activo",
+			"expired": "Cupón vencido",
+			"exhausted": "Cupón agotado — ya se usó el máximo de veces",
+			"min_amount": "El pedido no alcanza el mínimo para este cupón",
+		}
+		return {**res, "message": messages.get(res.get("reason"), "Cupón no válido")}
+	return {**res, "message": f"Cupón válido — {res.get('title') or res.get('coupon_name')}"}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -5284,7 +5281,10 @@ def _guest_preorder_line_amount(row) -> float:
 
 def _guest_preorder_estimated_total(so) -> float:
 	total = sum(_guest_preorder_line_amount(d) for d in (so.items or []))
-	return max(flt(total) - flt(getattr(so, "additional_discount_amount", None) or 0), 0.0)
+	# Document-level discount. ERPNext's own field is `discount_amount` (storefront coupons set it);
+	# `additional_discount_amount` is the name the staff-edit path uses, so honour whichever is set.
+	disc = flt(getattr(so, "additional_discount_amount", None) or 0) or flt(getattr(so, "discount_amount", None) or 0)
+	return max(flt(total) - disc, 0.0)
 
 
 def _calculate_guest_preorder_totals(so):
@@ -5459,6 +5459,7 @@ def create_guest_preorder(
 	pin_allowed_countries=None,
 	send_client_pin=1,
 	initial_status=None,
+	coupon_code=None,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -5473,6 +5474,10 @@ def create_guest_preorder(
 	a repeat order placed from the client tracking portal for a known
 	customer) - default behaviour (anonymous guest -> "Consumidor Final") is
 	unchanged when omitted.
+
+	``coupon_code``: optional storefront coupon. Re-validated here against the order subtotal (the client
+	never sends an amount); sets ``Sales Order.coupon_code`` + ``discount_amount`` and a
+	``coupon:CODE`` tag. ERPNext counts the use when staff submit the order.
 
 	``initial_status``: optional pipeline status after create. Default leaves
 	the SO as Consulta (draft). Pass ``Orden`` (e.g. Operaciones → Orden page)
@@ -5682,6 +5687,46 @@ def create_guest_preorder(
 	if resolved_rows:
 		_calculate_guest_preorder_totals(so)
 
+	coupon_applied = None
+	if cstr(coupon_code).strip() and resolved_rows:
+		from erpnext.erpnext_integrations.ecommerce_api.coupons_api import compute_coupon_discount
+
+		res = compute_coupon_discount(coupon_code, _guest_preorder_estimated_total(so))
+		if not res.get("valid"):
+			frappe.throw(
+				_("Coupon {0} cannot be applied ({1})").format(cstr(coupon_code).strip(), res.get("reason") or "invalid"),
+				frappe.ValidationError,
+			)
+		so.coupon_code = res["coupon_name"]
+		so.apply_discount_on = "Grand Total"
+		so.discount_amount = flt(res["discount"])  # ERPNext's document-level "Additional Discount Amount"
+		_calculate_guest_preorder_totals(so)
+		so.set(tag_fn, f"{so.get(tag_fn) or ''} | coupon:{res['code']}".strip(" |"))
+		coupon_applied = {"code": res["code"], "discount": flt(res["discount"])}
+
+	delivery_applied = None
+	if cint(is_delivery) and resolved_rows:
+		from erpnext.erpnext_integrations.ecommerce_api.delivery_promos import (
+			DELIVERY_ITEM_CODE,
+			compute_delivery_quote,
+			ensure_delivery_item,
+		)
+
+		# Threshold = what the customer pays for the goods (after any coupon); the fee itself is never client-supplied.
+		quote = compute_delivery_quote(_guest_preorder_estimated_total(so))
+		if quote.get("enabled"):
+			fee = flt(quote["fee"])
+			if fee > 0:
+				ensure_delivery_item()
+				so.append(
+					"items",
+					{"item_code": DELIVERY_ITEM_CODE, "qty": 1, "rate": fee, "delivery_date": so.delivery_date},
+				)
+				_calculate_guest_preorder_totals(so)
+			promo_tag = f" | delivery_promo:{quote['promo_id']}" if quote.get("promo_id") else ""
+			so.set(tag_fn, f"{so.get(tag_fn) or ''} | delivery_fee:{fee:g}{promo_tag}".strip(" |"))
+			delivery_applied = {"fee": fee, "base_fee": flt(quote["base_fee"]), "promo_id": quote.get("promo_id") or ""}
+
 	# Save as Draft (Consulta). Stamp the acting cashier so Pedidos propios can match.
 	if acting and frappe.db.exists("User", acting):
 		so.owner = acting
@@ -5787,6 +5832,10 @@ def create_guest_preorder(
 		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
 		"side_effects_queued": True,
 	}
+	if coupon_applied:
+		payload["coupon"] = coupon_applied
+	if delivery_applied:
+		payload["delivery"] = delivery_applied
 	if want_orden and resolved_rows:
 		payload["display_status"] = "Orden"
 		# Remito not ready yet — planner will pick it up after the background job.
@@ -6486,7 +6535,8 @@ def get_guest_preorder(preorder_name):
 		"currency": so.currency,
 		"remarks": getattr(so, "remarks", None),
 		"terms": getattr(so, "terms", None),
-		"additional_discount_amount": flt(getattr(so, "additional_discount_amount", 0)),
+		"additional_discount_amount": flt(getattr(so, "additional_discount_amount", 0))
+		or flt(getattr(so, "discount_amount", 0)),
 		"advance_paid": flt(getattr(so, "advance_paid", 0)),
 		"amended_from": so.amended_from or None,
 		"delivery_note": _delivery_note_for_sales_order(preorder_name),
@@ -11610,7 +11660,8 @@ def create_pos_sale(
 		offline_order_uuid (str): Client-generated UUID used as idempotency key.
 		receipt_number (str): Human-readable receipt number (e.g. MAIN-A1B2-20260311-0042).
 		items (list[dict]): List of {item_code, item_name, qty, rate, amount}.
-		total_amount (float): Expected grand total — validated against computed invoice total.
+		total_amount (float): Caja/POS grand total — authoritative money earned.
+			Server must not re-apply Pricing Rules; online rules sync *down* to POS only.
 		payment_method (str): Mode of payment when `payments` is omitted (Cash / Card / Mobile Money).
 		payments (list[dict]): Optional split: [{mode_of_payment|method, amount, cash_received?}].
 		cash_received (float): Cash tendered by the customer (for change / audit).
@@ -11770,6 +11821,8 @@ def create_pos_sale(
 			}
 		)
 
+	# Caja rates/totals win. Online Pricing Rules must not rewrite the ticket on
+	# sync — they only matter when pushed down to POS endpoints for local use.
 	invoice = frappe.get_doc(
 		{
 			"doctype": "Sales Invoice",
@@ -11777,17 +11830,19 @@ def create_pos_sale(
 			"company": company,
 			"is_pos": 0,
 			"is_return": is_return,
+			"ignore_pricing_rule": 1,
 			"posting_date": nowdate(),
 			"due_date": nowdate(),
 			"remarks": remarks_tag,
 			"items": invoice_items,
 		}
 	)
+	invoice.flags.ignore_pricing_rule = True
 
 	invoice.set_missing_values()
 	invoice.calculate_taxes_and_totals()
 
-	# ── Validate grand total matches client expectation (within 1 unit rounding) ──
+	# ── Validate grand total matches caja expectation (within 1 unit rounding) ──
 	# Credit notes have a negative grand_total; client still sends a positive total.
 	server_total = abs(flt(invoice.grand_total))
 	client_total = abs(flt(total_amount))

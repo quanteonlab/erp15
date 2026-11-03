@@ -4489,6 +4489,15 @@ def save_shop_ui_settings(settings=None):
 
 
 @frappe.whitelist()
+def upload_storefront_banner(filedata=None):
+    from erpnext.erpnext_integrations.ecommerce_api.shop_ui_settings import (
+        upload_storefront_banner as _impl,
+    )
+
+    return _impl(filedata=filedata)
+
+
+@frappe.whitelist()
 def get_company_settings(company=None):
     from erpnext.erpnext_integrations.ecommerce_api.company_settings import (
         get_company_settings as _impl,
