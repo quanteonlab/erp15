@@ -12030,3 +12030,182 @@ def driver_upload_stop_photo(trip_name, stop_idx, image_base64):
 	frappe.db.commit()
 
 	return get_trip_map_data(trip_name)
+
+
+@frappe.whitelist(allow_guest=True)
+def search_vehicles(q=None, limit=20):
+	"""Vehicle autocomplete for Receiving returns mode (plate / name)."""
+	limit = max(1, min(50, cint(limit) or 20))
+	q = cstr(q or "").strip()
+	filters = {}
+	or_filters = None
+	if q:
+		like = f"%{q}%"
+		or_filters = [
+			["license_plate", "like", like],
+			["name", "like", like],
+			["make", "like", like],
+			["model", "like", like],
+		]
+	rows = frappe.get_all(
+		"Vehicle",
+		filters=filters,
+		or_filters=or_filters,
+		fields=["name", "license_plate", "make", "model"],
+		order_by="license_plate asc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	return {
+		"vehicles": [
+			{
+				"name": r.name,
+				"license_plate": r.license_plate or r.name,
+				"make": r.make,
+				"model": r.model,
+				"label": " · ".join(
+					p
+					for p in [
+						cstr(r.license_plate or r.name).strip(),
+						(
+							" ".join(x for x in [cstr(r.make), cstr(r.model)] if x).strip()
+							or None
+						),
+					]
+					if p
+				),
+			}
+			for r in (rows or [])
+		]
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_pending_vehicle_returns(vehicle=None, days=30):
+	"""Aggregate Mobile Return Capture lines for trips of ``vehicle`` not yet warehouse-received.
+
+	Used by Recepción → Devoluciones: pick a car, see products pending to put back in stock.
+	"""
+	vehicle = cstr(vehicle or "").strip()
+	if not vehicle or vehicle.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Vehicle is required."))
+	if not frappe.db.exists("Vehicle", vehicle):
+		by_plate = frappe.db.get_value("Vehicle", {"license_plate": vehicle}, "name")
+		if by_plate:
+			vehicle = by_plate
+		else:
+			frappe.throw(_("Vehicle {0} not found").format(vehicle), frappe.DoesNotExistError)
+
+	if not frappe.db.exists("DocType", "Mobile Return Capture"):
+		return {"vehicle": vehicle, "items": [], "captures": []}
+
+	days = max(1, min(180, cint(days) or 30))
+	since = frappe.utils.add_days(frappe.utils.nowdate(), -days)
+	trips = frappe.get_all(
+		"Delivery Trip",
+		filters={"vehicle": vehicle, "modified": [">=", since]},
+		pluck="name",
+		ignore_permissions=True,
+	)
+	if not trips:
+		return {
+			"vehicle": vehicle,
+			"license_plate": frappe.db.get_value("Vehicle", vehicle, "license_plate") or vehicle,
+			"items": [],
+			"captures": [],
+		}
+
+	has_wh = frappe.db.has_column("Mobile Return Capture", "warehouse_received")
+	filters = {"delivery_trip": ["in", trips]}
+	if has_wh:
+		filters["warehouse_received"] = 0
+
+	caps = frappe.get_all(
+		"Mobile Return Capture",
+		filters=filters,
+		fields=["name", "delivery_trip", "stop_idx", "customer", "captured_at", "status", "notes"],
+		order_by="captured_at desc",
+		ignore_permissions=True,
+	)
+
+	agg = {}
+	captures_out = []
+	for cap in caps or []:
+		frappe.flags.ignore_permissions = True
+		try:
+			doc = frappe.get_doc("Mobile Return Capture", cap.name)
+		except Exception:
+			continue
+		finally:
+			frappe.flags.ignore_permissions = False
+		cap_lines = []
+		for row in doc.lines or []:
+			qty = flt(row.qty)
+			if qty <= 0:
+				continue
+			code = cstr(row.item_code or "").strip()
+			if not code:
+				continue
+			name = cstr(row.description or "").strip() or code
+			cap_lines.append(
+				{"item_code": code, "item_name": name, "qty": qty, "reason": cstr(row.reason or "")}
+			)
+			bucket = agg.get(code)
+			if not bucket:
+				agg[code] = {
+					"item_code": code,
+					"item_name": name,
+					"qty": qty,
+					"capture_names": [cap.name],
+				}
+			else:
+				bucket["qty"] = flt(bucket["qty"]) + qty
+				if cap.name not in bucket["capture_names"]:
+					bucket["capture_names"].append(cap.name)
+		if not cap_lines:
+			continue
+		captures_out.append(
+			{
+				"name": cap.name,
+				"delivery_trip": cap.delivery_trip,
+				"stop_idx": cint(cap.stop_idx),
+				"customer": cap.customer,
+				"captured_at": cap.captured_at,
+				"status": cap.status,
+				"notes": cap.notes,
+				"lines": cap_lines,
+			}
+		)
+
+	items = sorted(agg.values(), key=lambda r: cstr(r.get("item_name") or r.get("item_code")))
+	return {
+		"vehicle": vehicle,
+		"license_plate": frappe.db.get_value("Vehicle", vehicle, "license_plate") or vehicle,
+		"items": items,
+		"captures": captures_out,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def mark_vehicle_returns_received(capture_names=None):
+	"""Mark Mobile Return Capture docs as warehouse-received after Recepción commit."""
+	if isinstance(capture_names, str):
+		capture_names = frappe.parse_json(capture_names)
+	if not isinstance(capture_names, list) or not capture_names:
+		frappe.throw(_("capture_names is required."))
+	if not frappe.db.exists("DocType", "Mobile Return Capture"):
+		return {"ok": True, "updated": []}
+	if not frappe.db.has_column("Mobile Return Capture", "warehouse_received"):
+		return {"ok": True, "updated": [], "skipped": "no warehouse_received column — run migrate"}
+
+	updated = []
+	for raw in capture_names:
+		name = cstr(raw or "").strip()
+		if not name or not frappe.db.exists("Mobile Return Capture", name):
+			continue
+		frappe.db.set_value(
+			"Mobile Return Capture", name, "warehouse_received", 1, update_modified=True
+		)
+		updated.append(name)
+	frappe.db.commit()
+	return {"ok": True, "updated": updated}

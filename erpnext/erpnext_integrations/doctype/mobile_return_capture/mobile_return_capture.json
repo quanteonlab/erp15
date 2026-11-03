@@ -19,6 +19,7 @@
   "debit_note",
   "delivery_note_return",
   "process_error",
+  "warehouse_received",
   "section_break_2",
   "lines",
   "notes",
@@ -119,6 +120,13 @@
    "fieldtype": "Small Text",
    "label": "Process Error",
    "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "warehouse_received",
+   "fieldtype": "Check",
+   "in_standard_filter": 1,
+   "label": "Warehouse Received"
   },
   {
    "fieldname": "section_break_2",

@@ -692,22 +692,32 @@ def apply_pending_customer_suggestion(customer_name: str) -> dict | None:
 	"""Apply a queued Customer suggestion (admin Revisar confirm)."""
 	name = cstr(customer_name or "").strip()
 	sug = get_pending_customer_suggestion(name)
-	if not sug:
-		return None
-	change = sug.get("change") if isinstance(sug.get("change"), dict) else {}
-	if not change:
+	lead_name = cstr(frappe.db.get_value("Customer", name, "lead_name") or "").strip()
+
+	change = sug.get("change") if isinstance(sug, dict) and isinstance(sug.get("change"), dict) else {}
+	if sug and change:
+		from erpnext.erpnext_integrations.ecommerce_api import api as guest_api
+
+		frappe.flags.applying_creation_review_suggestion = True
+		try:
+			guest_api.update_customer(name, **change)
+		finally:
+			frappe.flags.applying_creation_review_suggestion = False
 		clear_pending_customer_suggestion(name)
-		return None
+	elif sug:
+		clear_pending_customer_suggestion(name)
 
-	from erpnext.erpnext_integrations.ecommerce_api import api as guest_api
+	# Preventa Cliente drawer may have queued Lead field patches alongside.
+	if lead_name:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api import preventa_api as pa
 
-	frappe.flags.applying_creation_review_suggestion = True
-	try:
-		guest_api.update_customer(name, **change)
-	finally:
-		frappe.flags.applying_creation_review_suggestion = False
+			lead_sug = pa.apply_pending_lead_suggestion(lead_name)
+			if lead_sug and not sug:
+				sug = lead_sug
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "apply pending lead suggestion")
 
-	clear_pending_customer_suggestion(name)
 	return sug
 
 
@@ -1041,6 +1051,14 @@ def delete_creation_review(kind=None, name=None):
 		):
 			_assert_can_decide_seller_suggestion(sug)
 			clear_pending_customer_suggestion(name)
+			lead_name = cstr(frappe.db.get_value("Customer", name, "lead_name") or "").strip()
+			if lead_name:
+				try:
+					from erpnext.erpnext_integrations.ecommerce_api import preventa_api as pa
+
+					pa.clear_pending_lead_suggestion(lead_name)
+				except Exception:
+					frappe.log_error(frappe.get_traceback(), "clear pending lead suggestion")
 			if frappe.db.has_column("Customer", FIELDNAME):
 				frappe.db.set_value("Customer", name, FIELDNAME, STATUS_CONFIRMED)
 			frappe.db.commit()

@@ -982,6 +982,233 @@ def save_board_columns(columns, owner_user=None):
 	return {"ok": True, "columns": columns}
 
 
+def _lead_is_client(doc) -> bool:
+	"""Converted / Cliente column — live field edits must go through suggestion."""
+	if not doc:
+		return False
+	if cstr(getattr(doc, "status", None) or "") == "Converted":
+		return True
+	stage = cstr(getattr(doc, "custom_preventa_stage", None) or "").strip().lower()
+	if stage in ("customer", "cliente", "won", "client"):
+		return True
+	# Linked Customer (Opportunity / Customer.lead_name).
+	name = cstr(getattr(doc, "name", None) or "").strip()
+	if name and frappe.db.exists("Customer", {"lead_name": name}):
+		return True
+	return False
+
+
+def _normalize_lead_suggestion_values(values) -> dict:
+	"""Keep only known Preventa lead field ids with non-empty string values."""
+	import json as _json
+
+	if values is None or values == "":
+		return {}
+	if isinstance(values, str):
+		raw = values.strip()
+		if not raw or raw.lower() in ("null", "undefined", "none"):
+			return {}
+		try:
+			values = _json.loads(raw)
+		except Exception:
+			frappe.throw(_("Invalid lead suggestion values JSON"), frappe.ValidationError)
+	if not isinstance(values, dict):
+		frappe.throw(_("values must be an object"), frappe.ValidationError)
+	out = {}
+	for fid in LEAD_FIELD_MAP:
+		if fid not in values:
+			continue
+		val = values.get(fid)
+		if val is None:
+			continue
+		s = cstr(val).strip()
+		if s.lower() in ("null", "undefined"):
+			continue
+		out[fid] = s
+	return out
+
+
+def _customer_for_lead(lead_name: str) -> str | None:
+	lead_name = cstr(lead_name or "").strip()
+	if not lead_name:
+		return None
+	cust = frappe.db.get_value("Customer", {"lead_name": lead_name}, "name")
+	return cstr(cust or "").strip() or None
+
+
+def _lead_values_to_customer_change(values: dict) -> dict:
+	"""Map Preventa lead field ids → Customer suggestion keys."""
+	out = {}
+	if "lead_name" in values and values.get("lead_name"):
+		out["customer_name"] = values["lead_name"]
+	elif "company_name" in values and values.get("company_name"):
+		out["customer_name"] = values["company_name"]
+	if "mobile_no" in values:
+		out["mobile_no"] = values["mobile_no"]
+	if "phone" in values:
+		out["phone"] = values["phone"]
+	if "address_line1" in values:
+		out["address_line1"] = values["address_line1"]
+	if "territory" in values:
+		out["territory"] = values["territory"]
+	# Compose a richer address line when only place parts change.
+	place_parts = [
+		values.get("address_line1"),
+		values.get("city"),
+		values.get("state"),
+		values.get("pincode"),
+		values.get("country"),
+	]
+	if any(place_parts[1:]) and "address_line1" not in out:
+		composed = ", ".join(cstr(p).strip() for p in place_parts if cstr(p or "").strip())
+		if composed:
+			out["address_line1"] = composed
+	return out
+
+
+LEAD_SUGGESTION_KV_SCOPE = "preventa.lead.suggestion"
+
+
+def get_pending_lead_suggestion(lead_name: str) -> dict | None:
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	name = cstr(lead_name or "").strip()
+	if not name:
+		return None
+	_doc, data = kv_get(LEAD_SUGGESTION_KV_SCOPE, name)
+	if not isinstance(data, dict):
+		return None
+	change = data.get("change")
+	if not isinstance(change, dict) or not change:
+		return None
+	if cstr(data.get("status") or "pending").lower() == "rejected":
+		clear_pending_lead_suggestion(name)
+		frappe.db.commit()
+		return None
+	return data
+
+
+def clear_pending_lead_suggestion(lead_name: str) -> bool:
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	name = cstr(lead_name or "").strip()
+	if not name:
+		return False
+	docname, _ = kv_get(LEAD_SUGGESTION_KV_SCOPE, name)
+	if not docname:
+		return False
+	frappe.delete_doc("Table Extra Data", docname, ignore_permissions=True)
+	return True
+
+
+def apply_pending_lead_suggestion(lead_name: str) -> dict | None:
+	"""Apply queued Lead field suggestion (Revisar confirm on linked Customer)."""
+	name = cstr(lead_name or "").strip()
+	sug = get_pending_lead_suggestion(name)
+	if not sug:
+		return None
+	change = sug.get("change") if isinstance(sug.get("change"), dict) else {}
+	if not change:
+		clear_pending_lead_suggestion(name)
+		return None
+	if not frappe.db.exists("Lead", name):
+		clear_pending_lead_suggestion(name)
+		return None
+
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Lead", name)
+	frappe.flags.ignore_permissions = False
+	frappe.flags.applying_creation_review_suggestion = True
+	try:
+		_apply_lead_values(doc, change)
+		doc.flags.ignore_permissions = True
+		doc.save(ignore_permissions=True)
+	finally:
+		frappe.flags.applying_creation_review_suggestion = False
+
+	clear_pending_lead_suggestion(name)
+	return sug
+
+
+@frappe.whitelist(allow_guest=True)
+@idempotent_request
+def suggest_lead_change(lead=None, values=None):
+	"""Queue Lead field edits for a Converted/Cliente card without mutating live docs.
+
+	Parks the linked Customer in Revisar (``custom_creation_review=Pending``) and
+	stores the Lead patch + mapped Customer fields for admin confirm.
+	"""
+	ensure_preventa_custom_fields()
+	lead = cstr(lead or "").strip()
+	if not lead:
+		frappe.throw(_("Lead is required"), frappe.ValidationError)
+	if not frappe.db.exists("Lead", lead):
+		frappe.throw(_("Lead {0} not found").format(lead), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Lead", lead)
+	frappe.flags.ignore_permissions = False
+	_require_owner_or_crm(doc.lead_owner)
+
+	if not _lead_is_client(doc):
+		frappe.throw(
+			_("Live edit is allowed until the lead becomes a client — use upsert_lead"),
+			frappe.ValidationError,
+		)
+
+	norm = _normalize_lead_suggestion_values(values)
+	if not norm:
+		frappe.throw(_("Suggestion change is empty"), frappe.ValidationError)
+
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+	from erpnext.erpnext_integrations.ecommerce_api import creation_review_api as cr
+
+	actor = _acting_user()
+	prev = get_pending_lead_suggestion(lead) or {}
+	prev_change = prev.get("change") if isinstance(prev.get("change"), dict) else {}
+	merged = dict(prev_change)
+	merged.update(norm)
+
+	payload = {
+		"change": merged,
+		"actor": actor,
+		"reason": cr.REASON_SELLER_SUGGESTION,
+		"summary": ",".join(sorted(merged.keys())) or "suggestion",
+		"status": "pending",
+		"modified": str(now_datetime()),
+	}
+	kv_set(LEAD_SUGGESTION_KV_SCOPE, lead, payload)
+
+	customer = _customer_for_lead(lead)
+	customer_change = _lead_values_to_customer_change(merged)
+	if customer and customer_change:
+		try:
+			cr.suggest_customer_change(customer_name=customer, change=customer_change)
+		except Exception:
+			# Still keep the lead suggestion even if customer mapping fails.
+			frappe.log_error(frappe.get_traceback(), "suggest_lead_change customer mirror")
+			cr.ensure_creation_review_custom_fields()
+			if frappe.db.has_column("Customer", cr.FIELDNAME):
+				frappe.db.set_value(
+					"Customer", customer, cr.FIELDNAME, cr.STATUS_PENDING, update_modified=False
+				)
+	elif customer:
+		cr.ensure_creation_review_custom_fields()
+		if frappe.db.has_column("Customer", cr.FIELDNAME):
+			frappe.db.set_value(
+				"Customer", customer, cr.FIELDNAME, cr.STATUS_PENDING, update_modified=False
+			)
+
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"name": lead,
+		"customer": customer,
+		"review_status": cr.STATUS_PENDING,
+		"suggestion": payload,
+	}
+
+
 @frappe.whitelist(allow_guest=True)
 @idempotent_request
 def upsert_lead(lead=None, values=None):
@@ -995,6 +1222,16 @@ def upsert_lead(lead=None, values=None):
 		doc = frappe.get_doc("Lead", lead)
 		frappe.flags.ignore_permissions = False
 		_require_owner_or_crm(doc.lead_owner)
+		# Converted / Cliente: sellers may only queue suggestions (unless Revisar apply).
+		if _lead_is_client(doc) and not frappe.flags.get("applying_creation_review_suggestion"):
+			field_touches = [fid for fid in LEAD_FIELD_MAP if fid in values]
+			if field_touches:
+				frappe.throw(
+					_(
+						"This lead is already a client — propose field changes with suggest_lead_change"
+					),
+					frappe.ValidationError,
+				)
 	else:
 		_require_app_permission("ops.preventa")
 		doc = frappe.new_doc("Lead")
@@ -1246,7 +1483,14 @@ def move_lead(lead, to_stage, lost_reason=None, values=None, force=0):
 			values = frappe.parse_json(values)
 		except Exception:
 			values = None
-	if isinstance(values, dict) and values:
+	# Cliente leads: stage moves stay live; field patches must use suggest_lead_change.
+	if (
+		isinstance(values, dict)
+		and values
+		and not (
+			_lead_is_client(doc) and not frappe.flags.get("applying_creation_review_suggestion")
+		)
+	):
 		_apply_lead_values(doc, values)
 
 	settings = _load_preventa_settings()

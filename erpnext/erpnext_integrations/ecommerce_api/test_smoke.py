@@ -1489,6 +1489,11 @@ def suite_5_9_master_data():
             so_name = out.get("preorder_name") or out.get("name")
             api.set_guest_preorder_status(so_name, "Orden")
             api.set_guest_preorder_status(so_name, "Preparado")
+            # Orden/Preparado → Completado is allowed (skip Delivery).
+            done = api.set_guest_preorder_status(so_name, "Completado")
+            assert api._pipeline_base_status(done.get("display_status")) == "Completado", done
+            # Back to Preparado for Delivery MAT checks.
+            api.set_guest_preorder_status(so_name, "Preparado")
             # Manual Delivery without MAT must fail controlled.
             blocked = False
             try:
@@ -1498,6 +1503,10 @@ def suite_5_9_master_data():
                 msg = str(e)
                 assert "MAT" in msg or "mat" in msg.lower(), msg
             assert blocked, "expected MAT gate on Delivery"
+            # Ops may proceed without MAT when allow_no_mat=1.
+            no_mat = api.set_guest_preorder_status(so_name, "Delivery", allow_no_mat=1)
+            assert api._pipeline_base_status(no_mat.get("display_status")) == "Delivery", no_mat
+            api.set_guest_preorder_status(so_name, "Preparado")
             # PoD path (source=tms_pod) may set Delivery without trip check.
             pod = api.set_guest_preorder_status(so_name, "Delivery", source="tms_pod")
             assert api._pipeline_base_status(pod.get("display_status")) == "Delivery", pod
@@ -2220,6 +2229,21 @@ def suite_5_12_modules_read():
             # Idempotent second call
             again = pa.convert_lead_to_customer(lead=conv.name, customer_type="Individual")
             assert again and again.get("customer") == cust_name, again
+            # Cliente lead: live upsert blocked; suggest queues for Revisar.
+            try:
+                pa.upsert_lead(lead=conv.name, values={"country": "Chile"})
+                raise AssertionError("upsert_lead must reject Converted lead field edits")
+            except Exception as blocked:
+                assert "suggest_lead_change" in str(blocked).lower() or "client" in str(
+                    blocked
+                ).lower(), blocked
+            sug = pa.suggest_lead_change(
+                lead=conv.name, values={"country": "Chile", "city": "Santiago"}
+            )
+            assert sug and sug.get("ok") and sug.get("customer") == cust_name, sug
+            pending_lead = pa.get_pending_lead_suggestion(conv.name)
+            assert pending_lead and pending_lead.get("change", {}).get("country") == "Chile", pending_lead
+            pa.clear_pending_lead_suggestion(conv.name)
         finally:
             if cust_name and frappe.db.exists("Customer", cust_name):
                 frappe.delete_doc("Customer", cust_name, ignore_permissions=True, force=True)

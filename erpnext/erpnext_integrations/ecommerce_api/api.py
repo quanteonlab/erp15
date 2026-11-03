@@ -7153,7 +7153,7 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 
 @frappe.whitelist(allow_guest=True)
 def set_guest_preorder_status(
-	preorder_name, target_status, source=None, ensure_planner_remito=0
+	preorder_name, target_status, source=None, ensure_planner_remito=0, allow_no_mat=0
 ):
 	"""
 	Unified status transition for the custom workflow.
@@ -7171,6 +7171,9 @@ def set_guest_preorder_status(
 	``ensure_planner_remito``: default 0 — Rutas planning lists Orden/Preparado by
 	Sales Order without requiring a remito. Pass 1 only when a caller explicitly
 	wants an early remito (legacy / stock paths). Remito is created on MAT claim.
+
+	``allow_no_mat``: when truthy, Delivery may proceed without a linked MAT
+	(UI warns first; ops can opt out for the session).
 	"""
 	target_status = _normalize_target_pipeline_status(target_status)
 	if target_status not in WORKFLOW_STATUSES:
@@ -7181,6 +7184,7 @@ def set_guest_preorder_status(
 
 	pipeline_source = _normalize_pipeline_source(source)
 	_require_guest_preorder_live_mutate(pipeline_source=pipeline_source)
+	allow_no_mat = cint(allow_no_mat)
 
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
@@ -7201,6 +7205,7 @@ def set_guest_preorder_status(
 			target_status,
 			source=pipeline_source,
 			ensure_planner_remito=ensure_planner_remito,
+			allow_no_mat=allow_no_mat,
 		)
 
 	current = _display_status(so)
@@ -7235,9 +7240,14 @@ def set_guest_preorder_status(
 				)
 			)
 
-	# Delivery requires a linked MAT (same pattern as Consulta → real client).
+	# Delivery normally wants a linked MAT (same pattern as Consulta → real client).
+	# Ops may proceed without one via allow_no_mat (UI warn / session skip).
 	# tms_claim / tms_pod already sit on a trip stop.
-	if target_status == "Delivery" and pipeline_source not in ("tms_claim", "tms_pod"):
+	if (
+		target_status == "Delivery"
+		and not allow_no_mat
+		and pipeline_source not in ("tms_claim", "tms_pod")
+	):
 		if not _so_has_mat_trip(preorder_name):
 			frappe.throw(
 				_("Assign a MAT before moving to Delivery."),

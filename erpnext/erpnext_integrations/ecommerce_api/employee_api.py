@@ -353,12 +353,12 @@ APP_PERMISSIONS = [
 	{
 		"id": "tables.orders.own",
 		"group": "tablas",
-		"label_en": "Pedidos table (own)",
-		"label_es": "Tabla Pedidos (propios)",
-		"label_zh": "订单表（自己的）",
-		"desc_en": "Opens Tablas → Pedidos for guest orders owned by this user. Prefer the Orden permission (ops.orden) for sellers.",
-		"desc_es": "Abre Tablas → Pedidos con pedidos de este usuario. Para vendedores preferí el permiso Orden (ops.orden).",
-		"desc_zh": "打开表格→订单（本人创建的访客单）。销售请用权限「下单」(ops.orden)。",
+		"label_en": "Pedidos table (own / suggest)",
+		"label_es": "Tabla Pedidos (propios / sugerir)",
+		"label_zh": "订单表（自己的 / 建议）",
+		"desc_en": "Sales default: open Pedidos (own scope) in suggestion mode — no live edits, no MAT; plate + shipment status visible. Full edit needs tables.orders.all or an order tag.",
+		"desc_es": "Default ventas: abre Pedidos (propios) en modo sugerencia — sin editar en vivo ni MAT; sí patente y estado de envío. Edición completa requiere tables.orders.all o un tag de pedido.",
+		"desc_zh": "销售默认：以建议模式打开订单表（本人范围）— 不可直接改单、不可见 MAT；可见车牌与配送状态。完整编辑需 tables.orders.all 或订单标签。",
 	},
 	{
 		"id": "tables.orders.all",
@@ -617,14 +617,16 @@ _SALES_SCOPE_IDS = frozenset(
 )
 # Official sales floor role title is ``Sales`` (EN). Legacy sites may still have ``ventas``.
 # No Entregas / Check / Armado — those are opt-in via group permissions.
-# No tables.* — Pedidos/RM editing stays admin-only; sellers use Operaciones → Orden.
-# Catalog is optional (navbar soft-gate); Orden is the dedicated seller order surface.
+# ``tables.orders.own`` opens Pedidos in **suggestion** mode (no live edit / no MAT).
+# Full Pedidos edit stays admin / tables.orders.all / order tags (caja).
+# Catalog is optional (navbar soft-gate); Orden remains the seller create surface.
 # Catalog PDF is a normal seller tool (share price lists); still toggleable in Groups.
 _STARTER_SALES = [
 	"ops.preventa",
 	"ops.orden",
 	"tools.sync",
 	"tools.catalog_pdf",
+	"tables.orders.own",
 	"sales.see_assigned",
 	"sales.commit_assigned",
 ]
@@ -735,9 +737,9 @@ def _floor_starter_needs_ops_only_upgrade(title: str, current: list[str]) -> boo
 	"""True when a floor starter still carries *legacy* tables.*/log.* extras.
 
 	Caja may still include ``tables.orders.own`` / tag perms (in its starter).
-	Ventas starter has **no** tables.* — table extras on ventas/Sales are stripped
-	by ``_strip_sales_table_access`` instead of a full perm reset (so optional
-	ops.* toggles are not undone).
+	Ventas may keep ``tables.orders.own`` (suggest-only Pedidos); other tables.*
+	on ventas/Sales are stripped by ``_strip_sales_table_access`` instead of a
+	full perm reset (so optional ops.* toggles are not undone).
 	"""
 	if title not in _FLOOR_STARTER_TITLES:
 		return False
@@ -2153,10 +2155,14 @@ def _strip_sales_floor_ops_extras(store: dict) -> bool:
 	return dirty
 
 
-def _strip_sales_table_access(store: dict) -> bool:
-	"""Sales/ventas must not keep Tablas (RM / Pedidos / …) — edit surface is admin-only.
+# Pedidos suggest-only is allowed on Sales; other tables.* stay admin-only.
+_SALES_ALLOWED_TABLE_PERMS = frozenset({"tables.orders.own"})
 
-	Sellers view/create Pedidos from Operaciones → Orden (ops.orden) instead.
+
+def _strip_sales_table_access(store: dict) -> bool:
+	"""Sales/ventas: keep ``tables.orders.own`` (suggest Pedidos); strip other tables.*.
+
+	Live Pedidos edit / RM / MAT ops stay admin (or tables.orders.all / order tags).
 	"""
 	dirty = False
 	for name, raw in list(store.items()):
@@ -2174,9 +2180,15 @@ def _strip_sales_table_access(store: dict) -> bool:
 		current = _normalize_permission_ids(raw)
 		if "*" in current:
 			continue
-		next_perms = [p for p in current if not str(p).startswith("tables.")]
+		next_perms = [
+			p
+			for p in current
+			if (not str(p).startswith("tables.")) or p in _SALES_ALLOWED_TABLE_PERMS
+		]
+		if "tables.orders.own" not in next_perms:
+			next_perms.append("tables.orders.own")
 		if _perm_set(next_perms) != _perm_set(current):
-			store[name] = next_perms
+			store[name] = _normalize_permission_ids(next_perms)
 			dirty = True
 	return dirty
 
@@ -2211,9 +2223,9 @@ def _backfill_floor_fulfillment_perms(store: dict) -> bool:
 				dirty = True
 			continue
 		if title_l in ("sales", "ventas"):
-			# Soft-add Orden + catalog PDF; never re-add tables.* or stripped floor ops.
-			# ops.orden is independent of ops.catalog (sellers may drop Catálogo).
-			need = ["ops.orden", "tools.catalog_pdf"]
+			# Soft-add Orden + catalog PDF + suggest-only Pedidos; never re-add
+			# tables.orders.all / CRM / stripped floor ops.
+			need = ["ops.orden", "tools.catalog_pdf", "tables.orders.own"]
 			missing = [p for p in need if p not in current]
 			if missing:
 				store[name] = _normalize_permission_ids(current + missing)

@@ -6730,6 +6730,84 @@
       "expect": "error",
       "source": "regression",
       "bug": "set_purchase_order_invoice_ref null name is a controlled error"
+    },
+    {
+      "id": "set_guest_preorder_status_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": null,
+        "target_status": "Delivery",
+        "allow_no_mat": 1
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_guest_preorder_status null preorder_name is controlled error (allow_no_mat must not TypeError)"
+    },
+    {
+      "id": "set_guest_preorder_status_allow_no_mat_string",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Delivery",
+        "allow_no_mat": "1"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "empty preorder_name + string allow_no_mat coerces via cint, controlled error"
+    },
+    {
+      "id": "search_vehicles_null_q",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.search_vehicles",
+      "args": {
+        "q": null,
+        "limit": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "search_vehicles null q/limit must not TypeError"
+    },
+    {
+      "id": "list_pending_vehicle_returns_null_vehicle",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_pending_vehicle_returns",
+      "args": {
+        "vehicle": null,
+        "days": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "list_pending_vehicle_returns null vehicle is controlled error"
+    },
+    {
+      "id": "mark_vehicle_returns_received_null_names",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.mark_vehicle_returns_received",
+      "args": {
+        "capture_names": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "mark_vehicle_returns_received null capture_names is controlled error"
+    },
+    {
+      "id": "suggest_lead_change_null_lead",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.suggest_lead_change",
+      "args": {
+        "lead": null,
+        "values": {"country": "Argentina"}
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "suggest_lead_change null lead is controlled error (Cliente suggest path)"
+    },
+    {
+      "id": "suggest_lead_change_empty_values",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.suggest_lead_change",
+      "args": {
+        "lead": "",
+        "values": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "suggest_lead_change empty lead/null values is controlled error"
     }
   ]
 }
