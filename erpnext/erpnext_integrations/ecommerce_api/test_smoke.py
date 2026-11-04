@@ -2070,6 +2070,12 @@ def suite_5_11_pos_session():
         flipped = ta.list_treasury_ledger(from_date="2026-12-31", to_date="2026-01-01")
         assert flipped["from_date"] <= flipped["to_date"]
         assert "ganancias" in led
+        for side in ("a", "b"):
+            for key in ("tax_cobrado", "tax_pagado", "tax_neto", "tax_unknown"):
+                assert key in led[side], f"ledger {side} missing {key}"
+            for r in led[side]["rows"]:
+                assert "tax" in r and "net" in r and "tax_known" in r, "ledger row missing tax split"
+                assert abs((r["net"] + r["tax"]) - r["amount"]) < 0.02, "net + tax must equal amount"
         pos_day = ta.list_treasury_pos_day(day="null", mop="")
         assert isinstance(pos_day, dict) and "sales" in pos_day
         preview = ta.preview_treasury_auto_order(to_code="null", kinds="")
@@ -2093,6 +2099,45 @@ def suite_5_11_pos_session():
             frappe.db.commit()
 
     _run("5.11.10 treasury accounts + ledger", check_treasury, "S3")
+
+    def check_item_taxes():
+        import json
+
+        from erpnext.erpnext_integrations.ecommerce_api import tax_api as tx
+        from erpnext.erpnext_integrations.ecommerce_api.product_manager import get_product_rows
+
+        co = tx._company()
+        tx.seed_tax_catalog(co)
+        listed = tx.list_taxes(co)
+        titles = {t["title"] for t in listed["taxes"]}
+        assert {"IVA 21%", "IVA 10.5%", "Exento", "No gravado"} <= titles, titles
+        item = _get_test_item()["item_code"]
+        try:
+            res = tx.set_item_taxes(item, ["IVA 21%"])
+            assert res["tax_rate"] == 21.0 and res["tax_names"] == ["IVA 21%"], res
+            rows = get_product_rows(filters=json.dumps({"search": item}), page_length=5)["rows"]
+            row = next(r for r in rows if r["client_sku"] == item)
+            assert row["tax_rate"] == 21.0 and row["tax_names"] == ["IVA 21%"], row.get("tax_names")
+            # Replacing keeps a single base tax; "Exento" is a known 0%, not "unknown".
+            res = tx.set_item_taxes(item, ["Exento"])
+            assert res["tax_rate"] == 0.0 and res["tax_names"] == ["Exento"], res
+            # Two taxes on the same account cannot be combined.
+            try:
+                tx.set_item_taxes(item, ["IVA 21%", "IVA 10.5%"])
+                raise AssertionError("two IVA taxes on one account must be rejected")
+            except frappe.ValidationError:
+                pass
+        finally:
+            tx.set_item_taxes(item, [])
+        assert item not in tx.item_tax_map([item]), "clearing taxes must leave the item unknown"
+        for bad in (dict(title=None, rate=21), dict(title="X", rate=150), dict(title="X", rate=None)):
+            try:
+                tx.save_tax(**bad)
+                raise AssertionError(f"save_tax must reject {bad}")
+            except frappe.ValidationError:
+                pass
+
+    _run("5.11.11 item taxes (IVA catalog + per-item assignment)", check_item_taxes, "S3")
 
 
 # ── Suite 5.12 — Preventa / staff / devices / floors / print / TMS ────────────

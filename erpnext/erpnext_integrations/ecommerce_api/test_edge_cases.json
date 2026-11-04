@@ -6808,6 +6808,117 @@
       "expect": "error",
       "source": "regression",
       "bug": "suggest_lead_change empty lead/null values is controlled error"
+    },
+    {
+      "id": "save_tax_null_title",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.save_tax",
+      "args": {
+        "title": null,
+        "rate": 21
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "save_tax null title is a controlled error"
+    },
+    {
+      "id": "save_tax_rate_out_of_range",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.save_tax",
+      "args": {
+        "title": "EDGE TAX",
+        "rate": 150
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "save_tax rate > 100 is a controlled error"
+    },
+    {
+      "id": "save_tax_null_rate",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.save_tax",
+      "args": {
+        "title": "EDGE TAX",
+        "rate": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "save_tax null rate is a controlled error"
+    },
+    {
+      "id": "save_tax_plus_in_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.save_tax",
+      "args": {
+        "title": "A + B",
+        "rate": 5
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "save_tax name with '+' would break compound parsing"
+    },
+    {
+      "id": "set_item_taxes_null_item",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.set_item_taxes",
+      "args": {
+        "item_code": null,
+        "taxes": [
+          "IVA 21%"
+        ]
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_item_taxes null item is a controlled error"
+    },
+    {
+      "id": "set_item_taxes_unknown_item",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.set_item_taxes",
+      "args": {
+        "item_code": "__no_such_item__",
+        "taxes": []
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "set_item_taxes unknown item is a controlled error"
+    },
+    {
+      "id": "bulk_set_item_taxes_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.bulk_set_item_taxes",
+      "args": {
+        "item_codes": [],
+        "taxes": [
+          "IVA 21%"
+        ]
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "bulk_set_item_taxes empty selection is a controlled error"
+    },
+    {
+      "id": "bulk_set_item_taxes_bad_mode",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.bulk_set_item_taxes",
+      "args": {
+        "item_codes": [
+          "x"
+        ],
+        "taxes": [
+          "IVA 21%"
+        ],
+        "mode": "nuke"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "bulk_set_item_taxes invalid mode is a controlled error"
+    },
+    {
+      "id": "bulk_set_item_taxes_null_taxes",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tax_api.bulk_set_item_taxes",
+      "args": {
+        "item_codes": [
+          "x"
+        ],
+        "taxes": null,
+        "mode": "replace"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "bulk_set_item_taxes null taxes is a controlled error"
     }
   ]
 }

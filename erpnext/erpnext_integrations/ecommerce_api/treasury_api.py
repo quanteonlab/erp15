@@ -407,27 +407,29 @@ def _pos_day_rows(company: str | None, start, end) -> list[dict]:
 	co = company or ""
 	splits = _pos_split_map(co) if co else {}
 	by_day: dict[tuple[str, str], float] = defaultdict(float)
+	inv_by_day: dict[tuple[str, str], list] = defaultdict(list)
 	for s in _pos_sale_slices(company, start, end):
 		if s["invoice"] in splits:
 			continue
 		by_day[(s["mop"], s["date"])] += s["amount"]
+		inv_by_day[(s["mop"], s["date"])].append(("Sales Invoice", s["invoice"], s["amount"]))
 	out = []
 	for (mop, day), amt in by_day.items():
 		if abs(amt) < PAID_EPS:
 			continue
-		out.append(
-			_row(
-				account=_account_for_mop(mop),
-				date=day,
-				kind=POS_KIND[mop],
-				amount=amt,
-				label=_pos_label(mop, day),
-				source_key=_pos_day_key(mop, day),
-				ref_doctype="Sales Invoice",
-				ref_name=None,
-				note=mop,
-			)
+		row = _row(
+			account=_account_for_mop(mop),
+			date=day,
+			kind=POS_KIND[mop],
+			amount=amt,
+			label=_pos_label(mop, day),
+			source_key=_pos_day_key(mop, day),
+			ref_doctype="Sales Invoice",
+			ref_name=None,
+			note=mop,
 		)
+		row["_slices"] = inv_by_day[(mop, day)]
+		out.append(row)
 	return out
 
 
@@ -516,18 +518,18 @@ def _so_paid_rows(company: str | None, start, end) -> list[dict]:
 		for mop_kind, amt in slices.items():
 			if abs(amt) < PAID_EPS:
 				continue
-			out.append(
-				_row(
-					account=_account_for_mop(mop_kind),
-					date=day,
-					kind="pedido",
-					amount=amt,
-					label=label,
-					source_key=f"so:{so.name}:{mop_kind}",
-					ref_doctype="Sales Order",
-					ref_name=so.name,
-				)
+			row = _row(
+				account=_account_for_mop(mop_kind),
+				date=day,
+				kind="pedido",
+				amount=amt,
+				label=label,
+				source_key=f"so:{so.name}:{mop_kind}",
+				ref_doctype="Sales Order",
+				ref_name=so.name,
 			)
+			row["_slices"] = [("Sales Order", so.name, amt)]
+			out.append(row)
 	return out
 
 
@@ -619,19 +621,19 @@ def _po_paid_rows(company: str | None, start, end) -> list[dict]:
 		for mop_kind, amt in slices.items():
 			if abs(amt) < PAID_EPS:
 				continue
-			out.append(
-				_row(
-					account="B",
-					date=day,
-					kind="compra",
-					amount=-abs(amt),
-					label=label,
-					source_key=f"po:{po.name}:{mop_kind}",
-					ref_doctype="Purchase Order",
-					ref_name=po.name,
-					note="sin factura" if not _po_has_factura(po.name) else "factura",
-				)
+			row = _row(
+				account="B",
+				date=day,
+				kind="compra",
+				amount=-abs(amt),
+				label=label,
+				source_key=f"po:{po.name}:{mop_kind}",
+				ref_doctype="Purchase Order",
+				ref_name=po.name,
+				note="sin factura" if not _po_has_factura(po.name) else "factura",
 			)
+			row["_slices"] = [("Purchase Order", po.name, -abs(amt))]
+			out.append(row)
 	return out
 
 
@@ -667,21 +669,69 @@ def _stored_rows(company: str, start, end) -> list[dict]:
 		if (r.kind or "") == POS_SPLIT_KIND and _as_str(r.source_key).startswith("pos_split:"):
 			ref_dt = "Sales Invoice"
 			ref_nm = r.source_key.split(":", 1)[-1]
-		out.append(
-			_row(
-				account=r.account_code,
-				date=r.posting_date,
-				kind=r.kind or "movimiento",
-				amount=flt(r.amount),
-				label=r.label or r.note or "Movimiento",
-				source_key=r.source_key or r.name,
-				ref_doctype=ref_dt,
-				ref_name=ref_nm,
-				counterpart=r.counterpart_code,
-				note=r.note,
-			)
+		row = _row(
+			account=r.account_code,
+			date=r.posting_date,
+			kind=r.kind or "movimiento",
+			amount=flt(r.amount),
+			label=r.label or r.note or "Movimiento",
+			source_key=r.source_key or r.name,
+			ref_doctype=ref_dt,
+			ref_name=ref_nm,
+			counterpart=r.counterpart_code,
+			note=r.note,
 		)
+		if ref_dt == "Sales Invoice":
+			row["_slices"] = [("Sales Invoice", ref_nm, flt(r.amount))]
+		out.append(row)
 	return out
+
+
+def _attach_tax(rows: list[dict], company: str) -> list[dict]:
+	"""Split each row's amount into ``net`` + ``tax`` (the IVA contained in it).
+
+	Tax follows the sign of the amount: IVA cobrado on sales (+), IVA pagado on purchases (−). A row's tax is the
+	document's tax share of each payment slice. ``tax_known`` is False when nothing taxable could be determined
+	(no tax assigned to the items, or a manual movement) so the UI shows "—" rather than a fake 0.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.tax_api import implied_doc_tax
+
+	wanted: dict[str, set] = defaultdict(set)
+	for r in rows:
+		for dt, name, _amt in r.get("_slices") or []:
+			wanted[dt].add(name)
+	docs = {}
+	for dt, names in wanted.items():
+		try:
+			docs[dt] = implied_doc_tax(dt, names, company)
+		except Exception:
+			frappe.log_error(title=f"treasury tax {dt}")
+			docs[dt] = {}
+	for r in rows:
+		tax, known = 0.0, False
+		for dt, name, amt in r.pop("_slices", None) or []:
+			info = (docs.get(dt) or {}).get(name)
+			if not info or not info["known"]:
+				continue
+			known = True
+			total = flt(info["total"])
+			share = (flt(amt) / total) if abs(total) > 1e-9 else 0.0
+			tax += flt(info["tax"]) * share
+		r["tax"] = flt(tax, 2)
+		r["net"] = flt(flt(r.get("amount")) - tax, 2)
+		r["tax_known"] = known
+	return rows
+
+
+def _tax_totals(rows: list[dict]) -> dict:
+	cobrado = sum(flt(r.get("tax")) for r in rows if r.get("kind") in GANANCIAS_KINDS and flt(r.get("tax")) > 0)
+	pagado = -sum(flt(r.get("tax")) for r in rows if r.get("kind") in GANANCIAS_KINDS and flt(r.get("tax")) < 0)
+	return {
+		"tax_cobrado": flt(cobrado, 2),
+		"tax_pagado": flt(pagado, 2),
+		"tax_neto": flt(cobrado - pagado, 2),
+		"tax_unknown": sum(1 for r in rows if r.get("kind") in GANANCIAS_KINDS and not r.get("tax_known")),
+	}
 
 
 def _ganancias(rows: list[dict]) -> float:
@@ -811,7 +861,9 @@ def list_treasury_ledger(from_date=None, to_date=None, company=None):
 	) + _stored_rows(co, getdate("2000-01-01"), before_end)
 	opening = _sum_by_account(opening_rows)
 
-	period = _apply_overrides(_auto_rows(co, start, end), ov) + _stored_rows(co, start, end)
+	period = _attach_tax(
+		_apply_overrides(_auto_rows(co, start, end), ov) + _stored_rows(co, start, end), co
+	)
 	by_acc = {"A": [], "B": []}
 	for r in period:
 		if r["account"] in by_acc:
@@ -833,6 +885,7 @@ def list_treasury_ledger(from_date=None, to_date=None, company=None):
 			"net": net,
 			"ganancias": gain,
 			"closing": flt(open_bal + net, 2),
+			**_tax_totals(rows),
 			"rows": rows,
 		}
 	out["ganancias"] = flt(gain_total, 2)

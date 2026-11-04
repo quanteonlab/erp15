@@ -1259,12 +1259,19 @@ def get_product_rows(
 
         codes = [r["client_sku"] for r in rows]
         tags_by_item = tags_map_for_docs("Item", codes)
+        from erpnext.erpnext_integrations.ecommerce_api.tax_api import item_tax_map
+
+        tax_by_item = item_tax_map(codes)
         for row in rows:
             row.pop("_user_tags", None)
             item_tags = tags_by_item.get(row["client_sku"], [])
             if not item_tags:
                 item_tags = migrate_item_user_tags(row["client_sku"])
             row["tags"] = item_tags
+            tax = tax_by_item.get(row["client_sku"])
+            row["tax_rate"] = tax["tax_rate"] if tax else None
+            row["tax_names"] = tax["tax_names"] if tax else []
+            row["tax_template"] = tax["tax_template"] if tax else None
             row["is_active"] = 0 if row.pop("_disabled", 0) else 1
             row.pop("_raw_norm", None)
             buying = flt(row.pop("buying_price", None) or 0)
@@ -1596,6 +1603,14 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             _sync_tags(item_code, changes["tags"])
             new_tags = _item_tags_value(item_code)
             history.append(("tags", old_tags or None, new_tags or None))
+
+        if "taxes" in changes:
+            from erpnext.erpnext_integrations.ecommerce_api.tax_api import apply_item_taxes, item_tax_map
+
+            old_tax = ", ".join((item_tax_map([item_code]).get(item_code) or {}).get("tax_names") or [])
+            apply_item_taxes(item_code, changes["taxes"])
+            new_tax = ", ".join((item_tax_map([item_code]).get(item_code) or {}).get("tax_names") or [])
+            history.append(("taxes", old_tax or None, new_tax or None))
 
         if stock_qty_target is not None:
             if not warehouse:
