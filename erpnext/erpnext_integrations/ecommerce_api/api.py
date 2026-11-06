@@ -5128,7 +5128,26 @@ def _item_line_weight_fields(
 	total_weight = flt(line_total_weight) if line_total_weight not in (None, "") else 0.0
 	if total_weight <= 0 and weight_per_unit > 0 and qty > 0:
 		total_weight = weight_per_unit * qty
-	return {
+	# Soft band for weigh UIs (units × catalog min/max); never raises.
+	# Only attach when a real min/max band exists (ignore 0/0 DB defaults).
+	weight_band = None
+	weight_warning = None
+	has_band = (
+		(unit_weight_min is not None and flt(unit_weight_min) > 0)
+		or (unit_weight_max is not None and flt(unit_weight_max) > 0)
+	)
+	if qty > 0 and has_band:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.weight_api import validate_total_weight
+
+			check = validate_total_weight(
+				item_code, qty, total_weight if total_weight > 0 else weight_per_unit * qty
+			)
+			weight_band = check.get("band")
+			weight_warning = check.get("warning")
+		except Exception:
+			pass
+	out = {
 		# Prefer the Sales Order line UOM so Pedidos "Tipo de peso" persists after save.
 		"stock_uom": sell_uom or stock_uom,
 		"uom": sell_uom or stock_uom,
@@ -5141,6 +5160,11 @@ def _item_line_weight_fields(
 		"unit": unit,
 		"is_weight_based": is_weight_based,
 	}
+	if weight_band is not None:
+		out["weight_band"] = weight_band
+	if weight_warning:
+		out["weight_warning"] = weight_warning
+	return out
 
 
 def _normalize_preorder_line_uom(raw_uom):

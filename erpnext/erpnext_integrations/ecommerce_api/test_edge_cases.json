@@ -6919,6 +6919,86 @@
       "expect": "error",
       "source": "regression",
       "bug": "bulk_set_item_taxes null taxes is a controlled error"
+    },
+    {
+      "id": "weight_import_csv_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.import_unit_weight_ranges_from_daily_csv",
+      "args": {
+        "csv_text": null,
+        "dry_run": 1
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "import_unit_weight_ranges_from_daily_csv null csv is controlled empty report"
+    },
+    {
+      "id": "weight_import_csv_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.import_unit_weight_ranges_from_daily_csv",
+      "args": {
+        "csv_text": "",
+        "dry_run": "1"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "import_unit_weight_ranges_from_daily_csv empty string is controlled"
+    },
+    {
+      "id": "weight_import_csv_unidades_zero_rows",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.import_unit_weight_ranges_from_daily_csv",
+      "args": {
+        "csv_text": "FECHA,CODIGO,CANTIDAD,UNIDADES\n2026-01-01,X,5,0\n",
+        "dry_run": 1
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "daily CSV with UNIDADES=0 skips ratios without ZeroDivision/500"
+    },
+    {
+      "id": "weight_expected_band_null_item",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.get_expected_weight_band",
+      "args": {
+        "item_code": null,
+        "units": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "get_expected_weight_band null item/units is controlled"
+    },
+    {
+      "id": "weight_validate_total_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.validate_item_total_weight",
+      "args": {
+        "item_code": "",
+        "units": "null",
+        "total_weight": "undefined"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "validate_item_total_weight dirty strings never TypeError/500"
+    },
+    {
+      "id": "weight_record_observation_null_item",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.record_item_weight_observation",
+      "args": {
+        "item_code": null,
+        "units": 1,
+        "total_weight": 1
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "record_item_weight_observation null item is controlled ValidationError"
+    },
+    {
+      "id": "weight_recompute_null_item",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.recompute_item_weight_catalog",
+      "args": {
+        "item_code": null,
+        "lookback_days": null,
+        "dry_run": 1
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "recompute_item_weight_catalog null item/lookback dry-run is controlled"
     }
   ]
 }

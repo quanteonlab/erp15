@@ -1761,6 +1761,95 @@ def suite_5_9_master_data():
     _run("5.9.18c seller_scope + amend → Revisar", check_seller_scope_list_and_amend_review, "S2")
     _run("5.9.19 Orden→next-day Entrega + planner without remito", check_orden_planner_remito_and_address_gate, "S2")
 
+    def check_unit_weight_median_mad_and_band():
+        """Median/MAD ignores planted spike; band scales with units; observation stores."""
+        from erpnext.erpnext_integrations.ecommerce_api import weight_api as wt
+
+        # Pure stats — no Item needed.
+        ratios = [1.0, 1.05, 0.98, 1.02, 1.01, 1.03, 0.99, 1.0, 1.04, 89.0]
+        stats = wt.compute_unit_weight_stats(ratios)
+        assert stats.get("ok"), stats
+        assert 0.9 < flt(stats["weight_per_unit"]) < 1.1, stats
+        assert flt(stats["unit_weight_max"]) < 10, stats
+        assert cint(stats.get("n_outliers") or 0) >= 1, stats
+
+        # Empty / dirty CSV controlled.
+        empty = wt.import_unit_weight_ranges_from_daily_csv(csv_text="", dry_run=1)
+        assert empty.get("ok") and empty.get("parsed_rows") == 0, empty
+        nullish = wt.import_unit_weight_ranges_from_daily_csv(csv_text=None, dry_run=1)
+        assert nullish.get("ok"), nullish
+
+        sku = f"SMOKE-WT-MAD-{frappe.generate_hash(length=6)}"
+        if not frappe.db.exists("Item", sku):
+            item = frappe.get_doc(
+                {
+                    "doctype": "Item",
+                    "item_code": sku,
+                    "item_name": sku,
+                    "item_group": frappe.db.get_value("Item Group", {"is_group": 0}, "name")
+                    or "All Item Groups",
+                    "stock_uom": "Nos",
+                    "is_stock_item": 1,
+                }
+            )
+            item.insert(ignore_permissions=True)
+            frappe.db.commit()
+        try:
+            csv_text = (
+                "FECHA,IDART,CODIGO,ARTICULO,CANTIDAD,UNIDADES\n"
+                f"2026-08-01,1,\"{sku}\",\"Smoke MAD\",2.0,2\n"
+                f"2026-08-02,1,\"{sku}\",\"Smoke MAD\",2.1,2\n"
+                f"2026-08-03,1,\"{sku}\",\"Smoke MAD\",1.9,2\n"
+                f"2026-08-04,1,\"{sku}\",\"Smoke MAD\",2.05,2\n"
+                f"2026-08-05,1,\"{sku}\",\"Smoke MAD\",1.95,2\n"
+                f"2026-08-06,1,\"{sku}\",\"Smoke MAD\",178.0,2\n"
+            )
+            # Force seed even if ratio≈1 would look pack-like: use only_weight_like=0.
+            res = wt.import_unit_weight_ranges_from_daily_csv(
+                csv_text=csv_text, dry_run=0, only_weight_like=0
+            )
+            assert res.get("ok"), res
+            seeded = [s for s in (res.get("seeded") or []) if s.get("item_code") == sku]
+            assert seeded, res
+            wpu = flt(frappe.db.get_value("Item", sku, "weight_per_unit"))
+            assert 0.9 < wpu < 1.15, wpu
+            wmax = flt(frappe.db.get_value("Item", sku, "custom_unit_weight_max") or 0)
+            assert wmax < 50, wmax
+
+            band3 = wt.expected_weight_band(sku, units=3)
+            assert band3.get("ok"), band3
+            assert abs(flt(band3["expected"]) - wpu * 3) < 1e-6, band3
+            assert abs(flt(band3["lo"]) - flt(frappe.db.get_value("Item", sku, "custom_unit_weight_min")) * 3) < 1e-6
+
+            # Soft validate: in-band and outlier.
+            ok = wt.validate_total_weight(sku, 2, wpu * 2)
+            assert ok.get("in_band") is True, ok
+            bad = wt.validate_total_weight(sku, 2, wpu * 2 * 20)
+            assert bad.get("is_outlier") is True and bad.get("warning"), bad
+
+            if wt.ensure_item_weight_observation_doctype():
+                obs = wt.record_item_weight_observation(
+                    item_code=sku, units=2, total_weight=wpu * 2, source="manual"
+                )
+                assert obs.get("ok") and obs.get("name"), obs
+                # Recompute from observations should keep a sane median.
+                recomputed = wt.recompute_item_weight_catalog(item_code=sku, lookback_days=365)
+                assert recomputed.get("ok"), recomputed
+        finally:
+            if frappe.db.exists("DocType", "Item Weight Observation"):
+                for name in frappe.get_all(
+                    "Item Weight Observation",
+                    filters={"item_code": sku},
+                    pluck="name",
+                    ignore_permissions=True,
+                ):
+                    frappe.delete_doc("Item Weight Observation", name, ignore_permissions=True, force=True)
+            if frappe.db.exists("Item", sku):
+                frappe.delete_doc("Item", sku, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    _run("5.9.20 unit-weight Median/MAD + band×units", check_unit_weight_median_mad_and_band, "S2")
+
 
 # ── Suite 5.10 — Product Manager / ops reads ──────────────────────────────────
 
