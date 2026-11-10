@@ -395,9 +395,27 @@ def get_armado_order(preorder_name=None):
 		}
 
 	sku_to_loc, _ = _floor_sku_locations(company=so.company)
+	codes = [
+		str(it.get("item_code") or "").strip()
+		for it in (detail.get("items") or [])
+		if it.get("item_code")
+	]
+	images = {}
+	if codes:
+		for r in frappe.get_all(
+			"Item",
+			filters={"name": ["in", codes]},
+			fields=["name", "image"],
+			ignore_permissions=True,
+		):
+			if r.image:
+				images[r.name] = r.image
 	for it in detail.get("items") or []:
 		loc = (sku_to_loc.get(it.get("item_code")) or {}).get("location") or ""
 		it["location"] = loc
+		code = str(it.get("item_code") or "").strip()
+		if code and not it.get("image"):
+			it["image"] = images.get(code) or ""
 
 	detail["ean13"] = armado_ean13_for_order(so.name)
 	detail["armado_notes"] = _load_armado_notes(so.name)
