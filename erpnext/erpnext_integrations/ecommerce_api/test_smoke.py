@@ -4683,6 +4683,10 @@ def suite_5_16b_dev_wipe():
         workers = dw.dev_wipe_preview(targets=["employees"], since="1w")
         assert workers.get("ok") and workers.get("since") == "1w", workers
         assert "employees" in (workers.get("counts") or {}), workers
+        catalog = dw.dev_wipe_preview(targets=["products", "categories"], since="all")
+        assert catalog.get("ok"), catalog
+        counts = catalog.get("counts") or {}
+        assert "products" in counts and "categories" in counts, counts
         try:
             dw.clear_dev_wipe_data(targets=["orders"], pin=None)
             assert False, "expected AuthenticationError for missing pin"

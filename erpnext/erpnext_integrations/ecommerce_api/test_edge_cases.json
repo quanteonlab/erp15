@@ -4221,6 +4221,28 @@
       "expect": "fail"
     },
     {
+      "id": "dev_wipe_preview_products_categories",
+      "source": "regression",
+      "bug": "dev_wipe_preview products+categories returns counts keys; never TypeError on catalog wipe plan",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.dev_wipe_preview",
+      "args": {
+        "targets": ["products", "categories"],
+        "since": "all"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "dev_wipe_preview_unknown_target",
+      "source": "regression",
+      "bug": "dev_wipe_preview ignores unknown target strings and still returns ok empty/partial plan",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.dev_wipe_preview",
+      "args": {
+        "targets": ["not_a_target", "products"],
+        "since": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_save_settings_late_penalty_dirty",
       "source": "regression",
       "bug": "save_tms_settings late_payment_penalty_pct/sync_delivery_payment_to_so dirty strings coerce; never TypeError",

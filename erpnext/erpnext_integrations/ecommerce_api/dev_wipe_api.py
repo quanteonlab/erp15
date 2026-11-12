@@ -5,6 +5,8 @@ Hard-deletes transactional docs for the active company. Cascade expands:
 - orders → related invoices/DNs/payments, then sales orders
 - invoices → related payments, then sales invoices
 - employees → HR rows that block delete (attendance, salary slips, …), then employees
+- products → Item Prices then Items (site-wide catalog)
+- categories → Item Groups except root ``All Item Groups`` (leaves first)
 
 Admin PIN required. Not for production tenants with real data.
 """
@@ -18,7 +20,8 @@ from frappe import _
 from frappe.utils import cint, cstr
 
 
-VALID_TARGETS = ("orders", "invoices", "customers", "employees")
+VALID_TARGETS = ("orders", "invoices", "customers", "employees", "products", "categories")
+_PROTECTED_ITEM_GROUPS = frozenset({"All Item Groups"})
 
 
 def _require_admin_pin(pin) -> None:
@@ -349,6 +352,50 @@ def _plan_wipe(targets: set[str], company: str, since: str = "all") -> dict:
 			or []
 		)
 
+	products: list[str] = []
+	if "products" in targets:
+		filters = {}
+		if cutoff is not None:
+			filters["creation"] = [">=", cutoff]
+		products = (
+			frappe.get_all(
+				"Item",
+				filters=filters,
+				pluck="name",
+				limit_page_length=50000,
+				ignore_permissions=True,
+			)
+			or []
+		)
+
+	categories: list[str] = []
+	if "categories" in targets:
+		filters = {}
+		if cutoff is not None:
+			filters["creation"] = [">=", cutoff]
+		raw_groups = (
+			frappe.get_all(
+				"Item Group",
+				filters=filters,
+				fields=["name", "parent_item_group", "lft", "rgt"],
+				limit_page_length=20000,
+				ignore_permissions=True,
+			)
+			or []
+		)
+		# Leaves first (deeper nested / larger lft-rgt span last).
+		ranked = []
+		for row in raw_groups:
+			name = cstr(row.get("name") or "")
+			if not name or name in _PROTECTED_ITEM_GROUPS:
+				continue
+			lft = cint(row.get("lft"))
+			rgt = cint(row.get("rgt"))
+			depth = max(0, rgt - lft)
+			ranked.append((depth, name))
+		ranked.sort(key=lambda x: x[0])  # smaller span = leafier first
+		categories = [n for _, n in ranked]
+
 	return {
 		"payment_entries": payment_entries,
 		"pos_invoices": pos_invoices,
@@ -357,6 +404,8 @@ def _plan_wipe(targets: set[str], company: str, since: str = "all") -> dict:
 		"sales_orders": sales_orders if want_orders else [],
 		"customers": customers if want_customers else [],
 		"employees": employees,
+		"products": products,
+		"categories": categories,
 		"targets": sorted(targets),
 		"since": since,
 		"company": company,
@@ -457,6 +506,56 @@ def _wipe_employee(emp: str) -> tuple[bool, str | None]:
 	return False, last_err or "sigue existiendo"
 
 
+def _wipe_item(item_code: str) -> tuple[bool, str | None]:
+	"""Delete prices / barcodes noise then force-delete Item."""
+	if not item_code or not frappe.db.exists("Item", item_code):
+		return True, None
+	try:
+		for price in frappe.get_all(
+			"Item Price",
+			filters={"item_code": item_code},
+			pluck="name",
+			ignore_permissions=True,
+		) or []:
+			_force_cancel_delete("Item Price", price)
+		if frappe.db.exists("DocType", "Item Barcode"):
+			# Child table — cleared with parent; no separate delete needed.
+			pass
+		if frappe.db.exists("DocType", "Bin"):
+			for bin_name in frappe.get_all(
+				"Bin", filters={"item_code": item_code}, pluck="name", ignore_permissions=True
+			) or []:
+				try:
+					frappe.db.set_value("Bin", bin_name, {"actual_qty": 0, "projected_qty": 0}, update_modified=False)
+					frappe.delete_doc("Bin", bin_name, ignore_permissions=True, force=True)
+				except Exception:
+					pass
+		frappe.flags.ignore_permissions = True
+		frappe.delete_doc("Item", item_code, ignore_permissions=True, force=True)
+		if not frappe.db.exists("Item", item_code):
+			return True, None
+		return False, "sigue existiendo"
+	except Exception as e:
+		frappe.log_error(title="dev_wipe Item", message=f"{item_code}: {e}")
+		return False, _brief_error(e)
+
+
+def _wipe_item_group(group: str) -> tuple[bool, str | None]:
+	if not group or group in _PROTECTED_ITEM_GROUPS:
+		return True, None
+	if not frappe.db.exists("Item Group", group):
+		return True, None
+	try:
+		frappe.flags.ignore_permissions = True
+		frappe.delete_doc("Item Group", group, ignore_permissions=True, force=True)
+		if not frappe.db.exists("Item Group", group):
+			return True, None
+		return False, "sigue existiendo"
+	except Exception as e:
+		frappe.log_error(title="dev_wipe Item Group", message=f"{group}: {e}")
+		return False, _brief_error(e)
+
+
 def _empty_counts() -> dict:
 	return {
 		"payment_entries": 0,
@@ -466,6 +565,8 @@ def _empty_counts() -> dict:
 		"sales_orders": 0,
 		"customers": 0,
 		"employees": 0,
+		"products": 0,
+		"categories": 0,
 	}
 
 
@@ -503,6 +604,8 @@ def dev_wipe_preview(targets=None, since=None):
 			"sales_orders": len(plan["sales_orders"]),
 			"customers": len(plan["customers"]),
 			"employees": len(plan["employees"]),
+			"products": len(plan["products"]),
+			"categories": len(plan["categories"]),
 		},
 	}
 
@@ -512,7 +615,9 @@ def clear_dev_wipe_data(targets=None, pin=None, since=None):
 	"""Wipe selected transactional data with cascade. Requires admin PIN."""
 	parsed = _parse_targets(targets)
 	if not parsed:
-		frappe.throw(_("Select at least one target: orders, invoices, customers, employees"))
+		frappe.throw(
+			_("Select at least one target: orders, invoices, customers, employees, products, categories")
+		)
 	_require_admin_pin(pin)
 	window = _parse_since(since)
 
@@ -586,6 +691,37 @@ def clear_dev_wipe_data(targets=None, pin=None, since=None):
 				removed["errors"] += 1
 				_note_block(blocked, "Employee", emp, _brief_error(e))
 				frappe.log_error(title="dev_wipe Employee", message=f"{emp}: {e}")
+			if (i + 1) % 25 == 0:
+				frappe.db.commit()
+
+		# Catalog last: products before categories so groups can empty out.
+		for i, item_code in enumerate(plan["products"]):
+			try:
+				ok, reason = _wipe_item(item_code)
+				if ok:
+					removed["products"] += 1
+				else:
+					removed["errors"] += 1
+					_note_block(blocked, "Item", item_code, reason)
+			except Exception as e:
+				removed["errors"] += 1
+				_note_block(blocked, "Item", item_code, _brief_error(e))
+				frappe.log_error(title="dev_wipe Item", message=f"{item_code}: {e}")
+			if (i + 1) % 25 == 0:
+				frappe.db.commit()
+
+		for i, group in enumerate(plan["categories"]):
+			try:
+				ok, reason = _wipe_item_group(group)
+				if ok:
+					removed["categories"] += 1
+				else:
+					removed["errors"] += 1
+					_note_block(blocked, "Item Group", group, reason)
+			except Exception as e:
+				removed["errors"] += 1
+				_note_block(blocked, "Item Group", group, _brief_error(e))
+				frappe.log_error(title="dev_wipe Item Group", message=f"{group}: {e}")
 			if (i + 1) % 25 == 0:
 				frappe.db.commit()
 
