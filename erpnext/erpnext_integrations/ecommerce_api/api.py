@@ -14532,6 +14532,22 @@ def clear_presentation_demo(pin=None):
 	return pd.clear_presentation_demo(pin=pin)
 
 
+@frappe.whitelist(allow_guest=True)
+def dev_wipe_preview(targets=None, since=None):
+	"""Settings → Desarrollador: preview cascade wipe counts."""
+	from erpnext.erpnext_integrations.ecommerce_api import dev_wipe_api as dw
+
+	return dw.dev_wipe_preview(targets=targets, since=since)
+
+
+@frappe.whitelist(allow_guest=True)
+def clear_dev_wipe_data(targets=None, pin=None, since=None):
+	"""Settings → Desarrollador: cascade wipe orders/invoices/customers. Admin PIN."""
+	from erpnext.erpnext_integrations.ecommerce_api import dev_wipe_api as dw
+
+	return dw.clear_dev_wipe_data(targets=targets, pin=pin, since=since)
+
+
 @frappe.whitelist()
 def import_catalog_image_zip(zip_base64=None):
 	"""

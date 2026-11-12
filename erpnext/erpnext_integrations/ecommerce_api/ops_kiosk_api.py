@@ -9,7 +9,10 @@ staff login session — same pattern as catalog.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import time
+from urllib.parse import quote
 
 import frappe
 from frappe import _
@@ -21,6 +24,9 @@ from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
 # Internal EAN-13 prefix for armado sheets. Retail product barcodes must not use
 # 290… (in-store / internal range). Lookup on /armado prefers this prefix.
 ARMADO_EAN13_PREFIX = "290"
+
+# Pedidos → /armado deep-link (theater hash). Opens any SO for ~1h even outside list filters.
+ARMADO_ACCESS_TTL_SECONDS = 3600
 
 
 def _ean13_check_digit(body12: str) -> str:
@@ -337,6 +343,120 @@ def list_armado_orders(delivery_date=None, limit=80):
 		"delivery_dates": delivery_dates,
 		"orders": out,
 	}
+
+
+def _armado_access_secret() -> str:
+	"""Site-local theater secret — not high security (sheet has no sensitive PII beyond order lines)."""
+	try:
+		from frappe.utils.password import get_encryption_key
+
+		key = str(get_encryption_key() or "")
+	except Exception:
+		key = str((frappe.conf or {}).get("encryption_key") or "")
+	site = getattr(frappe.local, "site", None) or "site"
+	return f"armado-access|{site}|{key}"
+
+
+def _armado_access_sig(preorder_name: str, exp: int) -> str:
+	msg = f"{preorder_name}|{int(exp)}|armado_access".encode("utf-8")
+	digest = hmac.new(
+		_armado_access_secret().encode("utf-8"),
+		msg,
+		hashlib.sha256,
+	).hexdigest()
+	return digest[:16]
+
+
+def _build_armado_access_token(preorder_name: str, *, ttl: int | None = None) -> dict:
+	ttl_i = int(ttl if ttl is not None else ARMADO_ACCESS_TTL_SECONDS)
+	if ttl_i < 60:
+		ttl_i = 60
+	if ttl_i > 86400:
+		ttl_i = 86400
+	exp = int(time.time()) + ttl_i
+	sig = _armado_access_sig(preorder_name, exp)
+	return {
+		"token": f"{exp}.{sig}",
+		"expires_at": exp,
+		"ttl_seconds": ttl_i,
+		"preorder_name": preorder_name,
+	}
+
+
+def verify_armado_access_payload(preorder_name=None, token=None) -> dict:
+	"""Validate Pedidos→Armado deep-link token. Always returns a controlled dict (no throw)."""
+	name = str(preorder_name or "").strip()
+	raw = str(token or "").strip()
+	if not name or not raw or raw in ("null", "undefined"):
+		return {"ok": True, "valid": 0, "reason": "missing"}
+	parts = raw.split(".", 1)
+	if len(parts) != 2:
+		return {"ok": True, "valid": 0, "reason": "malformed"}
+	try:
+		exp = int(parts[0])
+	except Exception:
+		return {"ok": True, "valid": 0, "reason": "malformed"}
+	sig = str(parts[1] or "").strip().lower()
+	if not sig or exp <= 0:
+		return {"ok": True, "valid": 0, "reason": "malformed"}
+	now = int(time.time())
+	if exp < now:
+		return {
+			"ok": True,
+			"valid": 0,
+			"reason": "expired",
+			"expires_at": exp,
+			"preorder_name": name,
+		}
+	expected = _armado_access_sig(name, exp)
+	if not hmac.compare_digest(expected, sig):
+		return {
+			"ok": True,
+			"valid": 0,
+			"reason": "bad_sig",
+			"expires_at": exp,
+			"preorder_name": name,
+		}
+	if not frappe.db.exists("Sales Order", name):
+		return {
+			"ok": True,
+			"valid": 0,
+			"reason": "not_found",
+			"expires_at": exp,
+			"preorder_name": name,
+		}
+	return {
+		"ok": True,
+		"valid": 1,
+		"expires_at": exp,
+		"preorder_name": name,
+		"ttl_remaining": max(0, exp - now),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def mint_armado_access_link(preorder_name=None, ttl_seconds=None):
+	"""Mint a ~1h deep-link so /armado can open this SO outside date/status list filters.
+
+	Theater HMAC only — Pedidos already gates staff; the link just looks signed.
+	"""
+	preorder_name = str(preorder_name or "").strip()
+	if not preorder_name or preorder_name in ("null", "undefined"):
+		frappe.throw(_("Order name required"))
+	if not frappe.db.exists("Sales Order", preorder_name):
+		frappe.throw(_("Order not found"))
+	ttl = None
+	if ttl_seconds not in (None, "", "null", "undefined"):
+		ttl = cint(ttl_seconds)
+	built = _build_armado_access_token(preorder_name, ttl=ttl)
+	path = f"/armado?order={quote(preorder_name, safe='')}&t={built['token']}"
+	return {"ok": True, **built, "path": path}
+
+
+@frappe.whitelist(allow_guest=True)
+def verify_armado_access_token(preorder_name=None, token=None):
+	"""Validate Pedidos→Armado deep-link token (controlled ok/valid dict — never TypeError)."""
+	return verify_armado_access_payload(preorder_name, token)
 
 
 @frappe.whitelist(allow_guest=True)

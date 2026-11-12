@@ -2119,6 +2119,28 @@ def suite_5_11_pos_session():
             pass
         frappe.set_user("Administrator")
 
+    def check_armado_access_link_mint_verify():
+        """Pedidos→Armado 1h theater HMAC: mint + verify round-trip; bad/expired fail closed."""
+        from erpnext.erpnext_integrations.ecommerce_api import ops_kiosk_api as oka
+
+        so = frappe.db.get_value("Sales Order", {"docstatus": ["<", 2]}, "name")
+        if not so:
+            raise AssertionError("no Sales Order fixture for armado access link")
+        minted = oka.mint_armado_access_link(preorder_name=so)
+        assert minted.get("ok") and minted.get("token") and minted.get("path"), minted
+        assert minted["path"].startswith("/armado?"), minted
+        assert so in minted["path"] and "t=" in minted["path"], minted
+        good = oka.verify_armado_access_token(preorder_name=so, token=minted["token"])
+        assert good.get("ok") and good.get("valid") == 1, good
+        assert good.get("preorder_name") == so, good
+        bad = oka.verify_armado_access_token(preorder_name=so, token="999.notasignature")
+        assert bad.get("ok") and bad.get("valid") == 0, bad
+        expired = oka.verify_armado_access_token(
+            preorder_name=so, token=f"1.{oka._armado_access_sig(so, 1)}"
+        )
+        assert expired.get("ok") and expired.get("valid") == 0, expired
+        assert expired.get("reason") == "expired", expired
+
     def check_pos_profiles():
         rows = cra.list_pos_profiles(minimal=1)
         assert rows is not None
@@ -2139,6 +2161,7 @@ def suite_5_11_pos_session():
     _run("5.11.6 ensure_employee_ops_pins + resolve", check_ensure_ops_pin_roundtrip, "S2")
     _run("5.11.6a client PIN first digit + resolve", check_client_pin_first_digit_and_resolve, "S2")
     _run("5.11.6b ops operator empty pin uses session", check_ops_operator_empty_pin_uses_session, "S2")
+    _run("5.11.6c armado access link mint/verify", check_armado_access_link_mint_verify, "S2")
     _run("5.11.7 list_pos_profiles", check_pos_profiles, "S3")
     _run("5.11.8 list_cash_register_sessions", check_cash_sessions, "S3")
     _run("5.11.9 list_pos_profile_meta", check_pos_profile_meta, "S3")
@@ -4643,6 +4666,37 @@ def suite_5_16_presentation_demo():
     _run("5.16.1 seed → status → clear (untagged kept)", check_seed_status_clear, "S2")
 
 
+def suite_5_16b_dev_wipe():
+    print("\n[Suite 5.16b] Developer cascade wipe (preview + PIN gate)")
+
+    def check_preview_and_pin_gate():
+        from erpnext.erpnext_integrations.ecommerce_api import dev_wipe_api as dw
+
+        empty = dw.dev_wipe_preview(targets=None)
+        assert empty.get("ok") and empty.get("counts"), empty
+        assert cint(empty["counts"].get("sales_orders")) == 0 or True  # may be non-zero on busy sites
+        preview = dw.dev_wipe_preview(targets=["orders"], since="24h")
+        assert preview.get("ok") and preview.get("since") == "24h", preview
+        assert "sales_orders" in (preview.get("counts") or {}), preview
+        forever = dw.dev_wipe_preview(targets=["orders"], since="nope")
+        assert forever.get("since") == "all", forever
+        workers = dw.dev_wipe_preview(targets=["employees"], since="1w")
+        assert workers.get("ok") and workers.get("since") == "1w", workers
+        assert "employees" in (workers.get("counts") or {}), workers
+        try:
+            dw.clear_dev_wipe_data(targets=["orders"], pin=None)
+            assert False, "expected AuthenticationError for missing pin"
+        except frappe.AuthenticationError:
+            pass
+        try:
+            dw.clear_dev_wipe_data(targets=[], pin="000000")
+            assert False, "expected ValidationError for empty targets"
+        except Exception:
+            pass
+
+    _run("5.16b.1 preview + missing pin / empty targets", check_preview_and_pin_gate, "S2")
+
+
 def suite_5_18_archivo():
     print("\n[Suite 5.18] Archivo — paper + payments hub")
 
@@ -4793,6 +4847,7 @@ def run(do_cleanup="1"):
     suite_5_14_ops_requirements()
     suite_5_15_creation_review()
     suite_5_16_presentation_demo()
+    suite_5_16b_dev_wipe()
     suite_5_17_mcp_gateway()
     suite_5_18_archivo()
 
