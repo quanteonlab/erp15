@@ -12308,6 +12308,39 @@ def _linked_box_pack(item_code):
 	return {"unit": unit, "pack": pack}
 
 
+def _receiving_flag(val, default=False):
+	"""Coerce a checkbox/API flag. null/""/"null" keep the default."""
+	if val in (None, ""):
+		return default
+	s = cstr(val).strip().lower()
+	if s in ("null", "undefined", "none"):
+		return default
+	if s in ("0", "false", "no", "off"):
+		return False
+	if s in ("1", "true", "yes", "on"):
+		return True
+	try:
+		return bool(cint(val))
+	except Exception:
+		return default
+
+
+def _line_measured_kg(line):
+	"""Optional measured total kg. Empty / dirty strings mean not weighed."""
+	if not isinstance(line, dict):
+		return 0.0
+	raw = line.get("measured_weight")
+	if raw in (None, ""):
+		return 0.0
+	if isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none", "nan"):
+		return 0.0
+	try:
+		kg = flt(raw)
+	except Exception:
+		return 0.0
+	return kg if kg > 0 else 0.0
+
+
 @frappe.whitelist(allow_guest=True)
 def commit_receiving_session(
 	session_id,
@@ -12317,14 +12350,18 @@ def commit_receiving_session(
 	lines,
 	draft_items,
 	purchase_order=None,
+	create_purchase_order=None,
+	is_return=None,
 ):
 	"""
 	Atomically:
 	1. Create new SilkOS Items for draft items (disabled/inactive until Review
 	   approves them — unless draft already has approved_at)
-	2. If no Purchase Order linked, auto-create a Compra (PO) from the lines
+	2. If no Purchase Order linked and this is not a return, create a Compra
+	   when create_purchase_order is on (default on, so older clients keep auto-OC)
 	3. Create a submitted Stock Entry (Material Receipt)
 	4. Create Stock Lot rows (logical lots) per line for Tables → Lotes
+	5. Optional measured kg on weight lines → Item Weight Observation (compras later)
 	Returns { stock_entry_id, new_item_codes, purchase_order, lot_names }
 	"""
 	import json
@@ -12354,6 +12391,11 @@ def commit_receiving_session(
 		purchase_order = ""
 	if purchase_order and not frappe.db.exists("Purchase Order", purchase_order):
 		purchase_order = ""
+	is_return_flag = _receiving_flag(is_return, default=False)
+	want_purchase_order = _receiving_flag(create_purchase_order, default=True)
+	for line in lines:
+		if isinstance(line, dict):
+			_line_measured_kg(line)
 
 
 	def _upsert_receiving_item_price(item_code: str, rate: float) -> None:
@@ -12573,10 +12615,10 @@ def commit_receiving_session(
 	if not resolved_lines:
 		frappe.throw("No valid lines to receive")
 
-	# Auto-create Compra (Purchase Order) when recepción has no linked OC —
-	# assume the buyer forgot to register the compra; autofill from session lines.
+	# Compra from this recepción when nothing is linked.
+	# Returns are registered as-is (no OC). Older callers omit the flag → still auto-create.
 	po_created = False
-	if not purchase_order:
+	if not purchase_order and not is_return_flag and want_purchase_order:
 		try:
 			from erpnext.erpnext_integrations.ecommerce_api.buying_api import create_purchase_order
 
@@ -12607,15 +12649,26 @@ def commit_receiving_session(
 					}
 				)
 			if po_items:
+				weight_bits = []
+				for line in lines:
+					kg = _line_measured_kg(line)
+					if kg <= 0:
+						continue
+					label = cstr(line.get("item_code") or line.get("item_name") or "").strip()
+					if label:
+						weight_bits.append(f"{label}: {kg} kg")
+				po_notes = (
+					f"Auto from recepción {cstr(session_id or '').strip()}"
+					+ (f" — ref: {reference}" if reference else "")
+				)
+				if weight_bits:
+					po_notes += "\nPeso medido: " + "; ".join(weight_bits)
 				po_res = create_purchase_order(
 					supplier=supplier or "Uncategorized",
 					schedule_date=nowdate(),
 					items=po_items,
 					submit=1,
-					notes=(
-						f"Auto from recepción {cstr(session_id or '').strip()}"
-						+ (f" — ref: {reference}" if reference else "")
-					),
+					notes=po_notes,
 					client_request_id=f"recv-auto-po:{cstr(session_id or '').strip()}"[:140] or None,
 				)
 				purchase_order = cstr((po_res or {}).get("name") or "").strip()
@@ -12722,6 +12775,46 @@ def commit_receiving_session(
 			frappe.db.commit()
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "receiving stock lots")
+
+	# Optional measured kg — stored so Compras can complete the weigh later.
+	# Soft: a missing DocType or a bad line must not roll back the receipt.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.weight_api import (
+			record_item_weight_observation,
+		)
+
+		ref_dt = "Purchase Order" if purchase_order else "Stock Entry"
+		ref_name = purchase_order or (se.name if se else None)
+		for line in lines:
+			kg = _line_measured_kg(line)
+			if kg <= 0:
+				continue
+			code = line.get("item_code")
+			if not code and line.get("draft_item_id"):
+				code = new_item_codes.get(line["draft_item_id"])
+			if not code:
+				continue
+			qty = flt(line.get("qty") or 0)
+			if qty <= 0:
+				continue
+			box = _linked_box_pack(code)
+			if box:
+				qty = qty * box["pack"]
+				code = box["unit"]
+			try:
+				record_item_weight_observation(
+					item_code=code,
+					units=qty,
+					total_weight=kg,
+					source="receiving",
+					reference_doctype=ref_dt if ref_name else None,
+					reference_name=ref_name,
+				)
+			except Exception:
+				frappe.clear_messages()
+				frappe.log_error(frappe.get_traceback(), "receiving measured weight")
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "receiving measured weight")
 
 	return {
 		"stock_entry_id": se.name if se else None,

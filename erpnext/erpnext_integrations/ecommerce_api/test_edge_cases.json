@@ -4803,6 +4803,31 @@
       "expect": "ok"
     },
     {
+      "id": "commit_receiving_return_skips_po_dirty_weight",
+      "source": "regression",
+      "bug": "return reception with null measured_weight and create_purchase_order 0 stays controlled (no OC, no TypeError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.commit_receiving_session",
+      "args": {
+        "session_id": "edge-return-weight",
+        "reference": "DEV-EDGE",
+        "supplier": null,
+        "warehouse": null,
+        "lines": [
+          {
+            "item_code": null,
+            "qty": "1",
+            "unit_cost": "",
+            "measured_weight": "null"
+          }
+        ],
+        "draft_items": [],
+        "purchase_order": "",
+        "create_purchase_order": 0,
+        "is_return": 1
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "commit_receiving_null_purchase_order",
       "source": "regression",
       "bug": "commit_receiving_session with null purchase_order never TypeError (auto-PO path coerced)",

@@ -12152,10 +12152,16 @@ def list_pending_vehicle_returns(vehicle=None, days=30):
 			)
 			bucket = agg.get(code)
 			if not bucket:
+				uom = frappe.db.get_value("Item", code, "stock_uom") if frappe.db.exists("Item", code) else None
+				wpu = None
+				if frappe.db.has_column("Item", "weight_per_unit") and frappe.db.exists("Item", code):
+					wpu = frappe.db.get_value("Item", code, "weight_per_unit")
 				agg[code] = {
 					"item_code": code,
 					"item_name": name,
 					"qty": qty,
+					"stock_uom": uom,
+					"weight_per_unit": wpu,
 					"capture_names": [cap.name],
 				}
 			else:
