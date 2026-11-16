@@ -186,6 +186,625 @@ def _log_armado_operator(so_name: str, identity: dict, *, via: str = "armado") -
 		frappe.log_error(frappe.get_traceback(), "armado operator audit")
 
 
+ARMADO_PROGRESS_EVENT_CAP = 100
+
+
+def _armado_progress_scope(so_name: str) -> str:
+	return f"ops.armado.progress::{so_name}"
+
+
+def _empty_armado_progress() -> dict:
+	return {"lines": {}, "boxes": {"count": 0, "by": "", "at": ""}, "events": []}
+
+
+def _load_armado_progress(so_name: str) -> dict:
+	scope = _armado_progress_scope(so_name)
+	base = _empty_armado_progress()
+	if not so_name or not frappe.db.exists("Table Extra Schema", scope):
+		return base
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Table Extra Schema", scope)
+	data = {}
+	try:
+		data = json.loads(doc.columns_json or "{}")
+	except Exception:
+		data = {}
+	if not isinstance(data, dict):
+		return base
+	lines = data.get("lines") if isinstance(data.get("lines"), dict) else {}
+	boxes = data.get("boxes") if isinstance(data.get("boxes"), dict) else {}
+	events = data.get("events") if isinstance(data.get("events"), list) else []
+	base["snapshot"] = data.get("snapshot") if isinstance(data.get("snapshot"), list) else []
+	base["last_saved_at"] = str(data.get("last_saved_at") or "")
+	base["last_saved_by"] = str(data.get("last_saved_by") or "")
+	base["lines"] = lines
+	base["boxes"] = {
+		"count": cint(boxes.get("count")),
+		"by": str(boxes.get("by") or ""),
+		"at": str(boxes.get("at") or ""),
+	}
+	base["events"] = events[-ARMADO_PROGRESS_EVENT_CAP:]
+	return base
+
+
+def _save_armado_progress(so_name: str, progress: dict) -> None:
+	scope = _armado_progress_scope(so_name)
+	events = progress.get("events") if isinstance(progress.get("events"), list) else []
+	progress["events"] = events[-ARMADO_PROGRESS_EVENT_CAP:]
+	payload = json.dumps(progress, ensure_ascii=False, default=str)
+	frappe.flags.ignore_permissions = True
+	if frappe.db.exists("Table Extra Schema", scope):
+		doc = frappe.get_doc("Table Extra Schema", scope)
+		doc.columns_json = payload
+		doc.save(ignore_permissions=True)
+	else:
+		doc = frappe.get_doc(
+			{"doctype": "Table Extra Schema", "scope": scope, "columns_json": payload}
+		)
+		doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+
+
+def _blank_progress_line(item_code: str) -> dict:
+	return {
+		"item_code": item_code,
+		"packed": False,
+		"missing": False,
+		"missing_reason": "",
+		"packed_by": "",
+		"packed_by_employee": "",
+		"packed_at": "",
+		"missing_by": "",
+		"missing_by_employee": "",
+		"missing_at": "",
+		"qty": None,
+		"total_weight": None,
+	}
+
+
+def _coerce_progress_map(raw, label: str):
+	"""None when the arg was omitted. Non-maps are a controlled error."""
+	if raw is None:
+		return None
+	if isinstance(raw, str):
+		text = raw.strip()
+		if text.lower() in ("", "null", "undefined", "none"):
+			return None
+		try:
+			raw = json.loads(text)
+		except Exception:
+			frappe.throw(_("{0} must be a map").format(label))
+	if raw is None:
+		return None
+	if isinstance(raw, (list, tuple, bool, int, float)):
+		frappe.throw(_("{0} must be a map").format(label))
+	if not isinstance(raw, dict):
+		frappe.throw(_("{0} must be a map").format(label))
+	return raw
+
+
+def _flag_from_value(value) -> bool:
+	if isinstance(value, dict):
+		if "missing" in value:
+			return _flag_from_value(value.get("missing"))
+		if "packed" in value:
+			return _flag_from_value(value.get("packed"))
+		return True
+	if value in (None, "", "null", "undefined", "none", "false", "False", "0", 0, 0.0, False):
+		return False
+	if value in (True, 1, "1", "true", "True", "yes", "on"):
+		return True
+	return bool(value)
+
+
+def _missing_reason_from_value(value) -> str:
+	if isinstance(value, dict):
+		reason = str(value.get("reason") or value.get("missing_reason") or "").strip()
+		return (reason or "sin stock")[:140]
+	return "sin stock"
+
+
+def _parse_box_count(raw, *, required: bool = False):
+	if isinstance(raw, dict):
+		raw = raw.get("count")
+	if raw is None:
+		if required:
+			frappe.throw(_("Box count required"))
+		return None
+	if isinstance(raw, str):
+		text = raw.strip()
+		if text.lower() in ("", "null", "undefined", "none"):
+			if required:
+				frappe.throw(_("Box count required"))
+			return None
+		raw = text
+	if isinstance(raw, (list, tuple, dict, bool)):
+		frappe.throw(_("Invalid box count"))
+	try:
+		count = cint(raw)
+	except Exception:
+		frappe.throw(_("Invalid box count"))
+	if count < 1 or count > 99:
+		frappe.throw(_("Box count must be between 1 and 99"))
+	return count
+
+
+def _so_armado_rows(so) -> list[dict]:
+	rows = []
+	seen = {}
+	for i, row in enumerate(so.items or []):
+		code = str(getattr(row, "item_code", None) or "").strip()
+		row_name = str(getattr(row, "name", None) or "").strip()
+		idx = cint(getattr(row, "idx", None) or (i + 1))
+		if row_name:
+			key = row_name
+		else:
+			n = seen.get(code, 0) + 1
+			seen[code] = n
+			key = f"{code or 'line'}#{idx or n}"
+		rows.append(
+			{
+				"key": key,
+				"item_code": code,
+				"item_name": str(getattr(row, "item_name", None) or code),
+				"idx": idx,
+				"qty": flt(getattr(row, "qty", None)),
+			}
+		)
+	return rows
+
+
+def _resolve_progress_key(token: str, rows: list[dict]) -> str | None:
+	token = str(token or "").strip()
+	if not token or token.lower() in ("null", "undefined", "none"):
+		return None
+	by_key = {r["key"]: r for r in rows}
+	if token in by_key:
+		return token
+	matches = [r["key"] for r in rows if r["item_code"] == token]
+	if len(matches) == 1:
+		return matches[0]
+	return None
+
+
+def _progress_event(identity: dict, *, via: str, action: str, item_codes: list, detail: str = "") -> dict:
+	return {
+		"at": cstr(frappe.utils.now()),
+		"via": via,
+		"employee": identity.get("employee") or "",
+		"employee_name": _operator_label(identity),
+		"action": action,
+		"item_codes": item_codes,
+		"detail": detail or "",
+	}
+
+
+def _merge_armado_progress(
+	so_name: str,
+	identity: dict,
+	*,
+	packed: dict | None = None,
+	missing: dict | None = None,
+	box_count: int | None = None,
+	items: list | None = None,
+	via: str = "armado_items",
+) -> dict:
+	"""Merge line flags. Unknown keys are ignored. Packed and missing are exclusive."""
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	rows = _so_armado_rows(so)
+	progress = _load_armado_progress(so_name)
+	lines = progress.setdefault("lines", {})
+	events = progress.setdefault("events", [])
+	by_code = {}
+	if isinstance(items, list):
+		for row in items:
+			if isinstance(row, dict) and row.get("item_code"):
+				by_code[str(row.get("item_code"))] = row
+
+	def _touch_qty(entry: dict):
+		src = by_code.get(entry.get("item_code") or "")
+		if not isinstance(src, dict):
+			return
+		if src.get("qty") is not None:
+			entry["qty"] = flt(src.get("qty"))
+		if src.get("total_weight") is not None:
+			entry["total_weight"] = flt(src.get("total_weight"))
+
+	packed_codes = []
+	unpacked_codes = []
+	missing_codes = []
+	unmissing_codes = []
+	restamp_codes = []
+	keys = set()
+	if isinstance(packed, dict):
+		keys.update(str(k) for k in packed.keys())
+	if isinstance(missing, dict):
+		keys.update(str(k) for k in missing.keys())
+
+	for token in keys:
+		key = _resolve_progress_key(token, rows)
+		if not key:
+			continue
+		row = next(r for r in rows if r["key"] == key)
+		entry = lines.get(key) if isinstance(lines.get(key), dict) else _blank_progress_line(row["item_code"])
+		entry["item_code"] = row["item_code"]
+		want_missing = missing.get(token) if isinstance(missing, dict) and token in missing else None
+		if want_missing is None and isinstance(missing, dict) and key in missing:
+			want_missing = missing.get(key)
+		want_packed = packed.get(token) if isinstance(packed, dict) and token in packed else None
+		if want_packed is None and isinstance(packed, dict) and key in packed:
+			want_packed = packed.get(key)
+
+		if want_missing is not None and _flag_from_value(want_missing):
+			entry["missing"] = True
+			entry["missing_reason"] = _missing_reason_from_value(want_missing)
+			entry["missing_by"] = _operator_label(identity)
+			entry["missing_by_employee"] = identity.get("employee") or ""
+			entry["missing_at"] = cstr(frappe.utils.now())
+			entry["packed"] = False
+			entry["packed_by"] = ""
+			entry["packed_by_employee"] = ""
+			entry["packed_at"] = ""
+			missing_codes.append(row["item_code"])
+		elif want_packed is not None and _flag_from_value(want_packed):
+			entry["packed"] = True
+			entry["packed_by"] = _operator_label(identity)
+			entry["packed_by_employee"] = identity.get("employee") or ""
+			entry["packed_at"] = cstr(frappe.utils.now())
+			entry["missing"] = False
+			entry["missing_reason"] = ""
+			entry["missing_by"] = ""
+			entry["missing_by_employee"] = ""
+			entry["missing_at"] = ""
+			packed_codes.append(row["item_code"])
+		else:
+			if want_packed is not None and not _flag_from_value(want_packed):
+				if entry.get("packed"):
+					unpacked_codes.append(row["item_code"])
+				entry["packed"] = False
+				entry["packed_by"] = ""
+				entry["packed_by_employee"] = ""
+				entry["packed_at"] = ""
+			if want_missing is not None and not _flag_from_value(want_missing):
+				if entry.get("missing"):
+					unmissing_codes.append(row["item_code"])
+				entry["missing"] = False
+				entry["missing_reason"] = ""
+				entry["missing_by"] = ""
+				entry["missing_by_employee"] = ""
+				entry["missing_at"] = ""
+		_touch_qty(entry)
+		lines[key] = entry
+
+	# Qty/weight edits on an already packed line restamp the current operator.
+	if by_code:
+		for row in rows:
+			entry = lines.get(row["key"])
+			if not isinstance(entry, dict) or not entry.get("packed"):
+				continue
+			if row["item_code"] not in by_code:
+				continue
+			if row["item_code"] in packed_codes:
+				_touch_qty(entry)
+				continue
+			entry["packed_by"] = _operator_label(identity)
+			entry["packed_by_employee"] = identity.get("employee") or ""
+			entry["packed_at"] = cstr(frappe.utils.now())
+			_touch_qty(entry)
+			restamp_codes.append(row["item_code"])
+
+	if box_count is not None:
+		progress["boxes"] = {
+			"count": int(box_count),
+			"by": _operator_label(identity),
+			"at": cstr(frappe.utils.now()),
+		}
+		events.append(
+			_progress_event(
+				identity,
+				via="armado_boxes",
+				action="boxes",
+				item_codes=[],
+				detail=str(int(box_count)),
+			)
+		)
+
+	for action, codes, detail in (
+		("pack", packed_codes, ""),
+		("unpack", unpacked_codes, ""),
+		("missing", missing_codes, "sin stock"),
+		("unmissing", unmissing_codes, ""),
+		("save", restamp_codes, ""),
+	):
+		if codes:
+			events.append(
+				_progress_event(identity, via=via, action=action, item_codes=codes, detail=detail)
+			)
+
+	progress["lines"] = lines
+	progress["events"] = events
+	progress["snapshot"] = [
+		{"key": row["key"], "item_code": row["item_code"], "qty": flt(row["qty"]), "idx": row["idx"]}
+		for row in rows
+	]
+	progress["last_saved_at"] = cstr(frappe.utils.now())
+	progress["last_saved_by"] = _operator_label(identity)
+	_save_armado_progress(so_name, progress)
+	return progress
+
+
+def _armado_row_fingerprint(rows: list) -> list:
+	"""Stable line identity + qty. Sorted so order of the child table does not matter."""
+	parts = []
+	for i, row in enumerate(rows or []):
+		if isinstance(row, dict):
+			code = str(row.get("item_code") or "")
+			key = str(row.get("key") or row.get("name") or "")
+			idx = cint(row.get("idx") or (i + 1))
+			qty = flt(row.get("qty"))
+		else:
+			code = str(getattr(row, "item_code", None) or "")
+			key = str(getattr(row, "name", None) or "")
+			idx = cint(getattr(row, "idx", None) or (i + 1))
+			qty = flt(getattr(row, "qty", None))
+		if not key:
+			key = f"{code or 'line'}#{idx}"
+		parts.append(f"{key}|{code}|{qty:.3f}")
+	return sorted(parts)
+
+
+def _armado_has_activity(progress: dict | None) -> bool:
+	if not isinstance(progress, dict):
+		return False
+	lines = progress.get("lines") if isinstance(progress.get("lines"), dict) else {}
+	for state in lines.values():
+		if isinstance(state, dict) and (state.get("packed") or state.get("missing")):
+			return True
+	if progress.get("events"):
+		return True
+	return cint(((progress.get("boxes") or {}) if isinstance(progress.get("boxes"), dict) else {}).get("count")) > 0
+
+
+def _armado_changed_since_save(item_rows: list, progress: dict | None) -> bool:
+	"""True when someone edited the order after a packer had already saved progress."""
+	if not _armado_has_activity(progress):
+		return False
+	current = _armado_row_fingerprint(item_rows)
+	snap = (progress or {}).get("snapshot") if isinstance(progress, dict) else None
+	if isinstance(snap, list) and snap:
+		return current != _armado_row_fingerprint(snap)
+	# Saves from before snapshots: compare qty stored on each packed/missing line.
+	lines = (progress or {}).get("lines") if isinstance(progress, dict) else {}
+	if not isinstance(lines, dict) or not lines:
+		return False
+	current_keys = set()
+	for i, row in enumerate(item_rows or []):
+		code = str(row.get("item_code") if isinstance(row, dict) else getattr(row, "item_code", "") or "")
+		key = str(row.get("name") if isinstance(row, dict) else getattr(row, "name", "") or "")
+		idx = cint(row.get("idx") if isinstance(row, dict) else getattr(row, "idx", i + 1))
+		qty = flt(row.get("qty") if isinstance(row, dict) else getattr(row, "qty", 0))
+		if not key:
+			key = f"{code or 'line'}#{idx or i + 1}"
+		current_keys.add(key)
+		state = lines.get(key) if isinstance(lines.get(key), dict) else None
+		if state is None:
+			return True
+		if state.get("qty") is not None and abs(flt(state.get("qty")) - qty) > 0.0001:
+			return True
+	for key, state in lines.items():
+		if key not in current_keys and isinstance(state, dict) and (state.get("packed") or state.get("missing")):
+			return True
+	return False
+
+
+def _summarize_progress(item_rows: list, progress: dict | None) -> dict:
+	lines = (progress or {}).get("lines") if isinstance(progress, dict) else {}
+	if not isinstance(lines, dict):
+		lines = {}
+	packed = 0
+	missing = 0
+	qty_total = 0.0
+	for i, row in enumerate(item_rows or []):
+		qty_total += flt(row.get("qty") if isinstance(row, dict) else getattr(row, "qty", 0))
+		code = str(row.get("item_code") if isinstance(row, dict) else getattr(row, "item_code", "") or "")
+		key = str(row.get("name") if isinstance(row, dict) else getattr(row, "name", "") or "")
+		idx = cint(row.get("idx") if isinstance(row, dict) else getattr(row, "idx", i + 1))
+		if not key:
+			key = f"{code or 'line'}#{idx or i + 1}"
+		state = lines.get(key) if isinstance(lines.get(key), dict) else None
+		if state is None:
+			matches = [
+				v
+				for k, v in lines.items()
+				if isinstance(v, dict) and str(v.get("item_code") or "") == code
+			]
+			state = matches[0] if len(matches) == 1 else None
+		if isinstance(state, dict) and state.get("packed"):
+			packed += 1
+		elif isinstance(state, dict) and state.get("missing"):
+			missing += 1
+	item_count = len(item_rows or [])
+	resolved = packed + missing
+	if item_count <= 0 or resolved <= 0:
+		bucket = "none"
+	elif resolved >= item_count:
+		bucket = "ready"
+	else:
+		bucket = "partial"
+	box_count = cint(((progress or {}).get("boxes") or {}).get("count")) if isinstance(progress, dict) else 0
+	events = (progress or {}).get("events") if isinstance(progress, dict) and isinstance((progress or {}).get("events"), list) else []
+	last_event = events[-1] if events else {}
+	if not isinstance(last_event, dict):
+		last_event = {}
+	last_saved_at = ""
+	last_saved_by = ""
+	if isinstance(progress, dict):
+		last_saved_at = str(progress.get("last_saved_at") or last_event.get("at") or "")
+		last_saved_by = str(progress.get("last_saved_by") or last_event.get("employee_name") or "")
+	return {
+		"packed": packed,
+		"missing": missing,
+		"item_count": item_count,
+		"qty_total": qty_total,
+		"box_count": box_count,
+		"bucket": bucket,
+		"changed": 1 if _armado_changed_since_save(item_rows, progress) else 0,
+		"last_saved_at": last_saved_at,
+		"last_saved_by": last_saved_by,
+	}
+
+
+def _attach_armado_list_progress(orders: list) -> None:
+	names = [o.get("name") for o in orders if o.get("name")]
+	if not names:
+		return
+	item_rows = frappe.get_all(
+		"Sales Order Item",
+		filters={"parent": ["in", names]},
+		fields=["parent", "name", "item_code", "idx", "qty"],
+		limit_page_length=8000,
+		ignore_permissions=True,
+	)
+	scopes = [_armado_progress_scope(n) for n in names]
+	schema_rows = frappe.get_all(
+		"Table Extra Schema",
+		filters={"name": ["in", scopes]},
+		fields=["name", "columns_json"],
+		limit_page_length=len(scopes) + 10,
+		ignore_permissions=True,
+	)
+	prog_by_scope = {}
+	for row in schema_rows:
+		try:
+			parsed = json.loads(row.columns_json or "{}")
+		except Exception:
+			parsed = {}
+		prog_by_scope[row.name] = parsed if isinstance(parsed, dict) else {}
+	by_parent = {}
+	for row in item_rows:
+		by_parent.setdefault(row.parent, []).append(row)
+	for order in orders:
+		rows = by_parent.get(order.get("name")) or []
+		progress = prog_by_scope.get(_armado_progress_scope(order.get("name"))) or {}
+		summary = _summarize_progress(rows, progress)
+		order["items_count"] = summary["item_count"]
+		order["qty_total"] = summary["qty_total"]
+		order["progress_summary"] = summary
+
+
+def _stamp_armado_sheet(detail: dict, so) -> dict:
+	"""Attach stable line keys, progress, and a read-only flag for non-Orden sheets."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
+
+	items = detail.get("items") or []
+	rows = list(so.items or [])
+	used = set()
+	for i, it in enumerate(items):
+		code = str(it.get("item_code") or "")
+		match = None
+		if i < len(rows) and str(getattr(rows[i], "item_code", "") or "") == code and rows[i].name not in used:
+			match = rows[i]
+		if match is None:
+			for row in rows:
+				if row.name in used:
+					continue
+				if str(getattr(row, "item_code", "") or "") == code:
+					match = row
+					break
+		if match is not None:
+			used.add(match.name)
+			it["line_key"] = str(match.name)
+		else:
+			it["line_key"] = f"{code or 'line'}#{i + 1}"
+	progress = _load_armado_progress(so.name)
+	detail["armado_progress"] = progress
+	detail["armado_changed"] = 1 if _armado_changed_since_save(list(so.items or []), progress) else 0
+	detail["armado_last_saved_at"] = progress.get("last_saved_at") or ""
+	detail["armado_last_saved_by"] = progress.get("last_saved_by") or ""
+	disp = _display_status(so)
+	detail["display_status"] = disp
+	detail["armado_readonly"] = 0 if disp == "Orden" else 1
+	remarks = cstr(getattr(so, "remarks", None) or "")
+	detail["armado_practice"] = 1 if "armado_practice:1" in remarks else 0
+	return detail
+
+
+def _armado_gate_ready(so_name: str) -> dict:
+	"""Raise a controlled error unless every current line is packed or missing and boxes are 1–99."""
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	rows = _so_armado_rows(so)
+	if not rows:
+		frappe.throw(_("Order has no items"))
+	progress = _load_armado_progress(so_name)
+	lines = progress.get("lines") or {}
+	pending = []
+	for row in rows:
+		state = lines.get(row["key"]) if isinstance(lines.get(row["key"]), dict) else {}
+		if not (state.get("packed") or state.get("missing")):
+			pending.append(row["item_code"] or row["key"])
+	if pending:
+		frappe.throw(
+			_("Armado incomplete: {0}").format(", ".join(pending[:12]))
+		)
+	box_count = cint((progress.get("boxes") or {}).get("count"))
+	if box_count < 1 or box_count > 99:
+		frappe.throw(_("Box count must be between 1 and 99"))
+	return progress
+
+
+def _armado_progress_public(so_name: str) -> dict | None:
+	so_name = str(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return None
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	rows = _so_armado_rows(so)
+	progress = _load_armado_progress(so_name)
+	lines = progress.get("lines") or {}
+	out_lines = []
+	for row in rows:
+		state = lines.get(row["key"]) if isinstance(lines.get(row["key"]), dict) else {}
+		out_lines.append(
+			{
+				"line_key": row["key"],
+				"item_code": row["item_code"],
+				"item_name": row["item_name"],
+				"packed": 1 if state.get("packed") else 0,
+				"missing": 1 if state.get("missing") else 0,
+				"missing_reason": state.get("missing_reason") or "",
+				"packed_by": state.get("packed_by") or "",
+				"packed_at": state.get("packed_at") or "",
+				"missing_by": state.get("missing_by") or "",
+				"missing_at": state.get("missing_at") or "",
+			}
+		)
+	summary = _summarize_progress(
+		[{"name": r["key"], "item_code": r["item_code"], "idx": r["idx"], "qty": r["qty"]} for r in rows],
+		progress,
+	)
+	return {
+		"sales_order": so_name,
+		"box_count": summary["box_count"],
+		"packed": summary["packed"],
+		"missing": summary["missing"],
+		"item_count": summary["item_count"],
+		"bucket": summary["bucket"],
+		"complete": 1 if summary["bucket"] == "ready" else 0,
+		"lines": out_lines,
+		"events": (progress.get("events") or [])[-30:],
+	}
+
+
+def _truthy_flag(raw) -> bool:
+	if raw in (None, "", 0, False, "0", "false", "False", "null", "undefined", "none", "no"):
+		return False
+	if isinstance(raw, str) and raw.strip().lower() in ("", "0", "false", "null", "undefined", "none", "no"):
+		return False
+	return True
+
+
 @frappe.whitelist(allow_guest=True)
 def resolve_armado_ean13(code=None):
 	"""Map a scanned armado EAN-13 → Sales Order name (Orden-stage only)."""
@@ -224,7 +843,7 @@ def resolve_armado_ean13(code=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def list_armado_orders(delivery_date=None, limit=80):
+def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 	"""Orders for the armado kiosk.
 
 	Only **Orden**-stage open orders (not Consulta drafts, not already Preparado /
@@ -232,6 +851,9 @@ def list_armado_orders(delivery_date=None, limit=80):
 	filter (default). Otherwise only orders due that day.
 	Also returns ``delivery_dates`` (distinct due dates among Orden-stage armado
 	orders) so the UI can offer a day picker.
+
+	``include_completed`` also returns Preparado sheets (read-only historial) with
+	``completed: 1``. Each row includes ``progress_summary``.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
 
@@ -332,11 +954,61 @@ def list_armado_orders(delivery_date=None, limit=80):
 				"display_status": disp,
 				"is_guest": is_guest,
 				"ean13": ean13,
-				"items_count": frappe.db.count("Sales Order Item", {"parent": r.name}),
+				"items_count": 0,
+				"qty_total": 0,
+				"completed": 0,
+				"practice": 1 if "armado_practice:1" in tag else 0,
 			}
 		)
 		if len(out) >= limit:
 			break
+
+	if _truthy_flag(include_completed):
+		done_filters = {"docstatus": 1, "status": "Preparado"}
+		if due is not None:
+			done_filters["delivery_date"] = due
+		done_rows = frappe.get_all(
+			"Sales Order",
+			filters=done_filters,
+			fields=fields,
+			order_by="modified desc",
+			limit_page_length=limit,
+			ignore_permissions=True,
+		)
+		seen = {o["name"] for o in out}
+		for r in done_rows:
+			if r.name in seen:
+				continue
+			disp = _display_status_from_row(
+				r.docstatus, r.status, r.grand_total, getattr(r, "advance_paid", 0)
+			)
+			if disp != "Preparado":
+				continue
+			tag = str(r.get(tag_field) or "") if tag_field else ""
+			out.append(
+				{
+					"name": r.name,
+					"customer": r.customer,
+					"customer_name": r.customer_name or r.customer,
+					"delivery_date": str(r.delivery_date or ""),
+					"transaction_date": str(r.transaction_date or ""),
+					"grand_total": flt(r.grand_total),
+					"currency": r.currency,
+					"docstatus": cint(r.docstatus),
+					"status": r.status,
+					"display_status": disp,
+					"is_guest": "guest_preorder=1" in tag,
+					"ean13": armado_ean13_for_order(r.name),
+					"items_count": 0,
+					"qty_total": 0,
+					"completed": 1,
+					"practice": 1 if "armado_practice:1" in tag else 0,
+				}
+			)
+			if len(out) >= limit * 2:
+				break
+
+	_attach_armado_list_progress(out)
 	return {
 		"ok": True,
 		"delivery_date": "" if due is None else str(due),
@@ -539,6 +1211,7 @@ def get_armado_order(preorder_name=None):
 
 	detail["ean13"] = armado_ean13_for_order(so.name)
 	detail["armado_notes"] = _load_armado_notes(so.name)
+	_stamp_armado_sheet(detail, so)
 	return {"ok": True, "order": detail}
 
 
@@ -596,56 +1269,136 @@ def save_armado_notes(preorder_name=None, notes=None, pin=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def update_armado_items(preorder_name=None, items=None, pin=None):
-	"""Update qty/weight on armado lines (reuses guest preorder item update when possible).
+def save_armado_boxes(preorder_name=None, box_count=None, pin=None):
+	"""Store how many boxes were used to pack this order. Does not promote pipeline."""
+	identity = _require_ops_operator(pin)
+	count = _parse_box_count(box_count, required=True)
+	preorder_name = str(preorder_name or "").strip()
+	if (
+		not preorder_name
+		or preorder_name.lower() in ("null", "undefined", "none")
+		or not frappe.db.exists("Sales Order", preorder_name)
+	):
+		frappe.throw(_("Order not found"))
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
 
-	Does **not** advance pipeline — use ``confirm_armado`` to move Orden → Preparado.
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", preorder_name)
+	disp = _display_status(so)
+	base = "Completado" if str(disp).startswith("Completado") else disp
+	if base != "Orden":
+		frappe.throw(
+			_("Only Orden-stage orders can be updated in armado (current: {0})").format(base)
+		)
+	_merge_armado_progress(preorder_name, identity, box_count=count, via="armado_boxes")
+	_log_armado_operator(preorder_name, identity, via="armado_boxes")
+	return {
+		"ok": True,
+		"box_count": count,
+		"operator": {
+			"kind": identity.get("kind"),
+			"employee": identity.get("employee"),
+			"employee_name": identity.get("employee_name"),
+		},
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_armado_progress(preorder_name=None):
+	"""Read-only pack history for Delivery and the armado sheet."""
+	preorder_name = str(preorder_name or "").strip()
+	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Order name required"))
+	progress = _armado_progress_public(preorder_name)
+	if not progress:
+		frappe.throw(_("Order not found"))
+	return {"ok": True, "progress": progress}
+
+
+@frappe.whitelist(allow_guest=True)
+def update_armado_items(
+	preorder_name=None, items=None, pin=None, packed=None, missing=None, box_count=None
+):
+	"""Update qty/weight and per-line pack/faltante progress. Does not promote pipeline.
+
+	``packed`` / ``missing`` maps merge by line key (or unique item code). Unknown keys
+	are ignored. A non-map payload is a controlled error. Already-Preparado orders reject.
 	"""
 	identity = _require_ops_operator(pin)
+	packed_map = _coerce_progress_map(packed, "packed")
+	missing_map = _coerce_progress_map(missing, "missing")
+	boxes_n = _parse_box_count(box_count)
+
 	preorder_name = str(preorder_name or "").strip()
+	if (
+		not preorder_name
+		or preorder_name.lower() in ("null", "undefined", "none")
+		or not frappe.db.exists("Sales Order", preorder_name)
+	):
+		frappe.throw(_("Order not found"))
+
 	if isinstance(items, str):
-		items = json.loads(items)
-	if not isinstance(items, list) or not items:
+		text = items.strip()
+		if text.lower() in ("", "null", "undefined", "none"):
+			items = None
+		else:
+			try:
+				items = json.loads(text)
+			except Exception:
+				frappe.throw(_("Items required"))
+	has_items = isinstance(items, list) and bool(items)
+	if not has_items and packed_map is None and missing_map is None and boxes_n is None:
 		frappe.throw(_("Items required"))
+	if not has_items:
+		items = None
 
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_display_status,
 		_is_guest_preorder_sales_order,
 		update_guest_preorder_items,
 	)
 
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
-	if _is_guest_preorder_sales_order(so):
-		detail = update_guest_preorder_items(preorder_name, items)
-		_log_armado_operator(detail.get("name") or preorder_name, identity, via="armado_items")
-		return {
-			"ok": True,
-			"order": {**detail, "ean13": armado_ean13_for_order(detail.get("name") or preorder_name)},
-			"operator": {
-				"kind": identity.get("kind"),
-				"employee": identity.get("employee"),
-				"employee_name": identity.get("employee_name"),
-			},
-		}
-
-	# Non-guest: edit draft in place only
-	if cint(so.docstatus) != 0:
-		frappe.throw(_("Only draft orders can be edited here"))
-	so.set("items", [])
-	for row in items:
-		so.append(
-			"items",
-			{
-				"item_code": row.get("item_code"),
-				"qty": flt(row.get("qty")),
-				"rate": flt(row.get("rate")),
-			},
+	disp = _display_status(so)
+	base = "Completado" if str(disp).startswith("Completado") else disp
+	if base != "Orden":
+		frappe.throw(
+			_("Only Orden-stage orders can be updated in armado (current: {0})").format(base)
 		)
-	so.flags.ignore_permissions = True
-	so.save(ignore_permissions=True)
-	frappe.db.commit()
-	_log_armado_operator(so.name, identity, via="armado_items")
-	out = get_armado_order(so.name)
+
+	if has_items:
+		if _is_guest_preorder_sales_order(so):
+			update_guest_preorder_items(preorder_name, items)
+		else:
+			if cint(so.docstatus) != 0:
+				frappe.throw(_("Only draft orders can be edited here"))
+			so.set("items", [])
+			for row in items:
+				so.append(
+					"items",
+					{
+						"item_code": row.get("item_code"),
+						"qty": flt(row.get("qty")),
+						"rate": flt(row.get("rate")),
+					},
+				)
+			so.flags.ignore_permissions = True
+			so.save(ignore_permissions=True)
+			frappe.db.commit()
+
+	if packed_map is not None or missing_map is not None or boxes_n is not None:
+		_merge_armado_progress(
+			preorder_name,
+			identity,
+			packed=packed_map,
+			missing=missing_map,
+			box_count=boxes_n,
+			items=items if has_items else None,
+			via="armado_items",
+		)
+	_log_armado_operator(preorder_name, identity, via="armado_items")
+	out = get_armado_order(preorder_name)
 	if isinstance(out, dict):
 		out["operator"] = {
 			"kind": identity.get("kind"),
@@ -656,18 +1409,27 @@ def update_armado_items(preorder_name=None, items=None, pin=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def confirm_armado(preorder_name=None, items=None, pin=None):
+def confirm_armado(preorder_name=None, items=None, pin=None, packed=None, missing=None, box_count=None):
 	"""Save armado quantities (optional) and move pipeline Orden → Preparado (armado).
 
-	``items`` when provided are persisted first via ``update_armado_items``; then the
-	order is promoted with ``source=armado``. Rejects non-Orden stages.
+	Every current line must be packed or marked missing, and ``box_count`` must be
+	1–99 (already saved, or sent on this call). Rejects non-Orden stages.
 
 	Planner remito/geocode is enqueued (not inline) so the kiosk confirm button
 	returns quickly — same pattern as create_guest_preorder → Orden.
 	"""
 	identity = _require_ops_operator(pin)
+	# Validate map/box types before the order lookup so dirty payloads stay controlled.
+	_coerce_progress_map(packed, "packed")
+	_coerce_progress_map(missing, "missing")
+	_parse_box_count(box_count)
+
 	preorder_name = str(preorder_name or "").strip()
-	if not preorder_name or not frappe.db.exists("Sales Order", preorder_name):
+	if (
+		not preorder_name
+		or preorder_name.lower() in ("null", "undefined", "none")
+		or not frappe.db.exists("Sales Order", preorder_name)
+	):
 		frappe.throw(_("Order not found"))
 
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
@@ -675,16 +1437,6 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 		_is_guest_preorder_sales_order,
 		set_guest_preorder_status,
 	)
-
-	# Persist qty edits before promoting when the kiosk sends the current sheet.
-	if items is not None and items != "" and items != "null":
-		if isinstance(items, str):
-			try:
-				items = json.loads(items)
-			except Exception:
-				items = None
-		if isinstance(items, list) and items:
-			update_armado_items(preorder_name=preorder_name, items=items, pin=pin)
 
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
@@ -713,6 +1465,30 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 		frappe.throw(
 			_("Only Orden-stage orders can be confirmed in armado (current: {0})").format(base)
 		)
+
+	# Persist qty / pack / faltante / boxes before the gate. Already-Preparado returned above.
+	has_sheet = items not in (None, "", "null")
+	if has_sheet or packed not in (None, "") or missing not in (None, "") or box_count not in (None, ""):
+		update_armado_items(
+			preorder_name=preorder_name,
+			items=items,
+			pin=pin,
+			packed=packed,
+			missing=missing,
+			box_count=box_count,
+		)
+
+	progress = _armado_gate_ready(preorder_name)
+	progress.setdefault("events", []).append(
+		_progress_event(
+			identity,
+			via="armado_confirm",
+			action="confirm",
+			item_codes=[],
+			detail=str(cint((progress.get("boxes") or {}).get("count"))),
+		)
+	)
+	_save_armado_progress(preorder_name, progress)
 
 	detail = set_guest_preorder_status(
 		preorder_name, "Preparado", source="armado", ensure_planner_remito=0
@@ -774,9 +1550,13 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 
 	remito_job = {"queued": 0}
 	if not is_practice:
-		from erpnext.erpnext_integrations.ecommerce_api.api import _enqueue_planner_remito
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.api import _enqueue_planner_remito
 
-		remito_job = _enqueue_planner_remito(name)
+			remito_job = _enqueue_planner_remito(name)
+		except Exception:
+			# Promotion already committed. A missing enqueue helper must not roll the kiosk back.
+			frappe.log_error(frappe.get_traceback(), "confirm_armado remito enqueue")
 	# Light payload — skip get_armado_order floor-map rebuild; UI drops the sheet.
 	order = dict(detail) if isinstance(detail, dict) else {"name": name}
 	order["ean13"] = armado_ean13_for_order(name)
@@ -909,11 +1689,19 @@ def get_delivery_check_items(delivery_note=None):
 				"against_sales_order": getattr(d, "against_sales_order", None),
 			}
 		)
+	sales_order = ""
+	for row in items:
+		sales_order = str(row.get("against_sales_order") or "").strip()
+		if sales_order:
+			break
+	armado_progress = _armado_progress_public(sales_order) if sales_order else None
 	return {
 		"ok": True,
 		"delivery_note": dn.name,
 		"customer": dn.customer,
 		"customer_name": dn.customer_name or dn.customer,
+		"sales_order": sales_order or None,
+		"armado_progress": armado_progress,
 		"cajas": [
 			{
 				"id": dn.name,

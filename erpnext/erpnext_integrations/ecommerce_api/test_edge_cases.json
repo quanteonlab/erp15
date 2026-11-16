@@ -7548,6 +7548,87 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "recompute_item_weight_catalog null item/lookback dry-run is controlled"
+    },
+    {
+      "id": "get_client_account_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.get_client_account",
+      "args": {
+        "phone": null,
+        "pin": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "guest account read with null phone/PIN is a controlled validation error"
+    },
+    {
+      "id": "update_client_account_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.update_client_account",
+      "args": {
+        "phone": "",
+        "pin": "null",
+        "customer_name": null,
+        "client_access_pin": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "guest account save with empty phone/PIN is a controlled validation error"
+    },
+    {
+      "id": "update_armado_items_packed_number",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.update_armado_items",
+      "args": {
+        "preorder_name": "SAL-ORD-NOPE",
+        "items": [{"item_code": "X", "qty": 1}],
+        "packed": 5
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "armado packed map must be an object, not a number"
+    },
+    {
+      "id": "update_armado_items_packed_null_order",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.update_armado_items",
+      "args": {
+        "preorder_name": null,
+        "items": null,
+        "packed": null,
+        "missing": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "armado update with null order/items is a controlled error"
+    },
+    {
+      "id": "confirm_armado_box_zero",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.confirm_armado",
+      "args": {
+        "preorder_name": "SAL-ORD-NOPE",
+        "box_count": 0
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "armado confirm rejects box_count 0"
+    },
+    {
+      "id": "save_armado_boxes_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.save_armado_boxes",
+      "args": {
+        "preorder_name": "",
+        "box_count": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "armado boxes with empty order/count is a controlled error"
+    },
+    {
+      "id": "get_armado_progress_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_progress",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "armado progress read with null name is a controlled error"
     }
   ]
 }

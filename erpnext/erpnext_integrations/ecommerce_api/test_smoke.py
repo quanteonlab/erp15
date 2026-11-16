@@ -2224,7 +2224,95 @@ def suite_5_11_pos_session():
     _run("5.11.6 ensure_employee_ops_pins + resolve", check_ensure_ops_pin_roundtrip, "S2")
     _run("5.11.6a client PIN first digit + resolve", check_client_pin_first_digit_and_resolve, "S2")
     _run("5.11.6b ops operator empty pin uses session", check_ops_operator_empty_pin_uses_session, "S2")
+    def check_partial_armado_progress():
+        """Partial pack + faltante + boxes stay on the order and survive confirm."""
+        from erpnext.erpnext_integrations.ecommerce_api import ops_kiosk_api as oka
+
+        frappe.set_user("Administrator")
+        stock = frappe.get_all(
+            "Item",
+            filters={"disabled": 0, "is_stock_item": 1},
+            fields=["item_code"],
+            limit=2,
+        )
+        assert stock, "need a stock item"
+        lines = [{"item_code": r.item_code, "qty": 1, "rate": 10} for r in stock]
+        so_name = None
+        try:
+            out = api.create_guest_preorder(
+                items=lines,
+                guest_name="Smoke Armado Partial",
+                guest_notes="partial armado",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            api.set_guest_preorder_status(so_name, "Orden")
+            sheet = oka.get_armado_order(so_name)
+            rows = (sheet.get("order") or {}).get("items") or []
+            assert rows and rows[0].get("line_key"), sheet
+            try:
+                oka.update_armado_items(
+                    preorder_name=so_name,
+                    items=[{"item_code": rows[0]["item_code"], "qty": 1, "rate": 10}],
+                    packed=5,
+                )
+                assert False, "a non-map packed payload must fail"
+            except frappe.ValidationError:
+                pass
+            payload_items = [
+                {"item_code": r["item_code"], "qty": r.get("qty") or 1, "rate": r.get("rate") or 10}
+                for r in rows
+            ]
+            packed = {rows[0]["line_key"]: True, "NO-SUCH-SKU": True}
+            missing = {
+                r["line_key"]: {"missing": True, "reason": "sin stock"}
+                for r in rows[1:]
+            } or None
+            upd = oka.update_armado_items(
+                preorder_name=so_name,
+                items=payload_items,
+                packed=packed,
+                missing=missing,
+            )
+            stored = ((upd.get("order") or {}).get("armado_progress") or {}).get("lines") or {}
+            assert stored[rows[0]["line_key"]]["packed"] is True, stored
+            assert stored[rows[0]["line_key"]].get("packed_by"), stored
+            assert "NO-SUCH-SKU" not in stored
+            if len(rows) > 1:
+                assert stored[rows[1]["line_key"]]["missing"] is True, stored
+            try:
+                oka.confirm_armado(preorder_name=so_name, box_count=0)
+                assert False, "box_count 0 must fail"
+            except frappe.ValidationError:
+                pass
+            confirmed = oka.confirm_armado(
+                preorder_name=so_name,
+                items=payload_items,
+                packed=packed,
+                missing=missing,
+                box_count=2,
+            )
+            assert confirmed.get("ok"), confirmed
+            listed = oka.list_armado_orders(include_completed=1, limit=80)
+            match = next((o for o in listed.get("orders") or [] if o.get("name") == so_name), None)
+            assert match and match.get("completed") == 1, match
+            assert (match.get("progress_summary") or {}).get("box_count") == 2, match
+            public = oka.get_armado_progress(so_name)
+            assert public["progress"]["box_count"] == 2, public
+            assert public["progress"]["complete"] == 1, public
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                doc = frappe.get_doc("Sales Order", so_name)
+                if cint(doc.docstatus) == 1:
+                    doc.flags.ignore_permissions = True
+                    doc.cancel()
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            scope = f"ops.armado.progress::{so_name}" if so_name else ""
+            if scope and frappe.db.exists("Table Extra Schema", scope):
+                frappe.delete_doc("Table Extra Schema", scope, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     _run("5.11.6c armado access link mint/verify", check_armado_access_link_mint_verify, "S2")
+    _run("5.11.6d partial armado progress + boxes", check_partial_armado_progress, "S2")
     _run("5.11.7 list_pos_profiles", check_pos_profiles, "S3")
     _run("5.11.8 list_cash_register_sessions", check_cash_sessions, "S3")
     _run("5.11.9 list_pos_profile_meta", check_pos_profile_meta, "S3")
