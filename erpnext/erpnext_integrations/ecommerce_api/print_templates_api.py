@@ -91,6 +91,9 @@ _DELIVERY_CHECKLIST_CHILD_FIELDS = [
 	{"fieldname": "location", "label": "Ubicación", "fieldtype": "Data"},
 	{"fieldname": "barcode", "label": "Codigo de Barras", "fieldtype": "Data"},
 	{"fieldname": "is_weight_based", "label": "Por peso", "fieldtype": "Check"},
+	{"fieldname": "tax_rate", "label": "% Alic", "fieldtype": "Data"},
+	{"fieldname": "rate", "label": "Precio unitario", "fieldtype": "Currency"},
+	{"fieldname": "amount", "label": "Importe", "fieldtype": "Currency"},
 ]
 
 _WEIGHT_UOMS = {
@@ -968,6 +971,8 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		qty_display = f"{flt(qty):.2f} {uom}".strip() if qty is not None else ""
 		row = _enrich_print_line_item(
 			{
+				"so_detail": it.name,
+				"name": it.name,
 				"item_code": it.item_code,
 				"item_name": it.item_name,
 				"qty": qty,
@@ -977,6 +982,9 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 				"code_display": code_display,
 				"rate": it.rate,
 				"amount": it.amount,
+				"item_tax_template": getattr(it, "item_tax_template", None) or "",
+				"item_tax_rate": getattr(it, "item_tax_rate", None) or "",
+				"discount_percentage": getattr(it, "discount_percentage", None) or "",
 				"weight_per_unit": getattr(it, "weight_per_unit", None),
 				"weight_uom": getattr(it, "weight_uom", None),
 				"total_weight": getattr(it, "total_weight", None),
@@ -997,6 +1005,19 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 	rows.sort(key=lambda r: (r.get("_location_sort_key") or (1e12,), r.get("item_code") or ""))
 	for r in rows:
 		r.pop("_location_sort_key", None)
+
+	# Factura A preview reuses checklist lines — fill % Alic from product IVA.
+	_apply_line_alicuotas(
+		rows,
+		company=company,
+		doc={
+			"tax_category": tax_category,
+			"taxes": [
+				{"rate": getattr(t, "rate", None), "description": getattr(t, "description", None)}
+				for t in (so.taxes or [])
+			],
+		},
+	)
 
 	map_out = None
 	if map_payload:
@@ -1078,6 +1099,143 @@ def _party_print_meta(party_type: str, party_name: str | None) -> dict:
 	return out
 
 
+def _parse_item_tax_rate_map(raw) -> dict:
+	"""ERPNext stores line ``item_tax_rate`` as JSON ``{account_head: rate}`` (often ``{}``)."""
+	if raw in (None, "", "{}", "null", "None", "undefined"):
+		return {}
+	if isinstance(raw, dict):
+		return raw
+	if isinstance(raw, str):
+		try:
+			parsed = json.loads(raw)
+			return parsed if isinstance(parsed, dict) else {}
+		except Exception:
+			return {}
+	return {}
+
+
+def _format_alicuota_pct(rate) -> str:
+	"""Print cell for Factura A ``% Alic`` — e.g. ``21%``, ``10.5%``."""
+	if rate in (None, ""):
+		return ""
+	try:
+		r = float(rate)
+	except (TypeError, ValueError):
+		text = cstr(rate).strip()
+		return text if text.endswith("%") else (f"{text}%" if text else "")
+	if r < 0:
+		return ""
+	if abs(r - round(r)) < 1e-9:
+		return f"{int(round(r))}%"
+	text = f"{r:.4f}".rstrip("0").rstrip(".")
+	return f"{text}%"
+
+
+def _pct_from_label(text) -> float | None:
+	"""Pull ``21`` from labels like ``IVA 21%`` / ``IVA 10,5%``."""
+	import re
+
+	m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", cstr(text or ""))
+	if not m:
+		return None
+	try:
+		return float(m.group(1).replace(",", "."))
+	except ValueError:
+		return None
+
+
+def _rate_from_item_tax_template(template_name) -> float | None:
+	name = cstr(template_name or "").strip()
+	if not name or not frappe.db.exists("Item Tax Template", name):
+		return None
+	# Prefer title parse (IVA 21%) so compound titles still surface the IVA figure.
+	title = frappe.db.get_value("Item Tax Template", name, "title") or name
+	from_label = _pct_from_label(title)
+	if from_label is not None:
+		return from_label
+	rows = frappe.get_all(
+		"Item Tax Template Detail",
+		filters={"parent": name},
+		fields=["tax_rate"],
+		order_by="idx asc",
+		ignore_permissions=True,
+	)
+	rates = [flt(r.tax_rate) for r in rows if r.get("tax_rate") is not None]
+	if not rates:
+		return None
+	return round(sum(rates), 4)
+
+
+def _numeric_alicuota(raw) -> float | None:
+	"""Accept already-resolved tax_rate (number or ``21%`` / ``21``). Skip JSON blobs."""
+	if raw in (None, ""):
+		return None
+	if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+		return float(raw)
+	text = cstr(raw).strip()
+	if not text or text.startswith("{") or text.startswith("["):
+		return None
+	from_label = _pct_from_label(text)
+	if from_label is not None:
+		return from_label
+	try:
+		return float(text.replace(",", ".").rstrip("%"))
+	except ValueError:
+		return None
+
+
+def _doc_tax_alicuota(data: dict | None) -> float | None:
+	"""Fallback when lines have no item tax: first non-zero Sales Taxes row, else Cond. IVA label."""
+	data = data or {}
+	for t in data.get("taxes") or []:
+		if not isinstance(t, dict):
+			continue
+		rate = flt(t.get("rate"))
+		if rate > 0:
+			return rate
+		from_label = _pct_from_label(t.get("description") or t.get("account_head"))
+		if from_label is not None and from_label > 0:
+			return from_label
+	return _pct_from_label(data.get("tax_category"))
+
+
+def _apply_line_alicuotas(rows: list, company=None, doc: dict | None = None) -> None:
+	"""Set printable ``tax_rate`` (``21%`` / ``10.5%`` / …) on each line for Factura A % Alic."""
+	if not rows:
+		return
+	codes = [cstr(r.get("item_code") or "").strip() for r in rows if isinstance(r, dict)]
+	codes = [c for c in codes if c]
+	tax_by_item: dict = {}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tax_api import item_tax_map
+
+		tax_by_item = item_tax_map(codes, company) or {}
+	except Exception:
+		frappe.log_error(title="print line alicuota item_tax_map")
+		tax_by_item = {}
+
+	doc_fallback = _doc_tax_alicuota(doc)
+
+	for r in rows:
+		if not isinstance(r, dict):
+			continue
+		rate = _numeric_alicuota(r.get("tax_rate"))
+		if rate is None:
+			tax_map = _parse_item_tax_rate_map(r.get("item_tax_rate"))
+			vals = [flt(v) for v in tax_map.values() if v is not None and cstr(v).strip() != ""]
+			if vals:
+				rate = round(max(vals), 4)
+		if rate is None:
+			rate = _rate_from_item_tax_template(r.get("item_tax_template"))
+		if rate is None:
+			info = tax_by_item.get(cstr(r.get("item_code") or "").strip()) or {}
+			if info.get("tax_rate") is not None:
+				rate = flt(info.get("tax_rate"))
+		if rate is None and doc_fallback is not None:
+			rate = doc_fallback
+		r["tax_rate"] = _format_alicuota_pct(rate) if rate is not None else ""
+
+
 def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) -> None:
 	"""Fill Armado-style header fields + line display helpers for DN / SI / PR."""
 	# Line display helpers (Codigo - barcode, qty + uom)
@@ -1130,12 +1288,9 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 			data.setdefault("cae_vto", cstr(data.get("cae_vto") or "").strip())
 			data.setdefault("factura_letter", cstr(data.get("factura_letter") or "").strip())
 			data.setdefault("factura_cod", cstr(data.get("factura_cod") or "").strip())
-			# Line % Alic. fallback when item tax rate is missing.
 			for r in rows:
 				if not isinstance(r, dict):
 					continue
-				if r.get("tax_rate") in (None, ""):
-					r["tax_rate"] = r.get("item_tax_rate") or ""
 				if r.get("discount_amount") in (None, ""):
 					try:
 						r["discount_amount"] = round(
@@ -1147,6 +1302,8 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 						) if flt(r.get("discount_percentage") or 0) else ""
 					except Exception:
 						r["discount_amount"] = ""
+		# Factura A % Alic — resolve per-line IVA (21% / 10.5% / …), never dump raw JSON.
+		_apply_line_alicuotas(rows, company=data.get("company"), doc=data)
 	elif source_doctype == "Purchase Receipt":
 		meta = _party_print_meta("Supplier", data.get("supplier"))
 		for k, v in meta.items():

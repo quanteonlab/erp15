@@ -449,6 +449,18 @@
       "expect": "error"
     },
     {
+      "id": "get_order_print_bundle_null_so_alicuota",
+      "source": "regression",
+      "bug": "Factura A % Alic enrich path: null sales_order must controlled error, not TypeError in alicuota helpers",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_order_print_bundle",
+      "args": {
+        "sales_order": null,
+        "warehouse": "",
+        "floor_id": "undefined"
+      },
+      "expect": "error"
+    },
+    {
       "id": "delivery_checklist_fields_ok",
       "source": "regression",
       "bug": "Delivery Checklist is synthetic — get_doctype_fields must not call get_meta",
@@ -3551,6 +3563,62 @@
       "expect": "error"
     },
     {
+      "id": "update_customer_null_price_list_hide",
+      "source": "regression",
+      "bug": "update_customer with null default_price_list/catalog_hide_prices must controlled error (missing customer), never TypeError on Check coerce",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "",
+        "default_price_list": null,
+        "catalog_hide_prices": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_customer_null_catalog_lang",
+      "source": "regression",
+      "bug": "update_customer with null catalog_lang must controlled error (missing customer), never crash on normalize",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "",
+        "catalog_lang": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_customer_dirty_catalog_lang",
+      "source": "regression",
+      "bug": "update_customer catalog_lang='null'/'ch' must controlled error (missing customer) after normalize, never write garbage",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "",
+        "catalog_lang": "ch"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_customer_dirty_price_list_hide",
+      "source": "regression",
+      "bug": "update_customer default_price_list='null' and catalog_hide_prices='undefined' must controlled error (missing customer), never write literal null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "",
+        "default_price_list": "null",
+        "catalog_hide_prices": "undefined"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "resolve_client_access_pin_null",
+      "source": "regression",
+      "bug": "resolve_client_access_pin with null pin must return controlled ok=false, never AttributeError on price list fields",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.resolve_client_access_pin",
+      "args": {
+        "pin": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "update_pending_delivery_zone_empty",
       "source": "regression",
       "bug": "update_pending_delivery_zone with empty delivery_note must controlled error not AttributeError",
@@ -6301,12 +6369,36 @@
       "id": "search_archivo_link_targets_bad_doctype",
       "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.search_archivo_link_targets",
       "args": {
-        "doctype": "Sales Invoice",
+        "doctype": "GL Entry",
         "search_term": "x"
       },
-      "expect": "no_500",
+      "expect": "error",
       "source": "regression",
       "bug": "search_archivo_link_targets unsupported doctype controlled"
+    },
+    {
+      "id": "search_archivo_link_targets_sales_order",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.search_archivo_link_targets",
+      "args": {
+        "doctype": "Sales Order",
+        "search_term": "",
+        "page_length": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_archivo_link_targets Sales Order (pedido link from Documentos) returns rows"
+    },
+    {
+      "id": "search_archivo_link_targets_sales_invoice",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.search_archivo_link_targets",
+      "args": {
+        "doctype": "Sales Invoice",
+        "search_term": "",
+        "page_length": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_archivo_link_targets Sales Invoice returns rows for factura refs"
     },
     {
       "id": "get_archivo_aggregates_null_dates",
@@ -6636,6 +6728,75 @@
       "expect": "error",
       "source": "regression",
       "bug": "issue_preorder_invoice null name is controlled error"
+    },
+    {
+      "id": "get_preorder_invoice_settings_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_preorder_invoice_settings",
+      "args": {},
+      "expect": "ok",
+      "source": "regression",
+      "bug": "get_preorder_invoice_settings returns defaults (3% A/B/C)"
+    },
+    {
+      "id": "save_preorder_invoice_settings_dirty_pct",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.save_preorder_invoice_settings",
+      "args": {
+        "adj_pct_negro": "",
+        "adj_pct_factura_a": "null",
+        "adj_pct_factura_b": "undefined",
+        "adj_pct_factura_c": "-2"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "save_preorder_invoice_settings dirty pct strings coerce; negative discount allowed"
+    },
+    {
+      "id": "issue_preorder_invoice_adj_pct_null_string",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.issue_preorder_invoice",
+      "args": {
+        "preorder_name": "",
+        "mode": "factura_a",
+        "adjustment_pct": "null"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "issue_preorder_invoice adjustment_pct=null with empty name is controlled error"
+    },
+    {
+      "id": "issue_preorder_invoice_items_empty_list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.issue_preorder_invoice",
+      "args": {
+        "preorder_name": "",
+        "mode": "negro",
+        "items": []
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "issue_preorder_invoice empty name + empty items is controlled error (not 500)"
+    },
+    {
+      "id": "issue_preorder_invoice_items_bad_type",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.issue_preorder_invoice",
+      "args": {
+        "preorder_name": "",
+        "mode": "negro",
+        "items": "not-a-list"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "issue_preorder_invoice empty name + non-list items is controlled error"
+    },
+    {
+      "id": "issue_preorder_invoice_items_null_string",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.issue_preorder_invoice",
+      "args": {
+        "preorder_name": null,
+        "mode": "negro",
+        "items": "null"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "issue_preorder_invoice items='null' with null name is controlled error"
     },
     {
       "id": "mark_preorder_invoiced_external_empty_name",

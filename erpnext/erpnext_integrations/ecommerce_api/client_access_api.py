@@ -381,11 +381,29 @@ def resolve_client_access_pin(pin=None):
 	lead = None
 	lead_name = None
 
+	default_price_list = None
+	catalog_hide_prices = 0
+	catalog_lang = "es"
+
 	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+				ensure_catalog_price_fields,
+				normalize_catalog_lang,
+			)
+
+			ensure_catalog_price_fields()
+		except Exception:
+			normalize_catalog_lang = lambda v: "es"  # noqa: E731
+		cust_fields = ["name", "customer_name", "mobile_no", "custom_client_phone_e164", "default_price_list"]
+		if frappe.db.has_column("Customer", "custom_catalog_hide_prices"):
+			cust_fields.append("custom_catalog_hide_prices")
+		if frappe.db.has_column("Customer", "custom_catalog_lang"):
+			cust_fields.append("custom_catalog_lang")
 		row = frappe.db.get_value(
 			"Customer",
 			{"custom_client_access_pin": raw, "disabled": 0},
-			["name", "customer_name", "mobile_no", "custom_client_phone_e164"],
+			cust_fields,
 			as_dict=True,
 		)
 		if row:
@@ -394,6 +412,9 @@ def resolve_client_access_pin(pin=None):
 			phone_e164 = _normalize_e164(
 				cstr(getattr(row, "custom_client_phone_e164", None) or row.mobile_no or "")
 			) or None
+			default_price_list = cstr(getattr(row, "default_price_list", None) or "").strip() or None
+			catalog_hide_prices = 1 if cint(getattr(row, "custom_catalog_hide_prices", 0)) else 0
+			catalog_lang = normalize_catalog_lang(getattr(row, "custom_catalog_lang", None))
 
 	if not customer and frappe.db.has_column("Lead", "custom_client_access_pin"):
 		fields = ["name", "lead_name", "mobile_no", "whatsapp_no", "phone"]
@@ -431,6 +452,9 @@ def resolve_client_access_pin(pin=None):
 		"phone_e164": phone_e164,
 		"pin": raw,
 		"portal_path": "/cliente",
+		"default_price_list": default_price_list,
+		"catalog_hide_prices": catalog_hide_prices,
+		"catalog_lang": catalog_lang,
 	}
 
 

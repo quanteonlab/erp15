@@ -7,6 +7,54 @@ from frappe import _
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.utils import flt
 
+_CATALOG_PRICE_FIELDS_READY = False
+
+
+def normalize_catalog_lang(raw) -> str:
+	"""Normalize client catalog language to ``es`` or ``zh`` (default Spanish)."""
+	from frappe.utils import cstr
+
+	s = cstr(raw or "").strip().lower()
+	if s in ("zh", "ch", "cn", "chinese", "中文"):
+		return "zh"
+	if s in ("es", "spanish", "español", "espanol"):
+		return "es"
+	# Dirty / empty → shop default Spanish
+	return "es"
+
+
+def ensure_catalog_price_fields():
+	"""Customer catalog prefs: hide prices + preferred catalog language (es/zh)."""
+	global _CATALOG_PRICE_FIELDS_READY
+	if _CATALOG_PRICE_FIELDS_READY:
+		return
+	create_custom_fields(
+		{
+			"Customer": [
+				{
+					"fieldname": "custom_catalog_hide_prices",
+					"label": "Catalog Hide Prices",
+					"fieldtype": "Check",
+					"default": "0",
+					"insert_after": "default_price_list",
+					"description": "When set, storefront/catalog hides prices and promotions for this customer.",
+				},
+				{
+					"fieldname": "custom_catalog_lang",
+					"label": "Catalog Language",
+					"fieldtype": "Select",
+					"options": "es\nzh",
+					"default": "es",
+					"insert_after": "custom_catalog_hide_prices",
+					"description": "Language the client sees on their catalog / portal (es or zh).",
+				},
+			]
+		},
+		ignore_validate=True,
+	)
+	frappe.clear_cache(doctype="Customer")
+	_CATALOG_PRICE_FIELDS_READY = True
+
 _DEFAULT_HOURS = [
 	("Mañana", 1),
 	("Mediodía", 2),

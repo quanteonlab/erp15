@@ -21,7 +21,7 @@ DOCTYPE = "Company Archive Entry"
 KINDS_SCOPE = "archivo.kinds"
 
 SYNC_TEMPLATES = frozenset({"payable", "cash_out", "paper", "none"})
-PARTY_TYPES = frozenset({"", "Supplier", "Employee", "Other"})
+PARTY_TYPES = frozenset({"", "Supplier", "Employee", "Customer", "Other"})
 RELATED_DOCTYPES = frozenset(
 	{
 		"Tag",
@@ -1460,6 +1460,8 @@ LINK_SEARCH_DOCTYPES = frozenset(
 		"Journal Entry",
 		"Asset",
 		"Purchase Order",
+		"Sales Order",
+		"Sales Invoice",
 		"Employee",
 		"Supplier",
 		"Customer",
@@ -1531,6 +1533,26 @@ def _link_search_rows(doctype: str, search_term: str, page_length: int, company:
 				["name", "like", like],
 				["supplier", "like", like],
 				["supplier_name", "like", like],
+			]
+	elif doctype == "Sales Order":
+		fields = ["name", "customer", "customer_name", "grand_total", "transaction_date", "status"]
+		if company:
+			filters["company"] = company
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["customer", "like", like],
+				["customer_name", "like", like],
+			]
+	elif doctype == "Sales Invoice":
+		fields = ["name", "customer", "customer_name", "grand_total", "posting_date", "status"]
+		if company:
+			filters["company"] = company
+		if like:
+			or_filters = [
+				["name", "like", like],
+				["customer", "like", like],
+				["customer_name", "like", like],
 			]
 	elif doctype == "Employee":
 		fields = ["name", "employee_name", "status", "company", "user_id"]
@@ -1622,6 +1644,13 @@ def _link_search_rows(doctype: str, search_term: str, page_length: int, company:
 				subtitle_parts.append(str(r.get("supplier_name") or r.get("supplier")))
 			if r.get("transaction_date"):
 				subtitle_parts.append(str(r.get("transaction_date")))
+		elif doctype in ("Sales Order", "Sales Invoice"):
+			if r.get("customer_name") or r.get("customer"):
+				subtitle_parts.append(str(r.get("customer_name") or r.get("customer")))
+			if r.get("transaction_date") or r.get("posting_date"):
+				subtitle_parts.append(str(r.get("transaction_date") or r.get("posting_date")))
+			if r.get("grand_total") is not None:
+				subtitle_parts.append(str(r.get("grand_total")))
 		elif doctype == "Employee":
 			if r.get("status"):
 				subtitle_parts.append(str(r.get("status")))

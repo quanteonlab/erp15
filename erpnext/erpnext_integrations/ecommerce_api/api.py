@@ -3327,11 +3327,13 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
 			ensure_argentina_iva_conditions,
+			ensure_catalog_price_fields,
 			ensure_preferred_delivery_hours,
 		)
 
 		ensure_preferred_delivery_hours()
 		ensure_argentina_iva_conditions()
+		ensure_catalog_price_fields()
 	except Exception:
 		pass
 
@@ -3361,11 +3363,16 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 		"tax_category",
 		"primary_address",
 		"customer_primary_address",
+		"default_price_list",
 	]
 	if frappe.db.has_column("Customer", "custom_client_access_pin"):
 		base_fields += ["custom_client_access_pin", "custom_client_phone_e164"]
 	if frappe.db.has_column("Customer", "custom_preferred_hours"):
 		base_fields.append("custom_preferred_hours")
+	if frappe.db.has_column("Customer", "custom_catalog_hide_prices"):
+		base_fields.append("custom_catalog_hide_prices")
+	if frappe.db.has_column("Customer", "custom_catalog_lang"):
+		base_fields.append("custom_catalog_lang")
 
 	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 		_assigned_customer_names,
@@ -3456,6 +3463,11 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 			cr_map[row.name] = getattr(row, CR_FIELD, None)
 			owner_map[row.name] = cstr(row.owner or "").strip() or None
 
+	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+		normalize_catalog_lang,
+	)
+
+	has_catalog_lang = frappe.db.has_column("Customer", "custom_catalog_lang")
 	out_customers = []
 	for r in rows:
 		salesmen = customer_salesmen(r.name)
@@ -3476,6 +3488,14 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"preferred_hours": getattr(r, "custom_preferred_hours", None),
 				"client_access_pin": getattr(r, "custom_client_access_pin", None),
 				"client_phone_e164": getattr(r, "custom_client_phone_e164", None),
+				"default_price_list": cstr(getattr(r, "default_price_list", None) or "").strip()
+				or None,
+				"catalog_hide_prices": 1
+				if cint(getattr(r, "custom_catalog_hide_prices", 0))
+				else 0,
+				"catalog_lang": normalize_catalog_lang(
+					getattr(r, "custom_catalog_lang", None) if has_catalog_lang else None
+				),
 				"is_bucket": (r.customer_name or r.name or "")
 				in (CONSUMIDOR_FINAL_NAME, UNCATEGORIZED_CUSTOMER_NAME),
 				"salesmen": salesmen,
@@ -3618,11 +3638,16 @@ def list_crm_customer_options():
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
 		ensure_argentina_iva_conditions,
+		ensure_catalog_price_fields,
 		list_preferred_delivery_hours,
 	)
 
 	try:
 		ensure_argentina_iva_conditions()
+	except Exception:
+		pass
+	try:
+		ensure_catalog_price_fields()
 	except Exception:
 		pass
 
@@ -3663,11 +3688,19 @@ def list_crm_customer_options():
 				zones.append(code)
 	except Exception:
 		pass
+	price_lists = frappe.get_all(
+		"Price List",
+		filters={"selling": 1},
+		pluck="name",
+		order_by="name asc",
+		ignore_permissions=True,
+	)
 	return {
 		"preferred_hours": hours.get("hours") or [],
 		"territories": [r.name for r in territories],
 		"zones": zones,
 		"tax_categories": [r.name for r in tax_categories],
+		"price_lists": price_lists or [],
 	}
 
 
@@ -3716,6 +3749,15 @@ def update_customer(customer_name, **kwargs):
 	if not frappe.db.exists("Customer", customer_name):
 		frappe.throw(_("Customer {0} not found").format(customer_name))
 
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+			ensure_catalog_price_fields,
+		)
+
+		ensure_catalog_price_fields()
+	except Exception:
+		pass
+
 	frappe.flags.ignore_permissions = True
 	customer = frappe.get_doc("Customer", customer_name)
 	frappe.flags.ignore_permissions = False
@@ -3739,6 +3781,44 @@ def update_customer(customer_name, **kwargs):
 		allowed_fields.append("custom_client_phone_e164")
 		if "client_phone_e164" in kwargs and "custom_client_phone_e164" not in kwargs:
 			kwargs["custom_client_phone_e164"] = kwargs.get("client_phone_e164")
+	if frappe.db.has_column("Customer", "custom_catalog_hide_prices"):
+		allowed_fields.append("custom_catalog_hide_prices")
+		if "catalog_hide_prices" in kwargs and "custom_catalog_hide_prices" not in kwargs:
+			kwargs["custom_catalog_hide_prices"] = kwargs.get("catalog_hide_prices")
+		raw_hide = kwargs.get("custom_catalog_hide_prices")
+		if raw_hide is not None:
+			# Dirty Flutter/Next: null / "" / "null" / bool / 0|1
+			if isinstance(raw_hide, str) and raw_hide.strip().lower() in (
+				"",
+				"null",
+				"undefined",
+				"none",
+			):
+				kwargs["custom_catalog_hide_prices"] = 0
+			else:
+				kwargs["custom_catalog_hide_prices"] = 1 if cint(raw_hide) else 0
+	if frappe.db.has_column("Customer", "custom_catalog_lang"):
+		allowed_fields.append("custom_catalog_lang")
+		if "catalog_lang" in kwargs and "custom_catalog_lang" not in kwargs:
+			kwargs["custom_catalog_lang"] = kwargs.get("catalog_lang")
+		if "custom_catalog_lang" in kwargs:
+			from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+				normalize_catalog_lang,
+			)
+
+			kwargs["custom_catalog_lang"] = normalize_catalog_lang(
+				kwargs.get("custom_catalog_lang")
+			)
+	# Empty / dirty price list → clear (shop default)
+	if "default_price_list" in kwargs:
+		raw_pl = kwargs.get("default_price_list")
+		if raw_pl is None or (
+			isinstance(raw_pl, str)
+			and cstr(raw_pl).strip().lower() in ("", "null", "undefined", "none")
+		):
+			kwargs["default_price_list"] = ""
+		else:
+			kwargs["default_price_list"] = cstr(raw_pl).strip()
 	# CRM TEL column aliases
 	if "phone" in kwargs and "mobile_no" not in kwargs:
 		kwargs["mobile_no"] = kwargs.get("phone")
@@ -3780,6 +3860,18 @@ def update_customer(customer_name, **kwargs):
 
 	out = customer.as_dict()
 	out["zone"] = _customer_delivery_zone_map([customer_name]).get(customer_name)
+	out["catalog_hide_prices"] = (
+		1 if cint(out.get("custom_catalog_hide_prices") or 0) else 0
+	)
+	out["default_price_list"] = cstr(out.get("default_price_list") or "").strip() or None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+			normalize_catalog_lang,
+		)
+
+		out["catalog_lang"] = normalize_catalog_lang(out.get("custom_catalog_lang"))
+	except Exception:
+		out["catalog_lang"] = "es"
 	return out
 
 
@@ -10084,6 +10176,134 @@ def update_tracking_info(delivery_note, tracking_number, carrier=None):
 # ========================================
 
 PREORDER_BILLING_SCOPE = "preorder_billing"
+PREORDER_INVOICE_SETTINGS_SCOPE = "settings.preorder_invoice"
+
+# User convention: +3 = +3% surcharge (recargo), -2 = -2% discount.
+# Defaults: Borrador 0%; Factura A/B/C +3%.
+PREORDER_INVOICE_SETTINGS_DEFAULTS = {
+	"adj_pct_negro": 0.0,
+	"adj_pct_factura_a": 3.0,
+	"adj_pct_factura_b": 3.0,
+	"adj_pct_factura_c": 3.0,
+}
+
+
+def _load_preorder_invoice_settings() -> dict:
+	settings = dict(PREORDER_INVOICE_SETTINGS_DEFAULTS)
+	if frappe.db.exists("Table Extra Schema", PREORDER_INVOICE_SETTINGS_SCOPE):
+		frappe.flags.ignore_permissions = True
+		try:
+			doc = frappe.get_doc("Table Extra Schema", PREORDER_INVOICE_SETTINGS_SCOPE)
+		finally:
+			frappe.flags.ignore_permissions = False
+		stored = frappe.parse_json(doc.columns_json) if doc.columns_json else {}
+		if isinstance(stored, dict):
+			settings.update(stored)
+	return settings
+
+
+def _coerce_adj_pct(raw, default=0.0) -> float:
+	"""Parse surcharge/discount %; allow negatives. Dirty → default."""
+	if raw is None:
+		return flt(default)
+	if isinstance(raw, str):
+		s = raw.strip().lower()
+		if s in ("", "null", "undefined", "none"):
+			return flt(default)
+		try:
+			raw = float(s)
+		except (TypeError, ValueError):
+			return flt(default)
+	try:
+		n = flt(raw)
+	except (TypeError, ValueError):
+		return flt(default)
+	# Hard cap ±100 to avoid nonsense payloads.
+	return max(-100.0, min(100.0, n))
+
+
+def _adj_pct_for_mode(mode, settings=None) -> float:
+	mode_u = _normalize_invoice_mode(mode) or "negro"
+	cfg = settings if isinstance(settings, dict) else _load_preorder_invoice_settings()
+	key = f"adj_pct_{mode_u}"
+	return _coerce_adj_pct(cfg.get(key), PREORDER_INVOICE_SETTINGS_DEFAULTS.get(key, 0.0))
+
+
+def _mode_adj_pct_map(settings=None) -> dict:
+	cfg = settings if isinstance(settings, dict) else _load_preorder_invoice_settings()
+	return {
+		"negro": _adj_pct_for_mode("negro", cfg),
+		"factura_a": _adj_pct_for_mode("factura_a", cfg),
+		"factura_b": _adj_pct_for_mode("factura_b", cfg),
+		"factura_c": _adj_pct_for_mode("factura_c", cfg),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_preorder_invoice_settings():
+	"""Pedidos Facturación: per-mode surcharge/discount % defaults."""
+	cfg = _load_preorder_invoice_settings()
+	return {
+		"ok": True,
+		**{k: _coerce_adj_pct(cfg.get(k), v) for k, v in PREORDER_INVOICE_SETTINGS_DEFAULTS.items()},
+		"mode_adj_pct": _mode_adj_pct_map(cfg),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def save_preorder_invoice_settings(
+	adj_pct_negro=None,
+	adj_pct_factura_a=None,
+	adj_pct_factura_b=None,
+	adj_pct_factura_c=None,
+):
+	"""Persist per-mode invoice adjustment % (+ surcharge / − discount)."""
+	current = _load_preorder_invoice_settings()
+	raw = {
+		"adj_pct_negro": adj_pct_negro,
+		"adj_pct_factura_a": adj_pct_factura_a,
+		"adj_pct_factura_b": adj_pct_factura_b,
+		"adj_pct_factura_c": adj_pct_factura_c,
+	}
+	for key, value in raw.items():
+		if value is None:
+			continue
+		current[key] = _coerce_adj_pct(value, PREORDER_INVOICE_SETTINGS_DEFAULTS.get(key, 0.0))
+	payload = frappe.as_json(current)
+	frappe.flags.ignore_permissions = True
+	try:
+		if frappe.db.exists("Table Extra Schema", PREORDER_INVOICE_SETTINGS_SCOPE):
+			doc = frappe.get_doc("Table Extra Schema", PREORDER_INVOICE_SETTINGS_SCOPE)
+			doc.columns_json = payload
+			doc.save(ignore_permissions=True)
+		else:
+			frappe.get_doc(
+				{
+					"doctype": "Table Extra Schema",
+					"scope": PREORDER_INVOICE_SETTINGS_SCOPE,
+					"columns_json": payload,
+				}
+			).insert(ignore_permissions=True)
+	finally:
+		frappe.flags.ignore_permissions = False
+	frappe.db.commit()
+	return get_preorder_invoice_settings()
+
+
+def _apply_invoice_adj_pct(si, pct):
+	"""Apply user adj % to SI: +pct surcharge, −pct discount via negated ERPNext discount %."""
+	pct = flt(pct)
+	if abs(pct) < 1e-12:
+		return
+	# ERPNext additional_discount_percentage reduces total → negate for surcharge.
+	if not cstr(getattr(si, "apply_discount_on", None) or "").strip():
+		si.apply_discount_on = "Grand Total"
+	si.additional_discount_percentage = -pct
+	si.flags.ignore_permissions = True
+	try:
+		si.calculate_taxes_and_totals()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "invoice adj pct calculate failed")
 
 
 @frappe.whitelist(allow_guest=True)
@@ -10250,14 +10470,100 @@ def create_preorder_credit_note(
 
 def _sales_invoice_for_sales_order(sales_order):
 	"""Latest non-cancelled Sales Invoice linked to this Sales Order."""
+	names = _sales_invoices_for_sales_order(sales_order)
+	return names[-1] if names else None
+
+
+def _sales_invoices_for_sales_order(sales_order):
+	"""Submitted/draft SI names linked to this Sales Order (docstatus != 2), oldest→newest."""
 	so = cstr(sales_order or "").strip()
 	if not so:
-		return None
-	return frappe.db.get_value(
-		"Sales Invoice Item",
-		{"sales_order": so, "docstatus": ["!=", 2]},
-		"parent",
+		return []
+	rows = frappe.db.sql(
+		"""
+		SELECT DISTINCT sii.parent, si.creation
+		FROM `tabSales Invoice Item` sii
+		INNER JOIN `tabSales Invoice` si ON si.name = sii.parent
+		WHERE sii.sales_order = %s AND si.docstatus != 2
+		ORDER BY si.creation ASC
+		""",
+		(so,),
 	)
+	return [cstr(r[0]) for r in (rows or []) if r and r[0]]
+
+
+def _billed_qty_by_so_detail(sales_order) -> dict:
+	"""Map Sales Order Item name → billed qty from submitted Sales Invoices."""
+	so = cstr(sales_order or "").strip()
+	if not so:
+		return {}
+	rows = frappe.db.sql(
+		"""
+		SELECT sii.so_detail, SUM(sii.qty)
+		FROM `tabSales Invoice Item` sii
+		INNER JOIN `tabSales Invoice` si ON si.name = sii.parent
+		WHERE sii.sales_order = %s AND si.docstatus = 1 AND IFNULL(sii.so_detail, '') != ''
+		GROUP BY sii.so_detail
+		""",
+		(so,),
+	)
+	return {cstr(r[0]): flt(r[1]) for r in (rows or []) if r and r[0]}
+
+
+def _preorder_invoice_lines(so) -> list:
+	"""Ordered / billed / remaining lines for multi-invoice UI."""
+	billed = _billed_qty_by_so_detail(so.name)
+	out = []
+	for it in so.get("items") or []:
+		ordered = flt(it.qty)
+		billed_qty = flt(billed.get(it.name) or 0)
+		remaining = max(0.0, ordered - billed_qty)
+		rate = flt(it.rate)
+		out.append(
+			{
+				"so_detail": it.name,
+				"item_code": it.item_code,
+				"item_name": it.item_name or it.item_code,
+				"qty": ordered,
+				"billed_qty": billed_qty,
+				"remaining_qty": remaining,
+				"rate": rate,
+				"amount": flt(it.amount),
+				"remaining_amount": remaining * rate,
+				"stock_uom": getattr(it, "stock_uom", None),
+				"uom": getattr(it, "uom", None),
+			}
+		)
+	return out
+
+
+def _parse_invoice_lines_arg(raw) -> list | None:
+	"""Normalize optional items=[{so_detail|item_code, qty}] for partial issue. None = all remaining."""
+	if raw is None:
+		return None
+	if isinstance(raw, str):
+		s = raw.strip()
+		if s.lower() in ("", "null", "undefined", "none"):
+			return None
+		try:
+			raw = frappe.parse_json(s)
+		except Exception:
+			frappe.throw(_("items must be a list"))
+	if not isinstance(raw, list):
+		frappe.throw(_("items must be a list"))
+	out = []
+	for row in raw:
+		if not isinstance(row, dict):
+			continue
+		so_detail = cstr(row.get("so_detail") or row.get("name") or "").strip()
+		item_code = cstr(row.get("item_code") or "").strip()
+		qty = flt(row.get("qty"))
+		if qty <= 0:
+			continue
+		if not so_detail and not item_code:
+			continue
+		out.append({"so_detail": so_detail or None, "item_code": item_code or None, "qty": qty})
+	return out
 
 
 def _billing_record_for(preorder_name):
@@ -10274,7 +10580,7 @@ def _set_billing_record(preorder_name, data):
 
 
 def _attach_billing_fields(rows):
-	"""Attach invoiced chip + billing snapshot onto list/detail payloads."""
+	"""Attach invoiced / partial chip + billing snapshot onto list/detail payloads."""
 	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get_many
 
 	if not rows:
@@ -10294,26 +10600,39 @@ def _attach_billing_fields(rows):
 		rec = by_key.get(n) if n else None
 		if not isinstance(rec, dict):
 			rec = {}
-		# Also treat linked SI / Factura A issued as invoiced for the chip.
+		si_list = list(rec.get("invoices") or [])
 		si = cstr(rec.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(n)
-		invoiced = bool(rec.get("invoiced")) or bool(si) or (
+		has_si = bool(si) or bool(si_list)
+		fully = bool(rec.get("invoiced")) or (
 			cstr(r.get("factura_a_status") or "").strip().lower() == "issued"
+			and not rec.get("partial")
 		)
-		r["invoiced"] = invoiced
+		# Prefer explicit remaining from record when present.
+		partial = bool(rec.get("partial"))
+		if has_si and not fully and not partial:
+			# Legacy single-SI mark → treat as fully invoiced.
+			fully = True
+		if partial:
+			fully = False
+		r["invoiced"] = fully
+		r["partially_invoiced"] = partial and has_si
 		r["billing"] = {
-			"invoiced": invoiced,
-			"source": rec.get("source") or ("silkos" if si else None),
+			"invoiced": fully,
+			"partial": partial,
+			"source": rec.get("source") or ("silkos" if has_si else None),
 			"mode": rec.get("mode"),
 			"sales_invoice": si or rec.get("sales_invoice"),
+			"invoices": si_list or None,
 			"template_id": rec.get("template_id"),
 			"template_name": rec.get("template_name"),
 			"archivo_entry": rec.get("archivo_entry"),
+			"archivo_entries": rec.get("archivo_entries") or None,
 			"file_url": rec.get("file_url"),
 			"file_name": rec.get("file_name"),
 			"issued_at": rec.get("issued_at"),
 			"cae": rec.get("cae"),
 			"note": rec.get("note"),
-		} if invoiced or rec else None
+		} if fully or partial or rec else None
 
 
 def _normalize_invoice_mode(mode) -> str:
@@ -10442,6 +10761,34 @@ def _default_invoice_templates(company=None):
 	}
 
 
+def _render_sales_invoice_pdf_b64(sales_invoice, print_format=None) -> str | None:
+	"""Render SI → PDF base64 for Documentos attach. Soft-fail → None."""
+	import base64
+
+	si_name = cstr(sales_invoice or "").strip()
+	if not si_name or not frappe.db.exists("Sales Invoice", si_name):
+		return None
+	pf = cstr(print_format or "").strip() or None
+	# ECommerce Print Template ids are not Frappe Print Formats — ignore those.
+	if pf and not frappe.db.exists("Print Format", {"name": pf, "doc_type": "Sales Invoice"}):
+		pf = None
+	try:
+		from frappe.utils.pdf import get_pdf
+
+		frappe.flags.ignore_permissions = True
+		try:
+			html = frappe.get_print("Sales Invoice", si_name, print_format=pf)
+		finally:
+			frappe.flags.ignore_permissions = False
+		pdf = get_pdf(html)
+		if not pdf or pdf[:4] != b"%PDF":
+			return None
+		return base64.b64encode(pdf).decode()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"SI PDF render failed for {si_name}")
+		return None
+
+
 def _file_archivo_sales_doc(
 	*,
 	title,
@@ -10452,6 +10799,10 @@ def _file_archivo_sales_doc(
 	file_name=None,
 	note=None,
 	kind="sales_invoice",
+	party_type=None,
+	party=None,
+	amount=None,
+	currency=None,
 ):
 	"""Create an Archivo paper row, optional attach, link SO/SI + month binder."""
 	from erpnext.erpnext_integrations.ecommerce_api import archivo_api
@@ -10465,40 +10816,42 @@ def _file_archivo_sales_doc(
 		refs.append(
 			{"link_doctype": "Sales Invoice", "link_name": sales_invoice, "note": "factura"}
 		)
+	common = dict(
+		title=title,
+		kind=kind,
+		sync_template="paper",
+		posting_date=nowdate(),
+		workflow_status="filed",
+		notes=note,
+		company=company,
+		party_type=cstr(party_type or "").strip() or None,
+		party=cstr(party or "").strip() or None,
+		amount=amount,
+		currency=cstr(currency or "").strip() or None,
+	)
 	try:
-		entry = archivo_api.create_archivo_entry(
-			title=title,
-			kind=kind,
-			sync_template="paper",
-			posting_date=nowdate(),
-			workflow_status="filed",
-			notes=note,
-			related_refs=refs,
-			company=company,
-		)
+		entry = archivo_api.create_archivo_entry(**common, related_refs=refs)
 	except Exception:
 		soft = []
 		if sales_order:
 			soft.append({"link_doctype": "Tag", "link_name": sales_order, "note": "pedido"})
 		if sales_invoice:
 			soft.append({"link_doctype": "Tag", "link_name": sales_invoice, "note": "factura"})
-		entry = archivo_api.create_archivo_entry(
-			title=title,
-			kind=kind,
-			sync_template="paper",
-			posting_date=nowdate(),
-			workflow_status="filed",
-			notes=note,
-			related_refs=soft,
-			company=company,
-		)
+		entry = archivo_api.create_archivo_entry(**common, related_refs=soft)
 	entry_name = (entry or {}).get("name")
 	file_meta = {}
-	if entry_name and file_b64:
+	# Auto-render SI PDF when caller did not supply one (SilkOS issue path).
+	b64 = file_b64
+	fname = file_name
+	if entry_name and not b64 and sales_invoice:
+		b64 = _render_sales_invoice_pdf_b64(sales_invoice)
+		if b64 and not fname:
+			fname = f"{cstr(sales_invoice).replace('/', '-')}.pdf"
+	if entry_name and b64:
 		file_meta = archivo_api.attach_archivo_file(
 			name=entry_name,
-			file_name=file_name or "factura.pdf",
-			content_b64=file_b64,
+			file_name=fname or "factura.pdf",
+			content_b64=b64,
 			is_private=1,
 		) or {}
 	binder = None
@@ -10512,13 +10865,66 @@ def _file_archivo_sales_doc(
 	return {
 		"archivo_entry": entry_name,
 		"file_url": file_meta.get("file_url"),
-		"file_name": file_meta.get("file_name") or file_name,
+		"file_name": file_meta.get("file_name") or fname,
 		"month_binder": binder,
 	}
 
 
-def _submit_sales_invoice_from_preorder(so, mode="negro"):
-	"""Build + submit SI from SO (prefer DN when present)."""
+def _apply_partial_lines_to_si(si, lines: list):
+	"""Keep only selected SO lines / qtys on a make_sales_invoice draft."""
+	by_detail = {}
+	by_code = {}
+	for row in lines or []:
+		qty = flt(row.get("qty"))
+		if qty <= 0:
+			continue
+		detail = cstr(row.get("so_detail") or "").strip()
+		code = cstr(row.get("item_code") or "").strip()
+		if detail:
+			by_detail[detail] = by_detail.get(detail, 0) + qty
+		elif code:
+			by_code[code] = by_code.get(code, 0) + qty
+	if not by_detail and not by_code:
+		frappe.throw(_("Select at least one line with qty > 0"))
+
+	keep = []
+	for item in list(si.get("items") or []):
+		detail = cstr(getattr(item, "so_detail", None) or "").strip()
+		code = cstr(getattr(item, "item_code", None) or "").strip()
+		wanted = None
+		if detail and detail in by_detail:
+			wanted = by_detail.pop(detail)
+		elif code and code in by_code:
+			wanted = by_code.pop(code)
+		if wanted is None:
+			continue
+		avail = flt(item.qty)
+		item.qty = min(avail, wanted) if avail > 0 else wanted
+		if flt(item.qty) <= 0:
+			continue
+		keep.append(item)
+
+	if by_detail or by_code:
+		missing = list(by_detail.keys()) + list(by_code.keys())
+		frappe.throw(
+			_("No remaining qty for: {0}").format(", ".join(missing[:8]))
+		)
+	if not keep:
+		frappe.throw(_("No invoice lines left after selection"))
+	si.set("items", keep)
+	si.flags.ignore_permissions = True
+	try:
+		si.calculate_taxes_and_totals()
+	except Exception:
+		pass
+
+
+def _submit_sales_invoice_from_preorder(so, mode="negro", lines=None, adjustment_pct=None):
+	"""Build + submit SI from SO (prefer DN when present).
+
+	``lines`` optional: [{so_detail|item_code, qty}] for partial invoicing.
+	``adjustment_pct``: +surcharge / −discount (user convention); None → settings default for mode.
+	"""
 	dn = _delivery_note_for_sales_order(so.name)
 	if dn:
 		from erpnext.stock.doctype.delivery_note.delivery_note import make_sales_invoice
@@ -10529,12 +10935,24 @@ def _submit_sales_invoice_from_preorder(so, mode="negro"):
 
 		si = make_sales_invoice(so.name)
 
+	if lines is not None:
+		_apply_partial_lines_to_si(si, lines)
+
 	mode_u = _normalize_invoice_mode(mode) or "negro"
+	if adjustment_pct is None:
+		adj = _adj_pct_for_mode(mode_u)
+	else:
+		adj = _coerce_adj_pct(adjustment_pct, _adj_pct_for_mode(mode_u))
+	_apply_invoice_adj_pct(si, adj)
+
 	sale_mode = "BLACK" if mode_u == "negro" else "WHITE"
 	is_borrador = 1 if sale_mode == "BLACK" else 0
 	# Stamp mode into remarks for reprint / audits (POS convention).
 	prev = cstr(getattr(si, "remarks", None) or "")
-	tag = f"sale_mode:{sale_mode} | invoice_mode:{mode_u} | is_borrador:{is_borrador}"
+	tag = (
+		f"sale_mode:{sale_mode} | invoice_mode:{mode_u} | is_borrador:{is_borrador}"
+		f" | adj_pct:{adj}"
+	)
 	si.remarks = f"{prev} | {tag}".strip(" |") if prev else tag
 	if hasattr(si, "is_pos"):
 		si.is_pos = 0
@@ -10542,6 +10960,8 @@ def _submit_sales_invoice_from_preorder(so, mode="negro"):
 	si.flags.ignore_permissions = True
 	si.submit()
 	frappe.db.commit()
+	# Stash for callers (issue_preorder_invoice response).
+	si.flags.invoice_adj_pct = adj
 	return si
 
 
@@ -10588,7 +11008,7 @@ def _maybe_afip_cae_for_si(si, afip_opts=None, mode=None):
 
 @frappe.whitelist(allow_guest=True)
 def get_preorder_invoice_state(preorder_name=None):
-	"""Options + saved billing state for the Pedidos Facturación modal."""
+	"""Options + saved billing state for the Pedidos Facturación modal (partial OK)."""
 	preorder_name = cstr(preorder_name or "").strip()
 	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
 		frappe.throw(_("preorder_name is required"))
@@ -10603,8 +11023,32 @@ def get_preorder_invoice_state(preorder_name=None):
 	_require_guest_preorder_visible(so)
 
 	rec = _billing_record_for(preorder_name)
-	si = cstr(rec.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(preorder_name)
-	invoiced = bool(rec.get("invoiced")) or bool(si)
+	si_names = list(rec.get("invoices") or [])
+	latest = cstr(rec.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(
+		preorder_name
+	)
+	if not si_names:
+		si_names = _sales_invoices_for_sales_order(preorder_name)
+	if latest and latest not in si_names:
+		si_names = list(si_names) + [latest]
+
+	lines = _preorder_invoice_lines(so)
+	remaining_lines = [r for r in lines if flt(r.get("remaining_qty")) > 1e-9]
+	remaining_amount = sum(flt(r.get("remaining_amount")) for r in remaining_lines)
+	has_si = bool(si_names) or bool(latest)
+	external_done = cstr(rec.get("source") or "").strip() == "external" and bool(rec.get("invoiced"))
+	fully = (not remaining_lines and has_si) or external_done or (
+		bool(rec.get("invoiced")) and not bool(rec.get("partial")) and has_si and not remaining_lines
+	)
+	# Legacy single-SI mark without line tracking → treat as fully invoiced.
+	if bool(rec.get("invoiced")) and not bool(rec.get("partial")) and has_si and not remaining_lines:
+		fully = True
+	if bool(rec.get("invoiced")) and not bool(rec.get("partial")) and has_si and remaining_lines:
+		# Record said fully but qty remains (data drift) — prefer qty truth.
+		fully = False
+	partial = (has_si and not fully and bool(remaining_lines)) or bool(rec.get("partial"))
+	if fully:
+		partial = False
 
 	afip_ready = False
 	afip_warning = None
@@ -10639,21 +11083,29 @@ def get_preorder_invoice_state(preorder_name=None):
 	blockers = []
 	if cint(so.docstatus) != 1:
 		blockers.append(_("Confirm the order before invoicing."))
-	if invoiced:
+	if fully:
 		blockers.append(_("Already invoiced — use reprint."))
 
 	billing_mode = _normalize_invoice_mode(rec.get("mode")) or rec.get("mode")
 	return {
 		"preorder_name": preorder_name,
-		"invoiced": invoiced,
+		"invoiced": fully,
+		"partially_invoiced": partial,
+		"lines": lines,
+		"remaining_lines": remaining_lines,
+		"remaining_amount": remaining_amount,
+		"fully_invoiced": fully,
 		"billing": {
-			"invoiced": invoiced,
-			"source": rec.get("source") or ("silkos" if si else None),
+			"invoiced": fully,
+			"partial": partial,
+			"source": rec.get("source") or ("silkos" if has_si else None),
 			"mode": billing_mode,
-			"sales_invoice": si,
+			"sales_invoice": latest,
+			"invoices": si_names or None,
 			"template_id": rec.get("template_id"),
 			"template_name": rec.get("template_name"),
 			"archivo_entry": rec.get("archivo_entry"),
+			"archivo_entries": rec.get("archivo_entries") or None,
 			"file_url": rec.get("file_url"),
 			"file_name": rec.get("file_name"),
 			"issued_at": rec.get("issued_at"),
@@ -10675,7 +11127,8 @@ def get_preorder_invoice_state(preorder_name=None):
 		},
 		"templates_by_mode": defaults.get("templates_by_mode") or {},
 		"templates": defaults.get("templates") or [],
-		"can_issue": not invoiced and cint(so.docstatus) == 1,
+		"mode_adj_pct": _mode_adj_pct_map(),
+		"can_issue": bool(remaining_lines) and cint(so.docstatus) == 1 and not external_done,
 		"blockers": blockers,
 		"delivery_note": _delivery_note_for_sales_order(preorder_name),
 		"estimated_total": _guest_preorder_estimated_total(so),
@@ -10683,6 +11136,63 @@ def get_preorder_invoice_state(preorder_name=None):
 		"customer": so.customer,
 		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
 	}
+
+
+def _resolve_preorder_issue_lines(so, items):
+	"""Build [{so_detail, item_code, qty}] from optional items arg; None → all remaining."""
+	lines_all = _preorder_invoice_lines(so)
+	remaining = [r for r in lines_all if flt(r.get("remaining_qty")) > 1e-9]
+	if not remaining:
+		frappe.throw(_("Nothing left to invoice on this Sales Order"))
+
+	parsed = _parse_invoice_lines_arg(items)
+	if parsed is None:
+		return [
+			{"so_detail": r["so_detail"], "item_code": r["item_code"], "qty": r["remaining_qty"]}
+			for r in remaining
+		]
+
+	rem_by_detail = {r["so_detail"]: r for r in remaining if r.get("so_detail")}
+	rem_by_code = {}
+	for r in remaining:
+		code = r.get("item_code")
+		if code:
+			rem_by_code.setdefault(code, []).append(r)
+
+	issue_lines = []
+	for row in parsed:
+		qty = flt(row.get("qty"))
+		if qty <= 0:
+			continue
+		detail = cstr(row.get("so_detail") or "").strip()
+		code = cstr(row.get("item_code") or "").strip()
+		target = None
+		if detail and detail in rem_by_detail:
+			target = rem_by_detail[detail]
+		elif code:
+			cands = rem_by_code.get(code) or []
+			target = cands[0] if cands else None
+		if not target:
+			frappe.throw(_("No remaining qty for item {0}").format(detail or code or "?"))
+		max_qty = flt(target.get("remaining_qty"))
+		if qty > max_qty + 1e-9:
+			frappe.throw(
+				_("Qty {0} exceeds remaining {1} for {2}").format(
+					qty, max_qty, target.get("item_code") or detail
+				)
+			)
+		# Consume so the same line cannot be over-allocated in one payload.
+		target["remaining_qty"] = max_qty - qty
+		issue_lines.append(
+			{
+				"so_detail": target.get("so_detail"),
+				"item_code": target.get("item_code"),
+				"qty": qty,
+			}
+		)
+	if not issue_lines:
+		frappe.throw(_("Select at least one line with qty > 0"))
+	return issue_lines
 
 
 @frappe.whitelist(allow_guest=True)
@@ -10694,8 +11204,13 @@ def issue_preorder_invoice(
 	use_afip=None,
 	afip=None,
 	note=None,
+	items=None,
+	adjustment_pct=None,
 ):
-	"""Create+submit SI once (Borrador / Factura A|B|C), optional AFIP CAE, file into Documentos."""
+	"""Create+submit SI (Borrador / Factura A|B|C). ``items`` = partial lines; omit = all remaining.
+
+	``adjustment_pct`` optional override (+surcharge / −discount). Omit/null → settings default for mode.
+	"""
 	preorder_name = cstr(preorder_name or "").strip()
 	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
 		frappe.throw(_("preorder_name is required"))
@@ -10712,11 +11227,10 @@ def issue_preorder_invoice(
 		frappe.throw(_("Confirm the order before invoicing."))
 
 	existing = _billing_record_for(preorder_name)
-	si_existing = cstr(existing.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(
-		preorder_name
-	)
-	if existing.get("invoiced") or si_existing:
-		frappe.throw(_("Already invoiced — use reprint."))
+	if cstr(existing.get("source") or "").strip() == "external" and existing.get("invoiced"):
+		frappe.throw(_("Already invoiced externally — use reprint."))
+
+	issue_lines = _resolve_preorder_issue_lines(so, items)
 
 	mode_u = _normalize_invoice_mode(mode)
 	if not mode_u:
@@ -10728,7 +11242,14 @@ def issue_preorder_invoice(
 		else:
 			mode_u = "negro"
 
-	si = _submit_sales_invoice_from_preorder(so, mode=mode_u)
+	# Resolve adj: explicit number (incl. 0) wins; null/empty → settings default.
+	adj_arg = adjustment_pct
+	if isinstance(adj_arg, str) and adj_arg.strip().lower() in ("", "null", "undefined", "none"):
+		adj_arg = None
+	si = _submit_sales_invoice_from_preorder(
+		so, mode=mode_u, lines=issue_lines, adjustment_pct=adj_arg
+	)
+	applied_adj = flt(getattr(si.flags, "invoice_adj_pct", None) or 0)
 
 	afip_opts = afip if isinstance(afip, dict) else {}
 	if isinstance(afip, str) and afip.strip() not in ("", "null", "undefined"):
@@ -10770,46 +11291,83 @@ def issue_preorder_invoice(
 
 	archivo_meta = {}
 	try:
+		mode_label = {
+			"negro": "Borrador",
+			"factura_a": "Factura A",
+			"factura_b": "Factura B",
+			"factura_c": "Factura C",
+		}.get(mode_u, mode_u)
 		archivo_meta = _file_archivo_sales_doc(
-			title=_("Factura {0}").format(si.name),
+			title=_("{0} · {1}").format(mode_label, si.name),
 			company=si.company,
 			sales_order=preorder_name,
 			sales_invoice=si.name,
-			note=cstr(note or "").strip() or f"mode:{mode_u}",
+			note=cstr(note or "").strip() or f"mode:{mode_u} | pedido:{preorder_name}",
 			kind="sales_invoice",
+			party_type="Customer",
+			party=so.customer,
+			amount=flt(si.grand_total),
+			currency=getattr(si, "currency", None) or so.currency,
 		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"archivo file failed for {si.name}")
 
-	# Mark Factura A checklist issued when Factura A or already required.
+	# Refresh remaining after submit.
+	lines_after = _preorder_invoice_lines(so)
+	still_remaining = any(flt(r.get("remaining_qty")) > 1e-9 for r in lines_after)
+	partial = still_remaining
+	fully = not still_remaining
+
+	# Mark Factura A checklist issued only when fully done (or this issue was Factura A).
 	if frappe.db.has_column("Sales Order", "custom_factura_a_status"):
-		if mode_u == "factura_a" or cint(getattr(so, "custom_requires_factura_a", 0) or 0):
+		if mode_u == "factura_a" or (
+			fully and cint(getattr(so, "custom_requires_factura_a", 0) or 0)
+		):
 			frappe.db.set_value(
 				"Sales Order",
 				preorder_name,
 				{
 					"custom_requires_factura_a": 1,
-					"custom_factura_a_status": "issued",
+					"custom_factura_a_status": "issued" if fully or mode_u == "factura_a" else (
+						cstr(getattr(so, "custom_factura_a_status", None) or "pending")
+					),
 				},
 				update_modified=False,
 			)
 
 	from frappe.utils import now_datetime
 
+	prev_invoices = list(existing.get("invoices") or [])
+	if not prev_invoices:
+		prev_invoices = _sales_invoices_for_sales_order(preorder_name)
+	if si.name not in prev_invoices:
+		prev_invoices = list(prev_invoices) + [si.name]
+
+	prev_archivos = list(existing.get("archivo_entries") or [])
+	if existing.get("archivo_entry") and existing.get("archivo_entry") not in prev_archivos:
+		prev_archivos.append(existing.get("archivo_entry"))
+	new_archivo = archivo_meta.get("archivo_entry")
+	if new_archivo and new_archivo not in prev_archivos:
+		prev_archivos.append(new_archivo)
+
 	rec = {
-		"invoiced": True,
+		"invoiced": fully,
+		"partial": partial,
 		"source": "silkos",
 		"mode": mode_u,
 		"sales_invoice": si.name,
+		"invoices": prev_invoices,
 		"template_id": tmpl_id,
 		"template_name": tmpl_name,
-		"archivo_entry": archivo_meta.get("archivo_entry"),
-		"file_url": archivo_meta.get("file_url"),
-		"file_name": archivo_meta.get("file_name"),
-		"month_binder": archivo_meta.get("month_binder"),
+		"archivo_entry": new_archivo or existing.get("archivo_entry"),
+		"archivo_entries": prev_archivos,
+		"file_url": archivo_meta.get("file_url") or existing.get("file_url"),
+		"file_name": archivo_meta.get("file_name") or existing.get("file_name"),
+		"month_binder": archivo_meta.get("month_binder") or existing.get("month_binder"),
 		"issued_at": str(now_datetime()),
 		"cae": cae,
 		"note": cstr(note or "").strip() or None,
+		"adjustment_pct": applied_adj,
 		"afip_warning": afip_result.get("warning"),
 	}
 	_set_billing_record(preorder_name, rec)
@@ -10820,6 +11378,13 @@ def issue_preorder_invoice(
 		"ok": True,
 		"billing": rec,
 		"sales_invoice": si.name,
+		"sales_invoices": prev_invoices,
+		"archivo_entry": new_archivo,
+		"file_url": archivo_meta.get("file_url"),
+		"adjustment_pct": applied_adj,
+		"billing_status": "partially_invoiced" if partial else "invoiced",
+		"fully_invoiced": fully,
+		"partially_invoiced": partial,
 		"detail": detail,
 		"afip_warning": afip_result.get("warning"),
 	}
@@ -10870,6 +11435,10 @@ def mark_preorder_invoiced_external(
 			file_name=file_name or "factura_externa.pdf",
 			note=cstr(note or "").strip() or "external",
 			kind="sales_invoice",
+			party_type="Customer",
+			party=so.customer,
+			amount=flt(getattr(so, "grand_total", 0) or 0) or None,
+			currency=getattr(so, "currency", None),
 		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"external invoice archivo failed for {preorder_name}")
@@ -10915,15 +11484,21 @@ def reprint_preorder_invoice(preorder_name=None):
 	if not preorder_name or preorder_name.lower() in ("null", "undefined", "none"):
 		frappe.throw(_("preorder_name is required"))
 	state = get_preorder_invoice_state(preorder_name)
-	if not state.get("invoiced"):
-		frappe.throw(_("Order is not invoiced yet."))
 	billing = state.get("billing") or {}
+	if not (
+		state.get("invoiced")
+		or state.get("partially_invoiced")
+		or billing.get("sales_invoice")
+		or billing.get("file_url")
+	):
+		frappe.throw(_("Order is not invoiced yet."))
 	source = cstr(billing.get("source") or "").strip() or "silkos"
 	out = {
 		"ok": True,
 		"source": source,
 		"billing": billing,
 		"sales_invoice": billing.get("sales_invoice"),
+		"sales_invoices": billing.get("invoices"),
 		"template_id": billing.get("template_id"),
 		"file_url": billing.get("file_url"),
 		"file_name": billing.get("file_name"),
