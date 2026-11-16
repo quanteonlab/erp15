@@ -935,8 +935,8 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 	Also returns ``delivery_dates`` (distinct due dates among Orden-stage armado
 	orders) so the UI can offer a day picker.
 
-	``include_completed`` also returns Preparado sheets (read-only historial) with
-	``completed: 1``. Each row includes ``progress_summary``.
+	``include_completed`` also returns Preparado sheets confirmed/saved **today**
+	(read-only) with ``completed: 1``. Each row includes ``progress_summary``.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
 
@@ -1047,7 +1047,13 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 			break
 
 	if _truthy_flag(include_completed):
-		done_filters = {"docstatus": 1, "status": "Preparado"}
+		# Completados chip = armado confirmed today only (not the whole Preparado historial).
+		day = str(today())
+		done_filters = {
+			"docstatus": 1,
+			"status": "Preparado",
+			"modified": [">=", f"{day} 00:00:00"],
+		}
 		if due is not None:
 			done_filters["delivery_date"] = due
 		done_rows = frappe.get_all(
@@ -1085,6 +1091,7 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 					"items_count": 0,
 					"qty_total": 0,
 					"completed": 1,
+					"modified": str(getattr(r, "modified", "") or ""),
 					"practice": 1 if "armado_practice:1" in tag else 0,
 				}
 			)
@@ -1092,6 +1099,26 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 				break
 
 	_attach_armado_list_progress(out)
+	# Prefer armado confirm/save stamp when present; drop Completados not from today.
+	day = getdate(today())
+	filtered = []
+	for order in out:
+		if not cint(order.get("completed")):
+			filtered.append(order)
+			continue
+		stamp = (
+			((order.get("progress_summary") or {}) if isinstance(order.get("progress_summary"), dict) else {}).get(
+				"last_saved_at"
+			)
+			or order.get("modified")
+			or ""
+		)
+		try:
+			if stamp and getdate(stamp) == day:
+				filtered.append(order)
+		except Exception:
+			pass
+	out = filtered
 	return {
 		"ok": True,
 		"delivery_date": "" if due is None else str(due),
