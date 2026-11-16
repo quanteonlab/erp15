@@ -1717,6 +1717,41 @@ def suite_5_9_master_data():
             assert "stage" in rows[0], f"search_customers must include stage (client state): {list(rows[0].keys())}"
             assert "stage_label" in rows[0], f"search_customers must include stage_label: {list(rows[0].keys())}"
 
+    def check_search_customers_assigned_scope_no_leak():
+        """sales.see_assigned typed search must not return unassigned clients (Orden privacy)."""
+        from unittest.mock import patch
+
+        from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+
+        # Pick a real customer that is NOT in the empty assigned set.
+        probe = frappe.get_all(
+            "Customer",
+            filters={"disabled": 0},
+            fields=["name", "customer_name"],
+            limit_page_length=5,
+            ignore_permissions=True,
+        )
+        if not probe:
+            return
+        token = cstr(probe[0].customer_name or probe[0].name or "").strip()
+        if len(token) < 2:
+            token = cstr(probe[0].name)
+        token = token[:8]
+        with (
+            patch.object(ea, "sales_visibility_scope", return_value="assigned"),
+            patch.object(ea, "_assigned_customer_names", return_value=[]),
+            patch.object(ea, "_acting_username", return_value="smoke_seller_assigned"),
+        ):
+            empty_browse = api.search_customers("", 20, 0)
+            typed = api.search_customers(token, 20, 0)
+        assert (empty_browse.get("customers") or []) == [], empty_browse
+        leaked = [
+            r
+            for r in (typed.get("customers") or [])
+            if not bool(r.get("is_bucket"))
+        ]
+        assert leaked == [], f"assigned-scope typed search leaked unassigned clients: {leaked}"
+
     def check_preorder_list_customer_stage():
         """Pedidos list exposes customer_stage so assigned clients show Preventa state."""
         listed = api.get_guest_preorders_list(page_length=5, scope="admin")
@@ -1820,6 +1855,11 @@ def suite_5_9_master_data():
     _run("5.9.17 external pipeline status audit", check_external_pipeline_status_audit, "S2")
     _run("5.9.17b Delivery MAT gate + #parcial/#devolucion", check_delivery_mat_gate_and_outcome_tags, "S2")
     _run("5.9.18 RM zona = TMS zones + custom_zone", check_crm_rm_zone_options, "S3")
+    _run(
+        "5.9.18b search_customers assigned scope no leak",
+        check_search_customers_assigned_scope_no_leak,
+        "S3",
+    )
     _run("5.9.18b preorder list customer_stage", check_preorder_list_customer_stage, "S3")
     _run("5.9.18c seller_scope + amend → Revisar", check_seller_scope_list_and_amend_review, "S2")
     _run("5.9.19 Orden→next-day Entrega + planner without remito", check_orden_planner_remito_and_address_gate, "S2")
@@ -2249,6 +2289,22 @@ def suite_5_11_pos_session():
             sheet = oka.get_armado_order(so_name)
             rows = (sheet.get("order") or {}).get("items") or []
             assert rows and rows[0].get("line_key"), sheet
+            assert isinstance(rows[0].get("barcodes"), list), rows[0]
+            # Admin-changed Preparado must reopen to Orden (Modificaciones / writable).
+            api.set_guest_preorder_status(so_name, "Preparado", source="armado")
+            progress = oka._load_armado_progress(so_name)
+            progress["snapshot"] = [{"item_code": "OLD-SKU", "qty": 1, "name": "old-line"}]
+            oka._save_armado_progress(so_name, progress)
+            # Touch lines so fingerprint ≠ snapshot.
+            so_doc = frappe.get_doc("Sales Order", so_name)
+            item_rows = list(so_doc.items or [])
+            assert oka._armado_changed_since_save(item_rows, progress)
+            assert oka._reopen_changed_preparado(so_name, item_rows=item_rows, progress=progress)
+            so_doc.reload()
+            from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
+
+            assert _display_status(so_doc) == "Orden", _display_status(so_doc)
+            api.set_guest_preorder_status(so_name, "Orden", source="armado")
             try:
                 oka.update_armado_items(
                     preorder_name=so_name,

@@ -598,6 +598,72 @@ def _armado_changed_since_save(item_rows: list, progress: dict | None) -> bool:
 	return False
 
 
+def _reopen_changed_preparado(so_name: str, item_rows: list | None = None, progress: dict | None = None) -> bool:
+	"""If admin edited a Preparado sheet after armado, demote back to Orden so packers can rework it.
+
+	Returns True when a demotion ran. Safe no-op when not changed / not Preparado / non-guest.
+	"""
+	so_name = str(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return False
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", so_name)
+	rows = item_rows if item_rows is not None else list(so.items or [])
+	prog = progress if progress is not None else _load_armado_progress(so_name)
+	if not _armado_changed_since_save(rows, prog):
+		return False
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_display_status,
+		_is_guest_preorder_sales_order,
+		set_guest_preorder_status,
+	)
+
+	disp = _display_status(so)
+	if disp != "Preparado":
+		return False
+	if not _is_guest_preorder_sales_order(so):
+		# Non-guest: soft demote via ERP status marker used for Orden.
+		try:
+			so.db_set("status", "To Deliver and Bill", update_modified=True)
+			frappe.db.commit()
+			return True
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"armado reopen non-guest {so_name}")
+			return False
+	try:
+		set_guest_preorder_status(
+			so_name, "Orden", source="armado", ensure_planner_remito=0
+		)
+		frappe.db.commit()
+		return True
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"armado reopen {so_name}")
+		return False
+
+
+def _require_armado_writable(so) -> str:
+	"""Ensure SO is Orden-stage for writes; reopen Preparado when admin changed lines after pack.
+
+	Returns display status after any reopen. Throws if still not writable.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
+
+	disp = _display_status(so)
+	base = "Completado" if str(disp).startswith("Completado") else disp
+	if base == "Orden":
+		return disp
+	if base == "Preparado":
+		if _reopen_changed_preparado(so.name):
+			so.reload()
+			disp = _display_status(so)
+			base = "Completado" if str(disp).startswith("Completado") else disp
+			if base == "Orden":
+				return disp
+	frappe.throw(
+		_("Only Orden-stage orders can be updated in armado (current: {0})").format(base)
+	)
+
+
 def _summarize_progress(item_rows: list, progress: dict | None) -> dict:
 	lines = (progress or {}).get("lines") if isinstance(progress, dict) else {}
 	if not isinstance(lines, dict):
@@ -687,6 +753,13 @@ def _attach_armado_list_progress(orders: list) -> None:
 	for order in orders:
 		rows = by_parent.get(order.get("name")) or []
 		progress = prog_by_scope.get(_armado_progress_scope(order.get("name"))) or {}
+		# Completados that admin edited → reopen to Orden (Para armar), not Completados.
+		if cint(order.get("completed")) and _armado_changed_since_save(rows, progress):
+			if _reopen_changed_preparado(order.get("name"), item_rows=rows, progress=progress):
+				order["completed"] = 0
+				order["status"] = "To Deliver and Bill"
+				order["display_status"] = "Orden"
+				progress = _load_armado_progress(order.get("name")) or progress
 		summary = _summarize_progress(rows, progress)
 		order["items_count"] = summary["item_count"]
 		order["qty_total"] = summary["qty_total"]
@@ -718,13 +791,23 @@ def _stamp_armado_sheet(detail: dict, so) -> dict:
 		else:
 			it["line_key"] = f"{code or 'line'}#{i + 1}"
 	progress = _load_armado_progress(so.name)
+	item_rows = list(so.items or [])
+	changed = _armado_changed_since_save(item_rows, progress)
+	# Admin edited a completed pack → reopen so the sheet is writable again.
+	if changed and _display_status(so) == "Preparado":
+		if _reopen_changed_preparado(so.name, item_rows=item_rows, progress=progress):
+			so.reload()
+			progress = _load_armado_progress(so.name)
+			item_rows = list(so.items or [])
+			changed = _armado_changed_since_save(item_rows, progress)
 	detail["armado_progress"] = progress
-	detail["armado_changed"] = 1 if _armado_changed_since_save(list(so.items or []), progress) else 0
+	detail["armado_changed"] = 1 if changed else 0
 	detail["armado_last_saved_at"] = progress.get("last_saved_at") or ""
 	detail["armado_last_saved_by"] = progress.get("last_saved_by") or ""
 	disp = _display_status(so)
 	detail["display_status"] = disp
-	detail["armado_readonly"] = 0 if disp == "Orden" else 1
+	# Changed sheets stay editable even before reopen finishes; Orden always writable.
+	detail["armado_readonly"] = 0 if (disp == "Orden" or changed) else 1
 	remarks = cstr(getattr(so, "remarks", None) or "")
 	detail["armado_practice"] = 1 if "armado_practice:1" in remarks else 0
 	return detail
@@ -1209,6 +1292,15 @@ def get_armado_order(preorder_name=None):
 		if code and not it.get("image"):
 			it["image"] = images.get(code) or ""
 
+	# Product barcodes so the armado sheet can +1 qty on scan.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _attach_barcodes
+
+		_attach_barcodes(detail.get("items") or [])
+	except Exception:
+		for it in detail.get("items") or []:
+			it.setdefault("barcodes", [])
+
 	detail["ean13"] = armado_ean13_for_order(so.name)
 	detail["armado_notes"] = _load_armado_notes(so.name)
 	_stamp_armado_sheet(detail, so)
@@ -1280,16 +1372,9 @@ def save_armado_boxes(preorder_name=None, box_count=None, pin=None):
 		or not frappe.db.exists("Sales Order", preorder_name)
 	):
 		frappe.throw(_("Order not found"))
-	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
-
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
-	disp = _display_status(so)
-	base = "Completado" if str(disp).startswith("Completado") else disp
-	if base != "Orden":
-		frappe.throw(
-			_("Only Orden-stage orders can be updated in armado (current: {0})").format(base)
-		)
+	_require_armado_writable(so)
 	_merge_armado_progress(preorder_name, identity, box_count=count, via="armado_boxes")
 	_log_armado_operator(preorder_name, identity, via="armado_boxes")
 	return {
@@ -1322,7 +1407,8 @@ def update_armado_items(
 	"""Update qty/weight and per-line pack/faltante progress. Does not promote pipeline.
 
 	``packed`` / ``missing`` maps merge by line key (or unique item code). Unknown keys
-	are ignored. A non-map payload is a controlled error. Already-Preparado orders reject.
+	are ignored. A non-map payload is a controlled error. Unchanged Preparado orders
+	reject; admin-changed Preparado sheets reopen to Orden first.
 	"""
 	identity = _require_ops_operator(pin)
 	packed_map = _coerce_progress_map(packed, "packed")
@@ -1353,19 +1439,13 @@ def update_armado_items(
 		items = None
 
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
-		_display_status,
 		_is_guest_preorder_sales_order,
 		update_guest_preorder_items,
 	)
 
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
-	disp = _display_status(so)
-	base = "Completado" if str(disp).startswith("Completado") else disp
-	if base != "Orden":
-		frappe.throw(
-			_("Only Orden-stage orders can be updated in armado (current: {0})").format(base)
-		)
+	_require_armado_writable(so)
 
 	if has_items:
 		if _is_guest_preorder_sales_order(so):
@@ -1445,10 +1525,14 @@ def confirm_armado(preorder_name=None, items=None, pin=None, packed=None, missin
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Only guest preorders can be confirmed in armado"))
 
+	# Admin edited after pack → reopen so confirm can run again.
+	_reopen_changed_preparado(so.name)
+	so.reload()
+
 	current = _display_status(so)
 	base = "Completado" if str(current).startswith("Completado") else current
 	if base == "Preparado":
-		# Idempotent: already armado — return sheet without regressing.
+		# Idempotent: already armado and unchanged — return sheet without regressing.
 		out = get_armado_order(preorder_name)
 		order = out.get("order") if isinstance(out, dict) else None
 		return {

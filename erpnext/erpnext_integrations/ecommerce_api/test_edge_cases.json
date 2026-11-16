@@ -4222,6 +4222,30 @@
       "expect": "ok"
     },
     {
+      "id": "weight_import_daily_csv_null_text",
+      "source": "regression",
+      "bug": "import_unit_weight_ranges_from_daily_csv with null/empty csv returns ok empty — never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.import_unit_weight_ranges_from_daily_csv",
+      "args": {
+        "csv_text": null,
+        "dry_run": 1,
+        "only_weight_like": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "weight_import_obs_csv_empty",
+      "source": "regression",
+      "bug": "import_weight_observations_from_daily_csv empty string is controlled ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.import_weight_observations_from_daily_csv",
+      "args": {
+        "csv_text": "",
+        "dry_run": 1
+      },
+      "expect": "ok"
+    },
+
+    {
       "id": "set_guest_preorder_status_ensure_planner_remito_null",
       "source": "regression",
       "bug": "ensure_planner_remito=0/null must not TypeError (armado confirm passes this kwarg)",
@@ -5312,6 +5336,39 @@
       "bug": "create_guest_preorder null items + Orden must ValidationError (empty cart), never PermissionError from suggestion-only guard"
     },
     {
+      "id": "create_guest_preorder_omitted_items_empty_cart",
+      "source": "regression",
+      "bug": "create_guest_preorder with items omitted entirely must ValidationError Cart is empty — never TypeError missing argument (prod lean clients)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "guest_name": "edge omit items"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "create_guest_preorder_items_null_string",
+      "source": "regression",
+      "bug": "create_guest_preorder items='null' / dirty string coerces to empty; empty cart without notes is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": "null",
+        "guest_name": "edge items null string"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "create_guest_preorder_omitted_items_notes_ok",
+      "source": "regression",
+      "bug": "create_guest_preorder with items omitted + guest_notes must create notes-only Consulta; never TypeError; ensures pipeline status options",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "guest_notes": "edge omit items notes-only inquiry",
+        "guest_name": "edge notes only omit items",
+        "guest_phone": "1199998888"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "set_guest_preorder_status_orden_null_name",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
       "args": {
@@ -5812,6 +5869,31 @@
       "expect": "ok",
       "source": "regression",
       "bug": "Orden client picker must match by address (primary_address / Address.address_line1), not only name"
+    },
+    {
+      "id": "search_customers_typed_term_ok_under_scope",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
+      "args": {
+        "search_term": "a",
+        "page_length": 12,
+        "ensure_buckets": 0
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "sales.see_assigned typed search in Orden must stay assigned-only (never leak other sellers' clients); empty/controlled ok"
+    },
+    {
+      "id": "get_guest_preorders_list_completado_not_auto_invoice",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_guest_preorders_list",
+      "args": {
+        "status": "Completed",
+        "page_length": 10,
+        "scope": "admin",
+        "seller_scope": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Completado pipeline must not imply Facturado; list Completado rows without requiring billing SI"
     },
     {
       "id": "get_guest_preorders_list_seller_scope_null",

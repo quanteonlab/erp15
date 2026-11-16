@@ -2411,6 +2411,8 @@ def get_customer(customer_name=None, email=None):
 	if not customer_name:
 		frappe.throw(_("Customer not found"))
 
+	_require_customer_visible_to_seller(customer_name)
+
 	customer = frappe.get_doc("Customer", customer_name)
 
 	# Get addresses
@@ -2467,6 +2469,33 @@ def _is_bucket_customer(name=None, customer_name=None) -> bool:
 		if label and label in buckets:
 			return True
 	return False
+
+
+def _require_customer_visible_to_seller(customer_name) -> None:
+	"""Block sales.see_assigned sellers from reading/ordering other sellers' clients.
+
+	Only enforces when visibility scope is ``assigned``. ``all`` is unrestricted;
+	``none`` (guest / no sales perms) must not break catalog consultas.
+	Bucket customers (Consumidor Final / Uncategorized) stay reachable for walk-in.
+	"""
+	cust = cstr(customer_name or "").strip()
+	if not cust or cust.lower() in ("null", "undefined", "none"):
+		return
+	if _is_bucket_customer(cust):
+		return
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		can_see_customer,
+		sales_visibility_scope,
+	)
+
+	if sales_visibility_scope() != "assigned":
+		return
+	if can_see_customer(cust):
+		return
+	frappe.throw(
+		_("Not permitted to use customer {0} (not assigned to you).").format(cust),
+		frappe.PermissionError,
+	)
 
 
 def _phones_match(a: str, b: str) -> bool:
@@ -2788,14 +2817,28 @@ def match_customers_for_consulta(
 			}
 		)
 
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		can_see_customer,
+		sales_visibility_scope,
+	)
+
+	scope = sales_visibility_scope()
+
+	def _append_visible(name, reason):
+		if not name:
+			return
+		if scope == "assigned" and not can_see_customer(name) and not _is_bucket_customer(name):
+			return
+		_append(name, reason)
+
 	for email_hit in _list_customers_by_email(guest_email):
-		_append(email_hit, "email")
+		_append_visible(email_hit, "email")
 		if len(out) >= limit:
 			break
 
 	phone_hit = _find_customer_by_phone(guest_phone)
 	if phone_hit:
-		_append(phone_hit, "phone")
+		_append_visible(phone_hit, "phone")
 	elif len(out) < limit:
 		digits = _normalize_phone_digits(guest_phone)
 		if len(digits) >= 6:
@@ -2814,14 +2857,14 @@ def match_customers_for_consulta(
 				if not mob or _is_bucket_customer(r.name, r.customer_name):
 					continue
 				if _phones_match(mob, digits):
-					_append(r.name, "phone")
+					_append_visible(r.name, "phone")
 				if len(out) >= limit:
 					break
 
 	if len(out) < limit:
 		local_hit = _find_customer_by_local(guest_address)
 		if local_hit:
-			_append(local_hit, "local")
+			_append_visible(local_hit, "local")
 
 	return {"customers": out[:limit]}
 
@@ -3310,9 +3353,9 @@ def _customer_names_matching_address(term: str, limit: int = 40) -> list[str]:
 def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	"""Typeahead / CRM list for Customer (name + phone + tax id + address).
 
-	``sales.see_assigned``: empty browse = assigned only; typed search expands to
-	all matches (assigned first) so Orden can pick an existing client without
-	creating a duplicate.
+	``sales.see_assigned``: browse **and** typed search stay inside assigned
+	clients only (Orden / Pedidos must not leak other sellers' clients).
+	``sales.see_all`` / admin: full directory; assigned matches still rank first.
 	"""
 	if cint(ensure_buckets):
 		ensure_crm_party_buckets()
@@ -3400,13 +3443,18 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 			ignore_permissions=True,
 		)
 
-	def _merge_address_hits(rows):
+	def _merge_address_hits(rows, *, allowed_names=None):
 		"""Pull in Address.address_line1 matches not covered by Customer.primary_address."""
 		if not term:
 			return rows
 		addr_names = _customer_names_matching_address(term, limit=max(limit, 40))
 		if not addr_names:
 			return rows
+		if allowed_names is not None:
+			allowed = set(allowed_names)
+			addr_names = [n for n in addr_names if n in allowed]
+			if not addr_names:
+				return rows
 		have = {cstr(r.name) for r in (rows or [])}
 		missing = [n for n in addr_names if n not in have]
 		if not missing:
@@ -3425,13 +3473,18 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	# otherwise seller-assigned clients outside the alphabetical first page never appear).
 	if scope == "none":
 		rows = []
-	elif scope == "assigned" and not term:
-		# Empty browse: assigned clients only.
-		rows = _fetch({"name": ["in", assigned_names]}, use_or=False) if assigned_names else []
-	elif scope == "assigned" and term:
-		# Typed search: find any matching client (Orden must not force duplicates),
-		# but keep assigned matches at the top.
-		rows = _rank_assigned_first(_merge_address_hits(_fetch()))[:limit]
+	elif scope == "assigned":
+		# Privacy: sellers with see_assigned never see other sellers' clients —
+		# empty browse and typed search (name/phone/address) stay in assigned set.
+		if not assigned_names:
+			rows = []
+		elif not term:
+			rows = _fetch({"name": ["in", assigned_names]}, use_or=False)
+		else:
+			rows = _merge_address_hits(
+				_fetch({"name": ["in", assigned_names]}),
+				allowed_names=assigned_set,
+			)[:limit]
 	elif not term and assigned_names:
 		# Prefer the acting seller's assigned clients at the top of an empty typeahead.
 		assigned_rows = _fetch({"name": ["in", assigned_names]}, use_or=False)
@@ -5552,7 +5605,7 @@ def _can_view_all_guest_preorders() -> bool:
 
 @frappe.whitelist(allow_guest=True)
 def create_guest_preorder(
-	items,
+	items=None,
 	guest_phone=None,
 	guest_name=None,
 	guest_email=None,
@@ -5599,11 +5652,31 @@ def create_guest_preorder(
 	the SO as Consulta (draft). Pass ``Orden`` (e.g. Operaciones → Orden page)
 	to submit and skip Inquiry.
 
+	``items`` may be omitted / null / dirty (Flutter/Next) — notes-only inquiries
+	are allowed; empty cart without notes is a controlled ValidationError.
+
 	Returns: { preorder_name, estimated_total, currency, status }
 	"""
+	# Lean tenants: ensure Consulta/Preparado/Delivery Select options before save.
+	ensure_guest_preorder_status_options()
+
+	# Dirty clients often omit ``items`` entirely (TypeError before this fix) or
+	# send null / "" / "null" / "undefined" / a bare object.
 	if isinstance(items, str):
-		import json
-		items = json.loads(items)
+		raw = items.strip()
+		if not raw or raw.lower() in ("null", "undefined", "none"):
+			items = []
+		else:
+			try:
+				items = frappe.parse_json(raw)
+			except Exception:
+				items = []
+	if items is None or items in ("", "null", "undefined"):
+		items = []
+	if isinstance(items, dict):
+		items = [items] if (items.get("item_code") or items.get("itemCode")) else []
+	if not isinstance(items, (list, tuple)):
+		items = []
 
 	notes_only = (
 		bool(cstr(guest_notes or "").strip())
@@ -5665,6 +5738,9 @@ def create_guest_preorder(
 		guest_email=guest_email,
 		guest_name=guest_name,
 	)
+	# Sellers with sales.see_assigned must not place Orden for another seller's client
+	# (search is assigned-only; also block direct customer= API bypass).
+	_require_customer_visible_to_seller(customer)
 	company_currency = frappe.db.get_value("Company", company, "default_currency") or "ARS"
 	price_list_currency = (
 		frappe.db.get_value("Price List", price_list, "currency") if price_list else None
@@ -7896,6 +7972,15 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 		_save_guest_preorder_so(so)
 	so.reload()
 	_requeue_seller_amend_review(so.name, reason="seller_amend_items")
+	# Pedidos table edit after armado → drop Preparado so Armado shows it under Para armar.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
+			_reopen_changed_preparado,
+		)
+
+		_reopen_changed_preparado(so.name)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"armado reopen after items edit {so.name}")
 	frappe.db.commit()
 	return get_guest_preorder(preorder_name)
 
@@ -10492,6 +10577,29 @@ def _sales_invoices_for_sales_order(sales_order):
 	return [cstr(r[0]) for r in (rows or []) if r and r[0]]
 
 
+def _submitted_sales_invoices_for_sales_order(sales_order):
+	"""Submitted non-return SI names linked to SO — used for Facturado chip inference.
+
+	Draft SIs and credit notes must not light the Pedidos ``Facturado`` chip.
+	"""
+	so = cstr(sales_order or "").strip()
+	if not so:
+		return []
+	rows = frappe.db.sql(
+		"""
+		SELECT DISTINCT sii.parent, si.creation
+		FROM `tabSales Invoice Item` sii
+		INNER JOIN `tabSales Invoice` si ON si.name = sii.parent
+		WHERE sii.sales_order = %s
+			AND si.docstatus = 1
+			AND IFNULL(si.is_return, 0) = 0
+		ORDER BY si.creation ASC
+		""",
+		(so,),
+	)
+	return [cstr(r[0]) for r in (rows or []) if r and r[0]]
+
+
 def _billed_qty_by_so_detail(sales_order) -> dict:
 	"""Map Sales Order Item name → billed qty from submitted Sales Invoices."""
 	so = cstr(sales_order or "").strip()
@@ -10601,12 +10709,14 @@ def _attach_billing_fields(rows):
 		if not isinstance(rec, dict):
 			rec = {}
 		si_list = list(rec.get("invoices") or [])
-		si = cstr(rec.get("sales_invoice") or "").strip() or _sales_invoice_for_sales_order(n)
+		# Facturado chip: billing KV and/or submitted SI — never Factura A checklist alone,
+		# never draft/return SI (those are not "facturado" for Pedidos).
+		si = cstr(rec.get("sales_invoice") or "").strip()
+		if not si:
+			submitted = _submitted_sales_invoices_for_sales_order(n)
+			si = submitted[-1] if submitted else ""
 		has_si = bool(si) or bool(si_list)
-		fully = bool(rec.get("invoiced")) or (
-			cstr(r.get("factura_a_status") or "").strip().lower() == "issued"
-			and not rec.get("partial")
-		)
+		fully = bool(rec.get("invoiced"))
 		# Prefer explicit remaining from record when present.
 		partial = bool(rec.get("partial"))
 		if has_si and not fully and not partial:

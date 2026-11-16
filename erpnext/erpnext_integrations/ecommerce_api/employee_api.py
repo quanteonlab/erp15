@@ -306,9 +306,9 @@ APP_PERMISSIONS = [
 		"label_en": "See assigned clients",
 		"label_es": "Ver clientes asignados",
 		"label_zh": "查看已分配客户",
-		"desc_en": "Empty client list = assigned only; typed search in Orden still finds any matching client (assigned first).",
-		"desc_es": "Lista vacía = solo asignados; al escribir en Orden encuentra cualquier cliente (asignados primero).",
-		"desc_zh": "空列表仅已分配；在下单中输入仍可搜到任意匹配客户（已分配优先）。",
+		"desc_en": "Orden / client search: only assigned clients (browse and typed search). Use See all clients to search the full directory.",
+		"desc_es": "Orden / búsqueda de clientes: solo asignados (lista vacía y al escribir). Usá Ver todos los clientes para el directorio completo.",
+		"desc_zh": "下单/客户搜索：仅已分配客户（空列表与输入均受限）。需搜全库请开“查看全部客户”。",
 	},
 	{
 		"id": "sales.commit_all",
