@@ -903,7 +903,9 @@ def _build_item_lot_timeline(
 			if q <= 0.0001:
 				continue
 			sb = lot_sell_by.get(m["name"])
-			days_left = (sb - today).days if sb else None
+			# Days remaining relative to this column's date (bucket end), not
+			# always "today" — otherwise every bar for a lot shows the same -Nd.
+			days_left = (sb - end).days if sb else None
 			stack.append(
 				{
 					"lot": m["name"],

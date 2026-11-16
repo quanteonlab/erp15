@@ -767,6 +767,27 @@ def suite_5_7_receiving():
             prev = pet
         assert saw_petition, "expected at least one future petition block on LOT-DEMO-SHORT"
 
+        # days_left must follow each bucket's date (not a flat "today" for all bars)
+        by_lot = {}
+        for b in res.get("buckets") or []:
+            end = b.get("end")
+            for seg in b.get("stack") or []:
+                lot = seg.get("lot")
+                if not lot or seg.get("days_left") is None:
+                    continue
+                by_lot.setdefault(lot, []).append((end, int(seg["days_left"])))
+        for lot, series in by_lot.items():
+            if len(series) < 2:
+                continue
+            ends = [e for e, _ in series]
+            days = [d for _, d in series]
+            # Later bucket end ⇒ fewer (more negative) days left for same sell-by
+            if ends[0] != ends[-1]:
+                assert days[0] > days[-1] or days[0] != days[-1], (
+                    f"days_left flat across buckets for {lot}: {series[:4]}…"
+                )
+                break
+
     _run("5.7.1 simulate_receiving_flow returns valid payload", check_simulate, "S2")
     _run("5.7.2 commit_receiving_session creates Stock Entry", check_commit, "S2")
     _run(
