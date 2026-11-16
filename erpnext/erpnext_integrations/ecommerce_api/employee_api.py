@@ -27,6 +27,66 @@ STAFF_OPS_PIN_SCOPE = "settings.staff_ops_pins"
 STAFF_OPS_PIN_LEN = 6
 STAFF_OPS_PIN_FIRST_DIGITS = "456789"
 
+# Employee.gender is a Link → Gender. Fresh / lean production sites often only
+# have Male/Female (or nothing). SilkOS defaults new staff to this value.
+DEFAULT_EMPLOYEE_GENDER = "Prefer not to say"
+STARTER_GENDERS = (
+	"Male",
+	"Female",
+	"Other",
+	"Non-binary",
+	DEFAULT_EMPLOYEE_GENDER,
+)
+
+
+def ensure_gender_masters():
+	"""Idempotent: create starter Gender rows (incl. Prefer not to say).
+
+	Wired into ``after_migrate`` and called before Employee insert so create
+	never LinkValidationError on lean tenants.
+	"""
+	if not frappe.db.exists("DocType", "Gender"):
+		return {"ok": False, "created": [], "reason": "Gender DocType missing"}
+	created: list[str] = []
+	prev = frappe.flags.ignore_permissions
+	frappe.flags.ignore_permissions = True
+	try:
+		for label in STARTER_GENDERS:
+			name = cstr(label or "").strip()
+			if not name or frappe.db.exists("Gender", name):
+				continue
+			doc = frappe.get_doc({"doctype": "Gender", "gender": name})
+			doc.insert(ignore_permissions=True)
+			created.append(name)
+		if created:
+			frappe.db.commit()
+	finally:
+		frappe.flags.ignore_permissions = prev
+	return {"ok": True, "created": created}
+
+
+def _resolve_employee_gender(raw) -> str:
+	"""Return a Gender name that exists (creates starters first)."""
+	ensure_gender_masters()
+	wanted = cstr(raw or "").strip()
+	if wanted and wanted.lower() not in ("null", "undefined", "none"):
+		if frappe.db.exists("Gender", wanted):
+			return wanted
+		# Soft-create a one-off label the UI sent (still a Link value).
+		try:
+			frappe.flags.ignore_permissions = True
+			frappe.get_doc({"doctype": "Gender", "gender": wanted}).insert(ignore_permissions=True)
+			frappe.db.commit()
+			return wanted
+		except Exception:
+			frappe.log_error(title="ensure Gender from employee payload")
+	if frappe.db.exists("Gender", DEFAULT_EMPLOYEE_GENDER):
+		return DEFAULT_EMPLOYEE_GENDER
+	# Last resort: first existing Gender, else empty (skip link).
+	any_gender = frappe.db.get_value("Gender", {}, "name")
+	return cstr(any_gender or "")
+
+
 # App permissions that match the current Next.js UI (not ERPNext desk roles).
 APP_PERMISSIONS = [
 	{
@@ -1286,7 +1346,9 @@ def save_employee(name=None, data=None):
 		doc.employee_name = full or first
 		doc.status = data.get("status") or "Active"
 		doc.date_of_joining = data.get("date_of_joining") or today()
-		doc.gender = data.get("gender") or "Prefer not to say"
+		gender = _resolve_employee_gender(data.get("gender"))
+		if gender:
+			doc.gender = gender
 		doc.date_of_birth = data.get("date_of_birth") or "1990-01-01"
 		for key in tracked:
 			if key in data and data[key] is not None and key not in (
@@ -1928,6 +1990,66 @@ def delete_employee_group(name):
 	return {"ok": True}
 
 
+@frappe.whitelist(allow_guest=True)
+def duplicate_employee_group(name=None, employee_group_name=None):
+	"""Clone an Employee Group: permissions + field ACL. Members are not copied.
+
+	``employee_group_name`` is the new display title (required). Admin uses
+	Settings → Grupos y permisos → Duplicar.
+	"""
+	_require_app_permission("settings.manage_groups")
+	source = cstr(name or "").strip()
+	if not source or source in ("null", "undefined") or not frappe.db.exists(
+		"Employee Group", source
+	):
+		frappe.throw(_("Group {0} not found").format(source or "—"))
+	title = cstr(employee_group_name or "").strip()
+	if not title or title in ("null", "undefined"):
+		frappe.throw(_("Group name is required"))
+	# Block collide with existing name OR title (case-insensitive).
+	if _find_employee_group_by_title(title):
+		frappe.throw(_("Group {0} already exists").format(title))
+
+	frappe.flags.ignore_permissions = True
+	src = frappe.get_doc("Employee Group", source)
+	doc = frappe.new_doc("Employee Group")
+	doc.employee_group_name = title
+	doc.insert(ignore_permissions=True)
+
+	# Copy app permission ids from the source group's store.
+	store = _load_perm_store()
+	perms = _normalize_permission_ids(store.get(source) or [])
+	store[doc.name] = list(perms)
+	_save_perm_store(store)
+
+	# Copy field ACL matrix (resolved/seeded for source → persist under new name).
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.field_acl import (
+			get_group_acl,
+			normalize_group_acl,
+			_load_field_acl_store,
+			_save_field_acl_store,
+		)
+
+		acl_store = _load_field_acl_store()
+		acl_store[doc.name] = normalize_group_acl(get_group_acl(source))
+		_save_field_acl_store(acl_store)
+	except Exception:
+		frappe.log_error(title="duplicate_employee_group field_acl")
+
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"source": source,
+		"group": {
+			"name": doc.name,
+			"employee_group_name": doc.employee_group_name,
+			"permissions": _permissions_for_group(doc.name),
+			"members": [],
+		},
+	}
+
+
 def _find_employee_group_by_title(title: str) -> str | None:
 	wanted = (title or "").strip()
 	if not wanted:
@@ -2457,6 +2579,10 @@ def _ensure_starter_staff_groups() -> dict:
 		return {"created": [], "attached": [], "upgraded": [], "skipped": []}
 	frappe.local._staff_starter_ensured = True
 	frappe.flags.ignore_permissions = True
+	try:
+		ensure_gender_masters()
+	except Exception:
+		frappe.log_error(title="ensure_gender_masters")
 	store = _load_perm_store()
 	created = []
 	attached = []
@@ -3444,7 +3570,9 @@ def _ensure_salesman_user_id(label: str) -> tuple[str, dict]:
 	doc.employee_name = q
 	doc.status = "Active"
 	doc.date_of_joining = today()
-	doc.gender = "Prefer not to say"
+	gender = _resolve_employee_gender(None)
+	if gender:
+		doc.gender = gender
 	doc.date_of_birth = "1990-01-01"
 	doc.insert(ignore_permissions=True)
 	log_field_changes(

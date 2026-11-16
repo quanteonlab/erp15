@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, getdate, today
+from frappe.utils import cint, cstr, flt, getdate, today
 
 from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
 
@@ -737,11 +737,46 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "armado last-editor tag")
 	name = (detail or {}).get("name") or preorder_name
-	# Remito + geocode used to run inline here and stall the kiosk — same deferral
-	# pattern as create_guest_preorder (Orden). Order is already Preparado.
-	from erpnext.erpnext_integrations.ecommerce_api.api import _enqueue_planner_remito
 
-	remito_job = _enqueue_planner_remito(name)
+	# i060 Part B: feed weight catalog from measured kg (never fails confirm).
+	weight_obs = {"ok": True, "recorded": [], "skipped": [], "errors": []}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.weight_api import (
+			soft_record_armado_weights,
+		)
+
+		obs_items = items if isinstance(items, list) else None
+		if not obs_items:
+			# Fall back to SO lines when confirm payload omitted weights.
+			obs_items = []
+			frappe.flags.ignore_permissions = True
+			so_obs = frappe.get_doc("Sales Order", name)
+			frappe.flags.ignore_permissions = False
+			for row in so_obs.get("items") or []:
+				obs_items.append(
+					{
+						"item_code": row.item_code,
+						"qty": row.qty,
+						"total_weight": getattr(row, "total_weight", None),
+					}
+				)
+		weight_obs = soft_record_armado_weights(reference_name=name, items=obs_items, source="armado")
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "confirm_armado weight obs")
+
+	# Remito + geocode — skip practice / scratch sessions (i060 Part D).
+	is_practice = False
+	try:
+		remarks = cstr(frappe.db.get_value("Sales Order", name, "remarks") or "")
+		is_practice = "armado_practice:1" in remarks
+	except Exception:
+		is_practice = False
+
+	remito_job = {"queued": 0}
+	if not is_practice:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _enqueue_planner_remito
+
+		remito_job = _enqueue_planner_remito(name)
 	# Light payload — skip get_armado_order floor-map rebuild; UI drops the sheet.
 	order = dict(detail) if isinstance(detail, dict) else {"name": name}
 	order["ean13"] = armado_ean13_for_order(name)
@@ -751,6 +786,8 @@ def confirm_armado(preorder_name=None, items=None, pin=None):
 		"ok": True,
 		"already_confirmed": 0,
 		"remito_queued": 1 if remito_job.get("queued") else 0,
+		"practice": 1 if is_practice else 0,
+		"weight_observations": weight_obs,
 		"order": order,
 		"operator": {
 			"kind": identity.get("kind"),
@@ -955,3 +992,156 @@ def save_cargo_check(delivery_note=None, qtys=None, updated_at=None):
 	kv_set(CARGO_CHECK_SCOPE, dn, {"qtys": clean, "updated_at": stamp})
 	frappe.db.commit()
 	return {"ok": True, "delivery_note": dn, "stale": 0, "updated_at": stamp}
+
+
+def _sanitize_armado_ref(raw) -> str:
+	text = cstr(raw or "").strip()
+	if not text or text.lower() in ("null", "undefined", "none"):
+		return ""
+	# Keep short printable refs for remarks tags.
+	return "".join(ch for ch in text[:80] if ch.isalnum() or ch in "-_/#. ")
+
+
+@frappe.whitelist(allow_guest=True)
+def create_armado_scratch_order(
+	mode=None,
+	customer=None,
+	reference=None,
+	items=None,
+	pin=None,
+	guest_name=None,
+):
+	"""Create Orden-stage sheet for Armado outside an existing pedido (i060 Part D).
+
+	``mode=practice`` → tagged ``armado_practice:1`` (no remito on confirm).
+	``mode=temporal`` → real guest preorder Orden for a customer (or Consumidor Final).
+	Optional ``reference`` stored as ``armado_ref:…`` in remarks/guest_notes.
+	"""
+	identity = _require_ops_operator(pin)
+	mode_s = cstr(mode or "practice").strip().lower()
+	if mode_s not in ("practice", "temporal"):
+		mode_s = "practice"
+
+	if isinstance(items, str):
+		try:
+			items = json.loads(items) if items.strip() else []
+		except Exception:
+			items = []
+	if not isinstance(items, list):
+		items = []
+
+	clean_items = []
+	for row in items[:200]:
+		if not isinstance(row, dict):
+			continue
+		code = cstr(row.get("item_code") or "").strip()
+		if not code or code.lower() in ("null", "undefined", "none"):
+			continue
+		qty = flt(row.get("qty") or 1)
+		if qty <= 0:
+			qty = 1
+		clean_items.append(
+			{
+				"item_code": code,
+				"qty": qty,
+				"rate": flt(row.get("rate") or 0),
+				"total_weight": row.get("total_weight"),
+				"weight_per_unit": row.get("weight_per_unit"),
+			}
+		)
+	if not clean_items:
+		frappe.throw(_("Add at least one product"))
+
+	ref = _sanitize_armado_ref(reference)
+	note_parts = []
+	if mode_s == "practice":
+		note_parts.append("armado_practice:1")
+	if ref:
+		note_parts.append(f"armado_ref:{ref}")
+	guest_notes = " ".join(note_parts)
+
+	cust = cstr(customer or "").strip()
+	if cust.lower() in ("null", "undefined", "none"):
+		cust = ""
+	if cust and not frappe.db.exists("Customer", cust):
+		frappe.throw(_("Customer {0} not found").format(cust))
+
+	name_hint = cstr(guest_name or "").strip()
+	if name_hint.lower() in ("null", "undefined", "none"):
+		name_hint = ""
+	if mode_s == "practice" and not name_hint:
+		name_hint = "Práctica Armado"
+		if ref:
+			name_hint = f"{name_hint} ({ref})"
+
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		create_guest_preorder,
+		set_guest_preorder_status,
+	)
+
+	# Create as Consulta first so create-side-effects do not enqueue a remito;
+	# then promote to Orden with ensure_planner_remito=0 (practice never remitos).
+	created = create_guest_preorder(
+		items=clean_items,
+		customer=cust or None,
+		guest_name=name_hint or None,
+		guest_notes=guest_notes or None,
+		initial_status=None,
+		is_delivery=0,
+		send_client_pin=0,
+	)
+	preorder_name = (
+		(created or {}).get("preorder_name")
+		or (created or {}).get("name")
+		or ""
+	)
+	if not preorder_name:
+		frappe.throw(_("Could not create armado scratch order"))
+
+	# Ensure practice / ref tags survive on remarks.
+	try:
+		remarks = cstr(frappe.db.get_value("Sales Order", preorder_name, "remarks") or "")
+		need = []
+		if mode_s == "practice" and "armado_practice:1" not in remarks:
+			need.append("armado_practice:1")
+		if ref and f"armado_ref:{ref}" not in remarks:
+			need.append(f"armado_ref:{ref}")
+		if need:
+			frappe.db.set_value(
+				"Sales Order",
+				preorder_name,
+				"remarks",
+				(remarks + " " + " ".join(need)).strip(),
+				update_modified=False,
+			)
+			frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "create_armado_scratch_order tags")
+
+	try:
+		set_guest_preorder_status(
+			preorder_name,
+			"Orden",
+			source="armado",
+			ensure_planner_remito=0,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "create_armado_scratch_order promote")
+		frappe.throw(_("Created draft but could not promote to Orden"))
+
+	_log_armado_operator(preorder_name, identity, via="armado_scratch")
+	out = get_armado_order(preorder_name)
+	order = out.get("order") if isinstance(out, dict) else None
+	return {
+		"ok": True,
+		"mode": mode_s,
+		"practice": 1 if mode_s == "practice" else 0,
+		"reference": ref or None,
+		"preorder_name": preorder_name,
+		"order": order,
+		"operator": {
+			"kind": identity.get("kind"),
+			"employee": identity.get("employee"),
+			"employee_name": identity.get("employee_name"),
+		},
+	}

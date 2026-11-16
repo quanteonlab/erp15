@@ -10522,6 +10522,34 @@ def _ensure_late_penalty_fields():
 	frappe.clear_cache(doctype="Delivery Stop")
 
 
+@frappe.whitelist(allow_guest=True)
+def ensure_tms_lean_site_fields():
+	"""Additive TMS custom fields lean tenants often miss (migrate/patch skipped).
+
+	Creates if missing:
+	- Customer.custom_delivery_warehouse
+	- Address.custom_delivery_frequency
+	- Delivery Trip.custom_locked
+	- Delivery Stop / SO payment-split fields
+	- Delivery Stop late-penalty fields
+	"""
+	_ensure_customer_delivery_warehouse_field()
+	_ensure_delivery_frequency_field()
+	_ensure_trip_locked_field()
+	_ensure_delivery_payment_split_fields()
+	_ensure_late_penalty_fields()
+	return {
+		"ok": True,
+		"fields": [
+			"Customer.custom_delivery_warehouse",
+			"Address.custom_delivery_frequency",
+			"Delivery Trip.custom_locked",
+			"Delivery Stop payment-split + Sales Order surcharge fields",
+			"Delivery Stop late-penalty fields",
+		],
+	}
+
+
 def _pending_penalty_amount(stop) -> float:
 	if not frappe.db.has_column("Delivery Stop", "custom_late_penalty_amount"):
 		return 0.0

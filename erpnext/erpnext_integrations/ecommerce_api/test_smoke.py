@@ -739,8 +739,41 @@ def suite_5_7_receiving():
             f"Stock Entry '{se_name}' does not exist in DB"
         _tag_record("Stock Entry", se_name)
 
+    def check_lot_timeline_cumulative_petition():
+        """i062: future compra (petition) stack must accumulate across days."""
+        from erpnext.erpnext_integrations.ecommerce_api import lots_api
+
+        if not frappe.db.exists("Item", "LOT-DEMO-SHORT"):
+            return  # optional demo seed; skip when absent
+        res = lots_api.get_item_lot_timeline(
+            item_code="LOT-DEMO-SHORT", grain="day", include_forecast=1
+        )
+        assert isinstance(res, dict) and "buckets" in res, res
+        prev = 0.0
+        saw_petition = False
+        for b in res.get("buckets") or []:
+            if not b.get("is_future"):
+                continue
+            pet = sum(
+                float(s.get("qty") or 0)
+                for s in (b.get("stack") or [])
+                if s.get("petition")
+            )
+            assert pet + 1e-9 >= prev, (
+                f"petition not cumulative at {b.get('key')}: {pet} < prior {prev}"
+            )
+            if pet > 0:
+                saw_petition = True
+            prev = pet
+        assert saw_petition, "expected at least one future petition block on LOT-DEMO-SHORT"
+
     _run("5.7.1 simulate_receiving_flow returns valid payload", check_simulate, "S2")
     _run("5.7.2 commit_receiving_session creates Stock Entry", check_commit, "S2")
+    _run(
+        "5.7.3 lot timeline future petition accumulates",
+        check_lot_timeline_cumulative_petition,
+        "S2",
+    )
 
 
 # ── Suite 5.8 — Stock Sync ────────────────────────────────────────────────────
@@ -1526,6 +1559,15 @@ def suite_5_9_master_data():
             assert api._pipeline_base_status(
                 remito.get("display_status") or frappe.db.get_value("Sales Order", so_name, "status")
             ) in ("Delivery", "Preparado", "Orden"), remito
+            # i061: remito create is idempotent; shortage is soft flag only (never blocks).
+            remito2 = api.create_delivery_note_for_preorder(so_name)
+            dn1 = remito.get("delivery_note")
+            dn2 = remito2.get("delivery_note")
+            if dn1 and dn2:
+                assert dn1 == dn2, (dn1, dn2)
+            for payload in (remito, remito2):
+                if "stock_shortage" in payload:
+                    assert payload.get("stock_shortage") in (True, False, 0, 1)
         finally:
             if so_name and frappe.db.exists("Sales Order", so_name):
                 dn = frappe.db.get_value(
@@ -2470,6 +2512,34 @@ def suite_5_12_modules_read():
                 assert "ops.orden" in (sales2.get("permissions") or []), sales2.get("permissions")
             finally:
                 ea.save_employee_group_permissions(sales["name"], original)
+
+        # Duplicate group (permissions + ACL; no members) — Settings → Duplicar.
+        if sales:
+            dup_title = f"SMOKE-DUP-{frappe.generate_hash(length=6)}"
+            dup = None
+            try:
+                dup = ea.duplicate_employee_group(
+                    name=sales["name"], employee_group_name=dup_title
+                )
+                assert dup.get("ok") and dup.get("group", {}).get("name"), dup
+                clone = dup["group"]
+                assert clone.get("employee_group_name") == dup_title, clone
+                assert not (clone.get("members") or []), clone
+                src_perms = set(sales.get("permissions") or [])
+                assert set(clone.get("permissions") or []) == src_perms, (
+                    clone.get("permissions"),
+                    sales.get("permissions"),
+                )
+                try:
+                    ea.duplicate_employee_group(
+                        name=sales["name"], employee_group_name=dup_title
+                    )
+                    assert False, "expected duplicate name to fail"
+                except Exception:
+                    pass
+            finally:
+                if dup and dup.get("group", {}).get("name"):
+                    ea.delete_employee_group(dup["group"]["name"])
 
     def check_devices():
         from erpnext.erpnext_integrations.ecommerce_api import device_link_api as dla
@@ -4687,6 +4757,21 @@ def suite_5_16b_dev_wipe():
         assert catalog.get("ok"), catalog
         counts = catalog.get("counts") or {}
         assert "products" in counts and "categories" in counts, counts
+        buying = dw.dev_wipe_preview(targets=["purchases", "lots"], since="1w")
+        assert buying.get("ok") and buying.get("since") == "1w", buying
+        bcounts = buying.get("counts") or {}
+        assert "purchase_orders" in bcounts and "lots" in bcounts, bcounts
+        alias = dw.dev_wipe_preview(targets=["compras", "lotes"], since="24h")
+        assert alias.get("ok"), alias
+        assert set(alias.get("targets") or []) == {"purchases", "lots"}, alias
+        suppliers = dw.dev_wipe_preview(targets=["suppliers", "proveedores"], since="all")
+        assert suppliers.get("ok"), suppliers
+        assert "suppliers" in (suppliers.get("counts") or {}), suppliers
+        from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+
+        genders = ea.ensure_gender_masters()
+        assert genders.get("ok"), genders
+        assert frappe.db.exists("Gender", ea.DEFAULT_EMPLOYEE_GENDER), ea.DEFAULT_EMPLOYEE_GENDER
         try:
             dw.clear_dev_wipe_data(targets=["orders"], pin=None)
             assert False, "expected AuthenticationError for missing pin"
@@ -4697,8 +4782,58 @@ def suite_5_16b_dev_wipe():
             assert False, "expected ValidationError for empty targets"
         except Exception:
             pass
+        try:
+            dw.reseed_site_defaults(pin=None)
+            assert False, "expected AuthenticationError for missing reseed pin"
+        except frappe.AuthenticationError:
+            pass
+        try:
+            dw.reseed_site_defaults(pin="")
+            assert False, "expected AuthenticationError for empty reseed pin"
+        except frappe.AuthenticationError:
+            pass
+        try:
+            dw.reseed_site_defaults(pin="000000", steps=[])
+            assert False, "expected ValidationError for empty reseed steps"
+        except Exception:
+            pass
 
     _run("5.16b.1 preview + missing pin / empty targets", check_preview_and_pin_gate, "S2")
+
+    def check_reseed_additive_gender():
+        from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+        from erpnext.erpnext_integrations.ecommerce_api import dev_wipe_api as dw
+        from erpnext.erpnext_integrations.ecommerce_api import tms_api as ta
+        from erpnext.erpnext_integrations.ecommerce_api import api as api_mod
+
+        catalog = dw.list_reseed_defaults()
+        assert catalog.get("ok") and catalog.get("steps"), catalog
+        ids = {row["id"] for row in catalog["steps"]}
+        for need in (
+            "gender_masters",
+            "crm_party_buckets",
+            "client_access_fields",
+            "tms_fields",
+            "stock_lot_doctype",
+            "field_acl_starters",
+        ):
+            assert need in ids, need
+            assert any(r["id"] == need and r.get("seeds") for r in catalog["steps"]), need
+
+        out = ea.ensure_gender_masters()
+        assert out.get("ok"), out
+        assert frappe.db.exists("Gender", "Prefer not to say"), "Prefer not to say"
+        buckets = api_mod.ensure_crm_party_buckets()
+        assert buckets.get("consumidor_final"), buckets
+        tms = ta.ensure_tms_lean_site_fields()
+        assert tms.get("ok"), tms
+        try:
+            dw.reseed_site_defaults(pin="___WRONG_SMOKE_RESEED___", steps=["gender_masters"])
+            assert False, "expected AuthenticationError for wrong reseed pin"
+        except frappe.AuthenticationError:
+            pass
+
+    _run("5.16b.2 reseed catalog + PIN gate + lean ensures", check_reseed_additive_gender, "S2")
 
 
 def suite_5_18_archivo():

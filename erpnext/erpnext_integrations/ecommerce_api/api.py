@@ -6386,6 +6386,8 @@ def get_guest_preorders_list(
 			o.get("advance_paid", 0),
 		)
 		o["delivery_date_forced"] = _delivery_date_forced_from_tags(o)
+		# Soft alert only (i061 R5) — never a gate.
+		o["stock_shortage"] = _stock_shortage_from_guest_tags(o)
 
 	ext_map = _external_status_change_map([o["name"] for o in filtered])
 	for o in filtered:
@@ -6614,6 +6616,10 @@ def get_guest_preorder(preorder_name):
 	payload["is_credit_note"] = cstr(tags.get("credit_note") or "") in ("1", "true", "yes")
 	payload["credit_of"] = cstr(tags.get("credit_of") or "").strip() or None
 	payload["credit_reason"] = cstr(tags.get("credit_reason") or "").strip() or None
+	# Soft alert only (i061 R5) — remito/POS never blocked by stock/lots.
+	payload["stock_shortage"] = _stock_shortage_from_guest_tags(so) or bool(
+		cstr(tags.get("stock_shortage") or "").strip().lower() in ("1", "true", "yes", "on")
+	)
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.tags_api import tags_map_for_docs
 
@@ -9797,8 +9803,11 @@ def _attach_planner_gate_fields(payload, gate):
 		payload["address"] = gate.get("address_line")
 	if gate.get("stock_warnings"):
 		payload["stock_warnings"] = gate["stock_warnings"]
+		payload["stock_shortage"] = True
 	if gate.get("warnings"):
 		payload["warnings"] = gate["warnings"]
+	if gate.get("stock_shortage"):
+		payload["stock_shortage"] = True
 	return payload
 
 
@@ -9896,8 +9905,125 @@ def _delivery_note_stock_shortages(dn):
 	return out
 
 
+def _consume_lots_for_delivery_note(dn):
+	"""Soft FIFO lot consume for a just-submitted remito (i061). Never throws."""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.lots_api import consume_stock_lots_fifo
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "lots_api import for DN FIFO")
+		return {"ok": True, "allocations": [], "remaining_unallocated_total": 0.0, "lines": []}
+
+	lines_out = []
+	alloc_all = []
+	unallocated_total = 0.0
+	for row in dn.get("items") or []:
+		code = cstr(getattr(row, "item_code", None) or "").strip()
+		qty = flt(getattr(row, "qty", None) or 0)
+		wh = cstr(getattr(row, "warehouse", None) or "").strip() or None
+		if not code or qty <= 0:
+			continue
+		box = _linked_box_pack(code)
+		if box:
+			code = box["unit"]
+			qty = qty * box["pack"]
+		try:
+			res = (
+				consume_stock_lots_fifo(
+					code,
+					qty,
+					warehouse=wh,
+					commit=False,
+					voucher_type="Delivery Note",
+					voucher_name=cstr(getattr(dn, "name", None) or "") or None,
+					posting_date=cstr(getattr(dn, "posting_date", None) or "") or None,
+				)
+				or {}
+			)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "DN soft FIFO lot consume")
+			res = {"ok": True, "allocations": [], "remaining_unallocated": qty}
+		left = flt(res.get("remaining_unallocated") or 0)
+		unallocated_total += left
+		allocs = res.get("allocations") or []
+		alloc_all.extend(allocs)
+		lines_out.append(
+			{
+				"item_code": code,
+				"warehouse": wh,
+				"qty": qty,
+				"allocations": allocs,
+				"remaining_unallocated": left,
+			}
+		)
+	return {
+		"ok": True,
+		"allocations": alloc_all,
+		"remaining_unallocated_total": max(0.0, round(unallocated_total, 6)),
+		"lines": lines_out,
+	}
+
+
+def _sales_orders_linked_to_delivery_note(dn):
+	names = []
+	for row in dn.get("items") or []:
+		so = cstr(getattr(row, "against_sales_order", None) or "").strip()
+		if so and so not in names:
+			names.append(so)
+	return names
+
+
+def _persist_guest_preorder_tag(so_name, key, value):
+	"""Update remarks/terms tag on SO without blocking callers."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return
+	try:
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", so_name)
+		frappe.flags.ignore_permissions = False
+		if not _is_guest_preorder_sales_order(so):
+			return
+		_update_guest_preorder_tag(so, key, value)
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn:
+			frappe.db.set_value(
+				"Sales Order",
+				so.name,
+				tag_fn,
+				getattr(so, tag_fn, None),
+				update_modified=False,
+			)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"persist tag {key} on {so_name}")
+
+
+def _mark_so_stock_shortage_from_dn(dn, stock_warnings=None, lot_result=None):
+	"""Soft Pedidos alert flag — never blocks. i061 R5."""
+	has_bin_short = bool(stock_warnings)
+	has_lot_short = flt((lot_result or {}).get("remaining_unallocated_total") or 0) > 0.0001
+	flag = "1" if (has_bin_short or has_lot_short) else None
+	for so_name in _sales_orders_linked_to_delivery_note(dn):
+		_persist_guest_preorder_tag(so_name, "stock_shortage", flag)
+
+
+def _stock_shortage_from_guest_tags(so_or_dict) -> bool:
+	raw = (_parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("stock_shortage") or "").strip().lower()
+	return raw in ("1", "true", "yes", "on")
+
+
 def _submit_delivery_note_allowing_negative(dn):
-	"""Submit DN even when warehouse qty is short (allow negative stock)."""
+	"""Submit DN even when warehouse qty is short (allow negative stock).
+
+	i061: same moment soft-FIFO consumes Stock Lots. Shortage never blocks —
+	stamp ``stock_shortage`` on linked guest preorders for Pedidos alert icon.
+	"""
+	stock_warnings = []
+	try:
+		stock_warnings = _delivery_note_stock_shortages(dn) or []
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "DN stock shortage probe")
+		stock_warnings = []
+
 	with _temporarily_allow_negative_stock():
 		orig = dn.update_stock_ledger
 
@@ -9906,6 +10032,24 @@ def _submit_delivery_note_allowing_negative(dn):
 
 		dn.update_stock_ledger = _update_stock_ledger
 		dn.submit()
+
+	lot_result = {"ok": True, "allocations": [], "remaining_unallocated_total": 0.0, "lines": []}
+	try:
+		lot_result = _consume_lots_for_delivery_note(dn) or lot_result
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "DN FIFO after submit")
+
+	try:
+		_mark_so_stock_shortage_from_dn(dn, stock_warnings=stock_warnings, lot_result=lot_result)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "DN stock_shortage tag")
+
+	return {
+		"stock_warnings": stock_warnings,
+		"lot_consume": lot_result,
+		"stock_shortage": bool(stock_warnings)
+		or flt((lot_result or {}).get("remaining_unallocated_total") or 0) > 0.0001,
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -11941,7 +12085,15 @@ def create_pos_sale(
 					if box:
 						code = box["unit"]
 						qty = qty * box["pack"]
-					consume_stock_lots_fifo(code, qty, warehouse=warehouse, commit=False)
+					consume_stock_lots_fifo(
+						code,
+						qty,
+						warehouse=warehouse,
+						commit=False,
+						voucher_type="Sales Invoice",
+						voucher_name=cstr(getattr(invoice, "name", None) or "") or None,
+						posting_date=nowdate(),
+					)
 			except Exception:
 				frappe.log_error(frappe.get_traceback(), "pos soft FIFO lot consume")
 
@@ -14639,6 +14791,22 @@ def clear_dev_wipe_data(targets=None, pin=None, since=None):
 	from erpnext.erpnext_integrations.ecommerce_api import dev_wipe_api as dw
 
 	return dw.clear_dev_wipe_data(targets=targets, pin=pin, since=since)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_reseed_defaults():
+	"""Settings → Desarrollador: catalog of selectable additive reseed steps."""
+	from erpnext.erpnext_integrations.ecommerce_api import dev_wipe_api as dw
+
+	return dw.list_reseed_defaults()
+
+
+@frappe.whitelist(allow_guest=True)
+def reseed_site_defaults(pin=None, steps=None):
+	"""Settings → Desarrollador: re-run selected additive defaults (PIN)."""
+	from erpnext.erpnext_integrations.ecommerce_api import dev_wipe_api as dw
+
+	return dw.reseed_site_defaults(pin=pin, steps=steps)
 
 
 @frappe.whitelist()

@@ -4105,6 +4105,55 @@
       "expect": "error"
     },
     {
+      "id": "ops_create_armado_scratch_null_items",
+      "source": "regression",
+      "bug": "create_armado_scratch_order with null items/pin fails controlled — never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.create_armado_scratch_order",
+      "args": {
+        "mode": null,
+        "customer": null,
+        "reference": null,
+        "items": null,
+        "pin": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "ops_create_armado_scratch_empty_items",
+      "source": "regression",
+      "bug": "create_armado_scratch_order with empty items list is ValidationError (need ≥1 product)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.create_armado_scratch_order",
+      "args": {
+        "mode": "practice",
+        "items": [],
+        "pin": "000000"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "weight_soft_record_armado_null_ref",
+      "source": "regression",
+      "bug": "soft_record_armado_weights with null reference returns ok:false controlled dict — never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.soft_record_armado_weights",
+      "args": {
+        "reference_name": null,
+        "items": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "weight_recompute_catalog_null_item",
+      "source": "regression",
+      "bug": "recompute_item_weight_catalog with null item_code/lookback dirty args stays controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.recompute_item_weight_catalog",
+      "args": {
+        "item_code": null,
+        "lookback_days": null,
+        "dry_run": 1
+      },
+      "expect": "ok"
+    },
+    {
       "id": "set_guest_preorder_status_ensure_planner_remito_null",
       "source": "regression",
       "bug": "ensure_planner_remito=0/null must not TypeError (armado confirm passes this kwarg)",
@@ -4240,6 +4289,101 @@
         "targets": ["not_a_target", "products"],
         "since": null
       },
+      "expect": "ok"
+    },
+    {
+      "id": "dev_wipe_preview_purchases_lots",
+      "source": "regression",
+      "bug": "dev_wipe_preview purchases+lots (and ES aliases compras/lotes) returns count keys; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.dev_wipe_preview",
+      "args": {
+        "targets": ["purchases", "lots", "compras", "lotes"],
+        "since": "1w"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "dev_wipe_preview_suppliers",
+      "source": "regression",
+      "bug": "dev_wipe_preview suppliers/proveedores returns counts; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.dev_wipe_preview",
+      "args": {
+        "targets": ["suppliers", "proveedores"],
+        "since": "all"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "ensure_gender_masters_ok",
+      "source": "regression",
+      "bug": "ensure_gender_masters must create Prefer not to say without TypeError (employee create LinkValidationError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.ensure_gender_masters",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "reseed_site_defaults_missing_pin",
+      "source": "regression",
+      "bug": "reseed_site_defaults without admin pin fails AuthenticationError; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.reseed_site_defaults",
+      "args": {
+        "pin": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "reseed_site_defaults_empty_pin",
+      "source": "regression",
+      "bug": "reseed_site_defaults with empty/\"null\" pin fails AuthenticationError; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.reseed_site_defaults",
+      "args": {
+        "pin": ""
+      },
+      "expect": "error"
+    },
+    {
+      "id": "reseed_site_defaults_null_string_pin",
+      "source": "regression",
+      "bug": "reseed_site_defaults with pin='null' fails AuthenticationError; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.reseed_site_defaults",
+      "args": {
+        "pin": "null"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "reseed_site_defaults_empty_steps",
+      "source": "regression",
+      "bug": "reseed_site_defaults with pin but empty steps list fails ValidationError; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.reseed_site_defaults",
+      "args": {
+        "pin": "000000",
+        "steps": []
+      },
+      "expect": "error"
+    },
+    {
+      "id": "list_reseed_defaults_ok",
+      "source": "regression",
+      "bug": "list_reseed_defaults returns selectable catalog with seeds labels; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.dev_wipe_api.list_reseed_defaults",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "ensure_tms_lean_site_fields_ok",
+      "source": "regression",
+      "bug": "ensure_tms_lean_site_fields creates missing TMS custom fields without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.ensure_tms_lean_site_fields",
+      "args": {},
+      "expect": "ok"
+    },
+    {
+      "id": "ensure_crm_party_buckets_ok",
+      "source": "regression",
+      "bug": "ensure_crm_party_buckets creates Consumidor Final / Uncategorized without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.ensure_crm_party_buckets",
+      "args": {},
       "expect": "ok"
     },
     {
@@ -4802,6 +4946,73 @@
       },
       "expect": "ok"
     },
+    {
+      "id": "consume_lots_dirty_strings_never_block",
+      "source": "regression",
+      "bug": "i061 R5: consume_lots with dirty empty strings stays ok (never blocks ops on missing lots)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.consume_lots",
+      "args": {
+        "item_code": "",
+        "qty": "null",
+        "warehouse": "undefined"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "consume_lots_unknown_item_soft",
+      "source": "regression",
+      "bug": "i061: consume_lots for unknown item returns ok with empty allocations (soft FIFO)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.consume_lots",
+      "args": {
+        "item_code": "__no_such_item_i061__",
+        "qty": 1,
+        "warehouse": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_item_lot_timeline_null_item",
+      "source": "regression",
+      "bug": "i062: get_item_lot_timeline with null item/grain returns empty buckets dict, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.get_item_lot_timeline",
+      "args": {
+        "item_code": null,
+        "warehouse": null,
+        "grain": null,
+        "from_date": null,
+        "to_date": null,
+        "include_forecast": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_item_lot_timeline_forecast_accumulates",
+      "source": "regression",
+      "bug": "i062: future petition/expected stack is cumulative across buckets (+35 then +50 → 85), never TypeError on forecast",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.get_item_lot_timeline",
+      "args": {
+        "item_code": "LOT-DEMO-SHORT",
+        "warehouse": null,
+        "grain": "day",
+        "from_date": null,
+        "to_date": null,
+        "include_forecast": 1
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_stock_lot_movements_null",
+      "source": "regression",
+      "bug": "i062: list_stock_lot_movements with null filters returns rows dict",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.lots_api.list_stock_lot_movements",
+      "args": {
+        "stock_lot": null,
+        "item_code": null,
+        "limit": null
+      },
+      "expect": "ok"
+    },
+
     {
       "id": "commit_receiving_return_skips_po_dirty_weight",
       "source": "regression",
@@ -5716,6 +5927,39 @@
         ]
       },
       "expect": "fail"
+    },
+    {
+      "id": "duplicate_employee_group_missing_source",
+      "source": "regression",
+      "bug": "duplicate_employee_group with null source fails controlled ValidationError; never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.duplicate_employee_group",
+      "args": {
+        "name": null,
+        "employee_group_name": "Copia"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "duplicate_employee_group_empty_name",
+      "source": "regression",
+      "bug": "duplicate_employee_group with empty/\"null\" new title fails controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.duplicate_employee_group",
+      "args": {
+        "name": "ventas",
+        "employee_group_name": ""
+      },
+      "expect": "error"
+    },
+    {
+      "id": "duplicate_employee_group_null_string_name",
+      "source": "regression",
+      "bug": "duplicate_employee_group with employee_group_name='null' fails controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.employee_api.duplicate_employee_group",
+      "args": {
+        "name": "ventas",
+        "employee_group_name": "null"
+      },
+      "expect": "error"
     },
     {
       "id": "mcp_save_matrix_empty_rows",

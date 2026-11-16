@@ -429,12 +429,13 @@ def _find_so_by_csv_order_code(order_code: str) -> str | None:
 def _submit_remito_for_so(so_name: str) -> str | None:
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		_delivery_note_for_sales_order,
-		_temporarily_allow_negative_stock,
+		_submit_delivery_note_allowing_negative,
 	)
 	from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
 
 	dn_name = _delivery_note_for_sales_order(so_name)
 	if dn_name:
+		# i061 R2: remito already exists — do not create/discount again.
 		return dn_name
 	dn = make_delivery_note(so_name)
 	default_warehouse = frappe.db.get_value("Company", dn.company, "custom_default_warehouse")
@@ -449,9 +450,8 @@ def _submit_remito_for_so(so_name: str) -> str | None:
 			row.allow_zero_valuation_rate = 1
 	dn.insert(ignore_permissions=True)
 	dn.flags.ignore_permissions = True
-	# CSV route planning should not fail on bin qty; same pattern as POS stock helpers.
-	with _temporarily_allow_negative_stock():
-		dn.submit()
+	# i061: SLE + soft FIFO lots together; never block on short Bin/lots.
+	_submit_delivery_note_allowing_negative(dn)
 	try:
 		frappe.db.set_value("Sales Order", so_name, "status", "Delivery")
 	except Exception:

@@ -5,6 +5,7 @@ from __future__ import unicode_literals
 
 import csv
 import io
+import json
 import math
 from collections import defaultdict
 from datetime import datetime
@@ -678,6 +679,128 @@ def recompute_item_weight_catalog(item_code=None, lookback_days=180, dry_run=0):
 		"observation_count": len(rows),
 		"dry_run": cint(dry_run),
 	}
+
+
+def soft_record_armado_weights(reference_name=None, items=None, source="armado"):
+	"""Upsert Item Weight Observation rows for armado lines (never raises to caller).
+
+	Idempotent per (Sales Order, item_code, source): updates units/total_weight when
+	the same reference is confirmed again. Skips lines without positive qty+kg.
+	Returns ``{ok, recorded, skipped, errors}``.
+	"""
+	out = {"ok": True, "recorded": [], "skipped": [], "errors": []}
+	name = cstr(reference_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		out["ok"] = False
+		out["errors"].append("reference_required")
+		return out
+	if isinstance(items, str):
+		try:
+			items = json.loads(items)
+		except Exception:
+			items = None
+	if not isinstance(items, list):
+		out["ok"] = False
+		out["errors"].append("items_required")
+		return out
+
+	if not ensure_item_weight_observation_doctype():
+		out["ok"] = False
+		out["errors"].append("doctype_missing")
+		return out
+
+	src = cstr(source or "armado").strip().lower() or "armado"
+	if src not in {"pos", "receiving", "armado", "import", "manual"}:
+		src = "armado"
+
+	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
+
+	comp = resolve_company() or None
+
+	for row in items:
+		if not isinstance(row, dict):
+			out["skipped"].append({"reason": "not_dict"})
+			continue
+		code = cstr(row.get("item_code") or "").strip()
+		units_f = flt(row.get("qty") if row.get("qty") not in (None, "") else row.get("units"))
+		total_f = flt(row.get("total_weight"))
+		if not code or code.lower() in ("null", "undefined", "none"):
+			out["skipped"].append({"reason": "no_item"})
+			continue
+		if units_f <= 0 or total_f <= 0:
+			out["skipped"].append({"item_code": code, "reason": "no_weight"})
+			continue
+		if not frappe.db.exists("Item", code):
+			out["skipped"].append({"item_code": code, "reason": "item_not_found"})
+			continue
+
+		try:
+			check = validate_total_weight(code, units_f, total_f)
+			is_outlier = 1 if check.get("is_outlier") else 0
+			kg_u = total_f / units_f if units_f else None
+			existing = frappe.get_all(
+				"Item Weight Observation",
+				filters={
+					"item_code": code,
+					"source": src,
+					"reference_doctype": "Sales Order",
+					"reference_name": name,
+				},
+				fields=["name"],
+				limit=1,
+				ignore_permissions=True,
+			)
+			if existing:
+				frappe.db.set_value(
+					"Item Weight Observation",
+					existing[0].name,
+					{
+						"units": units_f,
+						"total_weight": total_f,
+						"kg_per_unit": kg_u,
+						"is_outlier": is_outlier,
+						"observed_at": now_datetime(),
+						"company": comp,
+					},
+					update_modified=True,
+				)
+				obs_name = existing[0].name
+			else:
+				doc = frappe.get_doc(
+					{
+						"doctype": "Item Weight Observation",
+						"item_code": code,
+						"observed_at": now_datetime(),
+						"units": units_f,
+						"total_weight": total_f,
+						"kg_per_unit": kg_u,
+						"source": src,
+						"reference_doctype": "Sales Order",
+						"reference_name": name,
+						"is_outlier": is_outlier,
+						"company": comp,
+					}
+				)
+				doc.insert(ignore_permissions=True)
+				obs_name = doc.name
+			out["recorded"].append(
+				{
+					"item_code": code,
+					"name": obs_name,
+					"is_outlier": bool(is_outlier),
+					"kg_per_unit": kg_u,
+				}
+			)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "soft_record_armado_weights")
+			out["errors"].append({"item_code": code, "error": "insert_failed"})
+
+	if out["recorded"]:
+		try:
+			frappe.db.commit()
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "soft_record_armado_weights commit")
+	return out
 
 
 @frappe.whitelist(allow_guest=True)

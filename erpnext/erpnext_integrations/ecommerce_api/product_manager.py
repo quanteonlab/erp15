@@ -3845,6 +3845,15 @@ def delete_employee_group(name):
     return _impl(name)
 
 
+@frappe.whitelist(allow_guest=True)
+def duplicate_employee_group(name=None, employee_group_name=None):
+    from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+        duplicate_employee_group as _impl,
+    )
+
+    return _impl(name=name, employee_group_name=employee_group_name)
+
+
 @frappe.whitelist()
 def list_employee_meta():
     from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
