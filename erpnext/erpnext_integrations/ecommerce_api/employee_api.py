@@ -2751,7 +2751,7 @@ def _rebuild_ops_pin_index(by_employee: dict) -> dict:
 
 
 def _client_access_pin_owner(pin: str) -> str | None:
-	"""Return Customer or Lead name when ``pin`` is a CRM client-access PIN (not staff ops)."""
+	"""Return Customer, Lead, or Supplier name when ``pin`` is a party-access PIN (not staff ops)."""
 	raw = cstr(pin or "").strip()
 	if not raw:
 		return None
@@ -2763,6 +2763,10 @@ def _client_access_pin_owner(pin: str) -> str | None:
 		lead = frappe.db.get_value("Lead", {"custom_client_access_pin": raw}, "name")
 		if lead:
 			return lead
+	if frappe.db.has_column("Supplier", "custom_supplier_access_pin"):
+		sup = frappe.db.get_value("Supplier", {"custom_supplier_access_pin": raw}, "name")
+		if sup:
+			return sup
 	return None
 
 

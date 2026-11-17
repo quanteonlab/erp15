@@ -62,9 +62,29 @@ def ensure_client_access_custom_fields():
 			"read_only": 1,
 		},
 	]
-	create_custom_fields({"Customer": defs, "Lead": defs}, ignore_validate=True)
+	supplier_defs = [
+		{
+			"fieldname": "custom_supplier_access_pin",
+			"fieldtype": "Data",
+			"label": "Supplier Access PIN",
+			"insert_after": "mobile_no",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "custom_supplier_phone_e164",
+			"fieldtype": "Data",
+			"label": "Supplier Phone (E.164)",
+			"insert_after": "custom_supplier_access_pin",
+			"read_only": 1,
+		},
+	]
+	create_custom_fields(
+		{"Customer": defs, "Lead": defs, "Supplier": supplier_defs},
+		ignore_validate=True,
+	)
 	frappe.clear_cache(doctype="Customer")
 	frappe.clear_cache(doctype="Lead")
+	frappe.clear_cache(doctype="Supplier")
 	_CLIENT_ACCESS_FIELDS_READY = True
 
 
@@ -133,6 +153,7 @@ CLIENT_ACCESS_PIN_FIRST_DIGITS = "01234"
 
 
 def _client_pin_in_use(pin: str) -> bool:
+	"""True when pin is on Customer, Lead, or Supplier (party access fields)."""
 	raw = cstr(pin or "").strip()
 	if not raw:
 		return False
@@ -142,30 +163,43 @@ def _client_pin_in_use(pin: str) -> bool:
 	if frappe.db.has_column("Lead", "custom_client_access_pin"):
 		if frappe.db.exists("Lead", {"custom_client_access_pin": raw}):
 			return True
+	if frappe.db.has_column("Supplier", "custom_supplier_access_pin"):
+		if frappe.db.exists("Supplier", {"custom_supplier_access_pin": raw}):
+			return True
+	return False
+
+
+def pin_in_use_global(pin: str) -> bool:
+	"""Party PINs + staff ops store + admin PIN — shared mint guard."""
+	raw = cstr(pin or "").strip()
+	if not raw:
+		return False
+	if _client_pin_in_use(raw):
+		return True
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+			employee_ops_pin_taken,
+		)
+		from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
+			_verify_pin_value,
+		)
+
+		if employee_ops_pin_taken(raw) or _verify_pin_value(raw):
+			return True
+	except Exception:
+		pass
 	return False
 
 
 def _new_pin() -> str:
-	"""Mint a client-access PIN: 6 digits, first digit in 0–4 (below 5)."""
+	"""Mint a client/supplier-access PIN: 6 digits, first digit in 0–4 (below 5)."""
 	ensure_client_access_custom_fields()
 	for _ in range(120):
 		first = secrets.choice(CLIENT_ACCESS_PIN_FIRST_DIGITS)
 		rest = f"{secrets.randbelow(100_000):05d}"
 		candidate = f"{first}{rest}"
-		if _client_pin_in_use(candidate):
+		if pin_in_use_global(candidate):
 			continue
-		try:
-			from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
-				employee_ops_pin_taken,
-			)
-			from erpnext.erpnext_integrations.ecommerce_api.pos_session_api import (
-				_verify_pin_value,
-			)
-
-			if employee_ops_pin_taken(candidate) or _verify_pin_value(candidate):
-				continue
-		except Exception:
-			pass
 		return candidate
 	frappe.throw(_("Could not allocate a unique client PIN"))
 
@@ -253,13 +287,22 @@ def _stamp_party(doctype: str, name: str, pin: str, e164: str):
 	if not name or not frappe.db.exists(doctype, name):
 		return
 	updates = {}
-	if frappe.db.has_column(doctype, "custom_client_access_pin"):
-		updates["custom_client_access_pin"] = pin
-	if frappe.db.has_column(doctype, "custom_client_phone_e164"):
-		updates["custom_client_phone_e164"] = e164
-	if doctype == "Customer" and frappe.db.has_column("Customer", "mobile_no"):
-		if not frappe.db.get_value("Customer", name, "mobile_no"):
-			updates["mobile_no"] = e164
+	if doctype == "Supplier":
+		if frappe.db.has_column(doctype, "custom_supplier_access_pin"):
+			updates["custom_supplier_access_pin"] = pin
+		if e164 and frappe.db.has_column(doctype, "custom_supplier_phone_e164"):
+			updates["custom_supplier_phone_e164"] = e164
+		if e164 and frappe.db.has_column("Supplier", "mobile_no"):
+			if not frappe.db.get_value("Supplier", name, "mobile_no"):
+				updates["mobile_no"] = e164
+	else:
+		if frappe.db.has_column(doctype, "custom_client_access_pin"):
+			updates["custom_client_access_pin"] = pin
+		if e164 and frappe.db.has_column(doctype, "custom_client_phone_e164"):
+			updates["custom_client_phone_e164"] = e164
+		if doctype == "Customer" and e164 and frappe.db.has_column("Customer", "mobile_no"):
+			if not frappe.db.get_value("Customer", name, "mobile_no"):
+				updates["mobile_no"] = e164
 	if updates:
 		frappe.db.set_value(doctype, name, updates, update_modified=False)
 
@@ -949,4 +992,212 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 		"customer": matched_customer,
 		"lead": matched_lead,
 		"consultas": consultas,
+	}
+
+
+def _require_users_table_perm():
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _require_app_permission
+
+	_require_app_permission("tables.employees")
+
+
+@frappe.whitelist()
+def list_users_clients(search=None, page=1, page_length=100):
+	"""Usuarios → Clientes: identity + PIN (not full Relaciones CRM)."""
+	_require_users_table_perm()
+	ensure_client_access_custom_fields()
+	term = cstr(search or "").strip()
+	limit = max(1, min(cint(page_length) or 100, 200))
+	start = max(0, (cint(page) or 1) - 1) * limit
+	fields = [
+		"name",
+		"customer_name",
+		"mobile_no",
+		"disabled",
+		"modified",
+	]
+	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		fields += ["custom_client_access_pin", "custom_client_phone_e164"]
+	filters = {}
+	or_filters = None
+	if term:
+		like = f"%{term}%"
+		or_filters = [
+			["name", "like", like],
+			["customer_name", "like", like],
+			["mobile_no", "like", like],
+		]
+		if frappe.db.has_column("Customer", "custom_client_access_pin"):
+			or_filters.append(["custom_client_access_pin", "like", like])
+			or_filters.append(["custom_client_phone_e164", "like", like])
+	rows = frappe.get_all(
+		"Customer",
+		filters=filters,
+		or_filters=or_filters,
+		fields=fields,
+		order_by="modified desc",
+		limit_start=start,
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	clients = []
+	for r in rows:
+		clients.append(
+			{
+				"name": r.name,
+				"customer_name": r.customer_name,
+				"mobile_no": r.mobile_no,
+				"phone_e164": getattr(r, "custom_client_phone_e164", None) or r.mobile_no,
+				"client_access_pin": getattr(r, "custom_client_access_pin", None),
+				"disabled": cint(r.disabled),
+				"modified": r.modified,
+			}
+		)
+	return {"clients": clients, "page": cint(page) or 1, "page_length": limit}
+
+
+@frappe.whitelist()
+def rotate_client_access_pin(customer=None, lead=None, send=0):
+	"""Admin: mint a new client PIN and optionally re-send via Twilio."""
+	_require_users_table_perm()
+	ensure_client_access_custom_fields()
+	customer = cstr(customer or "").strip() or None
+	lead = cstr(lead or "").strip() or None
+	if not customer and not lead:
+		frappe.throw(_("customer or lead is required"))
+	e164 = ""
+	if customer and frappe.db.exists("Customer", customer):
+		e164 = cstr(
+			frappe.db.get_value("Customer", customer, "custom_client_phone_e164")
+			or frappe.db.get_value("Customer", customer, "mobile_no")
+			or ""
+		)
+	if not e164 and lead and frappe.db.exists("Lead", lead):
+		e164 = cstr(
+			frappe.db.get_value("Lead", lead, "custom_client_phone_e164")
+			or frappe.db.get_value("Lead", lead, "mobile_no")
+			or ""
+		)
+	e164 = _normalize_e164(e164) or e164
+	pin = _new_pin()
+	if customer:
+		_stamp_party("Customer", customer, pin, e164)
+	if lead:
+		_stamp_party("Lead", lead, pin, e164)
+	frappe.db.commit()
+	portal = f"{_portal_base_url()}/cliente"
+	send_result = {"sent": False, "reason": "skipped"}
+	if cint(send) and e164:
+		send_result = _send_pin_message(e164, pin, portal)
+	return {
+		"ok": True,
+		"pin": pin,
+		"customer": customer,
+		"lead": lead,
+		"phone_e164": e164 or None,
+		"portal_path": "/cliente",
+		"portal_url": portal,
+		"send": send_result,
+	}
+
+
+@frappe.whitelist()
+def list_users_suppliers(search=None, page=1, page_length=100):
+	"""Usuarios → Proveedores: contact + estimated PIN + recent PO counts."""
+	_require_users_table_perm()
+	ensure_client_access_custom_fields()
+	term = cstr(search or "").strip()
+	limit = max(1, min(cint(page_length) or 100, 200))
+	start = max(0, (cint(page) or 1) - 1) * limit
+	fields = ["name", "supplier_name", "mobile_no", "email_id", "disabled", "modified"]
+	if frappe.db.has_column("Supplier", "custom_supplier_access_pin"):
+		fields += ["custom_supplier_access_pin", "custom_supplier_phone_e164"]
+	filters = {}
+	or_filters = None
+	if term:
+		like = f"%{term}%"
+		or_filters = [
+			["name", "like", like],
+			["supplier_name", "like", like],
+			["mobile_no", "like", like],
+			["email_id", "like", like],
+		]
+	rows = frappe.get_all(
+		"Supplier",
+		filters=filters,
+		or_filters=or_filters,
+		fields=fields,
+		order_by="supplier_name asc",
+		limit_start=start,
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	names = [r.name for r in rows]
+	po_stats = {}
+	if names:
+		# Recent open/submitted POs per supplier (cheap aggregate).
+		for row in frappe.db.sql(
+			"""
+			select supplier, count(*) as cnt, max(transaction_date) as last_date
+			from `tabPurchase Order`
+			where supplier in %(names)s and docstatus < 2
+			group by supplier
+			""",
+			{"names": names},
+			as_dict=True,
+		):
+			po_stats[row.supplier] = {
+				"po_count": cint(row.cnt),
+				"last_po_date": row.last_date,
+			}
+	suppliers = []
+	for r in rows:
+		st = po_stats.get(r.name) or {}
+		suppliers.append(
+			{
+				"name": r.name,
+				"supplier_name": r.supplier_name,
+				"mobile_no": r.mobile_no,
+				"email": r.email_id,
+				"phone_e164": getattr(r, "custom_supplier_phone_e164", None) or r.mobile_no,
+				"supplier_access_pin": getattr(r, "custom_supplier_access_pin", None),
+				"disabled": cint(r.disabled),
+				"po_count": st.get("po_count") or 0,
+				"last_po_date": st.get("last_po_date"),
+				"modified": r.modified,
+			}
+		)
+	return {"suppliers": suppliers, "page": cint(page) or 1, "page_length": limit}
+
+
+@frappe.whitelist()
+def ensure_supplier_access_pin(supplier=None, rotate=0):
+	"""Mint or reuse estimated supplier PIN (no portal/SMS in v1)."""
+	_require_users_table_perm()
+	ensure_client_access_custom_fields()
+	supplier = cstr(supplier or "").strip()
+	if not supplier:
+		frappe.throw(_("supplier is required"))
+	if not frappe.db.exists("Supplier", supplier):
+		frappe.throw(_("Supplier not found"))
+	existing = None
+	if frappe.db.has_column("Supplier", "custom_supplier_access_pin"):
+		existing = cstr(frappe.db.get_value("Supplier", supplier, "custom_supplier_access_pin") or "").strip()
+	pin = existing
+	if cint(rotate) or not pin:
+		pin = _new_pin()
+	e164 = cstr(
+		frappe.db.get_value("Supplier", supplier, "custom_supplier_phone_e164")
+		or frappe.db.get_value("Supplier", supplier, "mobile_no")
+		or ""
+	)
+	e164 = _normalize_e164(e164) or e164
+	_stamp_party("Supplier", supplier, pin, e164)
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"supplier": supplier,
+		"pin": pin,
+		"phone_e164": e164 or None,
+		"rotated": bool(cint(rotate) or not existing),
 	}
