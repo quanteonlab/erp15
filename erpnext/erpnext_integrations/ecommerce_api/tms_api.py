@@ -8702,15 +8702,22 @@ def create_warehouse_at_location(
 	company=None,
 	parent_warehouse=None,
 ):
-	"""Create a non-group Warehouse + geocoded Address at the map pin."""
+	"""Create a non-group Warehouse + Address, and a map pin.
+
+	Coords are optional: from Pines the dispatcher can create a depot name-only
+	(``ungeocoded=1``) and assign a street later via map Assign.
+	"""
 	warehouse_name = cstr(warehouse_name or "").strip()
 	if not warehouse_name:
 		frappe.throw(_("Warehouse name is required."))
 	company = cstr(company or "").strip() or frappe.defaults.get_user_default("Company")
 	if not company:
 		frappe.throw(_("Company is required to create a warehouse."))
-	lat = flt(lat)
-	lng = flt(lng)
+	# Treat missing / non-numeric as no geo (Pines create without map click).
+	has_geo = lat not in (None, "", "null", "undefined") and lng not in (None, "", "null", "undefined")
+	lat = flt(lat) if has_geo else 0.0
+	lng = flt(lng) if has_geo else 0.0
+	ungeocoded = 0 if (lat or lng) else 1
 
 	parent = cstr(parent_warehouse or "").strip()
 	if not parent:
@@ -8763,6 +8770,7 @@ def create_warehouse_at_location(
 		"address_name": addr.name,
 		"vehicles": [],
 		"coverage": dict(BA_COVERAGE_DEFAULT),
+		"ungeocoded": ungeocoded,
 		"created_at": str(now_datetime()),
 		"updated_at": str(now_datetime()),
 	}

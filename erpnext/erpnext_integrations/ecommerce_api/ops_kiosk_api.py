@@ -399,7 +399,13 @@ def _progress_event(
 
 
 def _armado_trip_in_route(so_name: str) -> bool:
-	"""True when the SO is on a MAT that already left / is in transit (pack edits locked)."""
+	"""True when the SO is on a MAT that already left / finished (pack edits locked).
+
+	``departure_time`` alone is planning metadata (every MAT has a scheduled
+	08:00-style slot). Locking on it blocked weight revision as soon as ops
+	assigned a MAT — even before the truck left. Only ``In Transit`` /
+	``Completed`` mean the route has started / finished.
+	"""
 	so_name = str(so_name or "").strip()
 	if not so_name:
 		return False
@@ -410,11 +416,8 @@ def _armado_trip_in_route(so_name: str) -> bool:
 	except Exception:
 		return False
 	status = cstr(lg.get("trip_status") or "").strip().lower()
-	if status in ("in transit", "completed"):
-		return True
-	if lg.get("departure_time"):
-		return True
-	return False
+	# Draft / Scheduled (+ empty) stay editable for última revisión de pesajes.
+	return status in ("in transit", "completed")
 
 
 def _armado_has_delivery_note(so_name: str) -> bool:
@@ -1146,8 +1149,10 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 	Also returns ``delivery_dates`` (distinct due dates among Orden-stage armado
 	orders) so the UI can offer a day picker.
 
-	``include_completed`` also returns Preparado sheets confirmed/saved **today**
-	(read-only) with ``completed: 1``. Each row includes ``progress_summary``.
+	``include_completed`` also returns Preparado / Delivery sheets touched
+	**today** with ``completed: 1`` (still amendable until the MAT is In Transit /
+	pipeline Completado — última revisión de pesajes). Each row includes
+	``progress_summary``.
 	"""
 	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
 
@@ -1258,11 +1263,12 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 			break
 
 	if _truthy_flag(include_completed):
-		# Completados chip = armado confirmed today only (not the whole Preparado historial).
+		# Completados chip = armado done today (Preparado + Delivery) so ops can
+		# reopen for última revisión de pesajes before the MAT leaves.
 		day = str(today())
 		done_filters = {
 			"docstatus": 1,
-			"status": "Preparado",
+			"status": ["in", ["Preparado", "Delivery", "En Delivery"]],
 			"modified": [">=", f"{day} 00:00:00"],
 		}
 		if due is not None:
@@ -1282,7 +1288,8 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 			disp = _display_status_from_row(
 				r.docstatus, r.status, r.grand_total, getattr(r, "advance_paid", 0)
 			)
-			if disp != "Preparado":
+			base_disp = "Delivery" if str(disp).startswith("Delivery") else disp
+			if base_disp not in ("Preparado", "Delivery"):
 				continue
 			tag = str(r.get(tag_field) or "") if tag_field else ""
 			out.append(
@@ -2052,6 +2059,11 @@ def get_delivery_check_items(delivery_note=None):
 	):
 		frappe.throw(_("Delivery Note not found"))
 
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_guest_preorder_line_amount,
+		_item_line_weight_fields,
+	)
+
 	frappe.flags.ignore_permissions = True
 	dn = frappe.get_doc("Delivery Note", delivery_note)
 	frappe.flags.ignore_permissions = False
@@ -2059,7 +2071,18 @@ def get_delivery_check_items(delivery_note=None):
 	for d in dn.items or []:
 		qty = flt(d.qty)
 		rate = flt(getattr(d, "rate", None) or 0)
-		amount = flt(getattr(d, "amount", None) or (rate * qty))
+		# Agreed line total: WEIGHT is rate×kg (total_weight), never rate×units.
+		# Falling back to stored amount / rate×qty only when weight math is empty.
+		agreed = flt(_guest_preorder_line_amount(d))
+		if agreed <= 0:
+			agreed = flt(getattr(d, "amount", None) or (rate * qty))
+		weight = _item_line_weight_fields(
+			d.item_code,
+			line_uom=getattr(d, "uom", None),
+			line_weight_per_unit=getattr(d, "weight_per_unit", None),
+			line_total_weight=getattr(d, "total_weight", None),
+			line_qty=qty,
+		)
 		items.append(
 			{
 				"item_code": d.item_code,
@@ -2067,7 +2090,10 @@ def get_delivery_check_items(delivery_note=None):
 				"qty": qty,
 				"uom": d.uom,
 				"rate": rate,
-				"amount": amount,
+				"amount": agreed,
+				"total_weight": weight.get("total_weight"),
+				"weight_per_unit": weight.get("weight_per_unit"),
+				"is_weight_based": bool(weight.get("is_weight_based")),
 				"against_sales_order": getattr(d, "against_sales_order", None),
 			}
 		)

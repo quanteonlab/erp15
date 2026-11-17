@@ -2317,6 +2317,19 @@
       "expect": "no_500"
     },
     {
+      "id": "tms_create_warehouse_empty_coords_ok",
+      "source": "regression",
+      "bug": "create_warehouse_at_location from Pines with empty lat/lng must create ungeocoded pin (not 500)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_warehouse_at_location",
+      "args": {
+        "warehouse_name": "",
+        "address": "",
+        "lat": "",
+        "lng": ""
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "tms_link_customer_at_null",
       "source": "regression",
       "bug": "link_customer_at_location with null customer must not 500",
@@ -3833,6 +3846,16 @@
       "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_delivery_check_items",
       "args": {
         "delivery_note": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "ops_get_delivery_check_items_empty_string",
+      "source": "regression",
+      "bug": "get_delivery_check_items with empty delivery_note must controlled ValidationError (WEIGHT cobro must not crash / mis-read)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_delivery_check_items",
+      "args": {
+        "delivery_note": ""
       },
       "expect": "fail"
     },
@@ -7740,7 +7763,17 @@
       },
       "expect": "error",
       "source": "regression",
-      "bug": "Delivery→Armado rework: get_armado_order with null name is controlled (writable stamp covered in smoke 5.11.6d)"
+      "bug": "get_armado_order null name controlled; write_locked only on In Transit/Completed (not scheduled MAT departure_time) — smoke covers matrix"
+    },
+    {
+      "id": "get_armado_order_empty_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_order",
+      "args": {
+        "preorder_name": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "get_armado_order empty name must not 500 (última revisión de pesajes path)"
     },
     {
       "id": "get_armado_progress_null_name",

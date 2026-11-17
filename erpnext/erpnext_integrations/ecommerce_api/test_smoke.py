@@ -2395,6 +2395,49 @@ def suite_5_11_pos_session():
                 isinstance(ev, dict) and (ev.get("before") or ev.get("after"))
                 for ev in events
             ), "expected before/after on at least one progress event"
+            # Regression: scheduled MAT departure_time alone must NOT lock weight revision.
+            # Only In Transit / Completed means the truck left / finished.
+            from erpnext.erpnext_integrations.ecommerce_api import api as eapi
+
+            real_lg = eapi._tms_logistics_map_for_orders
+
+            def _lg_scheduled(_names):
+                return {
+                    so_name: {
+                        "trip_name": "MAT-SMOKE-SCHED",
+                        "trip_status": "Scheduled",
+                        "departure_time": "2026-11-17 08:00:00",
+                    }
+                }
+
+            def _lg_in_transit(_names):
+                return {
+                    so_name: {
+                        "trip_name": "MAT-SMOKE-RUN",
+                        "trip_status": "In Transit",
+                        "departure_time": "2026-11-17 08:00:00",
+                    }
+                }
+
+            eapi._tms_logistics_map_for_orders = _lg_scheduled
+            try:
+                assert not oka._armado_trip_in_route(so_name), (
+                    "Scheduled MAT with departure_time must not lock armado"
+                )
+                sheet_sched = oka.get_armado_order(so_name)
+                od_sched = sheet_sched.get("order") or {}
+                assert not cint(od_sched.get("armado_write_locked")), od_sched
+            finally:
+                eapi._tms_logistics_map_for_orders = real_lg
+
+            eapi._tms_logistics_map_for_orders = _lg_in_transit
+            try:
+                assert oka._armado_trip_in_route(so_name), "In Transit must lock armado"
+                sheet_run = oka.get_armado_order(so_name)
+                od_run = sheet_run.get("order") or {}
+                assert cint(od_run.get("armado_write_locked")) == 1, od_run
+            finally:
+                eapi._tms_logistics_map_for_orders = real_lg
             try:
                 oka.confirm_armado(preorder_name=so_name, box_count=0)
                 assert False, "box_count 0 must fail"
@@ -3766,6 +3809,18 @@ def suite_5_12_modules_read():
         tms.delete_map_plan(plan["plan"]["id"])
         tms.delete_map_pin(pin_id)
 
+        # Pines dock: create warehouse without coords (ungeocoded pin)
+        wh_label = f"Smoke WH {frappe.generate_hash(length=6)}"
+        wh_res = tms.create_warehouse_at_location(warehouse_name=wh_label, address=None, lat=None, lng=None)
+        assert isinstance(wh_res, dict) and wh_res.get("warehouse") and wh_res.get("pin")
+        assert cint(wh_res["pin"].get("ungeocoded")) == 1, wh_res["pin"]
+        wh_pin_id = wh_res["pin"]["id"]
+        wh_name = wh_res["warehouse"]
+        tms.delete_map_pin(wh_pin_id)
+        if frappe.db.exists("Warehouse", wh_name):
+            frappe.delete_doc("Warehouse", wh_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
         # Empty claim must raise a controlled error (not TypeError/500)
         try:
             tms.claim_orders_to_trip(delivery_notes=[], preorder_names=[], pin=None)
@@ -4535,8 +4590,86 @@ def suite_5_13_offline_outbox():
             else:
                 _drop_kv(ok_api.CARGO_CHECK_SCOPE, dn)
 
+    def check_delivery_check_weight_agreed_amount():
+        """Cobro-at-delivery: WEIGHT agreed amount is rate×kg, never rate×pack-units."""
+        item = frappe.db.get_value(
+            "Item", {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]}, "name"
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        customer = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+        company = frappe.defaults.get_global_default("company") or frappe.db.get_value(
+            "Company", {}, "name"
+        )
+        warehouse = frappe.db.get_value(
+            "Warehouse", {"company": company, "is_group": 0, "disabled": 0}, "name"
+        ) or frappe.db.get_value("Warehouse", {"is_group": 0, "disabled": 0}, "name")
+        assert item and customer and company and warehouse, "need item/customer/company/warehouse"
+        if not frappe.db.exists("UOM", "WEIGHT"):
+            frappe.get_doc({"doctype": "UOM", "uom_name": "WEIGHT"}).insert(ignore_permissions=True)
+            frappe.db.commit()
+        dn_name = None
+        try:
+            dn = frappe.get_doc(
+                {
+                    "doctype": "Delivery Note",
+                    "customer": customer,
+                    "company": company,
+                    "set_warehouse": warehouse,
+                    "items": [
+                        {
+                            "item_code": item,
+                            "qty": 4,  # pack units
+                            "uom": "WEIGHT",
+                            "stock_uom": "WEIGHT",
+                            "conversion_factor": 1,
+                            "rate": 1000,  # $/kg
+                            "warehouse": warehouse,
+                            "total_weight": 15.68,
+                        }
+                    ],
+                }
+            )
+            dn.flags.ignore_permissions = True
+            dn.flags.ignore_mandatory = True
+            dn.insert(ignore_permissions=True, ignore_mandatory=True)
+            frappe.db.commit()
+            dn_name = dn.name
+            dni = frappe.db.get_value(
+                "Delivery Note Item", {"parent": dn_name, "item_code": item}, "name"
+            )
+            assert dni, dn_name
+            frappe.db.set_value(
+                "Delivery Note Item",
+                dni,
+                {
+                    "total_weight": 15.68,
+                    "uom": "WEIGHT",
+                    "stock_uom": "WEIGHT",
+                    "qty": 4,
+                    "rate": 1000,
+                },
+                update_modified=False,
+            )
+            frappe.db.commit()
+            check = ok_api.get_delivery_check_items(delivery_note=dn_name)
+            rows = (check.get("cajas") or [{}])[0].get("items") or []
+            assert rows, check
+            row = rows[0]
+            # Fatal bug was amount = rate×units (4000). Agreed is rate×kg (15680).
+            assert abs(flt(row.get("amount")) - 15680) < 0.05, row
+            assert abs(flt(row.get("qty")) - 4) < 1e-9, row
+            assert row.get("is_weight_based") in (True, 1), row
+        finally:
+            if dn_name and frappe.db.exists("Delivery Note", dn_name):
+                frappe.delete_doc("Delivery Note", dn_name, ignore_permissions=True, force=True)
+                frappe.db.commit()
+
     _run("5.13.1 create_purchase_order replay with client_request_id returns same PO", check_po_replay_idempotent, "S1")
     _run("5.13.2 cargo_check save/get round-trip + stale replay ignored", check_cargo_check_roundtrip, "S2")
+    _run(
+        "5.13.3 delivery_check WEIGHT amount is rate×kg not rate×units (cobro entrega)",
+        check_delivery_check_weight_agreed_amount,
+        "S1",
+    )
 
 
 # ── Suite 5.14 — g013 phase 2: every queued write replays without requirement gaps ──
