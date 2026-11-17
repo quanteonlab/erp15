@@ -69,29 +69,29 @@ ERP_SYNC = frozenset(
 )
 
 SYSTEM_KINDS = [
-	{"code": "utility_bill", "label_es": "Servicio (luz, gas, inet)", "label_en": "Utility bill", "sync_template": "payable"},
-	{"code": "supplier_invoice", "label_es": "Factura de compra", "label_en": "Supplier invoice", "sync_template": "payable"},
-	{"code": "rent", "label_es": "Alquiler", "label_en": "Rent", "sync_template": "payable"},
-	{"code": "subscription", "label_es": "Suscripción", "label_en": "Subscription", "sync_template": "payable"},
-	{"code": "asset_purchase", "label_es": "Compra de activo", "label_en": "Asset purchase", "sync_template": "payable"},
-	{"code": "petty_expense", "label_es": "Gasto menor / outing", "label_en": "Petty expense", "sync_template": "cash_out"},
-	{"code": "reimbursement", "label_es": "Reintegro empleado", "label_en": "Reimbursement", "sync_template": "cash_out"},
-	{"code": "fine", "label_es": "Multa", "label_en": "Fine", "sync_template": "cash_out"},
-	{"code": "tax_payment", "label_es": "Impuesto / AFIP", "label_en": "Tax payment", "sync_template": "cash_out"},
-	{"code": "bank_fee", "label_es": "Gasto bancario", "label_en": "Bank fee", "sync_template": "cash_out"},
-	{"code": "other_expense", "label_es": "Otro egreso", "label_en": "Other expense", "sync_template": "cash_out"},
-	{"code": "employment_contract", "label_es": "Contrato laboral", "label_en": "Employment contract", "sync_template": "paper"},
-	{"code": "agreement", "label_es": "Acuerdo / NDA", "label_en": "Agreement", "sync_template": "paper"},
-	{"code": "certificate", "label_es": "Certificado", "label_en": "Certificate", "sync_template": "paper"},
-	{"code": "id_document", "label_es": "Documento de identidad", "label_en": "ID document", "sync_template": "paper"},
-	{"code": "insurance_doc", "label_es": "Póliza / seguro", "label_en": "Insurance doc", "sync_template": "paper"},
-	{"code": "permit_license", "label_es": "Permiso / habilitación", "label_en": "Permit / license", "sync_template": "paper"},
-	{"code": "other_document", "label_es": "Otro documento", "label_en": "Other document", "sync_template": "paper"},
+	{"code": "utility_bill", "label_es": "Servicio (luz, gas, inet)", "label_en": "Utility bill", "label_zh": "水电网费账单", "sync_template": "payable"},
+	{"code": "supplier_invoice", "label_es": "Factura de compra", "label_en": "Supplier invoice", "label_zh": "供应商发票", "sync_template": "payable"},
+	{"code": "rent", "label_es": "Alquiler", "label_en": "Rent", "label_zh": "租金", "sync_template": "payable"},
+	{"code": "subscription", "label_es": "Suscripción", "label_en": "Subscription", "label_zh": "订阅", "sync_template": "payable"},
+	{"code": "asset_purchase", "label_es": "Compra de activo", "label_en": "Asset purchase", "label_zh": "资产采购", "sync_template": "payable"},
+	{"code": "petty_expense", "label_es": "Gasto menor / outing", "label_en": "Petty expense", "label_zh": "小额支出", "sync_template": "cash_out"},
+	{"code": "reimbursement", "label_es": "Reintegro empleado", "label_en": "Reimbursement", "label_zh": "员工报销", "sync_template": "cash_out"},
+	{"code": "fine", "label_es": "Multa", "label_en": "Fine", "label_zh": "罚款", "sync_template": "cash_out"},
+	{"code": "tax_payment", "label_es": "Impuesto / AFIP", "label_en": "Tax payment", "label_zh": "税款缴纳", "sync_template": "cash_out"},
+	{"code": "bank_fee", "label_es": "Gasto bancario", "label_en": "Bank fee", "label_zh": "银行手续费", "sync_template": "cash_out"},
+	{"code": "other_expense", "label_es": "Otro egreso", "label_en": "Other expense", "label_zh": "其他支出", "sync_template": "cash_out"},
+	{"code": "employment_contract", "label_es": "Contrato laboral", "label_en": "Employment contract", "label_zh": "劳动合同", "sync_template": "paper"},
+	{"code": "agreement", "label_es": "Acuerdo / NDA", "label_en": "Agreement", "label_zh": "协议 / 保密协议", "sync_template": "paper"},
+	{"code": "certificate", "label_es": "Certificado", "label_en": "Certificate", "label_zh": "证书", "sync_template": "paper"},
+	{"code": "id_document", "label_es": "Documento de identidad", "label_en": "ID document", "label_zh": "身份证件", "sync_template": "paper"},
+	{"code": "insurance_doc", "label_es": "Póliza / seguro", "label_en": "Insurance doc", "label_zh": "保险单据", "sync_template": "paper"},
+	{"code": "permit_license", "label_es": "Permiso / habilitación", "label_en": "Permit / license", "label_zh": "许可证 / 执照", "sync_template": "paper"},
+	{"code": "other_document", "label_es": "Otro documento", "label_en": "Other document", "label_zh": "其他文件", "sync_template": "paper"},
 	# i051 — Enqueue Bulk lands here until a person or the MCP assistant classifies it.
-	{"code": "inbox_unsorted", "label_es": "Sin clasificar (cola)", "label_en": "Unsorted (queue)", "sync_template": "none"},
+	{"code": "inbox_unsorted", "label_es": "Sin clasificar (cola)", "label_en": "Unsorted (queue)", "label_zh": "未分类(队列)", "sync_template": "none"},
 	# i053 — one placeholder folder per (company, YYYY-MM) for auto-created docs.
-	{"code": "month_binder", "label_es": "Carpeta del mes", "label_en": "Month binder", "sync_template": "paper"},
-	{"code": "sales_invoice", "label_es": "Factura de venta", "label_en": "Sales invoice", "sync_template": "paper"},
+	{"code": "month_binder", "label_es": "Carpeta del mes", "label_en": "Month binder", "label_zh": "月度文件夹", "sync_template": "paper"},
+	{"code": "sales_invoice", "label_es": "Factura de venta", "label_en": "Sales invoice", "label_zh": "销售发票", "sync_template": "paper"},
 ]
 
 # i051 — Documentos inbox. Queue = enqueued files nobody classified yet;
@@ -177,6 +177,7 @@ def _load_custom_kinds() -> list[dict]:
 				"code": code,
 				"label_es": _as_str(row.get("label_es")) or code,
 				"label_en": _as_str(row.get("label_en")) or _as_str(row.get("label_es")) or code,
+				"label_zh": _as_str(row.get("label_zh")),
 				"sync_template": tmpl,
 				"custom": 1,
 			}
@@ -213,6 +214,7 @@ def _resolve_kind(kind: str) -> dict:
 		"code": code,
 		"label_es": code,
 		"label_en": code,
+		"label_zh": "",
 		"sync_template": "none",
 		"custom": 1,
 	}
@@ -471,7 +473,7 @@ def list_archivo_kinds():
 
 
 @frappe.whitelist(allow_guest=True)
-def save_archivo_custom_kind(code=None, label_es=None, label_en=None, sync_template=None):
+def save_archivo_custom_kind(code=None, label_es=None, label_en=None, sync_template=None, label_zh=None):
 	"""Append or update a tenant-custom kind (no migrate)."""
 	_require_app_permission()
 	code = _as_str(code).lower()
@@ -484,18 +486,27 @@ def save_archivo_custom_kind(code=None, label_es=None, label_en=None, sync_templ
 		frappe.throw(_("Invalid sync_template"))
 	label_es = _as_str(label_es) or code
 	label_en = _as_str(label_en) or label_es
+	label_zh = _as_str(label_zh)
 	rows = _load_custom_kinds()
 	found = False
 	for row in rows:
 		if row["code"] == code:
 			row["label_es"] = label_es
 			row["label_en"] = label_en
+			row["label_zh"] = label_zh
 			row["sync_template"] = tmpl
 			found = True
 			break
 	if not found:
 		rows.append(
-			{"code": code, "label_es": label_es, "label_en": label_en, "sync_template": tmpl, "custom": 1}
+			{
+				"code": code,
+				"label_es": label_es,
+				"label_en": label_en,
+				"label_zh": label_zh,
+				"sync_template": tmpl,
+				"custom": 1,
+			}
 		)
 	_save_custom_kinds(
 		[
@@ -503,6 +514,7 @@ def save_archivo_custom_kind(code=None, label_es=None, label_en=None, sync_templ
 				"code": r["code"],
 				"label_es": r["label_es"],
 				"label_en": r.get("label_en") or r["label_es"],
+				"label_zh": r.get("label_zh") or "",
 				"sync_template": r["sync_template"],
 			}
 			for r in rows
