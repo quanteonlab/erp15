@@ -2562,6 +2562,87 @@ def suite_5_11_pos_session():
     _run("5.11.11 item taxes (IVA catalog + per-item assignment)", check_item_taxes, "S3")
 
 
+def check_return_capture_registry():
+    """i064 — Revisar devoluciones: dirty list/get + seeded capture warehouse flag."""
+    from erpnext.erpnext_integrations.ecommerce_api import tms_api as tms
+
+    listed = tms.list_return_captures(
+        status=None,
+        warehouse_received=None,
+        customer=None,
+        from_date="",
+        to_date="null",
+        delivery_trip=None,
+        q="",
+        limit=None,
+        offset="",
+        include_absent="null",
+    )
+    assert isinstance(listed, dict) and isinstance(listed.get("rows"), list), listed
+    counts = listed.get("counts") or {}
+    assert "pending_warehouse" in counts and "absent" in counts, counts
+    badge = tms.count_pending_return_captures()
+    assert isinstance(badge, dict) and "total" in badge, badge
+    try:
+        tms.get_return_capture(name=None)
+        raise AssertionError("expected error for null return capture")
+    except Exception as exc:
+        assert "ValidationError" in type(exc).__name__ or "required" in str(exc).lower(), exc
+
+    if not frappe.db.exists("DocType", "Mobile Return Capture"):
+        return
+    trip_row = frappe.db.sql("select name from `tabDelivery Trip` order by modified desc limit 1")
+    trip = trip_row[0][0] if trip_row else None
+    customer = frappe.db.get_value("Customer", {}, "name")
+    item = frappe.db.get_value("Item", {"disabled": 0}, "name") or frappe.db.get_value("Item", {}, "name")
+    if not (trip and customer and item):
+        return
+
+    doc = frappe.get_doc(
+        {
+            "doctype": "Mobile Return Capture",
+            "delivery_trip": trip,
+            "stop_idx": 1,
+            "customer": customer,
+            "status": "Captured",
+            "captured_at": frappe.utils.now_datetime(),
+            "notes": "smoke i064",
+            "lines": [
+                {
+                    "item_code": item,
+                    "description": "Smoke return item",
+                    "qty": 1,
+                    "reason": "Damaged",
+                }
+            ],
+        }
+    )
+    if frappe.db.has_column("Mobile Return Capture", "warehouse_received"):
+        doc.warehouse_received = 0
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    try:
+        got = tms.get_return_capture(doc.name)
+        assert got.get("kind") == "capture", got
+        assert got.get("lines") and got["lines"][0].get("reason") == "Damaged", got
+        pending = tms.list_return_captures(
+            warehouse_received=0, q=doc.name, include_absent=0, limit=20
+        )
+        assert any(r.get("name") == doc.name for r in pending.get("rows") or []), pending
+        if frappe.db.has_column("Mobile Return Capture", "warehouse_received"):
+            marked = tms.mark_vehicle_returns_received([doc.name])
+            assert doc.name in (marked.get("updated") or []), marked
+            got2 = tms.get_return_capture(doc.name)
+            assert cint(got2.get("warehouse_received")) == 1, got2
+            received = tms.list_return_captures(
+                warehouse_received=1, q=doc.name, include_absent=0, limit=20
+            )
+            assert any(r.get("name") == doc.name for r in received.get("rows") or []), received
+    finally:
+        frappe.delete_doc("Mobile Return Capture", doc.name, ignore_permissions=True, force=True)
+        frappe.db.commit()
+
+
 # ── Suite 5.12 — Preventa / staff / devices / floors / print / TMS ────────────
 
 def suite_5_12_modules_read():
@@ -4393,6 +4474,7 @@ def suite_5_12_modules_read():
     else:
         _skip("5.12.5c catalog import reviews + permissive enqueue", "Catalog Import Session DocType not migrated", "S2")
     _run("5.12.6 tms planner context + settings", check_tms, "S3")
+    _run("5.12.6b return capture registry (Revisar devoluciones)", check_return_capture_registry, "S2")
     _run("5.12.7 get_shop_ui_settings", check_shop_ui, "S3")
     _run("5.12.8 search_tags", check_tags, "S3")
     _run("5.12.9 get_openapi_spec", check_openapi, "S3")

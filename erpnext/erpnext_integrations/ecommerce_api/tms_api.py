@@ -12490,3 +12490,581 @@ def mark_vehicle_returns_received(capture_names=None):
 		updated.append(name)
 	frappe.db.commit()
 	return {"ok": True, "updated": updated}
+
+
+def _omit_dirty(val):
+	"""Blank / null / "null" from Flutter or Next → empty string. Numbers stay."""
+	if val is None or isinstance(val, bool):
+		if isinstance(val, bool):
+			return "1" if val else "0"
+		return ""
+	if isinstance(val, (int, float)):
+		return cstr(val).strip()
+	s = cstr(val).strip()
+	if s.lower() in ("", "null", "undefined", "none"):
+		return ""
+	return s
+
+
+def _return_wh_filter(raw):
+	"""None = all, 0 = pending warehouse, 1 = received."""
+	s = _omit_dirty(raw).lower()
+	if s in ("", "all", "*"):
+		return None
+	if s in ("0", "false", "no", "pending"):
+		return 0
+	if s in ("1", "true", "yes", "received"):
+		return 1
+	return None
+
+
+def _bounded_int(raw, default, lo, hi):
+	s = _omit_dirty(raw)
+	if not s:
+		return default
+	try:
+		n = int(float(s))
+	except Exception:
+		return default
+	return max(lo, min(hi, n))
+
+
+def _include_absent_flag(raw):
+	if raw is None:
+		return True
+	s = cstr(raw).strip().lower()
+	if s in ("", "null", "undefined", "none"):
+		return True
+	if s in ("0", "false", "no", "off"):
+		return False
+	return True
+
+
+def _parse_url_list(raw):
+	if isinstance(raw, list):
+		return [cstr(x).strip() for x in raw if cstr(x).strip()]
+	s = cstr(raw or "").strip()
+	if not s or s.lower() in ("null", "undefined", "none"):
+		return []
+	try:
+		parsed = frappe.parse_json(s)
+	except Exception:
+		parsed = None
+	if isinstance(parsed, list):
+		return [cstr(x).strip() for x in parsed if cstr(x).strip()]
+	return [s]
+
+
+def _safe_date_prefix(raw):
+	s = _omit_dirty(raw)[:10]
+	if not s:
+		return ""
+	try:
+		return cstr(getdate(s))
+	except Exception:
+		return ""
+
+
+def _trip_vehicle_meta(trip_name, cache):
+	trip_name = cstr(trip_name or "").strip()
+	if trip_name in cache:
+		return cache[trip_name]
+	meta = {"vehicle": None, "license_plate": None, "driver": None, "driver_name": None}
+	if trip_name and frappe.db.exists("Delivery Trip", trip_name):
+		row = frappe.db.get_value(
+			"Delivery Trip",
+			trip_name,
+			["vehicle", "driver", "driver_name"],
+			as_dict=True,
+		)
+		if row:
+			meta["vehicle"] = row.vehicle
+			meta["driver"] = row.driver
+			driver_name = cstr(row.driver_name or "").strip()
+			if not driver_name and row.driver and frappe.db.exists("Driver", row.driver):
+				driver_name = cstr(frappe.db.get_value("Driver", row.driver, "full_name") or "")
+			meta["driver_name"] = driver_name or None
+			if row.vehicle and frappe.db.exists("Vehicle", row.vehicle):
+				meta["license_plate"] = (
+					frappe.db.get_value("Vehicle", row.vehicle, "license_plate") or row.vehicle
+				)
+			elif row.vehicle:
+				meta["license_plate"] = row.vehicle
+	cache[trip_name] = meta
+	return meta
+
+
+def _customer_name_map(names):
+	names = [cstr(n).strip() for n in (names or []) if cstr(n).strip()]
+	if not names:
+		return {}
+	rows = frappe.get_all(
+		"Customer",
+		filters={"name": ["in", list(set(names))]},
+		fields=["name", "customer_name"],
+		ignore_permissions=True,
+		limit_page_length=len(set(names)) + 5,
+	)
+	return {r.name: (r.customer_name or r.name) for r in (rows or [])}
+
+
+def _lines_by_capture(names):
+	names = [cstr(n).strip() for n in (names or []) if cstr(n).strip()]
+	out = {n: [] for n in names}
+	if not names or not frappe.db.exists("DocType", "Mobile Return Capture Item"):
+		return out
+	rows = frappe.get_all(
+		"Mobile Return Capture Item",
+		filters={"parent": ["in", names], "parenttype": "Mobile Return Capture"},
+		fields=["parent", "item_code", "description", "qty", "reason", "idx"],
+		order_by="idx asc",
+		ignore_permissions=True,
+		limit_page_length=max(500, len(names) * 40),
+	)
+	for row in rows or []:
+		parent = cstr(row.parent or "")
+		if parent not in out:
+			continue
+		qty = flt(row.qty)
+		if qty <= 0:
+			continue
+		code = cstr(row.item_code or "").strip()
+		out[parent].append(
+			{
+				"item_code": code,
+				"item_name": cstr(row.description or "").strip() or code,
+				"qty": qty,
+				"reason": cstr(row.reason or "").strip(),
+			}
+		)
+	return out
+
+
+def _primary_reason(lines):
+	from collections import Counter
+
+	reasons = [cstr(ln.get("reason") or "").strip() for ln in (lines or []) if cstr(ln.get("reason") or "").strip()]
+	if not reasons:
+		return ""
+	return Counter(reasons).most_common(1)[0][0]
+
+
+def _lines_summary(lines):
+	n = len(lines or [])
+	reason = _primary_reason(lines)
+	label = f"{n} ítems" if n != 1 else "1 ítem"
+	if reason:
+		label = f"{label} · {reason}"
+	return label
+
+
+def _list_open_absent_cargo():
+	"""All Not Home remitos still expected back (any vehicle)."""
+	if not frappe.db.exists("DocType", "Table Extra Data"):
+		return []
+	rows = frappe.get_all(
+		"Table Extra Data",
+		filters={"scope": ABSENT_CARGO_SCOPE},
+		fields=["name", "row_key", "data_json"],
+		ignore_permissions=True,
+		limit_page_length=500,
+	)
+	out = []
+	import json
+
+	for row in rows or []:
+		try:
+			data = json.loads(row.data_json or "{}")
+		except Exception:
+			continue
+		if not isinstance(data, dict) or cint(data.get("received")):
+			continue
+		out.append({"key": cstr(row.row_key or ""), "data": data})
+	return out
+
+
+def _mrc_covers_absent(data):
+	"""Hide the synthetic absent row once a real capture exists for the stop or remito."""
+	if not frappe.db.exists("DocType", "Mobile Return Capture"):
+		return False
+	trip = cstr(data.get("trip") or "").strip()
+	stop = cint(data.get("stop_idx") or 0)
+	if trip and stop and frappe.db.exists(
+		"Mobile Return Capture", {"delivery_trip": trip, "stop_idx": stop}
+	):
+		return True
+	dn = cstr(data.get("delivery_note") or "").strip()
+	if dn and frappe.db.has_column("Mobile Return Capture", "delivery_note"):
+		if frappe.db.exists("Mobile Return Capture", {"delivery_note": dn}):
+			return True
+	return False
+
+
+def _return_queue_counts():
+	pending = 0
+	if frappe.db.exists("DocType", "Mobile Return Capture"):
+		filters = {}
+		if frappe.db.has_column("Mobile Return Capture", "warehouse_received"):
+			filters["warehouse_received"] = 0
+		pending = cint(frappe.db.count("Mobile Return Capture", filters))
+	absent = 0
+	for row in _list_open_absent_cargo():
+		if not _mrc_covers_absent(row.get("data") or {}):
+			absent += 1
+	return {"pending_warehouse": pending, "absent": absent, "total": pending + absent}
+
+
+def _sales_orders_for_dn(dn_name):
+	dn_name = cstr(dn_name or "").strip()
+	if not dn_name or not frappe.db.exists("Delivery Note", dn_name):
+		return []
+	rows = frappe.get_all(
+		"Delivery Note Item",
+		filters={"parent": dn_name},
+		fields=["against_sales_order"],
+		ignore_permissions=True,
+		limit_page_length=80,
+	)
+	seen = []
+	for row in rows or []:
+		so = cstr(row.against_sales_order or "").strip()
+		if so and so not in seen:
+			seen.append(so)
+	return seen
+
+
+@frappe.whitelist(allow_guest=True)
+def list_return_captures(
+	status=None,
+	warehouse_received=None,
+	customer=None,
+	from_date=None,
+	to_date=None,
+	delivery_trip=None,
+	q=None,
+	limit=80,
+	offset=0,
+	include_absent=1,
+):
+	"""Admin registry of Mobile Return Capture + open Not Home cargo (i064).
+
+	Blank / null filters are ignored. ``warehouse_received`` 0|1|all.
+	"""
+	status = _omit_dirty(status)
+	if status not in ("", "Captured", "Processed", "Error", "Absent"):
+		status = ""
+	wh = _return_wh_filter(warehouse_received)
+	customer = _omit_dirty(customer)
+	trip = _omit_dirty(delivery_trip)
+	q = _omit_dirty(q).lower()
+	from_d = _safe_date_prefix(from_date)
+	to_d = _safe_date_prefix(to_date)
+	limit_n = _bounded_int(limit, 80, 1, 200)
+	offset_n = _bounded_int(offset, 0, 0, 100000)
+	want_absent = _include_absent_flag(include_absent) and status in ("", "Absent") and wh != 1
+
+	rows = []
+	has_doctype = frappe.db.exists("DocType", "Mobile Return Capture")
+	if has_doctype and status != "Absent":
+		filters = {}
+		if status:
+			filters["status"] = status
+		if wh is not None and frappe.db.has_column("Mobile Return Capture", "warehouse_received"):
+			filters["warehouse_received"] = wh
+		if customer:
+			filters["customer"] = customer
+		if trip:
+			filters["delivery_trip"] = trip
+		if from_d and to_d:
+			filters["captured_at"] = ["between", [from_d, f"{to_d} 23:59:59"]]
+		elif from_d:
+			filters["captured_at"] = [">=", from_d]
+		elif to_d:
+			filters["captured_at"] = ["<=", f"{to_d} 23:59:59"]
+
+		fields = [
+			"name",
+			"captured_at",
+			"customer",
+			"delivery_trip",
+			"stop_idx",
+			"status",
+			"notes",
+			"modified",
+		]
+		for optional in (
+			"delivery_note",
+			"credit_note",
+			"debit_note",
+			"delivery_note_return",
+			"process_error",
+			"warehouse_received",
+		):
+			if frappe.db.has_column("Mobile Return Capture", optional):
+				fields.append(optional)
+
+		caps = frappe.get_all(
+			"Mobile Return Capture",
+			filters=filters,
+			fields=fields,
+			order_by="captured_at desc",
+			ignore_permissions=True,
+			limit_page_length=500,
+		)
+		names = [c.name for c in (caps or [])]
+		by_lines = _lines_by_capture(names)
+		cust_map = _customer_name_map([c.customer for c in (caps or [])])
+		trip_cache = {}
+		for cap in caps or []:
+			lines = by_lines.get(cap.name) or []
+			meta = _trip_vehicle_meta(cap.delivery_trip, trip_cache)
+			cust_name = cust_map.get(cap.customer) or cap.customer
+			reason = _primary_reason(lines)
+			received = cint(getattr(cap, "warehouse_received", 0) or 0)
+			blob = " ".join(
+				[
+					cstr(cap.name),
+					cstr(cap.customer),
+					cstr(cust_name),
+					cstr(getattr(cap, "delivery_note", None) or ""),
+					cstr(cap.delivery_trip),
+					cstr(meta.get("license_plate") or ""),
+					cstr(meta.get("vehicle") or ""),
+					cstr(getattr(cap, "credit_note", None) or ""),
+					reason,
+					cstr(cap.notes or ""),
+				]
+				+ [cstr(ln.get("item_code")) + " " + cstr(ln.get("item_name")) for ln in lines]
+			).lower()
+			if q and q not in blob:
+				continue
+			rows.append(
+				{
+					"row_id": cap.name,
+					"name": cap.name,
+					"kind": "capture",
+					"captured_at": cap.captured_at,
+					"customer": cap.customer,
+					"customer_name": cust_name,
+					"delivery_trip": cap.delivery_trip,
+					"stop_idx": cint(cap.stop_idx),
+					"delivery_note": getattr(cap, "delivery_note", None) or None,
+					"status": cap.status,
+					"warehouse_received": received,
+					"warehouse_received_at": cap.modified if received else None,
+					"credit_note": getattr(cap, "credit_note", None) or None,
+					"debit_note": getattr(cap, "debit_note", None) or None,
+					"delivery_note_return": getattr(cap, "delivery_note_return", None) or None,
+					"process_error": getattr(cap, "process_error", None) or None,
+					"lines_summary": _lines_summary(lines),
+					"item_count": len(lines),
+					"primary_reason": reason or None,
+					"vehicle": meta.get("vehicle"),
+					"license_plate": meta.get("license_plate"),
+					"driver": meta.get("driver"),
+					"driver_name": meta.get("driver_name"),
+					"notes": cap.notes,
+				}
+			)
+
+	if want_absent:
+		trip_cache = {}
+		for entry in _list_open_absent_cargo():
+			data = entry.get("data") or {}
+			if _mrc_covers_absent(data):
+				continue
+			if customer and cstr(data.get("customer") or "") != customer:
+				continue
+			if trip and cstr(data.get("trip") or "") != trip:
+				continue
+			at = cstr(data.get("at") or "")[:10]
+			if from_d and at and at < from_d:
+				continue
+			if to_d and at and at > to_d:
+				continue
+			dn = cstr(data.get("delivery_note") or "")
+			note = cstr(data.get("note") or "")
+			label = _("Remito {0} debería estar — cliente ausente").format(dn or "—")
+			if note:
+				label = f"{label}: {note}"
+			meta = _trip_vehicle_meta(data.get("trip"), trip_cache)
+			blob = " ".join(
+				[
+					cstr(entry.get("key")),
+					dn,
+					cstr(data.get("customer") or ""),
+					cstr(data.get("customer_name") or ""),
+					cstr(data.get("trip") or ""),
+					note,
+					label,
+					cstr(data.get("vehicle") or ""),
+					cstr(meta.get("license_plate") or ""),
+				]
+			).lower()
+			if q and q not in blob:
+				continue
+			key = cstr(entry.get("key") or "")
+			rows.append(
+				{
+					"row_id": f"absent:{key}",
+					"name": None,
+					"kind": "absent",
+					"key": key,
+					"captured_at": data.get("at"),
+					"customer": data.get("customer"),
+					"customer_name": data.get("customer_name"),
+					"delivery_trip": data.get("trip"),
+					"stop_idx": cint(data.get("stop_idx") or 0),
+					"delivery_note": dn or None,
+					"status": "Absent",
+					"warehouse_received": 0,
+					"credit_note": None,
+					"delivery_note_return": None,
+					"process_error": None,
+					"lines_summary": label,
+					"item_count": 0,
+					"primary_reason": "absent",
+					"vehicle": data.get("vehicle") or meta.get("vehicle"),
+					"license_plate": meta.get("license_plate"),
+					"driver": meta.get("driver"),
+					"driver_name": meta.get("driver_name"),
+					"due": data.get("due"),
+					"label": label,
+					"notes": note or None,
+				}
+			)
+
+	def _sort_key(row):
+		return cstr(row.get("captured_at") or "")
+
+	rows.sort(key=_sort_key, reverse=True)
+	matched = len(rows)
+	page = rows[offset_n : offset_n + limit_n]
+	counts = _return_queue_counts()
+	counts["matched"] = matched
+	return {"rows": page, "counts": counts}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_return_capture(name=None):
+	"""Full capture (lines, photos, signature, linked docs) or an absent-cargo row."""
+	name = _omit_dirty(name)
+	if not name:
+		frappe.throw(_("Return capture is required."))
+	if name.startswith("absent:"):
+		return _get_absent_return_detail(name[len("absent:") :])
+	if not frappe.db.exists("DocType", "Mobile Return Capture") or not frappe.db.exists(
+		"Mobile Return Capture", name
+	):
+		frappe.throw(_("Return capture {0} not found").format(name), frappe.DoesNotExistError)
+
+	frappe.flags.ignore_permissions = True
+	try:
+		doc = frappe.get_doc("Mobile Return Capture", name)
+	finally:
+		frappe.flags.ignore_permissions = False
+
+	lines = []
+	for row in doc.lines or []:
+		qty = flt(row.qty)
+		if qty <= 0:
+			continue
+		code = cstr(row.item_code or "").strip()
+		uom = None
+		if code and frappe.db.exists("Item", code):
+			uom = frappe.db.get_value("Item", code, "stock_uom")
+		lines.append(
+			{
+				"item_code": code,
+				"item_name": cstr(row.description or "").strip() or code,
+				"qty": qty,
+				"uom": uom,
+				"reason": cstr(row.reason or "").strip(),
+			}
+		)
+	meta = _trip_vehicle_meta(doc.delivery_trip, {})
+	cust_name = None
+	if doc.customer and frappe.db.exists("Customer", doc.customer):
+		cust_name = frappe.db.get_value("Customer", doc.customer, "customer_name") or doc.customer
+	dn = cstr(getattr(doc, "delivery_note", None) or "").strip() or None
+	received = cint(getattr(doc, "warehouse_received", 0) or 0)
+	return {
+		"row_id": doc.name,
+		"name": doc.name,
+		"kind": "capture",
+		"captured_at": doc.captured_at,
+		"customer": doc.customer,
+		"customer_name": cust_name or doc.customer,
+		"delivery_trip": doc.delivery_trip,
+		"stop_idx": cint(doc.stop_idx),
+		"delivery_note": dn,
+		"sales_orders": _sales_orders_for_dn(dn),
+		"status": doc.status,
+		"warehouse_received": received,
+		"warehouse_received_at": doc.modified if received else None,
+		"credit_note": getattr(doc, "credit_note", None) or None,
+		"debit_note": getattr(doc, "debit_note", None) or None,
+		"delivery_note_return": getattr(doc, "delivery_note_return", None) or None,
+		"process_error": getattr(doc, "process_error", None) or None,
+		"lines": lines,
+		"lines_summary": _lines_summary(lines),
+		"primary_reason": _primary_reason(lines) or None,
+		"notes": doc.notes,
+		"signature": doc.signature or None,
+		"photo_urls": _parse_url_list(doc.photo_urls),
+		"vehicle": meta.get("vehicle"),
+		"license_plate": meta.get("license_plate"),
+		"driver": meta.get("driver"),
+		"driver_name": meta.get("driver_name"),
+	}
+
+
+def _get_absent_return_detail(key):
+	key = cstr(key or "").strip()
+	if not key:
+		frappe.throw(_("Return capture is required."))
+	for entry in _list_open_absent_cargo():
+		if cstr(entry.get("key") or "") != key:
+			continue
+		data = entry.get("data") or {}
+		dn = cstr(data.get("delivery_note") or "")
+		note = cstr(data.get("note") or "")
+		label = _("Remito {0} debería estar — cliente ausente").format(dn or "—")
+		if note:
+			label = f"{label}: {note}"
+		meta = _trip_vehicle_meta(data.get("trip"), {})
+		return {
+			"row_id": f"absent:{key}",
+			"name": None,
+			"kind": "absent",
+			"key": key,
+			"label": label,
+			"captured_at": data.get("at"),
+			"due": data.get("due"),
+			"customer": data.get("customer"),
+			"customer_name": data.get("customer_name"),
+			"delivery_trip": data.get("trip"),
+			"stop_idx": cint(data.get("stop_idx") or 0),
+			"delivery_note": dn or None,
+			"sales_orders": _sales_orders_for_dn(dn),
+			"status": "Absent",
+			"warehouse_received": 0,
+			"lines": [],
+			"notes": note or None,
+			"signature": None,
+			"photo_urls": [],
+			"vehicle": data.get("vehicle") or meta.get("vehicle"),
+			"license_plate": meta.get("license_plate"),
+			"driver": meta.get("driver"),
+			"driver_name": meta.get("driver_name"),
+			"credit_note": None,
+			"delivery_note_return": None,
+			"process_error": None,
+		}
+	frappe.throw(_("Return capture {0} not found").format(key), frappe.DoesNotExistError)
+
+
+@frappe.whitelist(allow_guest=True)
+def count_pending_return_captures():
+	"""Badge for Revisar → Devoluciones: pending warehouse + open absent cargo."""
+	return _return_queue_counts()

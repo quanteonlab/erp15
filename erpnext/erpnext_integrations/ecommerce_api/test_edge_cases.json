@@ -7521,6 +7521,53 @@
       "bug": "mark_vehicle_returns_received null capture_names is controlled error"
     },
     {
+      "id": "list_return_captures_null_filters",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_return_captures",
+      "args": {
+        "status": null,
+        "warehouse_received": "",
+        "customer": "null",
+        "from_date": null,
+        "to_date": "",
+        "delivery_trip": null,
+        "q": null,
+        "limit": null,
+        "offset": "",
+        "include_absent": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "i064 list_return_captures null/empty filters must return rows, not TypeError"
+    },
+    {
+      "id": "get_return_capture_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_return_capture",
+      "args": {
+        "name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "i064 get_return_capture null name is a controlled error"
+    },
+    {
+      "id": "get_return_capture_blank_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_return_capture",
+      "args": {
+        "name": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "i064 get_return_capture empty name is a controlled error"
+    },
+    {
+      "id": "count_pending_return_captures_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.count_pending_return_captures",
+      "args": {},
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "i064 Revisar devoluciones badge count must not crash"
+    },
+    {
       "id": "suggest_lead_change_null_lead",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.suggest_lead_change",
       "args": {
