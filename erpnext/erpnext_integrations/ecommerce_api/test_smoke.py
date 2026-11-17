@@ -3680,6 +3680,15 @@ def suite_5_12_modules_read():
         claimable = tms.list_claimable_orders()
         assert isinstance(claimable, dict) and isinstance(claimable.get("orders"), list)
 
+        # Entregas: ensure admin Employee/Driver is idempotent — never DuplicateEntryError
+        # "User permission already exists" when Company UP is already present.
+        admin = frappe.session.user or "Administrator"
+        d1 = tms._ensure_admin_driver_profile(admin)
+        d2 = tms._ensure_admin_driver_profile(admin)
+        assert d1 and d1.get("name") and d1["name"] == d2.get("name"), (d1, d2)
+        mine = tms.driver_get_my_trips()
+        assert isinstance(mine, dict) and mine.get("driver") and isinstance(mine.get("trips"), list)
+
         map_store = tms.list_map_pins_and_plans()
         assert isinstance(map_store, dict)
         assert isinstance(map_store.get("pins"), list)

@@ -247,6 +247,10 @@ def _ensure_driver_group_membership(employee: str | None) -> bool:
 
 
 def _ensure_driver_for_employee(employee: str, user: str) -> dict:
+	existing = _driver_from_employee(employee)
+	if existing:
+		_ensure_driver_group_membership(employee)
+		return existing
 	full_name = frappe.db.get_value("Employee", employee, "employee_name") or _driver_display_name(user)
 	driver = frappe.get_doc(
 		{
@@ -256,19 +260,35 @@ def _ensure_driver_for_employee(employee: str, user: str) -> dict:
 			"status": "Active",
 		}
 	)
-	driver.insert(ignore_permissions=True)
+	try:
+		driver.insert(ignore_permissions=True)
+	except frappe.DuplicateEntryError:
+		# Race: another request created the Driver — reuse it.
+		existing = _driver_from_employee(employee)
+		if existing:
+			_ensure_driver_group_membership(employee)
+			return existing
+		raise
 	_ensure_driver_group_membership(employee)
 	frappe.db.commit()
 	return frappe.db.get_value(
 		"Driver",
 		driver.name,
-		["name", "full_name", "cell_number", "address"],
+		["name", "full_name", "cell_number", "address", "employee"],
 		as_dict=True,
 	)
 
 
 def _ensure_admin_driver_profile(user: str) -> dict:
-	"""Desk admins may use driver APIs without a pre-existing Employee/Driver."""
+	"""Desk admins may use driver APIs without a pre-existing Employee/Driver.
+
+	Never auto-create User Permissions — admins often already have a Company UP,
+	and Employee.on_update would throw DuplicateEntryError ("User permission already exists").
+	"""
+	existing_emp = frappe.db.get_value("Employee", {"user_id": user}, "name")
+	if existing_emp:
+		return _ensure_driver_for_employee(existing_emp, user)
+
 	company = (
 		frappe.defaults.get_user_default("Company", user)
 		or frappe.db.get_single_value("Global Defaults", "default_company")
@@ -291,10 +311,19 @@ def _ensure_admin_driver_profile(user: str) -> dict:
 			"date_of_joining": getdate(),
 			"gender": "Other",
 			"status": "Active",
+			# Critical: skip Employee→User Permission (Company UP often already exists).
+			"create_user_permission": 0,
 		}
 	)
 	emp.flags.ignore_mandatory = True
-	emp.insert(ignore_permissions=True)
+	try:
+		emp.insert(ignore_permissions=True)
+	except frappe.DuplicateEntryError:
+		# Partial race / leftover unique key — prefer any Employee already linked to this user.
+		existing_emp = frappe.db.get_value("Employee", {"user_id": user}, "name")
+		if not existing_emp:
+			raise
+		return _ensure_driver_for_employee(existing_emp, user)
 	return _ensure_driver_for_employee(emp.name, user)
 
 
