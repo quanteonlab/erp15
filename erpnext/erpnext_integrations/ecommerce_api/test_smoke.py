@@ -47,13 +47,15 @@ def _run(label, fn, severity="S2"):
         print(f"  {_PASS}  [{severity}] {label}")
         return True
     except AssertionError as exc:
-        _results.append((label, "FAIL", severity, str(exc)))
-        print(f"  {_FAIL}  [{severity}] {label}: {exc}")
+        detail = str(exc).strip() or traceback.format_exc()
+        _results.append((label, "FAIL", severity, detail))
+        print(f"  {_FAIL}  [{severity}] {label}: {detail}")
         return False
     except Exception as exc:
         detail = traceback.format_exc()
         _results.append((label, "FAIL", severity, detail))
         print(f"  {_FAIL}  [{severity}] {label}: {exc}")
+        print(detail)
         return False
 
 
@@ -1574,7 +1576,9 @@ def suite_5_9_master_data():
             assert api._delivery_facet(None, "Partial") == "Delivery (partial)"
             assert api._delivery_facet("In Transit", None) == "Delivery (on)"
             assert api._delivery_facet(None, None) == "Delivery (plan)"
-            # Remito alone must not force Delivery / MAT error
+            # Remito alone must not force Delivery / MAT error.
+            # (Asignar MAT via update_guest_preorder_logistics also keeps pipeline —
+            # only explicit set_guest_preorder_status / TMS claim / PoD advances.)
             remito = api.create_delivery_note_for_preorder(so_name)
             assert remito.get("delivery_note") or remito.get("planner_ready") is not None, remito
             assert api._pipeline_base_status(
@@ -2266,6 +2270,7 @@ def suite_5_11_pos_session():
     _run("5.11.6b ops operator empty pin uses session", check_ops_operator_empty_pin_uses_session, "S2")
     def check_partial_armado_progress():
         """Partial pack + faltante + boxes stay on the order and survive confirm."""
+        from erpnext.erpnext_integrations.ecommerce_api import api
         from erpnext.erpnext_integrations.ecommerce_api import ops_kiosk_api as oka
 
         frappe.set_user("Administrator")
@@ -2290,21 +2295,8 @@ def suite_5_11_pos_session():
             rows = (sheet.get("order") or {}).get("items") or []
             assert rows and rows[0].get("line_key"), sheet
             assert isinstance(rows[0].get("barcodes"), list), rows[0]
-            # Admin-changed Preparado must reopen to Orden (Modificaciones / writable).
-            api.set_guest_preorder_status(so_name, "Preparado", source="armado")
-            progress = oka._load_armado_progress(so_name)
-            progress["snapshot"] = [{"item_code": "OLD-SKU", "qty": 1, "name": "old-line"}]
-            oka._save_armado_progress(so_name, progress)
-            # Touch lines so fingerprint ≠ snapshot.
-            so_doc = frappe.get_doc("Sales Order", so_name)
-            item_rows = list(so_doc.items or [])
-            assert oka._armado_changed_since_save(item_rows, progress)
-            assert oka._reopen_changed_preparado(so_name, item_rows=item_rows, progress=progress)
-            so_doc.reload()
             from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
 
-            assert _display_status(so_doc) == "Orden", _display_status(so_doc)
-            api.set_guest_preorder_status(so_name, "Orden", source="armado")
             try:
                 oka.update_armado_items(
                     preorder_name=so_name,
@@ -2335,6 +2327,74 @@ def suite_5_11_pos_session():
             assert "NO-SUCH-SKU" not in stored
             if len(rows) > 1:
                 assert stored[rows[1]["line_key"]]["missing"] is True, stored
+            # After pack activity exists: admin-changed Preparado must reopen to Orden.
+            api.set_guest_preorder_status(so_name, "Preparado", source="armado")
+            progress = oka._load_armado_progress(so_name)
+            progress["snapshot"] = [{"item_code": "OLD-SKU", "qty": 1, "name": "old-line"}]
+            oka._save_armado_progress(so_name, progress)
+            so_doc = frappe.get_doc("Sales Order", so_name)
+            item_rows = list(so_doc.items or [])
+            assert oka._armado_changed_since_save(item_rows, progress), "expected changed fingerprint"
+            assert oka._reopen_changed_preparado(so_name, item_rows=item_rows, progress=progress), (
+                "expected Preparado→Orden reopen when lines changed after armado"
+            )
+            so_doc.reload()
+            assert _display_status(so_doc) == "Orden", _display_status(so_doc)
+            # Delivery → Armado: sheet writable; Guardar demotes to Orden and persists qty.
+            api.set_guest_preorder_status(
+                so_name, "Delivery", source="armado", allow_no_mat=1
+            )
+            sheet_d = oka.get_armado_order(so_name)
+            od = sheet_d.get("order") or {}
+            assert not cint(od.get("armado_readonly")), (
+                f"expected writable on Delivery, got readonly={od.get('armado_readonly')} "
+                f"disp={od.get('display_status')}"
+            )
+            payload_delivery = [
+                {
+                    "item_code": r["item_code"],
+                    "qty": 2,
+                    "rate": r.get("rate") or 10,
+                    "total_weight": 1.25,
+                }
+                for r in rows
+            ]
+            upd_d = oka.update_armado_items(
+                preorder_name=so_name,
+                items=payload_delivery,
+                packed=packed,
+                missing=missing,
+            )
+            so_after = frappe.get_doc("Sales Order", so_name)
+            assert _display_status(so_after) == "Orden", (
+                f"expected Orden after armado save from Delivery, got {_display_status(so_after)}"
+            )
+            assert flt(so_after.items[0].qty) == 2, (
+                f"expected qty 2 after Delivery→Armado save, got {so_after.items[0].qty}"
+            )
+            tw = flt(getattr(so_after.items[0], "total_weight", 0) or 0)
+            assert abs(tw - 1.25) < 0.001, f"expected total_weight 1.25, got {tw}"
+            assert not cint((upd_d.get("order") or {}).get("armado_readonly")), (
+                f"expected writable after demote, got {(upd_d.get('order') or {}).get('armado_readonly')}"
+            )
+            assert cint((upd_d.get("order") or {}).get("armado_amended_after_pack")), (
+                "expected amended_after_pack after Delivery→Armado save"
+            )
+            pub = oka.get_armado_progress(so_name)
+            prog = pub.get("progress") or {}
+            assert cint(prog.get("amended_after_pack")), prog
+            assert prog.get("pending") is not None, prog
+            assert isinstance(prog.get("lines"), list) and prog["lines"], prog
+            assert prog["lines"][0].get("ordered_qty") is not None, prog["lines"][0]
+            events = prog.get("events") or []
+            assert any(
+                isinstance(ev, dict) and ev.get("action") in ("amend", "qty", "weight", "save", "pack")
+                for ev in events
+            ), events
+            assert any(
+                isinstance(ev, dict) and (ev.get("before") or ev.get("after"))
+                for ev in events
+            ), "expected before/after on at least one progress event"
             try:
                 oka.confirm_armado(preorder_name=so_name, box_count=0)
                 assert False, "box_count 0 must fail"

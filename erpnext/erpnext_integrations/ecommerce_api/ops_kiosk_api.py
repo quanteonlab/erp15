@@ -217,6 +217,8 @@ def _load_armado_progress(so_name: str) -> dict:
 	base["snapshot"] = data.get("snapshot") if isinstance(data.get("snapshot"), list) else []
 	base["last_saved_at"] = str(data.get("last_saved_at") or "")
 	base["last_saved_by"] = str(data.get("last_saved_by") or "")
+	base["amended_after_pack"] = 1 if cint(data.get("amended_after_pack")) else 0
+	base["remito_desynced"] = 1 if cint(data.get("remito_desynced")) else 0
 	base["lines"] = lines
 	base["boxes"] = {
 		"count": cint(boxes.get("count")),
@@ -367,8 +369,18 @@ def _resolve_progress_key(token: str, rows: list[dict]) -> str | None:
 	return None
 
 
-def _progress_event(identity: dict, *, via: str, action: str, item_codes: list, detail: str = "") -> dict:
-	return {
+def _progress_event(
+	identity: dict,
+	*,
+	via: str,
+	action: str,
+	item_codes: list,
+	detail: str = "",
+	line_keys: list | None = None,
+	before: dict | None = None,
+	after: dict | None = None,
+) -> dict:
+	ev = {
 		"at": cstr(frappe.utils.now()),
 		"via": via,
 		"employee": identity.get("employee") or "",
@@ -377,6 +389,61 @@ def _progress_event(identity: dict, *, via: str, action: str, item_codes: list, 
 		"item_codes": item_codes,
 		"detail": detail or "",
 	}
+	if line_keys:
+		ev["line_keys"] = [str(k) for k in line_keys if k]
+	if isinstance(before, dict) and before:
+		ev["before"] = before
+	if isinstance(after, dict) and after:
+		ev["after"] = after
+	return ev
+
+
+def _armado_trip_in_route(so_name: str) -> bool:
+	"""True when the SO is on a MAT that already left / is in transit (pack edits locked)."""
+	so_name = str(so_name or "").strip()
+	if not so_name:
+		return False
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _tms_logistics_map_for_orders
+
+		lg = (_tms_logistics_map_for_orders([so_name]) or {}).get(so_name) or {}
+	except Exception:
+		return False
+	status = cstr(lg.get("trip_status") or "").strip().lower()
+	if status in ("in transit", "completed"):
+		return True
+	if lg.get("departure_time"):
+		return True
+	return False
+
+
+def _armado_has_delivery_note(so_name: str) -> bool:
+	so_name = str(so_name or "").strip()
+	if not so_name:
+		return False
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _delivery_note_for_sales_order
+
+		return bool(_delivery_note_for_sales_order(so_name))
+	except Exception:
+		return bool(
+			frappe.db.exists(
+				"Delivery Note Item",
+				{"against_sales_order": so_name, "docstatus": ["!=", 2]},
+			)
+		)
+
+
+def _require_armado_not_in_route(so_name: str, identity: dict) -> None:
+	"""Block packer edits once the trip is in route; admin/senior PIN may proceed."""
+	if not _armado_trip_in_route(so_name):
+		return
+	if isinstance(identity, dict) and identity.get("kind") == "admin":
+		return
+	frappe.throw(
+		_("Armado locked: trip already in route. Use an admin PIN to amend."),
+		frappe.PermissionError,
+	)
 
 
 def _merge_armado_progress(
@@ -388,6 +455,7 @@ def _merge_armado_progress(
 	box_count: int | None = None,
 	items: list | None = None,
 	via: str = "armado_items",
+	amend: bool = False,
 ) -> dict:
 	"""Merge line flags. Unknown keys are ignored. Packed and missing are exclusive."""
 	frappe.flags.ignore_permissions = True
@@ -402,20 +470,33 @@ def _merge_armado_progress(
 			if isinstance(row, dict) and row.get("item_code"):
 				by_code[str(row.get("item_code"))] = row
 
-	def _touch_qty(entry: dict):
+	def _snapshot_qty(entry: dict) -> dict:
+		out = {}
+		if entry.get("qty") is not None:
+			out["qty"] = flt(entry.get("qty"))
+		if entry.get("total_weight") is not None:
+			out["total_weight"] = flt(entry.get("total_weight"))
+		return out
+
+	def _touch_qty(entry: dict) -> dict:
+		"""Apply qty/weight from items payload; return after-snapshot."""
 		src = by_code.get(entry.get("item_code") or "")
 		if not isinstance(src, dict):
-			return
+			return _snapshot_qty(entry)
 		if src.get("qty") is not None:
 			entry["qty"] = flt(src.get("qty"))
 		if src.get("total_weight") is not None:
 			entry["total_weight"] = flt(src.get("total_weight"))
+		return _snapshot_qty(entry)
 
 	packed_codes = []
+	packed_keys = []
 	unpacked_codes = []
 	missing_codes = []
 	unmissing_codes = []
 	restamp_codes = []
+	restamp_keys = []
+	qty_diffs = []  # (code, key, before, after)
 	keys = set()
 	if isinstance(packed, dict):
 		keys.update(str(k) for k in packed.keys())
@@ -429,6 +510,7 @@ def _merge_armado_progress(
 		row = next(r for r in rows if r["key"] == key)
 		entry = lines.get(key) if isinstance(lines.get(key), dict) else _blank_progress_line(row["item_code"])
 		entry["item_code"] = row["item_code"]
+		before = _snapshot_qty(entry)
 		want_missing = missing.get(token) if isinstance(missing, dict) and token in missing else None
 		if want_missing is None and isinstance(missing, dict) and key in missing:
 			want_missing = missing.get(key)
@@ -458,6 +540,7 @@ def _merge_armado_progress(
 			entry["missing_by_employee"] = ""
 			entry["missing_at"] = ""
 			packed_codes.append(row["item_code"])
+			packed_keys.append(key)
 		else:
 			if want_packed is not None and not _flag_from_value(want_packed):
 				if entry.get("packed"):
@@ -474,7 +557,9 @@ def _merge_armado_progress(
 				entry["missing_by"] = ""
 				entry["missing_by_employee"] = ""
 				entry["missing_at"] = ""
-		_touch_qty(entry)
+		after = _touch_qty(entry)
+		if before != after:
+			qty_diffs.append((row["item_code"], key, before, after))
 		lines[key] = entry
 
 	# Qty/weight edits on an already packed line restamp the current operator.
@@ -488,11 +573,15 @@ def _merge_armado_progress(
 			if row["item_code"] in packed_codes:
 				_touch_qty(entry)
 				continue
+			before = _snapshot_qty(entry)
 			entry["packed_by"] = _operator_label(identity)
 			entry["packed_by_employee"] = identity.get("employee") or ""
 			entry["packed_at"] = cstr(frappe.utils.now())
-			_touch_qty(entry)
+			after = _touch_qty(entry)
 			restamp_codes.append(row["item_code"])
+			restamp_keys.append(row["key"])
+			if before != after:
+				qty_diffs.append((row["item_code"], row["key"], before, after))
 
 	if box_count is not None:
 		progress["boxes"] = {
@@ -519,8 +608,36 @@ def _merge_armado_progress(
 	):
 		if codes:
 			events.append(
-				_progress_event(identity, via=via, action=action, item_codes=codes, detail=detail)
+				_progress_event(
+					identity,
+					via=via,
+					action=action,
+					item_codes=codes,
+					detail=detail,
+					line_keys=packed_keys if action == "pack" else (restamp_keys if action == "save" else None),
+				)
 			)
+
+	# Per-line qty/weight diffs (collaborative history).
+	for code, key, before, after in qty_diffs:
+		action = "amend" if amend else ("weight" if "total_weight" in after or "total_weight" in before else "qty")
+		events.append(
+			_progress_event(
+				identity,
+				via=via,
+				action=action,
+				item_codes=[code],
+				line_keys=[key],
+				before=before,
+				after=after,
+				detail="post-armado" if amend else "",
+			)
+		)
+
+	if amend:
+		progress["amended_after_pack"] = 1
+		if _armado_has_delivery_note(so_name):
+			progress["remito_desynced"] = 1
 
 	progress["lines"] = lines
 	progress["events"] = events
@@ -641,8 +758,45 @@ def _reopen_changed_preparado(so_name: str, item_rows: list | None = None, progr
 		return False
 
 
+def _demote_to_orden_for_armado(so) -> bool:
+	"""Soft-demote Preparado / Delivery → Orden so Armado can Guardar after a rework.
+
+	Returns True when the SO is Orden afterward.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_display_status,
+		_is_guest_preorder_sales_order,
+		set_guest_preorder_status,
+	)
+
+	disp = _display_status(so)
+	base = "Completado" if str(disp).startswith("Completado") else disp
+	if base == "Orden":
+		return True
+	if base not in ("Preparado", "Delivery"):
+		return False
+	try:
+		if _is_guest_preorder_sales_order(so):
+			set_guest_preorder_status(
+				so.name, "Orden", source="armado", ensure_planner_remito=0
+			)
+		else:
+			so.db_set("status", "To Deliver and Bill", update_modified=True)
+		frappe.db.commit()
+		so.reload()
+		disp = _display_status(so)
+		base = "Completado" if str(disp).startswith("Completado") else disp
+		return base == "Orden"
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"armado demote {so.name}")
+		return False
+
+
 def _require_armado_writable(so) -> str:
-	"""Ensure SO is Orden-stage for writes; reopen Preparado when admin changed lines after pack.
+	"""Ensure SO is Orden-stage for writes.
+
+	Preparado / Delivery are demoted to Orden on write (re-pack after pipeline move).
+	Completado / Consulta / Archivado stay blocked.
 
 	Returns display status after any reopen. Throws if still not writable.
 	"""
@@ -652,13 +806,17 @@ def _require_armado_writable(so) -> str:
 	base = "Completado" if str(disp).startswith("Completado") else disp
 	if base == "Orden":
 		return disp
-	if base == "Preparado":
-		if _reopen_changed_preparado(so.name):
+	if base in ("Preparado", "Delivery"):
+		# Prefer the existing "changed Preparado" path first, then force demote.
+		if base == "Preparado":
+			_reopen_changed_preparado(so.name)
 			so.reload()
 			disp = _display_status(so)
 			base = "Completado" if str(disp).startswith("Completado") else disp
 			if base == "Orden":
 				return disp
+		if _demote_to_orden_for_armado(so):
+			return _display_status(so)
 	frappe.throw(
 		_("Only Orden-stage orders can be updated in armado (current: {0})").format(base)
 	)
@@ -692,6 +850,7 @@ def _summarize_progress(item_rows: list, progress: dict | None) -> dict:
 			missing += 1
 	item_count = len(item_rows or [])
 	resolved = packed + missing
+	pending = max(0, item_count - resolved)
 	if item_count <= 0 or resolved <= 0:
 		bucket = "none"
 	elif resolved >= item_count:
@@ -705,23 +864,43 @@ def _summarize_progress(item_rows: list, progress: dict | None) -> dict:
 		last_event = {}
 	last_saved_at = ""
 	last_saved_by = ""
+	amended = 0
+	remito_desynced = 0
 	if isinstance(progress, dict):
 		last_saved_at = str(progress.get("last_saved_at") or last_event.get("at") or "")
 		last_saved_by = str(progress.get("last_saved_by") or last_event.get("employee_name") or "")
+		amended = 1 if cint(progress.get("amended_after_pack")) else 0
+		remito_desynced = 1 if cint(progress.get("remito_desynced")) else 0
 	return {
 		"packed": packed,
 		"missing": missing,
+		"pending": pending,
 		"item_count": item_count,
 		"qty_total": qty_total,
 		"box_count": box_count,
 		"bucket": bucket,
 		"changed": 1 if _armado_changed_since_save(item_rows, progress) else 0,
+		"amended_after_pack": amended,
+		"remito_desynced": remito_desynced,
 		"last_saved_at": last_saved_at,
 		"last_saved_by": last_saved_by,
+		"last_event": {
+			"at": last_event.get("at") or "",
+			"by": last_event.get("employee_name") or "",
+			"action": last_event.get("action") or "",
+			"item_codes": last_event.get("item_codes") or [],
+		}
+		if last_event
+		else None,
 	}
 
 
-def _attach_armado_list_progress(orders: list) -> None:
+def _attach_armado_progress_summaries(orders: list, *, reopen_changed_completed: bool = False) -> None:
+	"""Stamp ``progress_summary`` on order rows (Pedidos list / Armado cola).
+
+	When ``reopen_changed_completed`` is True (Armado cola only), admin-edited
+	Completados demote back to Orden.
+	"""
 	names = [o.get("name") for o in orders if o.get("name")]
 	if not names:
 		return
@@ -753,8 +932,9 @@ def _attach_armado_list_progress(orders: list) -> None:
 	for order in orders:
 		rows = by_parent.get(order.get("name")) or []
 		progress = prog_by_scope.get(_armado_progress_scope(order.get("name"))) or {}
-		# Completados that admin edited → reopen to Orden (Para armar), not Completados.
-		if cint(order.get("completed")) and _armado_changed_since_save(rows, progress):
+		if reopen_changed_completed and cint(order.get("completed")) and _armado_changed_since_save(
+			rows, progress
+		):
 			if _reopen_changed_preparado(order.get("name"), item_rows=rows, progress=progress):
 				order["completed"] = 0
 				order["status"] = "To Deliver and Bill"
@@ -764,6 +944,11 @@ def _attach_armado_list_progress(orders: list) -> None:
 		order["items_count"] = summary["item_count"]
 		order["qty_total"] = summary["qty_total"]
 		order["progress_summary"] = summary
+
+
+def _attach_armado_list_progress(orders: list) -> None:
+	"""Armado cola: summaries + reopen Completados that admin changed."""
+	_attach_armado_progress_summaries(orders, reopen_changed_completed=True)
 
 
 def _stamp_armado_sheet(detail: dict, so) -> dict:
@@ -804,10 +989,20 @@ def _stamp_armado_sheet(detail: dict, so) -> dict:
 	detail["armado_changed"] = 1 if changed else 0
 	detail["armado_last_saved_at"] = progress.get("last_saved_at") or ""
 	detail["armado_last_saved_by"] = progress.get("last_saved_by") or ""
+	detail["armado_amended_after_pack"] = 1 if cint(progress.get("amended_after_pack")) else 0
+	detail["armado_remito_desynced"] = 1 if cint(progress.get("remito_desynced")) else 0
+	detail["armado_write_locked"] = 1 if _armado_trip_in_route(so.name) else 0
 	disp = _display_status(so)
 	detail["display_status"] = disp
-	# Changed sheets stay editable even before reopen finishes; Orden always writable.
-	detail["armado_readonly"] = 0 if (disp == "Orden" or changed) else 1
+	# Orden always writable. Preparado / Delivery stay editable so Guardar works when
+	# ops moves Delivery → Armado (write path demotes back to Orden). Completado /
+	# Consulta / Archivado stay read-only. Trip in-route locks packers (admin override).
+	base = "Completado" if str(disp).startswith("Completado") else disp
+	writable = base in ("Orden", "Preparado", "Delivery") or changed
+	if detail["armado_write_locked"]:
+		# Sheet still viewable; writes gated in update path via admin PIN.
+		pass
+	detail["armado_readonly"] = 0 if writable else 1
 	remarks = cstr(getattr(so, "remarks", None) or "")
 	detail["armado_practice"] = 1 if "armado_practice:1" in remarks else 0
 	return detail
@@ -849,11 +1044,16 @@ def _armado_progress_public(so_name: str) -> dict | None:
 	out_lines = []
 	for row in rows:
 		state = lines.get(row["key"]) if isinstance(lines.get(row["key"]), dict) else {}
+		qty_measured = state.get("qty")
+		tw = state.get("total_weight")
 		out_lines.append(
 			{
 				"line_key": row["key"],
 				"item_code": row["item_code"],
 				"item_name": row["item_name"],
+				"ordered_qty": flt(row["qty"]),
+				"qty": flt(qty_measured) if qty_measured is not None else None,
+				"total_weight": flt(tw) if tw is not None else None,
 				"packed": 1 if state.get("packed") else 0,
 				"missing": 1 if state.get("missing") else 0,
 				"missing_reason": state.get("missing_reason") or "",
@@ -867,16 +1067,27 @@ def _armado_progress_public(so_name: str) -> dict | None:
 		[{"name": r["key"], "item_code": r["item_code"], "idx": r["idx"], "qty": r["qty"]} for r in rows],
 		progress,
 	)
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
+
 	return {
 		"sales_order": so_name,
+		"display_status": _display_status(so),
 		"box_count": summary["box_count"],
 		"packed": summary["packed"],
 		"missing": summary["missing"],
+		"pending": summary.get("pending") or 0,
 		"item_count": summary["item_count"],
 		"bucket": summary["bucket"],
 		"complete": 1 if summary["bucket"] == "ready" else 0,
+		"changed": summary.get("changed") or 0,
+		"amended_after_pack": summary.get("amended_after_pack") or 0,
+		"remito_desynced": summary.get("remito_desynced") or 0,
+		"write_locked": 1 if _armado_trip_in_route(so_name) else 0,
+		"last_saved_at": summary.get("last_saved_at") or "",
+		"last_saved_by": summary.get("last_saved_by") or "",
+		"last_event": summary.get("last_event"),
 		"lines": out_lines,
-		"events": (progress.get("events") or [])[-30:],
+		"events": (progress.get("events") or [])[-ARMADO_PROGRESS_EVENT_CAP:],
 	}
 
 
@@ -1428,6 +1639,58 @@ def get_armado_progress(preorder_name=None):
 
 
 @frappe.whitelist(allow_guest=True)
+def sync_armado_remito(preorder_name=None, pin=None):
+	"""Re-run planner remito after a post-armado qty/peso amend; clear desync flag."""
+	identity = _require_ops_operator(pin)
+	preorder_name = str(preorder_name or "").strip()
+	if (
+		not preorder_name
+		or preorder_name.lower() in ("null", "undefined", "none")
+		or not frappe.db.exists("Sales Order", preorder_name)
+	):
+		frappe.throw(_("Order not found"))
+	_require_armado_not_in_route(preorder_name, identity)
+
+	gate = {"ok": 0, "delivery_note": None}
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import _ensure_planner_delivery_note
+
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", preorder_name)
+		gate = _ensure_planner_delivery_note(so) or {}
+		frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"sync_armado_remito {preorder_name}")
+		frappe.throw(_("Could not sync remito after armado amend"))
+
+	progress = _load_armado_progress(preorder_name)
+	progress["remito_desynced"] = 0
+	events = progress.setdefault("events", [])
+	events.append(
+		_progress_event(
+			identity,
+			via="armado_remito_sync",
+			action="remito_sync",
+			item_codes=[],
+			detail=cstr((gate or {}).get("delivery_note") or ""),
+		)
+	)
+	progress["last_saved_at"] = cstr(frappe.utils.now())
+	progress["last_saved_by"] = _operator_label(identity)
+	_save_armado_progress(preorder_name, progress)
+	return {
+		"ok": True,
+		"delivery_note": (gate or {}).get("delivery_note"),
+		"progress": _armado_progress_public(preorder_name),
+		"operator": {
+			"kind": identity.get("kind"),
+			"employee": identity.get("employee"),
+			"employee_name": identity.get("employee_name"),
+		},
+	}
+
+
+@frappe.whitelist(allow_guest=True)
 def update_armado_items(
 	preorder_name=None, items=None, pin=None, packed=None, missing=None, box_count=None
 ):
@@ -1466,12 +1729,17 @@ def update_armado_items(
 		items = None
 
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_display_status,
 		_is_guest_preorder_sales_order,
 		update_guest_preorder_items,
 	)
 
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", preorder_name)
+	_require_armado_not_in_route(preorder_name, identity)
+	disp_before = _display_status(so)
+	base_before = "Completado" if str(disp_before).startswith("Completado") else disp_before
+	amend = base_before in ("Preparado", "Delivery")
 	_require_armado_writable(so)
 
 	if has_items:
@@ -1494,7 +1762,7 @@ def update_armado_items(
 			so.save(ignore_permissions=True)
 			frappe.db.commit()
 
-	if packed_map is not None or missing_map is not None or boxes_n is not None:
+	if packed_map is not None or missing_map is not None or boxes_n is not None or has_items:
 		_merge_armado_progress(
 			preorder_name,
 			identity,
@@ -1503,6 +1771,7 @@ def update_armado_items(
 			box_count=boxes_n,
 			items=items if has_items else None,
 			via="armado_items",
+			amend=amend,
 		)
 	_log_armado_operator(preorder_name, identity, via="armado_items")
 	out = get_armado_order(preorder_name)
@@ -1551,6 +1820,8 @@ def confirm_armado(preorder_name=None, items=None, pin=None, packed=None, missin
 
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Only guest preorders can be confirmed in armado"))
+
+	_require_armado_not_in_route(preorder_name, identity)
 
 	# Admin edited after pack → reopen so confirm can run again.
 	_reopen_changed_preparado(so.name)

@@ -5086,6 +5086,42 @@ def _apply_orden_default_delivery_date(so):
 	return str(due_d)
 
 
+def _apply_so_delivery_date(so, delivery_date, *, forced: bool = False):
+	"""Set SO + line delivery_date; stamp forced tag; clamp ≥ transaction_date."""
+	if not so or not delivery_date:
+		return None
+	try:
+		due_d = getdate(delivery_date)
+	except Exception:
+		return None
+	if so.transaction_date and due_d < getdate(so.transaction_date):
+		due_d = getdate(so.transaction_date)
+	so.db_set("delivery_date", due_d, update_modified=True)
+	try:
+		frappe.db.sql(
+			"UPDATE `tabSales Order Item` SET delivery_date=%s WHERE parent=%s",
+			(due_d, so.name),
+		)
+	except Exception:
+		pass
+	_update_guest_preorder_tag(so, "delivery_forced", "1" if forced else None)
+	_stamp_delivery_date_changed(so, persist=True)
+	return str(due_d)
+
+
+def _coerce_optional_ymd(raw):
+	"""Dirty-safe optional date: null / "" / "null" / "undefined" / junk → None."""
+	if raw is None or isinstance(raw, bool):
+		return None
+	s = cstr(raw).strip()
+	if not s or s.lower() in ("null", "undefined", "none", "nan"):
+		return None
+	try:
+		return str(getdate(s))
+	except Exception:
+		return None
+
+
 def _auto_delivery_date_for_zone(zone_label, as_of=None):
 	"""Next promised due from zone visit days, or greedy pack when strategy says so (i043/i045).
 
@@ -5986,8 +6022,14 @@ def create_guest_preorder(
 	if want_orden and resolved_rows:
 		frappe.flags.creating_guest_preorder = True
 		try:
+			# Seller-chosen date (ask_on_convert) must survive the Orden default.
+			seller_due = _coerce_optional_ymd(delivery_date)
 			promoted = set_guest_preorder_status(
-				so.name, "Orden", ensure_planner_remito=0
+				so.name,
+				"Orden",
+				ensure_planner_remito=0,
+				delivery_date=seller_due,
+				delivery_date_forced=1 if seller_due else None,
 			)
 		finally:
 			frappe.flags.creating_guest_preorder = False
@@ -6595,6 +6637,16 @@ def get_guest_preorders_list(
 		o["pod"] = lg.get("pod")
 		_apply_tms_display_status(o)
 
+	# Armado pack chips for senior Delivery (packed/total, amended). Read-only stamp.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
+			_attach_armado_progress_summaries,
+		)
+
+		_attach_armado_progress_summaries(filtered, reopen_changed_completed=False)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "attach armado list progress")
+
 	_attach_factura_a_fields(filtered)
 	_attach_billing_fields(filtered)
 	# Ecommerce system tags (PRINTED, L_*, SRV-*) for pipeline icons.
@@ -6781,6 +6833,15 @@ def get_guest_preorder(preorder_name):
 	_attach_billing_fields([payload])
 	# Cliente Pending badge (r:actor) — same fields as Pedidos list column.
 	_attach_creation_review_fields([payload])
+	# Armado pack progress for senior Delivery (checks / history).
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
+			_armado_progress_public,
+		)
+
+		payload["armado_progress"] = _armado_progress_public(preorder_name)
+	except Exception:
+		payload["armado_progress"] = None
 	payload["is_credit_note"] = cstr(tags.get("credit_note") or "") in ("1", "true", "yes")
 	payload["credit_of"] = cstr(tags.get("credit_of") or "").strip() or None
 	payload["credit_reason"] = cstr(tags.get("credit_reason") or "").strip() or None
@@ -7351,7 +7412,13 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 
 @frappe.whitelist(allow_guest=True)
 def set_guest_preorder_status(
-	preorder_name, target_status, source=None, ensure_planner_remito=0, allow_no_mat=0
+	preorder_name,
+	target_status,
+	source=None,
+	ensure_planner_remito=0,
+	allow_no_mat=0,
+	delivery_date=None,
+	delivery_date_forced=None,
 ):
 	"""
 	Unified status transition for the custom workflow.
@@ -7372,8 +7439,28 @@ def set_guest_preorder_status(
 
 	``allow_no_mat``: when truthy, Delivery may proceed without a linked MAT
 	(UI warns first; ops can opt out for the session).
+
+	``delivery_date`` / ``delivery_date_forced`` (Orden only): seller-confirmed
+	delivery day (ordenDeliveryDateMode = ask_on_convert). When a valid date is
+	passed it is applied instead of the auto next-business-day and is forced
+	(``delivery_date_forced`` defaults to 1) so zone edits do not clobber it.
+	Dirty values (null / "" / "null") fall back to the auto default.
 	"""
 	target_status = _normalize_target_pipeline_status(target_status)
+	delivery_date_override = _coerce_optional_ymd(delivery_date)
+	# Explicit date from ask mode is forced unless the caller says otherwise.
+	_forced_raw = cstr(delivery_date_forced).strip().lower()
+	if delivery_date_forced is None or _forced_raw in ("", "null", "undefined", "none"):
+		delivery_forced_flag = 1
+	elif _forced_raw in ("true", "yes"):
+		delivery_forced_flag = 1
+	elif _forced_raw in ("false", "no"):
+		delivery_forced_flag = 0
+	else:
+		try:
+			delivery_forced_flag = cint(delivery_date_forced)
+		except Exception:
+			delivery_forced_flag = 1
 	if target_status not in WORKFLOW_STATUSES:
 		frappe.throw(_("Invalid target status: {0}").format(target_status))
 
@@ -7404,6 +7491,8 @@ def set_guest_preorder_status(
 			source=pipeline_source,
 			ensure_planner_remito=ensure_planner_remito,
 			allow_no_mat=allow_no_mat,
+			delivery_date=delivery_date_override,
+			delivery_date_forced=delivery_forced_flag,
 		)
 
 	current = _display_status(so)
@@ -7489,7 +7578,12 @@ def set_guest_preorder_status(
 		pass
 	# Orden → blue Entrega = tomorrow / next working day (not +7 / next zone week).
 	if target_status == "Orden":
-		_apply_orden_default_delivery_date(so)
+		if delivery_date_override:
+			_apply_so_delivery_date(
+				so, delivery_date_override, forced=bool(delivery_forced_flag)
+			)
+		else:
+			_apply_orden_default_delivery_date(so)
 		so.reload()
 	detail = get_guest_preorder(preorder_name)
 	# Optional early remito (default off — planner keys off SO.delivery_date).
@@ -9472,6 +9566,10 @@ def update_guest_preorder_logistics(
 	Creates a Delivery Note when assigning a MAT / warehouse if missing.
 	Vehicle / driver options for the UI should come from the selected MAT
 	(and planner context); changing them updates the trip assignment.
+
+	Linking a MAT does **not** change pipeline status (Orden / Preparado /
+	Delivery). Ops moves the step separately; TMS claim / PoD may still
+	advance Delivery when those flows run.
 	"""
 	name = cstr(preorder_name or "").strip()
 	if not name or not frappe.db.exists("Sales Order", name):
@@ -9548,11 +9646,12 @@ def update_guest_preorder_logistics(
 			except Exception:
 				frappe.log_error(frappe.get_traceback(), "pedidos clear previous MAT")
 		# Add to target MAT (steal=True lets admin pull from other drafts).
+		# Do NOT advance pipeline here — Asignar MAT is logistics only.
+		# Delivery / Preparado stay explicit via set_guest_preorder_status (or TMS claim/PoD).
 		try:
 			tms_api.add_stops_to_trip(trip_in, [dn_name], allow_steal=1)
 		except TypeError:
 			tms_api.add_stops_to_trip(trip_in, [dn_name])
-		set_guest_preorder_status(name, "Delivery", source="tms_claim")
 		current_trip = frappe._dict(trip_name=trip_in, docstatus=frappe.db.get_value("Delivery Trip", trip_in, "docstatus"), status=frappe.db.get_value("Delivery Trip", trip_in, "status"))
 
 	target_trip = trip_in or (current_trip.trip_name if current_trip else None)
@@ -10021,9 +10120,10 @@ def create_delivery_note_for_preorder(preorder_name):
 	so it becomes visible in the TMS dispatcher (get_pending_deliveries only
 	lists submitted Delivery Notes).
 
-	Does **not** move the pipeline to Delivery — that requires a MAT
-	(``update_guest_preorder_logistics`` / PoD claim). Idempotent: reuses an
-	existing linked DN instead of creating a duplicate.
+	Does **not** move the pipeline to Delivery. Asignar MAT
+	(``update_guest_preorder_logistics``) also keeps the current pipeline step;
+	ops advances Delivery / Preparado explicitly (or via TMS claim / PoD).
+	Idempotent: reuses an existing linked DN instead of creating a duplicate.
 
 	Insufficient warehouse qty does **not** block submit — stock may go
 	negative (Pedidos remitos are operational; shortfalls are warned only).
@@ -10047,7 +10147,7 @@ def create_delivery_note_for_preorder(preorder_name):
 			or _("Could not create Delivery Note for {0}").format(preorder_name)
 		)
 
-	# Remito alone stays on Orden/Preparado; MAT assignment advances to Delivery.
+	# Remito / MAT link stay on the current pipeline step (Orden/Preparado/…).
 	detail = get_guest_preorder(preorder_name)
 	return _attach_planner_gate_fields(detail, gate)
 

@@ -355,6 +355,13 @@ def _normalize_catalog_promo_conflict(val) -> str:
 	return "best_price"
 
 
+def _normalize_orden_delivery_date_mode(val) -> str:
+	"""auto_tomorrow = server next business day; ask_on_convert = seller confirms date."""
+	if val in ("auto_tomorrow", "ask_on_convert"):
+		return val
+	return "auto_tomorrow"
+
+
 def _as_string_list(val, max_items: int = 500, max_len: int = 140) -> list:
 	"""Deduped trimmed strings (e.g. Item Group names to hide in catalog)."""
 	if not isinstance(val, (list, tuple)):
@@ -402,6 +409,10 @@ def _normalize_catalog_display(raw) -> dict:
 		# Tablas → Pedidos default toggle for salesmen: assigned | mine | all ("").
 		"pedidosDefaultSellerScope": _normalize_pedidos_default_seller_scope(
 			src.get("pedidosDefaultSellerScope")
+		),
+		# Consulta→Orden / seller Orden create: auto next business day vs ask the seller.
+		"ordenDeliveryDateMode": _normalize_orden_delivery_date_mode(
+			src.get("ordenDeliveryDateMode")
 		),
 		# When True, PoD/payment that fully settles a Delivery order auto-moves to Completado.
 		# Default False — ops closes Completado manually (or jumps with UI warning).

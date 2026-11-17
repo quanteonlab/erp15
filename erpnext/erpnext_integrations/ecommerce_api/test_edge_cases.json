@@ -7387,6 +7387,71 @@
       "bug": "empty preorder_name + string allow_no_mat coerces via cint, controlled error"
     },
     {
+      "id": "set_guest_preorder_status_delivery_date_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Orden",
+        "delivery_date": null,
+        "delivery_date_forced": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Seller delivery-date confirm (ordenDeliveryDateMode=ask_on_convert): null delivery_date/forced must not TypeError, falls back to auto next business day"
+    },
+    {
+      "id": "set_guest_preorder_status_delivery_date_empty_string",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Orden",
+        "delivery_date": "",
+        "delivery_date_forced": ""
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Seller delivery-date confirm: empty-string delivery_date/forced is treated as omitted (auto date), controlled error on missing SO"
+    },
+    {
+      "id": "set_guest_preorder_status_delivery_date_null_string",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Orden",
+        "delivery_date": "null",
+        "delivery_date_forced": "undefined"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Seller delivery-date confirm: \"null\"/\"undefined\" strings from Flutter/JS must be ignored, never getdate() TypeError"
+    },
+    {
+      "id": "set_guest_preorder_status_delivery_date_garbage",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Orden",
+        "delivery_date": "not-a-date",
+        "delivery_date_forced": "maybe"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Seller delivery-date confirm: unparseable date / flag falls back to auto default instead of 500"
+    },
+    {
+      "id": "set_guest_preorder_status_delivery_date_valid_iso",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
+      "args": {
+        "preorder_name": "",
+        "target_status": "Orden",
+        "delivery_date": "2099-01-05",
+        "delivery_date_forced": 1
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Seller delivery-date confirm: valid ISO delivery_date + forced=1 accepted; missing SO is a controlled error"
+    },
+    {
       "id": "search_vehicles_null_q",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.search_vehicles",
       "args": {
@@ -7666,6 +7731,37 @@
       "expect": "error",
       "source": "regression",
       "bug": "armado packed map must be an object, not a number"
+    },
+    {
+      "id": "get_armado_order_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_order",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "Delivery→Armado rework: get_armado_order with null name is controlled (writable stamp covered in smoke 5.11.6d)"
+    },
+    {
+      "id": "get_armado_progress_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_progress",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "senior Armado panel: null preorder_name is controlled error"
+    },
+    {
+      "id": "sync_armado_remito_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.sync_armado_remito",
+      "args": {
+        "preorder_name": null,
+        "pin": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "post-armado remito sync with null order is controlled (PIN or not found)"
     },
     {
       "id": "update_armado_items_packed_null_order",
