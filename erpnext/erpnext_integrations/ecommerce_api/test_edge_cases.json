@@ -3850,6 +3850,20 @@
       "expect": "fail"
     },
     {
+      "id": "tms_driver_record_stop_outcome_claims_null",
+      "source": "regression",
+      "bug": "driver_record_stop_outcome with null trip/claims must controlled ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.driver_record_stop_outcome",
+      "args": {
+        "trip_name": null,
+        "stop_idx": null,
+        "outcome": null,
+        "claims": null,
+        "attempt_note": null
+      },
+      "expect": "fail"
+    },
+    {
       "id": "ops_get_delivery_check_items_empty_string",
       "source": "regression",
       "bug": "get_delivery_check_items with empty delivery_note must controlled ValidationError (WEIGHT cobro must not crash / mis-read)",

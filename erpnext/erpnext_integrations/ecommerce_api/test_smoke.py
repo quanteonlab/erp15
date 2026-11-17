@@ -4671,6 +4671,40 @@ def suite_5_13_offline_outbox():
         "S1",
     )
 
+    def check_claim_reduction_and_absent_day():
+        from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+            _claim_goods_reduction,
+            _next_confirm_day,
+            _normalize_delivery_claims,
+        )
+        from frappe.utils import add_days, getdate, today
+
+        rows = _normalize_delivery_claims(
+            [
+                {
+                    "item_code": "X",
+                    "reason": "weight",
+                    "note": "balanza de mas",
+                    "weight": 12,
+                    "rate": 1000,
+                    "agreed_amount": 15680,
+                }
+            ]
+        )
+        assert rows and abs(flt(rows[0]["new_amount"]) - 12000) < 0.01, rows
+        assert abs(_claim_goods_reduction(rows) - 3680) < 0.01
+        assert _normalize_delivery_claims(None) == []
+        assert _normalize_delivery_claims("") == []
+        due = getdate(_next_confirm_day())
+        assert due >= getdate(add_days(today(), 1))
+        assert due.weekday() != 6
+
+    _run(
+        "5.13.4 claim weight reduces cobro; absent day skips Sunday",
+        check_claim_reduction_and_absent_day,
+        "S1",
+    )
+
 
 # ── Suite 5.14 — g013 phase 2: every queued write replays without requirement gaps ──
 

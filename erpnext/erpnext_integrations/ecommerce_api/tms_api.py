@@ -10701,8 +10701,85 @@ def _record_so_receive_payment(so_name: str, paid_amount, mode_of_payment=None) 
 	return pe.name
 
 
+ABSENT_CARGO_SCOPE = "absent_cargo"
+DELIVERY_CLAIMS_SCOPE = "delivery_claims"
+
+
+def _next_confirm_day(as_of=None):
+	"""Next day to replan an absent stop (skip Sunday). Does not touch pipeline status."""
+	from frappe.utils import add_days, getdate, today as _today
+
+	d = add_days(getdate(as_of or _today()), 1)
+	if d.weekday() == 6:
+		d = add_days(d, 1)
+	return d
+
+
+def _normalize_delivery_claims(claims) -> list:
+	"""Claim rows from the driver: reason, note, optional weight, new_amount."""
+	if isinstance(claims, str):
+		import json
+
+		raw = claims.strip()
+		if not raw or raw.lower() in ("null", "undefined", "none"):
+			return []
+		try:
+			claims = json.loads(raw)
+		except Exception:
+			return []
+	if claims in (None, "") or not isinstance(claims, list):
+		return []
+	out = []
+	for row in claims[:80]:
+		if not isinstance(row, dict):
+			continue
+		reason = cstr(row.get("reason") or "other").strip()[:40] or "other"
+		note = cstr(row.get("note") or "").strip()[:500]
+		weight = row.get("weight")
+		try:
+			weight_n = flt(weight) if weight not in (None, "", "null") else None
+		except Exception:
+			weight_n = None
+		agreed = flt(row.get("agreed_amount") or 0)
+		rate = flt(row.get("rate") or 0)
+		new_raw = row.get("new_amount")
+		new_amt = None
+		if new_raw not in (None, "", "null"):
+			try:
+				new_amt = max(0.0, flt(new_raw))
+			except Exception:
+				new_amt = None
+		if reason == "weight" and new_amt is None and rate > 0 and weight_n and weight_n > 0:
+			new_amt = flt(rate * weight_n)
+		out.append(
+			{
+				"item_code": cstr(row.get("item_code") or "")[:140],
+				"item_name": cstr(row.get("item_name") or "")[:200],
+				"reason": reason,
+				"note": note,
+				"weight": weight_n,
+				"rate": rate or None,
+				"agreed_amount": agreed,
+				"new_amount": new_amt,
+			}
+		)
+	return out
+
+
+def _claim_goods_reduction(claims) -> float:
+	"""How much to subtract from remito grand_total because of accepted claims."""
+	cut = 0.0
+	for row in _normalize_delivery_claims(claims):
+		agreed = flt(row.get("agreed_amount") or 0)
+		new_amt = row.get("new_amount")
+		if new_amt is None or agreed <= 0:
+			continue
+		cut += max(0.0, agreed - flt(new_amt))
+	return flt(cut)
+
+
 def _stamp_delivery_outcome_tags(so_name: str, outcome: str, *, has_returns: bool = False) -> None:
-	"""Tag Pedidos for partial delivery / returns (#parcial, #devolucion)."""
+	"""Tag Pedidos for partial delivery / returns (#parcial, #devolucion) / absent."""
 	so_name = cstr(so_name or "").strip()
 	if not so_name:
 		return
@@ -10715,10 +10792,52 @@ def _stamp_delivery_outcome_tags(so_name: str, outcome: str, *, has_returns: boo
 			tags.append("#parcial")
 		if has_returns or out == "Refused":
 			tags.append("#devolucion")
+		if out == "Not Home":
+			tags.append("#ausente")
 		if tags:
 			add_tags_for_doc("Sales Order", so_name, tags=tags, commit=False)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "stamp delivery outcome tags")
+
+
+def _record_not_home_followup(trip, stop, attempt_note):
+	"""Reschedule an absent stop without sending the order back to Orden.
+
+	Bumps delivery due, tags #ausente, and records expected return cargo for recepción.
+	Pipeline status is left as-is (Preparado / En Delivery / Delivery).
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	dn = cstr(getattr(stop, "delivery_note", None) or "").strip()
+	note = cstr(attempt_note or "").strip()
+	due = _next_confirm_day()
+	so_names = _sales_orders_for_dn(dn) if dn else []
+	if dn:
+		try:
+			_apply_pending_delivery_due(dn, due)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "not home reschedule due")
+	for so_name in so_names:
+		_stamp_delivery_outcome_tags(so_name, "Not Home")
+	key = f"{cstr(getattr(trip, 'name', None) or '')}:{cint(getattr(stop, 'idx', None) or 0)}"
+	payload = {
+		"trip": cstr(getattr(trip, "name", None) or ""),
+		"vehicle": cstr(getattr(trip, "vehicle", None) or ""),
+		"stop_idx": cint(getattr(stop, "idx", None) or 0),
+		"delivery_note": dn,
+		"customer": cstr(getattr(stop, "customer", None) or ""),
+		"customer_name": cstr(getattr(stop, "customer_name", None) or getattr(stop, "customer", None) or ""),
+		"note": note,
+		"due": str(due),
+		"reason": "absent",
+		"received": 0,
+		"at": str(now_datetime()),
+	}
+	try:
+		kv_set(ABSENT_CARGO_SCOPE, key, payload)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "absent cargo kv")
+	return payload
 
 
 def _mark_so_after_pod(so_name: str, outcome: str | None = None, *, has_returns: bool = False):
@@ -10991,6 +11110,7 @@ def _record_stop_outcome_impl(
 	payments=None,
 	requires_factura_a=None,
 	credit_items=None,
+	claims=None,
 	clear_signature=False,
 ):
 	"""Shared PoD apply for driver + Tables→MATs admin. Always writes Historial."""
@@ -11084,8 +11204,35 @@ def _record_stop_outcome_impl(
 	# Payment: only relevant once something changed hands (Delivered/Partial).
 	# "separate_collector" mode means someone else collects later, so the
 	# driver isn't asked for these fields at all - ignore anything sent.
+	claim_rows = _normalize_delivery_claims(claims)
+	if claim_rows:
+		missing = [c for c in claim_rows if not c.get("note") or c.get("new_amount") is None]
+		if missing:
+			frappe.throw(_("Cada reclamo necesita justificación y un monto (o peso para calcularlo)."))
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+		try:
+			kv_set(
+				DELIVERY_CLAIMS_SCOPE,
+				f"{trip_name}:{stop_idx}",
+				{"claims": claim_rows, "at": str(now_datetime())},
+			)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "delivery claims kv")
+		summary = "\n".join(
+			_("Reclamo {0}: {1} → {2} ({3})").format(
+				c.get("item_name") or c.get("item_code") or "—",
+				flt(c.get("agreed_amount")),
+				flt(c.get("new_amount")),
+				c.get("note"),
+			)
+			for c in claim_rows
+		)
+		prev_notes = cstr(getattr(stop, "custom_pod_notes", None) or "")
+		stop.custom_pod_notes = (prev_notes + "\n" + summary).strip() if prev_notes else summary
+
 	if outcome in ("Delivered", "Partial"):
-		goods_total = flt(stop.grand_total)
+		goods_total = max(0.0, flt(stop.grand_total) - _claim_goods_reduction(claim_rows))
 		prior = flt(getattr(stop, "custom_amount_collected", 0) or 0)
 		# Factura A: explicit flag wins; else keep prior stop/SO flag.
 		if requires_factura_a is None:
@@ -11203,6 +11350,9 @@ def _record_stop_outcome_impl(
 	elif outcome == "Refused":
 		for so_name in so_names:
 			_stamp_delivery_outcome_tags(so_name, outcome, has_returns=True)
+	elif outcome == "Not Home":
+		# Stay armado (do not set Orden). Bump due + expect the caja back.
+		_record_not_home_followup(trip, stop, attempt_note or notes)
 
 	frappe.db.commit()
 
@@ -11250,6 +11400,7 @@ def driver_record_stop_outcome(
 	payments=None,
 	requires_factura_a=None,
 	credit_items=None,
+	claims=None,
 ):
 	"""Replaces/extends `driver_complete_stop` with an outcome enum.
 
@@ -11287,6 +11438,7 @@ def driver_record_stop_outcome(
 		payments=payments,
 		requires_factura_a=requires_factura_a,
 		credit_items=credit_items,
+		claims=claims,
 	)
 
 
@@ -11308,6 +11460,7 @@ def admin_record_stop_outcome(
 	payments=None,
 	requires_factura_a=None,
 	credit_items=None,
+	claims=None,
 	clear_signature=0,
 ):
 	"""Tables→MATs admin PoD editor — no driver ownership check.
@@ -11348,6 +11501,7 @@ def admin_record_stop_outcome(
 		payments=payments,
 		requires_factura_a=requires_factura_a,
 		credit_items=credit_items,
+		claims=claims,
 		clear_signature=cint(clear_signature),
 	)
 
@@ -12249,12 +12403,68 @@ def list_pending_vehicle_returns(vehicle=None, days=30):
 		)
 
 	items = sorted(agg.values(), key=lambda r: cstr(r.get("item_name") or r.get("item_code")))
+	absent = _absent_cargo_for_vehicle(vehicle, since)
 	return {
 		"vehicle": vehicle,
 		"license_plate": frappe.db.get_value("Vehicle", vehicle, "license_plate") or vehicle,
 		"items": items,
 		"captures": captures_out,
+		"absent": absent,
 	}
+
+
+def _absent_cargo_for_vehicle(vehicle, since=None):
+	"""Remitos expected back because the customer was absent (Not Home)."""
+	vehicle = cstr(vehicle or "").strip()
+	if not vehicle or not frappe.db.exists("DocType", "Table Extra Data"):
+		return []
+	rows = frappe.get_all(
+		"Table Extra Data",
+		filters={"scope": ABSENT_CARGO_SCOPE},
+		fields=["name", "row_key", "data_json"],
+		ignore_permissions=True,
+		limit=500,
+	)
+	out = []
+	since_d = getdate(since) if since else None
+	import json
+
+	for row in rows or []:
+		try:
+			data = json.loads(row.data_json or "{}")
+		except Exception:
+			continue
+		if not isinstance(data, dict):
+			continue
+		if cstr(data.get("vehicle") or "") != vehicle:
+			continue
+		if cint(data.get("received")):
+			continue
+		at = cstr(data.get("at") or "")[:10]
+		if since_d and at:
+			try:
+				if getdate(at) < since_d:
+					continue
+			except Exception:
+				pass
+		dn = cstr(data.get("delivery_note") or "")
+		note = cstr(data.get("note") or "")
+		out.append(
+			{
+				"key": row.row_key,
+				"delivery_note": dn,
+				"customer": data.get("customer"),
+				"customer_name": data.get("customer_name"),
+				"trip": data.get("trip"),
+				"stop_idx": cint(data.get("stop_idx") or 0),
+				"note": note,
+				"due": data.get("due"),
+				"reason": "absent",
+				"label": _("Remito {0} debería estar — cliente ausente").format(dn or "—")
+				+ (f": {note}" if note else ""),
+			}
+		)
+	return out
 
 
 @frappe.whitelist(allow_guest=True)
