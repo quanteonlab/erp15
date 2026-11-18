@@ -2,7 +2,7 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import cstr, flt, nowdate
+from frappe.utils import cint, cstr, flt, nowdate
 
 # Fields exposed per source doctype, plus the child-table (line items) fieldname
 # used by the 'line-items' element kind in the template designer.
@@ -61,6 +61,7 @@ _DELIVERY_CHECKLIST_FIELDS = [
 	{"fieldname": "zona", "label": "Zona", "fieldtype": "Data"},
 	{"fieldname": "horario", "label": "Horario", "fieldtype": "Data"},
 	{"fieldname": "fletero", "label": "Fletero", "fieldtype": "Data"},
+	{"fieldname": "cajas", "label": "Cajas", "fieldtype": "Data"},
 	{"fieldname": "cargado", "label": "Cargado", "fieldtype": "Data"},
 	{"fieldname": "armado_flag", "label": "Armado", "fieldtype": "Data"},
 	{"fieldname": "facturado_flag", "label": "Facturado", "fieldtype": "Data"},
@@ -252,6 +253,25 @@ def _format_units_qty(raw) -> str:
 	return f"{v:.3f}".rstrip("0").rstrip(".")
 
 
+def _round_print_number(value, places: int):
+	"""Snap binary float junk (11.129999999999999) to a short print number.
+
+	Whole values stay integers so 78000 does not print as 78000.0.
+	"""
+	if value in (None, ""):
+		return value
+	try:
+		n = float(value)
+	except (TypeError, ValueError):
+		return value
+	if n != n or n in (float("inf"), float("-inf")):
+		return value
+	n = round(n, places)
+	if abs(n - round(n)) < 10 ** (-(places + 2)):
+		return int(round(n))
+	return n
+
+
 def _format_peso_display(total_w, *, tx_uom) -> str:
 	"""Peso column: measured/est. kg, or '-' when the line is not sold by weight."""
 	# Countable UM (Nos/Uni/CAJA) → always dash, even if Item.weight_uom is Kg.
@@ -337,6 +357,9 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 		total_w = None
 
 	# Remito "Peso" = line kg (matches Pedidos PESO), not unit count.
+	# Round before money so rate × kg cannot print 11.129999999999999.
+	if total_w is not None:
+		total_w = _round_print_number(total_w, 3)
 	weight_val = total_w
 
 	out["weight"] = weight_val if weight_val not in (None, 0) else ""
@@ -378,7 +401,113 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 			out["amount"] = round(rate * float(total_w), 2)
 		elif rate > 0 and qty > 0 and not weight_based:
 			out["amount"] = round(rate * qty, 2)
+	if frappe.utils.cint(out.get("armado_missing")):
+		out["amount"] = 0
+		out["net_amount"] = 0
+		out["rate"] = 0
+		out["precio_kg"] = ""
+		out["precio_u"] = ""
+	else:
+		for key, places in (
+			("amount", 2),
+			("net_amount", 2),
+			("base_amount", 2),
+			("base_net_amount", 2),
+			("rate", 2),
+			("net_rate", 2),
+			("precio_kg", 2),
+			("precio_u", 2),
+		):
+			if out.get(key) not in (None, ""):
+				out[key] = _round_print_number(out.get(key), places)
 	return out
+
+
+def _armado_missing_line_keys(so_name) -> set:
+	"""Sales Order Item names marked faltante in armado."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name:
+		return set()
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
+			_load_armado_progress,
+		)
+
+		progress = _load_armado_progress(so_name) or {}
+	except Exception:
+		return set()
+	lines = progress.get("lines") if isinstance(progress.get("lines"), dict) else {}
+	return {
+		str(key)
+		for key, state in lines.items()
+		if isinstance(state, dict) and state.get("missing")
+	}
+
+
+def _print_totals_without_missing(data: dict, dropped_net: float) -> None:
+	"""Drop a faltante line's net (and its share of tax) from the printed total."""
+	if not dropped_net:
+		return
+	net = flt(data.get("net_total"))
+	grand = flt(data.get("grand_total"))
+	base_net = flt(data.get("base_net_total"))
+	base_grand = flt(data.get("base_grand_total"))
+	tax = max(0.0, grand - net)
+	tax_drop = tax * (dropped_net / net) if net > 0 else 0.0
+	data["net_total"] = max(0.0, net - dropped_net)
+	data["grand_total"] = max(0.0, grand - dropped_net - tax_drop)
+	if data.get("rounded_total") not in (None, ""):
+		data["rounded_total"] = data["grand_total"]
+	if data.get("base_net_total") not in (None, ""):
+		data["base_net_total"] = max(0.0, base_net - dropped_net)
+	if data.get("base_grand_total") not in (None, ""):
+		base_tax = max(0.0, base_grand - base_net)
+		base_tax_drop = base_tax * (dropped_net / base_net) if base_net > 0 else 0.0
+		data["base_grand_total"] = max(0.0, base_grand - dropped_net - base_tax_drop)
+	if data.get("base_rounded_total") not in (None, ""):
+		data["base_rounded_total"] = data.get("base_grand_total") or data["grand_total"]
+
+
+def _blank_print_line_money(row: dict) -> None:
+	row["armado_missing"] = 1
+	row["amount"] = 0
+	row["net_amount"] = 0
+	row["base_amount"] = 0
+	row["base_net_amount"] = 0
+	row["rate"] = 0
+	row["net_rate"] = 0
+	row["precio_kg"] = ""
+	row["precio_u"] = ""
+
+
+def _apply_armado_missing_print_money(source_doctype, data: dict, rows) -> None:
+	"""Printed line importe and document total are 0 for armado faltante lines."""
+	if source_doctype not in ("Sales Order", "Delivery Note", "Sales Invoice"):
+		return
+	dropped = 0.0
+	if source_doctype == "Sales Order":
+		keys = _armado_missing_line_keys(data.get("name"))
+		for row in rows or []:
+			if not isinstance(row, dict) or str(row.get("name") or "") not in keys:
+				continue
+			dropped += flt(row.get("amount"))
+			_blank_print_line_money(row)
+	else:
+		cache: dict = {}
+		for row in rows or []:
+			if not isinstance(row, dict):
+				continue
+			so_name = cstr(row.get("against_sales_order") or row.get("sales_order") or "").strip()
+			key = cstr(row.get("so_detail") or row.get("against_sales_order_item") or "").strip()
+			if not so_name or not key:
+				continue
+			if so_name not in cache:
+				cache[so_name] = _armado_missing_line_keys(so_name)
+			if key not in cache[so_name]:
+				continue
+			dropped += flt(row.get("amount"))
+			_blank_print_line_money(row)
+	_print_totals_without_missing(data, dropped)
 
 
 def _sum_line_total_weight(rows) -> float:
@@ -946,6 +1075,8 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 	item_codes = [it.item_code for it in (so.items or []) if it.item_code]
 	provisional_by_sku = _item_provisional_paths(item_codes)
 	index = (map_payload or {}).get("_index") if map_payload else None
+	missing_keys = _armado_missing_line_keys(so.name)
+	dropped_net = 0.0
 
 	for it in so.items or []:
 		loc_info = sku_to_loc.get(it.item_code) or {}
@@ -969,6 +1100,9 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		uom = it.uom or ""
 		qty = it.qty
 		qty_display = f"{flt(qty):.2f} {uom}".strip() if qty is not None else ""
+		is_missing = str(it.name) in missing_keys
+		if is_missing:
+			dropped_net += flt(it.amount)
 		row = _enrich_print_line_item(
 			{
 				"so_detail": it.name,
@@ -980,8 +1114,9 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 				"stock_uom": getattr(it, "stock_uom", None) or "",
 				"qty_display": qty_display,
 				"code_display": code_display,
-				"rate": it.rate,
-				"amount": it.amount,
+				"rate": 0 if is_missing else it.rate,
+				"amount": 0 if is_missing else it.amount,
+				"armado_missing": 1 if is_missing else 0,
 				"item_tax_template": getattr(it, "item_tax_template", None) or "",
 				"item_tax_rate": getattr(it, "item_tax_rate", None) or "",
 				"discount_percentage": getattr(it, "discount_percentage", None) or "",
@@ -1043,6 +1178,7 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"horario": horario,
 		"mat_ref": mat_ref,
 		"fletero": fletero,
+		"cajas": _armado_boxes_for_print(so.name),
 		"cargado": cargado,
 		"armado_flag": "SI" if has_dn else "NO",
 		"facturado_flag": "SI" if has_si else "NO",
@@ -1061,6 +1197,7 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"order_ean13": _armado_order_ean13(so.name),
 		"_map": map_out,
 	}
+	_print_totals_without_missing(doc, dropped_net)
 	return {"doc": doc, "lineItems": rows, "map": map_out}
 
 
@@ -1360,6 +1497,15 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 		if wh:
 			data["set_warehouse"] = wh
 
+	# Cajas from armado (ops.armado.progress). Blank when the packer never set a count.
+	if source_doctype in ("Delivery Note", "Sales Invoice", "Sales Order") and not cstr(
+		data.get("cajas") or ""
+	).strip():
+		so_for_boxes = cstr(data.get("pedido_ref") or "").strip()
+		if source_doctype == "Sales Order":
+			so_for_boxes = cstr(data.get("name") or so_for_boxes).strip()
+		data["cajas"] = _armado_boxes_for_print(so_for_boxes)
+
 
 def _trip_row_for_delivery_note(dn_name):
 	"""Active Delivery Trip (MAT) for a remito — None when not assigned."""
@@ -1401,6 +1547,28 @@ def _fletero_for_delivery_note(dn_name) -> str:
 	if not row:
 		return ""
 	return _short_person_name(row.get("fletero") or "")
+
+
+def _armado_boxes_for_print(so_name) -> str:
+	"""Box count saved in armado, or "" when the order has none."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name:
+		return ""
+	scope = f"ops.armado.progress::{so_name}"
+	if not frappe.db.exists("Table Extra Schema", scope):
+		return ""
+	raw = frappe.db.get_value("Table Extra Schema", scope, "columns_json")
+	try:
+		data = json.loads(raw or "{}")
+	except Exception:
+		return ""
+	if not isinstance(data, dict):
+		return ""
+	boxes = data.get("boxes") if isinstance(data.get("boxes"), dict) else {}
+	count = cint(boxes.get("count"))
+	if count < 1:
+		return ""
+	return str(count)
 
 
 def _mat_ref_for_delivery_note(dn_name) -> str:
@@ -1445,6 +1613,7 @@ def get_print_data(source_doctype, docname, warehouse=None, floor_id=None):
 
 	if source_doctype in ("Delivery Note", "Sales Invoice", "Purchase Receipt"):
 		_enrich_commercial_print_doc(source_doctype, data, rows)
+	_apply_armado_missing_print_money(source_doctype, data, rows)
 
 	return {
 		"doc": data,
@@ -1672,21 +1841,26 @@ def _ar_documento_no_valido_a4_elements(
 	h_items = y_sub - y_items - 3  # ~215
 	fs_title, fs, fs_sm, fs_tot = 13, 11, 10, 14
 	fs_table = 11
-	els = [
-		# Header (right)
-		{
-			"id": f"{p}-title",
-			"kind": "text",
-			"x": 80,
-			"y": y_title,
-			"width": 115,
-			"height": 6,
-			"staticText": title,
-			"fontSize": fs_title,
-			"bold": True,
-			"align": "right",
-			"textColor": "#1e3a5f",
-		},
+	els = []
+	# Black invoices no longer print the "not a valid invoice" banner.
+	if str(title or "").strip():
+		els.append(
+			{
+				"id": f"{p}-title",
+				"kind": "text",
+				"x": 80,
+				"y": y_title,
+				"width": 115,
+				"height": 6,
+				"staticText": title,
+				"fontSize": fs_title,
+				"bold": True,
+				"align": "right",
+				"textColor": "#1e3a5f",
+			}
+		)
+	els.extend(
+		[
 		{
 			"id": f"{p}-nro-label",
 			"kind": "text",
@@ -1906,7 +2080,8 @@ def _ar_documento_no_valido_a4_elements(
 			"fontSize": fs_table,
 			"columns": cols,
 		},
-	]
+		]
+	)
 	# Money fields only when requested; remito still prints Subtotal/TOTAL labels.
 	els.extend(
 		[
@@ -2467,7 +2642,7 @@ def _compact_party_doc_header_elements(
 			]
 		)
 		meta_y += row_pitch
-	max_rows = 3 if wide_rows else 4
+	max_rows = 4
 	for i, (l1, f1, l2, f2) in enumerate(rows[:max_rows]):
 		yy = meta_y + i * row_pitch
 		xa = ped_x
@@ -2526,6 +2701,9 @@ def _compact_party_doc_header_elements(
 				},
 			]
 		)
+	for el in els:
+		if el.get("fieldPath") == "cajas" or el.get("staticText") == "Cajas:":
+			el["hideWhenEmpty"] = "cajas"
 	return els
 
 
@@ -2659,6 +2837,9 @@ def _compact_commercial_a4_elements(
 	wide_n = len(_normalize_wide_metas(wide_meta))
 	# Extra mm per full-width Pedido/Remito row under the badge.
 	extra = 5 * wide_n
+	# Base header fits 3 meta rows beside wide refs, or 4 without them.
+	base_meta = 3 if wide_n else 4
+	extra += 5 * max(0, len(meta_rows or []) - base_meta)
 	header_h = (48 if use_tear else 40) + extra
 	table_y = header_h + (6 if disclaimer else 3)
 	table_w = 190
@@ -2917,6 +3098,7 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem", *, layout: str = "c
 			("Fecha:", "posting_date", "Horario:", "horario"),
 			("Vend:", "vendedor", "Zona:", "zona"),
 			("Almacen:", "set_warehouse", "Fletero:", "fletero"),
+			("Cajas:", "cajas", "", ""),
 		],
 		columns=[
 			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
@@ -3398,10 +3580,10 @@ def _en_sales_invoice_with_weights_a4_elements(id_prefix: str = "starter-sienw")
 		if not isinstance(el, dict):
 			continue
 		if el.get("id") == f"{id_prefix}-title":
-			el["staticText"] = "DOCUMENT NOT VALID AS INVOICE"
+			# Black invoice: no "not valid as invoice" banner in any language.
+			el["staticText"] = ""
 			el["fontSize"] = 13
 			el["textColor"] = "#0f172a"
-			# Keep compact height from commercial ladder (do not inflate).
 			break
 
 	for el in elements:
@@ -4317,7 +4499,7 @@ _STARTER_TEMPLATES = [
 		"gift": True,
 		"resync": True,
 		# v2: denser header/footer + larger type
-		"resync_if_missing_id": "starter-clssis-items-v3",
+		"resync_if_missing_id": "starter-clssis-notitle-v4",
 		"skip_locale_expand": True,
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_documento_no_valido_a4_elements(
@@ -4325,8 +4507,22 @@ _STARTER_TEMPLATES = [
 			party_field="customer_name",
 			id_prefix="starter-clssis",
 			columns=_CLASSIC_SISTEMA_COLUMNS,
+			title="",
 			items_id="starter-clssis-items-v3",
-		),
+		)
+		+ [
+			{
+				"id": "starter-clssis-notitle-v4",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	{
 		"template_name": "Classic · Factura Kg/U (A4)",
@@ -4336,7 +4532,7 @@ _STARTER_TEMPLATES = [
 		"gift": True,
 		"resync": True,
 		# v2: denser header/footer + larger type
-		"resync_if_missing_id": "starter-clsfac-items-v3",
+		"resync_if_missing_id": "starter-clsfac-notitle-v4",
 		"skip_locale_expand": True,
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_documento_no_valido_a4_elements(
@@ -4344,8 +4540,22 @@ _STARTER_TEMPLATES = [
 			party_field="customer_name",
 			id_prefix="starter-clsfac",
 			columns=_CLASSIC_FACTURA_KGU_COLUMNS,
+			title="",
 			items_id="starter-clsfac-items-v3",
-		),
+		)
+		+ [
+			{
+				"id": "starter-clsfac-notitle-v4",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	{
 		"template_name": "Classic · Remito (A4)",
@@ -4432,16 +4642,15 @@ _STARTER_TEMPLATES = [
 		"gift": True,
 		"resync": True,
 		# v6: 50/50 CLIENTE|Pedido header (Cargado datetime).
-		"resync_if_missing_id": "starter-siad-classic-v6",
+		"resync_if_missing_id": "starter-siad-nodisclaimer-v7",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _si_compact_a4_elements(
 			id_prefix="starter-siad",
-			disclaimer="DOCUMENTO NO VALIDO COMO FACTURA",
 			layout="classic",
 		)
 		+ [
 			{
-				"id": "starter-siad-classic-v6",
+				"id": "starter-siad-nodisclaimer-v7",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -4461,16 +4670,15 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-siadtear-header50-v7",
+		"resync_if_missing_id": "starter-siadtear-nodisclaimer-v8",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _si_compact_a4_elements(
 			id_prefix="starter-siadtear",
-			disclaimer="DOCUMENTO NO VALIDO COMO FACTURA",
 			layout="tearoff",
 		)
 		+ [
 			{
-				"id": "starter-siadtear-header50-v7",
+				"id": "starter-siadtear-nodisclaimer-v8",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -4506,14 +4714,27 @@ _STARTER_TEMPLATES = [
 		"gift": True,
 		"resync": True,
 		# v6: Detalle ~half-row via relative column weights.
-		"resync_if_missing_id": "starter-sienw-items-v6",
+		"resync_if_missing_id": "starter-sienw-notitle-v7",
 		# Official locale names (seeded via gift_core / ensure_starter).
 		"locale_names": {
 			"es": "Factura No valid. Con pesos",
 			"zh": "CH - Invoice (no valid.) with weights",
 		},
 		"margin_mm": [8, 8, 8, 8],
-		"elements": _en_sales_invoice_with_weights_a4_elements(id_prefix="starter-sienw"),
+		"elements": _en_sales_invoice_with_weights_a4_elements(id_prefix="starter-sienw")
+		+ [
+			{
+				"id": "starter-sienw-notitle-v7",
+				"kind": "shape",
+				"x": 0,
+				"y": 0,
+				"width": 0.1,
+				"height": 0.1,
+				"shapeType": "rect",
+				"color": "transparent",
+				"filled": False,
+			}
+		],
 	},
 	# ── Sales Invoice ──────────────────────────────────────────────────
 	{
@@ -5094,12 +5315,12 @@ _STARTER_TEMPLATES = [
 		"gift": True,
 		"resync": True,
 		# v9: 50/50 CLIENTE|Pedido header (Cargado datetime).
-		"resync_if_missing_id": "starter-dnrem-mat-v9",
+		"resync_if_missing_id": "starter-dnrem-cajas-v10",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem", layout="classic")
 		+ [
 			{
-				"id": "starter-dnrem-mat-v9",
+				"id": "starter-dnrem-cajas-v10",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -5119,12 +5340,12 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-dnremtear-mat-v9",
+		"resync_if_missing_id": "starter-dnremtear-cajas-v10",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnremtear", layout="tearoff")
 		+ [
 			{
-				"id": "starter-dnremtear-mat-v9",
+				"id": "starter-dnremtear-cajas-v10",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -5340,6 +5561,7 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Zona:": ("Zona:", "区域："),
 		"Horario:": ("Horario:", "时段："),
 		"Fletero:": ("Fletero:", "司机："),
+		"Cajas:": ("Cajas:", "箱数："),
 		"Cargado:": ("Cargado:", "装载："),
 		"Armado:": ("Armado:", "配货："),
 		"Facturado:": ("Facturado:", "已开票："),

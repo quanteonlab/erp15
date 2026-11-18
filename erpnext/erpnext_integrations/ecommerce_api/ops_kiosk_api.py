@@ -219,6 +219,7 @@ def _load_armado_progress(so_name: str) -> dict:
 	base["last_saved_by"] = str(data.get("last_saved_by") or "")
 	base["amended_after_pack"] = 1 if cint(data.get("amended_after_pack")) else 0
 	base["remito_desynced"] = 1 if cint(data.get("remito_desynced")) else 0
+	base["awaiting_rearm"] = 1 if cint(data.get("awaiting_rearm")) else 0
 	base["lines"] = lines
 	base["boxes"] = {
 		"count": cint(boxes.get("count")),
@@ -644,6 +645,10 @@ def _merge_armado_progress(
 
 	progress["lines"] = lines
 	progress["events"] = events
+	try:
+		_sync_missing_line_prices(so, lines)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"armado missing price {so_name}")
 	progress["snapshot"] = [
 		{"key": row["key"], "item_code": row["item_code"], "qty": flt(row["qty"]), "idx": row["idx"]}
 		for row in rows
@@ -706,6 +711,48 @@ def _armado_has_activity(progress: dict | None) -> bool:
 	return cint(((progress.get("boxes") or {}) if isinstance(progress.get("boxes"), dict) else {}).get("count")) > 0
 
 
+ARMADO_CHANGED_DISPLAY = "Armado (cambios)"
+
+
+def _set_awaiting_rearm(so_name: str, on: bool) -> None:
+	"""Remember a Preparado/Delivery demote until armado is confirmed again."""
+	so_name = str(so_name or "").strip()
+	if not so_name:
+		return
+	progress = _load_armado_progress(so_name)
+	flag = 1 if on else 0
+	if cint(progress.get("awaiting_rearm")) == flag:
+		return
+	progress["awaiting_rearm"] = flag
+	_save_armado_progress(so_name, progress)
+
+
+def apply_armado_changed_display(row) -> dict | None:
+	"""Pipeline facet: stale pack reads Armado (cambios) until it is re-confirmed.
+
+	Stored status stays Orden / Preparado / Delivery. Completado is left alone.
+	"""
+	if not isinstance(row, dict):
+		return row
+	summary = row.get("progress_summary") if isinstance(row.get("progress_summary"), dict) else {}
+	progress = row.get("armado_progress") if isinstance(row.get("armado_progress"), dict) else {}
+	changed = cint(summary.get("changed")) or cint(progress.get("changed"))
+	awaiting = cint(summary.get("awaiting_rearm")) or cint(progress.get("awaiting_rearm"))
+	disp = cstr(row.get("display_status") or row.get("status") or "")
+	if disp.startswith("Completado"):
+		base = "Completado"
+	elif disp.startswith("Delivery") or disp == "En Delivery":
+		base = "Delivery"
+	else:
+		base = disp
+	if base in ("Consulta", "Archivado", "Cancelled", "Closed", "Completado"):
+		return row
+	# Fingerprint differs, or the sheet was demoted to Orden and not re-confirmed.
+	if changed or (awaiting and base == "Orden"):
+		row["display_status"] = ARMADO_CHANGED_DISPLAY
+	return row
+
+
 def _armado_changed_since_save(item_rows: list, progress: dict | None) -> bool:
 	"""True when someone edited the order after a packer had already saved progress."""
 	if not _armado_has_activity(progress):
@@ -759,13 +806,16 @@ def _reopen_changed_preparado(so_name: str, item_rows: list | None = None, progr
 	)
 
 	disp = _display_status(so)
-	if disp != "Preparado":
+	# Delivery is already on a route, but the pack is stale — bring it back to Orden
+	# so the order shows up under Armado → Changes.
+	if disp not in ("Preparado", "Delivery"):
 		return False
 	if not _is_guest_preorder_sales_order(so):
 		# Non-guest: soft demote via ERP status marker used for Orden.
 		try:
 			so.db_set("status", "To Deliver and Bill", update_modified=True)
 			frappe.db.commit()
+			_set_awaiting_rearm(so_name, True)
 			return True
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"armado reopen non-guest {so_name}")
@@ -775,6 +825,7 @@ def _reopen_changed_preparado(so_name: str, item_rows: list | None = None, progr
 			so_name, "Orden", source="armado", ensure_planner_remito=0
 		)
 		frappe.db.commit()
+		_set_awaiting_rearm(so_name, True)
 		return True
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"armado reopen {so_name}")
@@ -806,6 +857,7 @@ def _demote_to_orden_for_armado(so) -> bool:
 		else:
 			so.db_set("status", "To Deliver and Bill", update_modified=True)
 		frappe.db.commit()
+		_set_awaiting_rearm(so.name, True)
 		so.reload()
 		disp = _display_status(so)
 		base = "Completado" if str(disp).startswith("Completado") else disp
@@ -903,6 +955,7 @@ def _summarize_progress(item_rows: list, progress: dict | None) -> dict:
 		"box_count": box_count,
 		"bucket": bucket,
 		"changed": 1 if _armado_changed_since_save(item_rows, progress) else 0,
+		"awaiting_rearm": 1 if isinstance(progress, dict) and cint(progress.get("awaiting_rearm")) else 0,
 		"amended_after_pack": amended,
 		"remito_desynced": remito_desynced,
 		"last_saved_at": last_saved_at,
@@ -1055,6 +1108,121 @@ def _armado_gate_ready(so_name: str) -> dict:
 	return progress
 
 
+def _armado_line_changed(row: dict, progress: dict) -> bool:
+	"""True when this line's ordered qty differs from the last armado snapshot."""
+	if not _armado_has_activity(progress):
+		return False
+	snap = progress.get("snapshot") if isinstance(progress.get("snapshot"), list) else []
+	if not snap:
+		return False
+	key = str(row.get("key") or "")
+	match = None
+	for s in snap:
+		if not isinstance(s, dict):
+			continue
+		if str(s.get("key") or s.get("name") or "") == key:
+			match = s
+			break
+	if match is None:
+		return True
+	return abs(flt(match.get("qty")) - flt(row.get("qty"))) > 0.0001
+
+
+def _progress_state_for_item(lines: dict, item) -> dict | None:
+	key = str(getattr(item, "name", None) or "")
+	state = lines.get(key) if key and isinstance(lines.get(key), dict) else None
+	if state is not None:
+		return state
+	code = str(getattr(item, "item_code", None) or "")
+	matches = [
+		v
+		for v in (lines or {}).values()
+		if isinstance(v, dict) and str(v.get("item_code") or "") == code
+	]
+	return matches[0] if len(matches) == 1 else None
+
+
+def _sync_missing_line_prices(so, lines: dict) -> None:
+	"""Faltante lines bill at 0. The previous rate is kept on the progress line and restored when cleared."""
+	if not isinstance(lines, dict) or not lines:
+		return
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_is_guest_preorder_sales_order,
+		_save_guest_preorder_so,
+		_set_line_rate,
+	)
+
+	changed = False
+	for item in so.items or []:
+		state = _progress_state_for_item(lines, item)
+		if not isinstance(state, dict):
+			continue
+		if state.get("missing"):
+			held = state.get("price_held") if isinstance(state.get("price_held"), dict) else None
+			if not held and (abs(flt(item.rate)) > 0.0001 or abs(flt(item.amount)) > 0.0001):
+				state["price_held"] = {
+					"rate": flt(item.rate),
+					"price_list_rate": flt(getattr(item, "price_list_rate", None)),
+					"discount_percentage": flt(getattr(item, "discount_percentage", None)),
+				}
+			if abs(flt(item.rate)) > 0.0001 or abs(flt(item.amount)) > 0.0001 or abs(flt(item.net_amount)) > 0.0001:
+				_set_line_rate(item, 0, price_list_rate=0)
+				item.discount_percentage = 0
+				item.amount = 0
+				item.net_rate = 0
+				item.net_amount = 0
+				item.base_rate = 0
+				item.base_amount = 0
+				item.base_net_rate = 0
+				item.base_net_amount = 0
+				changed = True
+		elif isinstance(state.get("price_held"), dict):
+			held = state["price_held"]
+			_set_line_rate(
+				item,
+				held.get("rate"),
+				price_list_rate=held.get("price_list_rate"),
+			)
+			item.discount_percentage = flt(held.get("discount_percentage"))
+			state.pop("price_held", None)
+			changed = True
+	if not changed:
+		return
+	so.flags.ignore_pricing_rule = True
+	so.flags.ignore_permissions = True
+	if cint(so.docstatus) == 1:
+		so.flags.ignore_validate_update_after_submit = True
+	so.calculate_taxes_and_totals()
+	# Pricing can put the rate back when it sees 0. Force faltante lines to 0 and retotal.
+	rewritten = False
+	for item in so.items or []:
+		state = _progress_state_for_item(lines, item)
+		if not isinstance(state, dict) or not state.get("missing"):
+			continue
+		if (
+			abs(flt(item.rate)) > 0.0001
+			or abs(flt(item.amount)) > 0.0001
+			or abs(flt(item.net_amount)) > 0.0001
+		):
+			_set_line_rate(item, 0, price_list_rate=0)
+			item.discount_percentage = 0
+			item.amount = 0
+			item.net_rate = 0
+			item.net_amount = 0
+			item.base_rate = 0
+			item.base_amount = 0
+			item.base_net_rate = 0
+			item.base_net_amount = 0
+			rewritten = True
+	if rewritten:
+		so.calculate_taxes_and_totals()
+	if _is_guest_preorder_sales_order(so):
+		_save_guest_preorder_so(so)
+	else:
+		so.save(ignore_permissions=True)
+	frappe.db.commit()
+
+
 def _armado_progress_public(so_name: str) -> dict | None:
 	so_name = str(so_name or "").strip()
 	if not so_name or not frappe.db.exists("Sales Order", so_name):
@@ -1069,6 +1237,7 @@ def _armado_progress_public(so_name: str) -> dict | None:
 		state = lines.get(row["key"]) if isinstance(lines.get(row["key"]), dict) else {}
 		qty_measured = state.get("qty")
 		tw = state.get("total_weight")
+		is_missing = bool(state.get("missing"))
 		out_lines.append(
 			{
 				"line_key": row["key"],
@@ -1078,7 +1247,8 @@ def _armado_progress_public(so_name: str) -> dict | None:
 				"qty": flt(qty_measured) if qty_measured is not None else None,
 				"total_weight": flt(tw) if tw is not None else None,
 				"packed": 1 if state.get("packed") else 0,
-				"missing": 1 if state.get("missing") else 0,
+				"missing": 1 if is_missing else 0,
+				"changed": 0 if is_missing else (1 if _armado_line_changed(row, progress) else 0),
 				"missing_reason": state.get("missing_reason") or "",
 				"packed_by": state.get("packed_by") or "",
 				"packed_at": state.get("packed_at") or "",
@@ -1103,6 +1273,7 @@ def _armado_progress_public(so_name: str) -> dict | None:
 		"bucket": summary["bucket"],
 		"complete": 1 if summary["bucket"] == "ready" else 0,
 		"changed": summary.get("changed") or 0,
+		"awaiting_rearm": summary.get("awaiting_rearm") or 0,
 		"amended_after_pack": summary.get("amended_after_pack") or 0,
 		"remito_desynced": summary.get("remito_desynced") or 0,
 		"write_locked": 1 if _armado_trip_in_route(so_name) else 0,
@@ -1157,6 +1328,97 @@ def resolve_armado_ean13(code=None):
 		if armado_ean13_for_order(row.name) == code:
 			return {"ok": True, "match": row.name, "ean13": code}
 	return {"ok": False, "match": None, "ean13": code}
+
+
+def _append_changed_since_armado(out: list, *, due, tag_field) -> None:
+	"""Add orders edited after the last armado save.
+
+	The Orden query and the "completed today" query both miss these: a Preparado
+	or Delivery sheet whose pack save was another day, after someone changed the
+	lines in Pedidos.
+	"""
+	seen = {o.get("name") for o in out if o.get("name")}
+	prefix = "ops.armado.progress::"
+	try:
+		schemas = frappe.get_all(
+			"Table Extra Schema",
+			filters={"name": ["like", f"{prefix}%"]},
+			fields=["name"],
+			limit_page_length=400,
+			ignore_permissions=True,
+		)
+	except Exception:
+		return
+	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
+
+	fields = [
+		"name",
+		"customer",
+		"customer_name",
+		"delivery_date",
+		"transaction_date",
+		"grand_total",
+		"currency",
+		"docstatus",
+		"status",
+		"advance_paid",
+		"modified",
+	]
+	if tag_field:
+		fields.append(tag_field)
+	added = 0
+	for row in schemas or []:
+		if added >= 80:
+			break
+		raw = str(getattr(row, "name", None) or "")
+		so_name = raw[len(prefix) :] if raw.startswith(prefix) else ""
+		if not so_name or so_name in seen or not frappe.db.exists("Sales Order", so_name):
+			continue
+		so = frappe.db.get_value("Sales Order", so_name, fields, as_dict=True)
+		if not so or cint(so.docstatus) != 1:
+			continue
+		if due is not None and str(so.delivery_date or "") != str(due):
+			continue
+		disp = _display_status_from_row(
+			so.docstatus, so.status, so.grand_total, so.advance_paid
+		)
+		base = "Completado" if str(disp).startswith("Completado") else disp
+		if base in ("Consulta", "Archivado"):
+			continue
+		progress = _load_armado_progress(so_name)
+		items = frappe.get_all(
+			"Sales Order Item",
+			filters={"parent": so_name},
+			fields=["parent", "name", "item_code", "idx", "qty"],
+			limit_page_length=200,
+			ignore_permissions=True,
+		)
+		if not _armado_changed_since_save(items, progress):
+			continue
+		tag = str(so.get(tag_field) or "") if tag_field else ""
+		out.append(
+			{
+				"name": so.name,
+				"customer": so.customer,
+				"customer_name": so.customer_name or so.customer,
+				"delivery_date": str(so.delivery_date or ""),
+				"transaction_date": str(so.transaction_date or ""),
+				"grand_total": flt(so.grand_total),
+				"currency": so.currency,
+				"docstatus": cint(so.docstatus),
+				"status": so.status,
+				"display_status": disp,
+				"is_guest": "guest_preorder=1" in tag,
+				"ean13": armado_ean13_for_order(so.name),
+				"items_count": 0,
+				"qty_total": 0,
+				"completed": 0 if base == "Orden" else 1,
+				"modified": str(so.modified or ""),
+				"practice": 1 if "armado_practice:1" in tag else 0,
+			}
+		)
+		seen.add(so.name)
+		added += 1
 
 
 @frappe.whitelist(allow_guest=True)
@@ -1336,11 +1598,17 @@ def list_armado_orders(delivery_date=None, limit=80, include_completed=None):
 			if len(out) >= limit * 2:
 				break
 
+	_append_changed_since_armado(out, due=due, tag_field=tag_field)
 	_attach_armado_list_progress(out)
 	# Prefer armado confirm/save stamp when present; drop Completados not from today.
+	# A post-armado edit stays in the queue even when the pack save was another day.
 	day = getdate(today())
 	filtered = []
 	for order in out:
+		summary = order.get("progress_summary") if isinstance(order.get("progress_summary"), dict) else {}
+		if cint(summary.get("changed")):
+			filtered.append(order)
+			continue
 		if not cint(order.get("completed")):
 			filtered.append(order)
 			continue
@@ -1857,7 +2125,8 @@ def confirm_armado(preorder_name=None, items=None, pin=None, packed=None, missin
 	current = _display_status(so)
 	base = "Completado" if str(current).startswith("Completado") else current
 	if base == "Preparado":
-		# Idempotent: already armado and unchanged — return sheet without regressing.
+		# Idempotent: already armado and unchanged — drop the rework facet.
+		_set_awaiting_rearm(preorder_name, False)
 		out = get_armado_order(preorder_name)
 		order = out.get("order") if isinstance(out, dict) else None
 		return {
@@ -1897,6 +2166,7 @@ def confirm_armado(preorder_name=None, items=None, pin=None, packed=None, missin
 			detail=str(cint((progress.get("boxes") or {}).get("count"))),
 		)
 	)
+	progress["awaiting_rearm"] = 0
 	_save_armado_progress(preorder_name, progress)
 
 	detail = set_guest_preorder_status(

@@ -705,6 +705,139 @@ def get_archivo_entry(name=None):
 	return _apply_overdue(_row_dict(doc))
 
 
+def _party_display_name(party_type=None, party=None) -> str:
+	"""Human label for title slug (Supplier/Customer/Employee name when linked)."""
+	party = _as_str(party)
+	if not party:
+		return ""
+	pt = _as_str(party_type)
+	try:
+		if pt == "Supplier" and frappe.db.exists("Supplier", party):
+			return cstr(frappe.db.get_value("Supplier", party, "supplier_name") or party).strip() or party
+		if pt == "Customer" and frappe.db.exists("Customer", party):
+			return cstr(frappe.db.get_value("Customer", party, "customer_name") or party).strip() or party
+		if pt == "Employee" and frappe.db.exists("Employee", party):
+			return cstr(frappe.db.get_value("Employee", party, "employee_name") or party).strip() or party
+	except Exception:
+		pass
+	return party
+
+
+def _kind_label_for_title(kind=None) -> str:
+	info = _resolve_kind(kind or "other_expense")
+	return (
+		cstr(info.get("label_es") or info.get("label_en") or info.get("label_zh") or info.get("code") or "")
+		.strip()
+	)
+
+
+def _date_slug_for_title(posting_date=None) -> str:
+	raw = _as_str(posting_date) or nowdate()
+	try:
+		return str(getdate(raw))
+	except Exception:
+		return str(nowdate())
+
+
+def build_archivo_title_base(posting_date=None, kind=None, party=None, party_type=None) -> str:
+	"""``YYYY-MM-DD · Proveedor · Factura de compra`` (omit empty party)."""
+	parts = [_date_slug_for_title(posting_date)]
+	party_label = _party_display_name(party_type, party)
+	if party_label:
+		parts.append(party_label)
+	kind_label = _kind_label_for_title(kind)
+	if kind_label:
+		parts.append(kind_label)
+	# Leave room for `` · N`` uniqueness suffix (title field ~140).
+	return " · ".join(parts)[:120].strip(" ·")
+
+
+def ensure_unique_archivo_title(title=None, exclude_name=None) -> str:
+	"""If ``title`` already exists on another Archivo row, append `` · 2``, `` · 3``, …"""
+	_require_doctype()
+	base = _as_str(title)[:140]
+	if not base:
+		return base
+	exclude = _as_str(exclude_name)
+
+	def _taken(candidate: str) -> bool:
+		names = frappe.get_all(
+			DOCTYPE,
+			filters={"title": candidate},
+			pluck="name",
+			limit_page_length=5,
+			ignore_permissions=True,
+		)
+		if exclude:
+			names = [n for n in (names or []) if cstr(n) != exclude]
+		return bool(names)
+
+	if not _taken(base):
+		return base
+	n = 2
+	while n < 1000:
+		# Keep under 140 chars.
+		suffix = f" · {n}"
+		stem = base[: max(1, 140 - len(suffix))]
+		candidate = f"{stem}{suffix}"
+		if not _taken(candidate):
+			return candidate
+		n += 1
+	return f"{base[:130]} · {frappe.generate_hash(length=6)}"
+
+
+def resolve_archivo_title(
+	title=None,
+	posting_date=None,
+	kind=None,
+	party=None,
+	party_type=None,
+	exclude_name=None,
+) -> str:
+	"""Use given title, or auto-build from date+party+kind; then uniquify."""
+	t = _as_str(title)
+	if t.lower() in ("null", "undefined", "none"):
+		t = ""
+	if not t:
+		t = build_archivo_title_base(
+			posting_date=posting_date,
+			kind=kind,
+			party=party,
+			party_type=party_type,
+		)
+	if not t:
+		frappe.throw(_("title is required"))
+	return ensure_unique_archivo_title(t, exclude_name=exclude_name)
+
+
+@frappe.whitelist(allow_guest=True)
+def suggest_archivo_title(
+	posting_date=None,
+	kind=None,
+	party=None,
+	party_type=None,
+	exclude_name=None,
+	title=None,
+):
+	"""Documentos form: preview auto title (unique) from date + party + kind."""
+	_require_app_permission()
+	_require_doctype()
+	base = build_archivo_title_base(
+		posting_date=posting_date,
+		kind=kind,
+		party=party,
+		party_type=party_type,
+	)
+	# If caller passed a manual title stem, uniquify that instead.
+	stem = _as_str(title) or base
+	unique = ensure_unique_archivo_title(stem, exclude_name=exclude_name)
+	return {
+		"ok": 1,
+		"base": base,
+		"title": unique,
+	}
+
+
 @frappe.whitelist(allow_guest=True)
 def create_archivo_entry(
 	title=None,
@@ -734,9 +867,6 @@ def create_archivo_entry(
 	"""Create one Archivo row (local_only until Contabilizar)."""
 	_require_app_permission()
 	_require_doctype()
-	title = _as_str(title)
-	if not title:
-		frappe.throw(_("title is required"))
 	kind_info = _resolve_kind(kind or "other_expense")
 	tmpl = _as_str(sync_template) or kind_info["sync_template"]
 	if tmpl not in SYNC_TEMPLATES:
@@ -777,6 +907,14 @@ def create_archivo_entry(
 	pay_date = _as_str(payment_date)
 	if ws == "paid" and not pay_date:
 		pay_date = pd
+
+	title = resolve_archivo_title(
+		title,
+		posting_date=pd,
+		kind=kind_info["code"],
+		party=party,
+		party_type=pt,
+	)
 
 	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc(
@@ -887,6 +1025,16 @@ def update_archivo_entry(name=None, changes=None):
 			if doc.erp_sync_status == "local_only":
 				doc.erp_sync_status = "linked"
 				doc.sync_error_message = None
+
+	# Empty title → rebuild; always uniquify vs other rows (keep own name).
+	doc.title = resolve_archivo_title(
+		getattr(doc, "title", None),
+		posting_date=getattr(doc, "posting_date", None),
+		kind=getattr(doc, "kind", None),
+		party=getattr(doc, "party", None),
+		party_type=getattr(doc, "party_type", None),
+		exclude_name=doc.name,
+	)
 
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()

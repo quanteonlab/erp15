@@ -2327,11 +2327,30 @@ def suite_5_11_pos_session():
             assert "NO-SUCH-SKU" not in stored
             if len(rows) > 1:
                 assert stored[rows[1]["line_key"]]["missing"] is True, stored
+                so_miss = frappe.get_doc("Sales Order", so_name)
+                missed = next(i for i in so_miss.items if i.name == rows[1]["line_key"])
+                assert flt(missed.rate) == 0 and flt(missed.amount) == 0, (
+                    missed.rate,
+                    missed.amount,
+                )
+                held = (stored[rows[1]["line_key"]] or {}).get("price_held") or {}
+                assert flt(held.get("rate")) > 0, held
+                pub_now = oka._armado_progress_public(so_name) or {}
+                by_key = {l["line_key"]: l for l in pub_now.get("lines") or []}
+                assert by_key[rows[1]["line_key"]]["missing"] == 1
+                assert by_key[rows[1]["line_key"]]["changed"] == 0
+                assert flt(so_miss.items[0].amount) > 0
+                assert abs(
+                    flt(so_miss.net_total) - flt(so_miss.items[0].net_amount or so_miss.items[0].amount)
+                ) < 0.05, (so_miss.net_total, so_miss.items[0].amount, missed.amount)
             # After pack activity exists: admin-changed Preparado must reopen to Orden.
             api.set_guest_preorder_status(so_name, "Preparado", source="armado")
             progress = oka._load_armado_progress(so_name)
             progress["snapshot"] = [{"item_code": "OLD-SKU", "qty": 1, "name": "old-line"}]
             oka._save_armado_progress(so_name, progress)
+            changed_pub = oka._armado_progress_public(so_name) or {}
+            changed_by = {l["line_key"]: l for l in changed_pub.get("lines") or []}
+            assert changed_by[rows[0]["line_key"]]["changed"] == 1, changed_by.get(rows[0]["line_key"])
             so_doc = frappe.get_doc("Sales Order", so_name)
             item_rows = list(so_doc.items or [])
             assert oka._armado_changed_since_save(item_rows, progress), "expected changed fingerprint"
@@ -2340,6 +2359,11 @@ def suite_5_11_pos_session():
             )
             so_doc.reload()
             assert _display_status(so_doc) == "Orden", _display_status(so_doc)
+            detail_changed = api.get_guest_preorder(so_name)
+            assert detail_changed.get("display_status") == "Armado (cambios)", (
+                detail_changed.get("display_status"),
+                (detail_changed.get("armado_progress") or {}).get("changed"),
+            )
             # Delivery → Armado: sheet writable; Guardar demotes to Orden and persists qty.
             api.set_guest_preorder_status(
                 so_name, "Delivery", source="armado", allow_no_mat=1
@@ -2368,6 +2392,11 @@ def suite_5_11_pos_session():
             so_after = frappe.get_doc("Sales Order", so_name)
             assert _display_status(so_after) == "Orden", (
                 f"expected Orden after armado save from Delivery, got {_display_status(so_after)}"
+            )
+            detail_rework = api.get_guest_preorder(so_name)
+            assert detail_rework.get("display_status") == "Armado (cambios)", (
+                "pipeline should stay Armado (cambios) until the rework is confirmed, got "
+                f"{detail_rework.get('display_status')}"
             )
             assert flt(so_after.items[0].qty) == 2, (
                 f"expected qty 2 after Delivery→Armado save, got {so_after.items[0].qty}"
@@ -2451,6 +2480,11 @@ def suite_5_11_pos_session():
                 box_count=2,
             )
             assert confirmed.get("ok"), confirmed
+            detail_armed = api.get_guest_preorder(so_name)
+            assert detail_armed.get("display_status") == "Preparado", (
+                "re-confirmed pack should leave the pipeline on Armado, got "
+                f"{detail_armed.get('display_status')}"
+            )
             listed = oka.list_armado_orders(include_completed=1, limit=80)
             match = next((o for o in listed.get("orders") or [] if o.get("name") == so_name), None)
             assert match and match.get("completed") == 1, match
@@ -2458,6 +2492,10 @@ def suite_5_11_pos_session():
             public = oka.get_armado_progress(so_name)
             assert public["progress"]["box_count"] == 2, public
             assert public["progress"]["complete"] == 1, public
+            from erpnext.erpnext_integrations.ecommerce_api import print_templates_api as pta
+
+            chk = pta._delivery_checklist_print_data(so_name)
+            assert (chk.get("doc") or {}).get("cajas") == "2", (chk.get("doc") or {}).get("cajas")
         finally:
             if so_name and frappe.db.exists("Sales Order", so_name):
                 doc = frappe.get_doc("Sales Order", so_name)
@@ -2998,6 +3036,21 @@ def suite_5_12_modules_read():
             }
         )
         assert abs(flt(weighed.get("weight")) - 13.43) < 1e-9, weighed
+        # Binary float weight must not print as 11.129999999999999 or blow up Importe.
+        dirty = pta._enrich_print_line_item(
+            {
+                "item_code": "SMOKE-WT",
+                "item_name": "Barra",
+                "qty": 3,
+                "uom": "WEIGHT",
+                "total_weight": 11.129999999999999,
+                "rate": 9200,
+                "amount": 11.129999999999999 * 9200,
+            }
+        )
+        assert abs(flt(dirty.get("weight")) - 11.13) < 1e-9, dirty
+        assert abs(flt(dirty.get("amount")) - round(flt(dirty.get("amount")), 2)) < 1e-9, dirty
+        assert "." not in str(dirty.get("amount")) or len(str(dirty.get("amount")).split(".")[-1]) <= 2, dirty
         assert abs(flt(weighed.get("total_weight")) - 13.43) < 1e-9, weighed
         assert weighed.get("units_qty") == "4", weighed
         assert weighed.get("um_display") == "Kil", weighed
@@ -3050,15 +3103,22 @@ def suite_5_12_modules_read():
         assert any(
             isinstance(e, dict) and e.get("label") == "UM" for e in (sienw_items.get("columns") or [])
         ), sienw_items
-        # Sole header title — not "SALES INVOICE" + non-valid banner.
+        # Black invoice: no "not valid as invoice" banner, and not "SALES INVOICE".
         # Use exact id (not endswith "-title") — Observations uses id "...-obs-title".
         header = next(
             (e for e in sienw if isinstance(e, dict) and e.get("id") == "starter-sienw-title"),
             None,
         )
-        assert header and header.get("staticText") == "DOCUMENT NOT VALID AS INVOICE", header
+        assert header and not str(header.get("staticText") or "").strip(), header
         assert not any(
-            isinstance(e, dict) and e.get("staticText") == "SALES INVOICE" for e in sienw
+            isinstance(e, dict)
+            and e.get("staticText") in (
+                "SALES INVOICE",
+                "DOCUMENT NOT VALID AS INVOICE",
+                "DOCUMENTO NO VALIDO COMO FACTURA",
+                "非正式发票单据",
+            )
+            for e in sienw
         ), sienw
         # Compact header pitch; no signature; footer near page bottom.
         nro = next(e for e in sienw if isinstance(e, dict) and e.get("id") == "starter-sienw-nro")
@@ -3071,7 +3131,7 @@ def suite_5_12_modules_read():
         ), sienw
         obs_box = next(e for e in sienw if isinstance(e, dict) and e.get("id") == "starter-sienw-obs-box")
         assert float(obs_box.get("y") or 0) >= 250, obs_box
-        assert sienw_items.get("id") == "starter-sienw-items-v5", sienw_items.get("id")
+        assert sienw_items.get("id") == "starter-sienw-items-v6", sienw_items.get("id")
         # Official EN + ES + CH seeded names (gift_core / ensure_starter).
         starter_names = {
             s.get("template_name")
@@ -3098,9 +3158,12 @@ def suite_5_12_modules_read():
             (e for e in es_els if isinstance(e, dict) and e.get("id") == "starter-sienw-title"),
             None,
         )
-        assert es_header and es_header.get("staticText") == "DOCUMENTO NO VALIDO COMO FACTURA", es_header
+        assert es_header and not str(es_header.get("staticText") or "").strip(), es_header
         assert not any(
-            isinstance(e, dict) and e.get("staticText") == "FACTURA DE VENTA" for e in es_els
+            isinstance(e, dict)
+            and e.get("staticText")
+            in ("FACTURA DE VENTA", "DOCUMENTO NO VALIDO COMO FACTURA", "非正式发票单据")
+            for e in es_els
         ), es_els
         # DN remito keeps line amount for Importe even when WEIGHT + no measured kg yet.
         dn_amt = pta._enrich_print_line_item(
@@ -3150,6 +3213,18 @@ def suite_5_12_modules_read():
             None,
         )
         assert wide_remito and wide_remito.get("fieldPath") == "name", wide_remito
+        cajas_el = next(
+            (e for e in remito_els if isinstance(e, dict) and e.get("fieldPath") == "cajas"),
+            None,
+        )
+        assert cajas_el and cajas_el.get("hideWhenEmpty") == "cajas", cajas_el
+        items_y = float(items_el.get("y") or 0)
+        assert float(cajas_el.get("y") or 0) + float(cajas_el.get("height") or 0) <= items_y, (
+            cajas_el,
+            items_el.get("y"),
+        )
+        assert pta._armado_boxes_for_print("") == ""
+        assert pta._armado_boxes_for_print("NO-SUCH") == ""
         # Remito must not sit in the 2-col Fecha row.
         assert not any(
             isinstance(e, dict)
@@ -5482,6 +5557,40 @@ def suite_5_18_archivo():
         agg = aa.get_archivo_aggregates()
         assert "totals" in agg and "ops_total" in agg["totals"], agg
 
+    def check_auto_title_unique():
+        """Empty title → date · kind; duplicate stem gets `` · 2``."""
+        company = resolve_company() or frappe.db.get_value("Company", {}, "name")
+        pd = "2026-11-18"
+        kind = "supplier_invoice"
+        a = aa.create_archivo_entry(
+            title="",
+            kind=kind,
+            posting_date=pd,
+            amount=100,
+            company=company,
+            notes="I014_SMOKE_TITLE",
+        )
+        created.append(a["name"])
+        base = aa.build_archivo_title_base(
+            posting_date=pd, kind=kind, party=None, party_type=None
+        )
+        assert a.get("title") == base or a.get("title", "").startswith(base), a
+
+        b = aa.create_archivo_entry(
+            title="",
+            kind=kind,
+            posting_date=pd,
+            amount=200,
+            company=company,
+            notes="I014_SMOKE_TITLE",
+        )
+        created.append(b["name"])
+        assert b.get("title") != a.get("title"), (a.get("title"), b.get("title"))
+        assert " · " in (b.get("title") or ""), b
+        sug = aa.suggest_archivo_title(posting_date=pd, kind=kind)
+        assert sug.get("ok") and sug.get("title"), sug
+        assert sug["title"] != a["title"] and sug["title"] != b["title"], sug
+
     def check_custom_kind():
         out = aa.save_archivo_custom_kind(
             code="smoke_permiso",
@@ -5547,6 +5656,7 @@ def suite_5_18_archivo():
     try:
         _run("5.18.1 list_archivo_kinds", check_kinds, "S2")
         _run("5.18.2 create paper + expense + list/agg", check_create_paper_and_expense, "S2")
+        _run("5.18.2b auto title + unique suffix", check_auto_title_unique, "S2")
         _run("5.18.3 save custom kind", check_custom_kind, "S3")
         _run("5.18.4 enqueue bulk → queue → classify → confirm (i051)", check_inbox_enqueue_classify_confirm, "S2")
     finally:

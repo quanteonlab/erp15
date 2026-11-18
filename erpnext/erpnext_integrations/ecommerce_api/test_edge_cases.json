@@ -6420,9 +6420,9 @@
         "kind": "petty_expense",
         "amount": null
       },
-      "expect": "no_500",
+      "expect": "ok",
       "source": "regression",
-      "bug": "create_archivo_entry with null title must controlled error not TypeError"
+      "bug": "create_archivo_entry with null title auto-builds date · kind (no TypeError)"
     },
     {
       "id": "create_archivo_entry_empty_title",
@@ -6432,9 +6432,24 @@
         "kind": "other_document",
         "amount": ""
       },
-      "expect": "no_500",
+      "expect": "ok",
       "source": "regression",
-      "bug": "create_archivo_entry with empty title is controlled ValidationError"
+      "bug": "create_archivo_entry with empty title auto-builds from date+kind instead of ValidationError"
+    },
+    {
+      "id": "suggest_archivo_title_nulls",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.suggest_archivo_title",
+      "args": {
+        "posting_date": null,
+        "kind": null,
+        "party": null,
+        "party_type": "null",
+        "exclude_name": "",
+        "title": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "suggest_archivo_title dirty nulls must return a base title not 500"
     },
     {
       "id": "list_archivo_entries_null_filters",

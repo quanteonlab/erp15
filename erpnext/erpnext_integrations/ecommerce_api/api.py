@@ -6641,9 +6641,13 @@ def get_guest_preorders_list(
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
 			_attach_armado_progress_summaries,
+			apply_armado_changed_display,
 		)
 
 		_attach_armado_progress_summaries(filtered, reopen_changed_completed=False)
+
+		for o in filtered:
+			apply_armado_changed_display(o)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "attach armado list progress")
 
@@ -6837,9 +6841,12 @@ def get_guest_preorder(preorder_name):
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
 			_armado_progress_public,
+			apply_armado_changed_display,
 		)
 
 		payload["armado_progress"] = _armado_progress_public(preorder_name)
+
+		apply_armado_changed_display(payload)
 	except Exception:
 		payload["armado_progress"] = None
 	payload["is_credit_note"] = cstr(tags.get("credit_note") or "") in ("1", "true", "yes")
@@ -7210,6 +7217,8 @@ def _pipeline_base_status(status_or_display) -> str:
 		return s
 	if s.startswith("Completado"):
 		return "Completado"
+	if s == "Armado (cambios)" or s.startswith("Armado ("):
+		return "Preparado"
 	if s.startswith("Delivery") or s == "En Delivery":
 		return "Delivery"
 	return s
