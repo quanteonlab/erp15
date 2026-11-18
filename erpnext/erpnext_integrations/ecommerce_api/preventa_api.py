@@ -31,7 +31,12 @@ from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
 	customer_salesmen,
 	_acting_username,
 )
-from erpnext.erpnext_integrations.ecommerce_api.tags_api import set_tags_for_doc, tags_map_for_docs
+from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
+	TAG_ORGANICO,
+	add_tags_for_doc,
+	set_tags_for_doc,
+	tags_map_for_docs,
+)
 from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
 
 # ---------------------------------------------------------------------------
@@ -619,6 +624,52 @@ def _apply_lead_values(doc, values: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _backfill_organic_clientes_for_board(owner_user: str) -> int:
+	"""Ensure assigned Customers show under CLIENTE ✓ (organicos) for this seller."""
+	owner_user = cstr(owner_user or "").strip()
+	if not owner_user or owner_user in ("Guest", "Administrator"):
+		return 0
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+			_assigned_customer_names,
+		)
+
+		assigned = list(_assigned_customer_names(owner_user) or [])
+	except Exception:
+		return 0
+	if not assigned:
+		return 0
+
+	owned_leads = frappe.get_all(
+		"Lead",
+		filters={"lead_owner": owner_user, "disabled": 0},
+		pluck="name",
+		ignore_permissions=True,
+	)
+	linked = set()
+	if owned_leads:
+		linked = set(
+			frappe.get_all(
+				"Customer",
+				filters={"lead_name": ["in", owned_leads]},
+				pluck="name",
+				ignore_permissions=True,
+			)
+			or []
+		)
+	created = 0
+	for cust in assigned[:80]:
+		if cust in linked:
+			continue
+		out = ensure_organic_cliente_for_seller(cust, owner_user, commit=False)
+		if out and out.get("lead"):
+			created += 1
+			linked.add(cust)
+	if created:
+		frappe.db.commit()
+	return created
+
+
 @frappe.whitelist(allow_guest=True)
 def get_my_board(owner_user=None):
 	owner_user = (owner_user or _acting_user() or "").strip()
@@ -635,6 +686,12 @@ def get_my_board(owner_user=None):
 		ensure_client_access_custom_fields()
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "client access fields ensure failed")
+
+	# Assigned / Orden clients → CLIENTE ✓ (organicos). Best-effort backfill.
+	try:
+		_backfill_organic_clientes_for_board(owner_user)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"organic cliente backfill for {owner_user}")
 
 	columns = _load_board_columns(owner_user)
 	settings = _load_preventa_settings()
@@ -1256,7 +1313,13 @@ def upsert_lead(lead=None, values=None):
 		doc.save(ignore_permissions=True)
 
 	if "tags" in values:
-		set_tags_for_doc("Lead", doc.name, tags=values.get("tags"), commit=False)
+		set_tags_for_doc(
+			"Lead",
+			doc.name,
+			tags=values.get("tags"),
+			commit=False,
+			enforce_protected=True,
+		)
 
 	frappe.db.commit()
 	return {"ok": True, "name": doc.name}
@@ -2722,6 +2785,121 @@ def _normalize_phone(value) -> str | None:
 def _normalize_email(value) -> str | None:
 	value = str(value or "").strip().lower()
 	return value or None
+
+
+def ensure_organic_cliente_for_seller(customer, owner_user, *, commit: bool = True):
+	"""Mirror an assigned/Orden Customer onto the seller's Preventa CLIENTE column.
+
+	Creates or updates a Converted Lead owned by ``owner_user``, stamps the
+	protected ``organicos`` tag (metrics / commissions), and links
+	``Customer.lead_name`` when free. Best-effort — never raises to callers.
+	"""
+	try:
+		customer = cstr(customer or "").strip()
+		owner_user = cstr(owner_user or "").strip()
+		if not customer or not owner_user or owner_user in ("Guest", "Administrator"):
+			return None
+		if not frappe.db.exists("Customer", customer):
+			return None
+
+		ensure_preventa_custom_fields()
+		cust = frappe.db.get_value(
+			"Customer",
+			customer,
+			["name", "customer_name", "lead_name", "mobile_no", "email_id"],
+			as_dict=True,
+		)
+		if not cust:
+			return None
+
+		label = cstr(cust.customer_name or customer).strip() or customer
+		won = _won_stage_key(owner_user)
+		lead_name = None
+
+		# Prefer Customer's linked Lead when unowned or already this seller's.
+		linked = cstr(cust.lead_name or "").strip()
+		if linked and frappe.db.exists("Lead", linked):
+			lo = cstr(frappe.db.get_value("Lead", linked, "lead_owner") or "").strip()
+			disabled = cint(frappe.db.get_value("Lead", linked, "disabled") or 0)
+			status = cstr(frappe.db.get_value("Lead", linked, "status") or "")
+			if not disabled and status != "Do Not Contact" and (not lo or lo == owner_user):
+				lead_name = linked
+
+		# Else reuse a board Lead this seller already has for the same name.
+		if not lead_name:
+			found = frappe.get_all(
+				"Lead",
+				filters={
+					"lead_owner": owner_user,
+					"disabled": 0,
+					"status": ["!=", "Do Not Contact"],
+				},
+				or_filters=[
+					["lead_name", "=", label],
+					["company_name", "=", label],
+					["company_name", "=", customer],
+				],
+				fields=["name"],
+				order_by="modified desc",
+				limit_page_length=1,
+				ignore_permissions=True,
+			)
+			if found:
+				lead_name = found[0].name
+
+		if lead_name:
+			frappe.db.set_value(
+				"Lead",
+				lead_name,
+				{
+					"status": "Converted",
+					"lead_owner": owner_user,
+					"custom_preventa_stage": won,
+					"custom_preventa_stage_since": now_datetime(),
+				},
+				update_modified=False,
+			)
+		else:
+			lead_doc = frappe.new_doc("Lead")
+			lead_doc.lead_name = label
+			lead_doc.company_name = label
+			lead_doc.lead_owner = owner_user
+			lead_doc.source = _ensure_lead_source_catalog()
+			lead_doc.custom_preventa_stage = won
+			lead_doc.custom_preventa_stage_since = now_datetime()
+			if cust.mobile_no:
+				lead_doc.mobile_no = cust.mobile_no
+			if cust.email_id:
+				lead_doc.email_id = cust.email_id
+			lead_doc.flags.ignore_permissions = True
+			lead_doc.insert(ignore_permissions=True)
+			lead_name = lead_doc.name
+			frappe.db.set_value(
+				"Lead",
+				lead_name,
+				{
+					"status": "Converted",
+					"custom_preventa_stage": won,
+					"custom_preventa_stage_since": now_datetime(),
+				},
+				update_modified=False,
+			)
+
+		# Link Customer → Lead when free so board cards show the Customer id.
+		if not linked:
+			frappe.db.set_value("Customer", customer, "lead_name", lead_name, update_modified=False)
+
+		add_tags_for_doc("Lead", lead_name, tags=[TAG_ORGANICO], commit=False)
+		add_tags_for_doc("Customer", customer, tags=[TAG_ORGANICO], commit=False)
+		if commit:
+			frappe.db.commit()
+		return {"ok": True, "lead": lead_name, "customer": customer, "owner": owner_user, "tag": TAG_ORGANICO}
+	except Exception:
+		frappe.log_error(
+			frappe.get_traceback(),
+			f"ensure_organic_cliente_for_seller {customer} {owner_user}",
+		)
+		return None
 
 
 def sync_lead_from_guest_preorder(so_name, guest_name=None, guest_phone=None, guest_email=None, seller_ref_user=None):

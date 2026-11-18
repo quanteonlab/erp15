@@ -2570,6 +2570,41 @@
       "expect": "fail"
     },
     {
+      "id": "doc_activity_info_nulls",
+      "source": "regression",
+      "bug": "log_doc_activity_info with null doctype/name/message returns None (no TypeError) — seller attribution helper",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.log_doc_activity_info",
+      "args": {
+        "doctype": null,
+        "name": null,
+        "message": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "doc_activity_for_dn_null",
+      "source": "regression",
+      "bug": "log_activity_for_delivery_note with null DN returns 0",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.log_activity_for_delivery_note",
+      "args": {
+        "delivery_note": null,
+        "message": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "doc_activity_stamp_versions_nulls",
+      "source": "regression",
+      "bug": "stamp_recent_versions_actor with nulls returns 0 without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.stamp_recent_versions_actor",
+      "args": {
+        "doctype": null,
+        "name": null,
+        "user": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_pending_deliveries_null_date",
       "source": "regression",
       "bug": "get_pending_deliveries with null date must default as_of=today and return deliveries list (due<=as_of queue), never TypeError",
@@ -4514,7 +4549,7 @@
     {
       "id": "ensure_tms_lean_site_fields_ok",
       "source": "regression",
-      "bug": "ensure_tms_lean_site_fields creates missing TMS custom fields without TypeError",
+      "bug": "ensure_tms_lean_site_fields creates missing TMS custom fields (incl. depot pickup warehouse) without TypeError",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.ensure_tms_lean_site_fields",
       "args": {},
       "expect": "ok"
@@ -4894,6 +4929,29 @@
         ]
       },
       "expect": "ok"
+    },
+    {
+      "id": "ensure_organic_cliente_nulls",
+      "source": "regression",
+      "bug": "ensure_organic_cliente_for_seller with null customer/owner returns None (no TypeError)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.ensure_organic_cliente_for_seller",
+      "args": {
+        "customer": null,
+        "owner_user": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "set_doc_tags_protected_organicos_empty",
+      "source": "regression",
+      "bug": "set_doc_tags with empty tags list is controlled (does not crash); protected organicos stay admin-gated when present",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tags_api.set_doc_tags",
+      "args": {
+        "reference_doctype": "Lead",
+        "reference_name": null,
+        "tags": null
+      },
+      "expect": "fail"
     },
     {
       "id": "ensure_salesman_null",
@@ -6336,6 +6394,25 @@
       "bug": "Auto Assign MAT with empty list is controlled"
     },
     {
+      "id": "auto_assign_preorders_to_mats_missing_depot_col",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.auto_assign_preorders_to_mats",
+      "args": {
+        "preorder_names": ["SO-MISSING-DEPOT-COL-REGRESSION"],
+        "company": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "auto_assign must not OperationalError 1054 Unknown column custom_pickup_warehouse — ensure depot fields + has_column before SELECT; missing SO is controlled"
+    },
+    {
+      "id": "ensure_tms_depot_fields_via_lean",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.ensure_tms_lean_site_fields",
+      "args": {},
+      "expect": "ok",
+      "source": "regression",
+      "bug": "ensure_tms_lean_site_fields must create Company.custom_default_warehouse + Delivery Trip.custom_pickup_warehouse when missing"
+    },
+    {
       "id": "create_archivo_entry_null_title",
       "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.create_archivo_entry",
       "args": {
@@ -7744,6 +7821,18 @@
       "expect": "no_500",
       "source": "regression",
       "bug": "daily CSV with UNIDADES=0 skips ratios without ZeroDivision/500"
+    },
+    {
+      "id": "weight_import_csv_only_weight_like_dirty_default_allow",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_api.import_unit_weight_ranges_from_daily_csv",
+      "args": {
+        "csv_text": "FECHA,CODIGO,CANTIDAD,UNIDADES\n2026-01-01,PACK1,1,1\n2026-01-02,PACK1,1,1\n2026-01-03,PACK1,1,1\n2026-01-04,PACK1,1,1\n2026-01-05,PACK1,1,1\n",
+        "dry_run": 1,
+        "only_weight_like": "null"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "only_weight_like null/dirty defaults to allow all SKUs; returns accepted/skipped_by_reason without TypeError"
     },
     {
       "id": "weight_expected_band_null_item",

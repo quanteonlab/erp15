@@ -77,6 +77,7 @@ after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.coupons_api.ensure_coupon_custom_fields",
 	"erpnext.erpnext_integrations.ecommerce_api.tax_api.ensure_tax_catalog_all_companies",
 	"erpnext.erpnext_integrations.ecommerce_api.employee_api.ensure_gender_masters",
+	"erpnext.erpnext_integrations.ecommerce_api.tms_api.ensure_tms_lean_site_fields",
 ]
 
 boot_session = "erpnext.startup.boot.boot_session"

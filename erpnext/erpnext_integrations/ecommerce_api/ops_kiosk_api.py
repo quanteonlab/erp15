@@ -651,6 +651,26 @@ def _merge_armado_progress(
 	progress["last_saved_at"] = cstr(frappe.utils.now())
 	progress["last_saved_by"] = _operator_label(identity)
 	_save_armado_progress(so_name, progress)
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import log_doc_activity_info
+
+		bits = []
+		if packed_codes:
+			bits.append(_("packed {0}").format(", ".join(packed_codes[:12])))
+		if missing_codes:
+			bits.append(_("missing {0}").format(", ".join(missing_codes[:12])))
+		if unpacked_codes:
+			bits.append(_("unchecked {0}").format(", ".join(unpacked_codes[:8])))
+		if bits:
+			actor = identity.get("user_id") or identity.get("employee_name") or None
+			log_doc_activity_info(
+				"Sales Order",
+				so_name,
+				_("armado: {0}").format("; ".join(bits)),
+				user=actor,
+			)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"armado activity {so_name}")
 	return progress
 
 
@@ -1885,6 +1905,19 @@ def confirm_armado(preorder_name=None, items=None, pin=None, packed=None, missin
 	_log_armado_operator(
 		(detail or {}).get("name") or preorder_name, identity, via="armado_confirm"
 	)
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import log_doc_activity_info
+
+		boxes = cint((progress.get("boxes") or {}).get("count"))
+		actor = identity.get("user_id") or identity.get("employee_name") or None
+		log_doc_activity_info(
+			"Sales Order",
+			(detail or {}).get("name") or preorder_name,
+			_("confirmed armado ({0} boxes)").format(boxes or "—"),
+			user=actor,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "armado confirm activity")
 	# Prefer ops PIN employee user_id / name for L_* over API-key session user.
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.tags_api import (
@@ -2186,6 +2219,19 @@ def save_cargo_check(delivery_note=None, qtys=None, updated_at=None):
 	if current_stamp and stamp < current_stamp:
 		return {"ok": True, "delivery_note": dn, "stale": 1, "updated_at": current_stamp}
 	kv_set(CARGO_CHECK_SCOPE, dn, {"qtys": clean, "updated_at": stamp})
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+			log_activity_for_delivery_note,
+		)
+
+		parts = [f"{k}×{clean[k]:g}" for k in list(clean)[:12]]
+		summary = ", ".join(parts) if parts else _("no lines")
+		log_activity_for_delivery_note(
+			dn,
+			_("driver pre-delivery check: {0}").format(summary),
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"cargo check activity {dn}")
 	frappe.db.commit()
 	return {"ok": True, "delivery_note": dn, "stale": 0, "updated_at": stamp}
 

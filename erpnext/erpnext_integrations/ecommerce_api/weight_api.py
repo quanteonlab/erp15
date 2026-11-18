@@ -358,11 +358,11 @@ def _apply_stats_to_item(item_code, stats, dry_run=False):
 
 
 @frappe.whitelist(allow_guest=True)
-def import_unit_weight_ranges_from_daily_csv(csv_text=None, dry_run=0, only_weight_like=1):
+def import_unit_weight_ranges_from_daily_csv(csv_text=None, dry_run=0, only_weight_like=0):
 	"""Seed Item weight_per_unit / min / max from daily CANTIDAD/UNIDADES CSV.
 
-	Uses Median/MAD (not RSS). ``only_weight_like`` (default on) seeds SKUs where
-	CANTIDAD often differs from UNIDADES (≥30% of rows).
+	Uses Median/MAD (not RSS). ``only_weight_like`` (default off) when set seeds
+	only SKUs where CANTIDAD often differs from UNIDADES (≥30% of rows).
 	"""
 	if csv_text is None or cstr(csv_text).strip() in ("", "null", "undefined", "None"):
 		return {
@@ -370,7 +370,12 @@ def import_unit_weight_ranges_from_daily_csv(csv_text=None, dry_run=0, only_weig
 			"seeded": [],
 			"skipped": [],
 			"unmatched": [],
+			"accepted": 0,
+			"skipped_count": 0,
+			"unmatched_count": 0,
+			"skipped_by_reason": {},
 			"parsed_rows": 0,
+			"sku_count": 0,
 			"dry_run": cint(dry_run),
 			"message": "empty csv",
 		}
@@ -378,7 +383,19 @@ def import_unit_weight_ranges_from_daily_csv(csv_text=None, dry_run=0, only_weig
 	_ensure_item_weight_columns()
 	rows = _parse_daily_csv(csv_text)
 	by = _ratios_by_codigo(rows)
-	weight_like_only = cint(only_weight_like) != 0
+	# Dirty clients may send "null"/"true"/""; only explicit 1/true enables the filter.
+	raw_owl = only_weight_like
+	if isinstance(raw_owl, str) and raw_owl.strip().lower() in (
+		"",
+		"null",
+		"undefined",
+		"none",
+		"false",
+		"0",
+	):
+		weight_like_only = False
+	else:
+		weight_like_only = cint(raw_owl) != 0
 
 	seeded = []
 	skipped = []
@@ -426,13 +443,23 @@ def import_unit_weight_ranges_from_daily_csv(csv_text=None, dry_run=0, only_weig
 	if not cint(dry_run) and seeded:
 		frappe.db.commit()
 
+	skipped_by_reason = {}
+	for row in skipped:
+		reason = cstr(row.get("reason") or "other")
+		skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+
 	return {
 		"ok": True,
 		"seeded": seeded,
 		"skipped": skipped,
 		"unmatched": unmatched,
+		"accepted": len(seeded),
+		"skipped_count": len(skipped),
+		"unmatched_count": len(unmatched),
+		"skipped_by_reason": skipped_by_reason,
 		"parsed_rows": len(rows),
 		"sku_count": len(by),
+		"only_weight_like": 1 if weight_like_only else 0,
 		"dry_run": cint(dry_run),
 	}
 

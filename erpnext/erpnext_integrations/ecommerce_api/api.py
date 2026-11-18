@@ -7034,11 +7034,51 @@ def _normalize_pipeline_source(source):
 
 
 def _record_guest_preorder_status_audit(so_name, old_display, new_display, source=None):
-	"""Version Historial row + optional external-change KV for Órdenes highlight/banner."""
+	"""Version Historial row + Activity Info + optional external-change KV."""
 	old_s = cstr(old_display or "").strip()
 	new_s = cstr(new_display or "").strip()
 	if not so_name or old_s == new_s:
 		return
+
+	actor = None
+	event = None
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.company_context import (
+			acting_user,
+			is_desk_admin,
+		)
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+			log_doc_activity_info,
+			resolve_activity_actor,
+			stamp_recent_versions_actor,
+		)
+
+		actor = resolve_activity_actor(acting_user())
+		# Seller create Orden / Consulta→Orden = "requested"; admin confirm = "approved".
+		creating = bool(frappe.flags.get("creating_guest_preorder"))
+		approving = bool(frappe.flags.get("approving_creation_review"))
+		if new_s == "Orden" and old_s in ("Consulta", "Draft", ""):
+			if approving or (is_desk_admin(actor) and not creating):
+				event = "approved"
+				log_doc_activity_info(
+					"Sales Order",
+					so_name,
+					_("approved this order ({0} → {1})").format(old_s or "Consulta", new_s),
+					user=actor,
+				)
+			else:
+				event = "requested"
+				log_doc_activity_info(
+					"Sales Order",
+					so_name,
+					_("requested this order ({0} → {1})").format(old_s or "Consulta", new_s),
+					user=actor,
+				)
+		# SO.submit() / db_set Version rows land as Administrator under API key.
+		stamp_recent_versions_actor("Sales Order", so_name, actor)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "guest preorder status activity")
+
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
 
@@ -7046,7 +7086,7 @@ def _record_guest_preorder_status_audit(so_name, old_display, new_display, sourc
 		src = _normalize_pipeline_source(source)
 		if src in EXTERNAL_PIPELINE_SOURCES:
 			changes.append(("status_via", "", src))
-		log_field_changes("Sales Order", so_name, changes)
+		log_field_changes("Sales Order", so_name, changes, actor=actor, event=event)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "guest preorder status audit")
 
@@ -7065,7 +7105,7 @@ def _record_guest_preorder_status_audit(so_name, old_display, new_display, sourc
 				"previous": old_s,
 				"source": src,
 				"at": at,
-				"by": frappe.session.user,
+				"by": actor or frappe.session.user,
 				"fingerprint": f"{src}:{new_s}:{at}",
 			},
 		)
@@ -7405,6 +7445,18 @@ def set_guest_preorder_factura_a(preorder_name=None, requires_factura_a=None, fa
 
 	if updates:
 		frappe.db.set_value("Sales Order", name, updates, update_modified=True)
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.doc_activity import log_doc_activity_info
+
+			st = cstr(updates.get("custom_factura_a_status") or "").strip().lower()
+			if st == "issued":
+				log_doc_activity_info("Sales Order", name, _("issued Factura A"))
+			elif st == "pending":
+				log_doc_activity_info("Sales Order", name, _("marked Factura A as pending"))
+			elif st == "na" and "custom_factura_a_status" in updates:
+				log_doc_activity_info("Sales Order", name, _("cleared Factura A"))
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"factura activity {name}")
 		frappe.db.commit()
 
 	return get_guest_preorder(name)
@@ -9146,6 +9198,9 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 	if not names:
 		frappe.throw(_("Select at least one order."))
 
+	# Lean tenants may miss the depot Custom Field (patch skipped) — create before SELECT.
+	tms_api._ensure_tms_depot_fields()
+
 	company = cstr(company or "").strip() or resolve_company() or frappe.defaults.get_user_default("Company")
 	settings = tms_api._load_tms_settings()
 	max_orders = max(1, cint(settings.get("driver_day_max_orders") or 30))
@@ -9162,22 +9217,24 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 	driver_ids = [d.name for d in drivers]
 
 	# Open MATs with stop counts + day + centroid.
+	trip_fields = [
+		"name",
+		"driver",
+		"driver_name",
+		"vehicle",
+		"departure_time",
+		"company",
+		"status",
+	]
+	if frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse"):
+		trip_fields.append("custom_pickup_warehouse")
 	open_trips = frappe.get_all(
 		"Delivery Trip",
 		filters={
 			"docstatus": ["<", 2],
 			"status": ["in", ["Draft", "Scheduled", ""]],
 		},
-		fields=[
-			"name",
-			"driver",
-			"driver_name",
-			"vehicle",
-			"departure_time",
-			"custom_pickup_warehouse",
-			"company",
-			"status",
-		],
+		fields=trip_fields,
 		ignore_permissions=True,
 	)
 	if company:
@@ -9467,22 +9524,24 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 		fetch_limit = limit * 3
 	else:
 		fetch_limit = limit
+	mat_fields = [
+		"name",
+		"status",
+		"docstatus",
+		"driver",
+		"driver_name",
+		"vehicle",
+		"departure_time",
+		"company",
+		"modified",
+	]
+	if frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse"):
+		mat_fields.append("custom_pickup_warehouse")
 	rows = frappe.get_all(
 		"Delivery Trip",
 		filters=filters,
 		or_filters=or_filters,
-		fields=[
-			"name",
-			"status",
-			"docstatus",
-			"driver",
-			"driver_name",
-			"vehicle",
-			"departure_time",
-			"custom_pickup_warehouse",
-			"company",
-			"modified",
-		],
+		fields=mat_fields,
 		order_by="modified desc",
 		limit_page_length=fetch_limit,
 		ignore_permissions=True,
@@ -9659,14 +9718,16 @@ def update_guest_preorder_logistics(
 	target_trip = trip_in or (current_trip.trip_name if current_trip else None)
 
 	if wh_in and target_trip:
+		tms_api._ensure_tms_depot_fields()
 		# Admin override — allow on Draft via API, force on published.
 		docstatus = cint(frappe.db.get_value("Delivery Trip", target_trip, "docstatus") or 0)
 		if docstatus == 0:
 			try:
 				tms_api.update_trip_assignment(target_trip, pickup_warehouse=wh_in)
 			except Exception:
-				frappe.db.set_value("Delivery Trip", target_trip, "custom_pickup_warehouse", wh_in)
-		else:
+				if frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse"):
+					frappe.db.set_value("Delivery Trip", target_trip, "custom_pickup_warehouse", wh_in)
+		elif frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse"):
 			frappe.db.set_value("Delivery Trip", target_trip, "custom_pickup_warehouse", wh_in)
 
 	if veh_in is not None and target_trip:

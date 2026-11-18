@@ -69,6 +69,26 @@ def _ensure_customer_delivery_warehouse_field():
 	frappe.clear_cache(doctype="Customer")
 
 
+def _ensure_tms_depot_fields():
+	"""Idempotent — Company.custom_default_warehouse + Delivery Trip.custom_pickup_warehouse.
+
+	Patch ``add_tms_depot_fields`` may have been skipped on lean/older tenants; without
+	these columns, Pedidos auto-MAT assign and Rutas crash with MySQL 1054.
+	"""
+	need_company = not frappe.db.has_column("Company", "custom_default_warehouse")
+	need_trip = not frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse")
+	if not need_company and not need_trip:
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+	from erpnext.patches.v15_0.add_tms_depot_fields import CUSTOM_FIELDS
+
+	create_custom_fields(CUSTOM_FIELDS, update=True)
+	if need_company:
+		frappe.clear_cache(doctype="Company")
+	if need_trip:
+		frappe.clear_cache(doctype="Delivery Trip")
+
+
 def _resolve_pickup_address(company, driver_doc=None, pickup_warehouse=None):
 	"""Depot/pickup address resolution for a trip, in priority order:
 
@@ -88,7 +108,9 @@ def _resolve_pickup_address(company, driver_doc=None, pickup_warehouse=None):
 		if addr:
 			return addr, pickup_warehouse
 
-	default_warehouse = company and frappe.db.get_value("Company", company, "custom_default_warehouse")
+	default_warehouse = None
+	if company and frappe.db.has_column("Company", "custom_default_warehouse"):
+		default_warehouse = frappe.db.get_value("Company", company, "custom_default_warehouse")
 	if default_warehouse:
 		addr = _default_address("Warehouse", default_warehouse)
 		if addr:
@@ -340,10 +362,16 @@ def _require_owned_trip(trip_name, driver):
 
 def _ensure_trip_locked_field():
 	"""Idempotent — create Delivery Trip.custom_locked if patch has not run."""
+	_ensure_tms_depot_fields()
 	if frappe.db.has_column("Delivery Trip", "custom_locked"):
 		return
 	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
+	insert_after = (
+		"custom_pickup_warehouse"
+		if frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse")
+		else "driver_address"
+	)
 	create_custom_fields(
 		{
 			"Delivery Trip": [
@@ -352,7 +380,7 @@ def _ensure_trip_locked_field():
 					"fieldtype": "Check",
 					"label": "Route Locked",
 					"default": "0",
-					"insert_after": "custom_pickup_warehouse",
+					"insert_after": insert_after,
 				},
 			]
 		},
@@ -1919,6 +1947,23 @@ def list_claimable_orders(date=None, company=None):
 	return {"orders": deliveries + preorders, "deliveries": deliveries, "preorders": preorders}
 
 
+def _log_route_reception(delivery_notes, trip_name) -> None:
+	"""Activity: order was received onto a delivery route."""
+	trip_name = cstr(trip_name or "").strip()
+	if not trip_name:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+			log_activity_for_delivery_note,
+		)
+
+		msg = _("received onto route {0}").format(trip_name)
+		for dn in delivery_notes or []:
+			log_activity_for_delivery_note(dn, msg)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "route reception activity")
+
+
 @frappe.whitelist(allow_guest=True)
 def claim_orders_to_trip(
 	delivery_notes=None,
@@ -2011,6 +2056,7 @@ def claim_orders_to_trip(
 
 	if trip:
 		map_data = add_stops_to_trip(trip, all_dns)
+		_log_route_reception(all_dns, trip)
 		return {
 			"trip": trip,
 			"delivery_notes": all_dns,
@@ -2027,6 +2073,7 @@ def claim_orders_to_trip(
 		company=company,
 		pickup_warehouse=pickup_warehouse,
 	)
+	_log_route_reception(all_dns, created.get("trip"))
 	return {
 		"trip": created.get("trip"),
 		"delivery_notes": all_dns,
@@ -3898,6 +3945,22 @@ def start_trip(trip_name):
 	frappe.flags.ignore_permissions = False
 
 	_ensure_trip_published_for_driving(trip)
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+			log_activity_for_delivery_note,
+		)
+
+		driver_label = cstr(getattr(trip, "driver_name", None) or trip.driver or "").strip()
+		msg = _("started delivery ({0})").format(driver_label or name)
+		seen = set()
+		for stop in trip.delivery_stops or []:
+			dn = cstr(getattr(stop, "delivery_note", None) or "").strip()
+			if not dn or dn in seen:
+				continue
+			seen.add(dn)
+			log_activity_for_delivery_note(dn, msg)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"start_trip activity {name}")
 	return get_trip_map_data(name)
 
 
@@ -10564,12 +10627,14 @@ def ensure_tms_lean_site_fields():
 	"""Additive TMS custom fields lean tenants often miss (migrate/patch skipped).
 
 	Creates if missing:
+	- Company.custom_default_warehouse + Delivery Trip.custom_pickup_warehouse
 	- Customer.custom_delivery_warehouse
 	- Address.custom_delivery_frequency
 	- Delivery Trip.custom_locked
 	- Delivery Stop / SO payment-split fields
 	- Delivery Stop late-penalty fields
 	"""
+	_ensure_tms_depot_fields()
 	_ensure_customer_delivery_warehouse_field()
 	_ensure_delivery_frequency_field()
 	_ensure_trip_locked_field()
@@ -10578,6 +10643,8 @@ def ensure_tms_lean_site_fields():
 	return {
 		"ok": True,
 		"fields": [
+			"Company.custom_default_warehouse",
+			"Delivery Trip.custom_pickup_warehouse",
 			"Customer.custom_delivery_warehouse",
 			"Address.custom_delivery_frequency",
 			"Delivery Trip.custom_locked",
@@ -11355,6 +11422,29 @@ def _record_stop_outcome_impl(
 		_record_not_home_followup(trip, stop, attempt_note or notes)
 
 	frappe.db.commit()
+
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+			log_activity_for_delivery_note,
+		)
+
+		driver_label = cstr(getattr(trip, "driver_name", None) or trip.driver or "").strip()
+		who = f" ({driver_label})" if driver_label else ""
+		recipient = cstr(recipient_name or "").strip()
+		if outcome == "Delivered":
+			msg = _("reached the client — delivered to {0}{1}").format(recipient or "—", who)
+		elif outcome == "Partial":
+			msg = _("reached the client — partial delivery{0}").format(who)
+		elif outcome == "Not Home":
+			msg = _("delivery attempt — client not home{0}").format(who)
+		elif outcome == "Refused":
+			msg = _("reached the client — refused{0}").format(who)
+		else:
+			msg = ""
+		if msg and dn:
+			log_activity_for_delivery_note(dn, msg)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "stop outcome activity")
 
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.webhook_api import emit_ecommerce_webhook

@@ -2799,6 +2799,62 @@ def suite_5_12_modules_read():
                 frappe.delete_doc("Lead", conv.name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+        # Orden/assigned Customer → CLIENTE ✓ with protected organicos tag.
+        from erpnext.erpnext_integrations.ecommerce_api import tags_api as ta
+
+        owner = frappe.session.user or "Administrator"
+        org_cust = None
+        org_lead = None
+        try:
+            # Skip Administrator owner (ensure_organic ignores it); use a staff user when possible.
+            staff = None
+            if owner == "Administrator":
+                staff = frappe.db.get_value(
+                    "User",
+                    {"enabled": 1, "name": ["not in", ["Administrator", "Guest", "guest@localhost"]]},
+                    "name",
+                )
+            seller = staff or owner
+            if seller and seller not in ("Guest", "Administrator"):
+                created = api.create_customer(
+                    customer_name=f"Smoke Organico {frappe.generate_hash(length=6)}",
+                    salesmen=[seller],
+                )
+                org_cust = created.get("name") if isinstance(created, dict) else created
+                assert org_cust
+                mirrored = pa.ensure_organic_cliente_for_seller(org_cust, seller, commit=True)
+                assert mirrored and mirrored.get("lead"), mirrored
+                org_lead = mirrored["lead"]
+                assert frappe.db.get_value("Lead", org_lead, "status") == "Converted"
+                assert frappe.db.get_value("Lead", org_lead, "lead_owner") == seller
+                tags = ta.get_tags_list("Lead", org_lead)
+                assert ta.TAG_ORGANICO in tags, tags
+                board_org = pa.get_my_board(owner_user=seller)
+                card = next(
+                    (l for l in (board_org.get("leads") or []) if l.get("name") == org_lead),
+                    None,
+                )
+                assert card, "organic cliente missing from Preventa board"
+                assert card.get("stage") == "customer", card
+                assert ta.TAG_ORGANICO in (card.get("tags") or []), card.get("tags")
+                # Non-admin cannot strip organicos via set_doc_tags.
+                prev_user = frappe.session.user
+                try:
+                    frappe.set_user(seller)
+                    try:
+                        ta.set_doc_tags("Lead", org_lead, tags=[])
+                        raise AssertionError("set_doc_tags must block removing organicos")
+                    except frappe.ValidationError:
+                        pass
+                finally:
+                    frappe.set_user(prev_user)
+        finally:
+            if org_lead and frappe.db.exists("Lead", org_lead):
+                frappe.delete_doc("Lead", org_lead, ignore_permissions=True, force=True)
+            if org_cust and frappe.db.exists("Customer", org_cust):
+                frappe.delete_doc("Customer", org_cust, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_employees():
         from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
         perms = ea.list_app_permissions()
@@ -4485,6 +4541,7 @@ def suite_5_12_modules_read():
 
 def check_doc_activity():
     from erpnext.erpnext_integrations.ecommerce_api import doc_activity as da
+    from unittest.mock import patch
 
     item = frappe.db.get_value("Item", {"disabled": 0}, "name")
     assert item, "need at least one Item for activity smoke"
@@ -4503,6 +4560,63 @@ def check_doc_activity():
     feed2 = da.get_doc_activity(doctype="Item", name=item, limit=20)
     texts = [i.get("content") or i.get("summary") for i in (feed2.get("items") or [])]
     assert marker in texts, f"comment not in feed: {texts[:5]}"
+
+    # Pedidos Actividad: seller request must not show as Administrator.
+    so_name = None
+    seller = frappe.db.get_value(
+        "User",
+        {"enabled": 1, "name": ["not in", ["Administrator", "Guest", "guest@localhost"]]},
+        "name",
+    )
+    item_code = frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+    if seller and item_code:
+        try:
+            with patch(
+                "erpnext.erpnext_integrations.ecommerce_api.company_context.acting_user",
+                return_value=seller,
+            ), patch(
+                "erpnext.erpnext_integrations.ecommerce_api.doc_activity.acting_user",
+                return_value=seller,
+            ):
+                created = api.create_guest_preorder(
+                    items=[{"item_code": item_code, "qty": 1, "rate": 9}],
+                    guest_name="Smoke Activity Seller",
+                    guest_phone="5491100007788",
+                    seller_ref_user=seller,
+                    initial_status="Orden",
+                )
+                so_name = created.get("preorder_name") or created.get("name")
+                assert so_name, created
+                feed_so = da.get_doc_activity(doctype="Sales Order", name=so_name, limit=40)
+                rows = feed_so.get("items") or []
+                requested = [
+                    r
+                    for r in rows
+                    if "requested this order" in cstr(r.get("summary") or "").lower()
+                    or "requested this order" in cstr(r.get("content") or "").lower()
+                ]
+                assert requested, f"missing requested activity: {[(r.get('who'), r.get('summary')) for r in rows[:8]]}"
+                assert any(
+                    cstr(r.get("who_user") or "") == seller
+                    or seller.split("@")[0].lower() in cstr(r.get("who") or "").lower()
+                    for r in requested
+                ), requested[0]
+                assert all(
+                    cstr(r.get("who_user") or "") != "Administrator"
+                    for r in requested
+                ), requested[0]
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                docstatus = frappe.db.get_value("Sales Order", so_name, "docstatus")
+                if cint(docstatus) == 1:
+                    try:
+                        so = frappe.get_doc("Sales Order", so_name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    except Exception:
+                        pass
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+                frappe.db.commit()
 
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────

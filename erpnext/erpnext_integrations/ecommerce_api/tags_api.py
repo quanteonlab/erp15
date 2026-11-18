@@ -16,6 +16,9 @@ TAG_SRV_FACTURA_A = "SRV-FACTURA_A"
 TAG_SRV_LATE = "SRV_LATE"
 TAG_PARCIAL = "#parcial"
 TAG_DEVOLUCION = "#devolucion"
+# Seller-originated clients (Orden create / assigned / organic capture).
+# Used for Preventa CLIENTE metrics + commission splits — not user-editable.
+TAG_ORGANICO = "organicos"
 LAST_EDITOR_PREFIX = "L_"
 SYSTEM_SO_TAGS = frozenset(
 	{
@@ -29,6 +32,52 @@ SYSTEM_SO_TAGS = frozenset(
 )
 # Tags that mean “was printed/downloaded”; cleared on pipeline status change.
 PRINT_OUTPUT_TAGS = frozenset({TAG_PRINTED, TAG_DOWNLOADED})
+# Metrics / commission tags — sellers may see them but cannot add/remove via API.
+PROTECTED_TAGS = frozenset({TAG_ORGANICO})
+
+
+def is_protected_tag(name: str) -> bool:
+	key = _normalize_tag_name(cstr(name or "")).casefold()
+	if not key:
+		return False
+	return key in {t.casefold() for t in PROTECTED_TAGS}
+
+
+def _can_manage_protected_tags() -> bool:
+	user = cstr(frappe.session.user or "").strip()
+	if not user or user == "Guest":
+		return False
+	if user == "Administrator":
+		return True
+	try:
+		if "System Manager" in (frappe.get_roles(user) or []):
+			return True
+	except Exception:
+		pass
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import _is_sales_admin
+
+		return bool(_is_sales_admin())
+	except Exception:
+		return False
+
+
+def _assert_protected_tag_mutation(current: list[str], desired: list[str]) -> None:
+	"""Block non-admins from adding/removing protected metric tags."""
+	if _can_manage_protected_tags():
+		return
+	cur_p = {t.casefold() for t in (current or []) if is_protected_tag(t)}
+	des_p = {t.casefold() for t in (desired or []) if is_protected_tag(t)}
+	removed = sorted(cur_p - des_p)
+	added = sorted(des_p - cur_p)
+	if not removed and not added:
+		return
+	labels = sorted({t for t in (current or []) + (desired or []) if is_protected_tag(t)}, key=str.casefold)
+	frappe.throw(
+		_("Cannot create or remove protected tag(s) used for metrics/commissions: {0}").format(
+			", ".join(labels) or ", ".join(PROTECTED_TAGS)
+		)
+	)
 
 
 def _normalize_tag_name(name: str) -> str:
@@ -193,6 +242,7 @@ def set_tags_for_doc(
 	tags=None,
 	*,
 	commit: bool = True,
+	enforce_protected: bool = False,
 ) -> dict:
 	reference_doctype = (reference_doctype or "").strip()
 	reference_name = (reference_name or "").strip()
@@ -204,6 +254,8 @@ def set_tags_for_doc(
 	current_tag_ids = [r.tag for r in current if r.tag]
 	current_names = _tag_names_by_ids(current_tag_ids)
 	current_set = {name.casefold(): (tid, name) for tid, name in current_names.items()}
+	if enforce_protected:
+		_assert_protected_tag_mutation(list(current_names.values()), desired)
 
 	desired_by_key = {name.casefold(): name for name in desired}
 	to_add = [name for key, name in desired_by_key.items() if key not in current_set]
@@ -438,6 +490,12 @@ def mark_sales_orders_print_action(
 		remove_tags_for_doc("Sales Order", name, tags=[TAG_DOWNLOADED], commit=False)
 		add_tags_for_doc("Sales Order", name, tags=[TAG_PRINTED], commit=False)
 		touch_sales_order_last_editor(name, commit=False)
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.doc_activity import log_doc_activity_info
+
+			log_doc_activity_info("Sales Order", name, _("printed this order"))
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"print activity {name}")
 		updated.append(name)
 
 	if commit:
@@ -472,7 +530,9 @@ def search_tags(query=""):
 		limit_page_length=30,
 		ignore_permissions=True,
 	)
-	return {"tags": rows}
+	for row in rows:
+		row["protected"] = 1 if is_protected_tag(row.get("tag_name")) else 0
+	return {"tags": rows, "protected_tags": sorted(PROTECTED_TAGS)}
 
 
 @frappe.whitelist()
@@ -492,7 +552,13 @@ def get_tags_for_doc(reference_doctype, reference_name):
 
 @frappe.whitelist()
 def set_doc_tags(reference_doctype, reference_name, tags=None):
-	return set_tags_for_doc(reference_doctype, reference_name, tags=tags, commit=True)
+	return set_tags_for_doc(
+		reference_doctype,
+		reference_name,
+		tags=tags,
+		commit=True,
+		enforce_protected=True,
+	)
 
 
 @frappe.whitelist()

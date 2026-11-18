@@ -3632,6 +3632,7 @@ def _set_customer_salesmen_users(customer: str, user_ids, store=None) -> list[st
 		cleaned.append(uid)
 	store = store or _load_customer_sellers_store()
 	by_customer = dict(store.get("by_customer") or {})
+	prev_users = list(by_customer.get(cust) or [])
 	if cleaned:
 		by_customer[cust] = cleaned
 	else:
@@ -3639,6 +3640,22 @@ def _set_customer_salesmen_users(customer: str, user_ids, store=None) -> list[st
 	by_user = _rebuild_by_user(by_customer)
 	_save_customer_sellers_store({"by_customer": by_customer, "by_user": by_user})
 	_sync_account_manager(cust, cleaned)
+	# Orden create / CRM assign → Preventa CLIENTE ✓ with protected organicos tag.
+	prev_set = {cstr(u).strip() for u in prev_users if cstr(u).strip()}
+	for uid in cleaned:
+		if uid in prev_set:
+			continue
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.preventa_api import (
+				ensure_organic_cliente_for_seller,
+			)
+
+			ensure_organic_cliente_for_seller(cust, uid, commit=False)
+		except Exception:
+			frappe.log_error(
+				frappe.get_traceback(),
+				f"organic cliente mirror for {cust} → {uid}",
+			)
 	return cleaned
 
 

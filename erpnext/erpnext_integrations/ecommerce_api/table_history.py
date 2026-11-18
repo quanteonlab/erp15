@@ -34,8 +34,19 @@ def _serialize_val(val):
 	return str(val)
 
 
-def log_field_changes(doctype: str, docname: str, changes: list[tuple[str, object, object]]) -> None:
-	"""Insert a Version row for API-driven edits (works even if track_changes is off)."""
+def log_field_changes(
+	doctype: str,
+	docname: str,
+	changes: list[tuple[str, object, object]],
+	*,
+	actor: str | None = None,
+	event: str | None = None,
+) -> None:
+	"""Insert a Version row for API-driven edits (works even if track_changes is off).
+
+	Stamps ``actor`` (X-ERP-Acting-User) so Actividad does not show the API-key
+	Administrator when a seller requested the change.
+	"""
 	changed = []
 	for field, old, new in changes:
 		if old == new:
@@ -43,22 +54,41 @@ def log_field_changes(doctype: str, docname: str, changes: list[tuple[str, objec
 		changed.append([field, _serialize_val(old), _serialize_val(new)])
 	if not changed:
 		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+			resolve_activity_actor,
+		)
+
+		who = resolve_activity_actor(actor)
+	except Exception:
+		who = (actor or frappe.session.user or "").strip() or None
+	payload = {
+		"changed": changed,
+		"added": [],
+		"removed": [],
+		"row_changed": [],
+	}
+	if who:
+		payload["actor"] = who
+	if event:
+		payload["event"] = str(event)
 	doc = frappe.get_doc(
 		{
 			"doctype": "Version",
 			"ref_doctype": doctype,
 			"docname": docname,
-			"data": frappe.as_json(
-				{
-					"changed": changed,
-					"added": [],
-					"removed": [],
-					"row_changed": [],
-				}
-			),
+			"data": frappe.as_json(payload),
 		}
 	)
 	doc.insert(ignore_permissions=True)
+	# Version.owner defaults to API-key session — rewrite to acting seller.
+	if who and frappe.db.exists("User", who) and doc.name:
+		frappe.db.set_value(
+			"Version",
+			doc.name,
+			{"owner": who, "modified_by": who},
+			update_modified=False,
+		)
 
 
 def _friendly_item_field(field: str) -> str:

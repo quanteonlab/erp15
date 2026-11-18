@@ -415,20 +415,18 @@ def _assert_can_decide_seller_suggestion(sug: dict | None) -> None:
 		)
 
 
-def _log_suggestion_activity(preorder_name: str, text: str) -> None:
-	"""Write a Comment on the Sales Order so Actividad shows propose / approve / reject."""
+def _log_suggestion_activity(preorder_name: str, text: str, *, user: str | None = None) -> None:
+	"""Write an Activity Info line attributed to the acting user (not API-key Admin)."""
 	name = cstr(preorder_name or "").strip()
 	msg = cstr(text or "").strip()
 	if not name or not msg:
 		return
 	try:
-		frappe.flags.ignore_permissions = True
-		so = frappe.get_doc("Sales Order", name)
-		so.add_comment("Comment", msg)
+		from erpnext.erpnext_integrations.ecommerce_api.doc_activity import log_doc_activity_info
+
+		log_doc_activity_info("Sales Order", name, msg, user=user)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"suggestion activity {name}")
-	finally:
-		frappe.flags.ignore_permissions = False
 
 
 def suggest_guest_preorder_change(preorder_name=None, change=None):
@@ -485,10 +483,10 @@ def suggest_guest_preorder_change(preorder_name=None, change=None):
 	mark_seller_amend_for_review(name, actor=actor, reason=REASON_SELLER_SUGGESTION)
 	_log_suggestion_activity(
 		name,
-		_("Seller suggestion queued ({summary}) by {actor}").format(
+		_("queued a suggestion ({summary})").format(
 			summary=payload.get("summary") or "suggestion",
-			actor=actor or frappe.session.user,
 		),
+		user=actor,
 	)
 	frappe.db.commit()
 
@@ -545,7 +543,7 @@ def apply_pending_suggestion(preorder_name: str) -> dict | None:
 	clear_pending_suggestion(name)
 	_log_suggestion_activity(
 		name,
-		_("Seller suggestion approved / applied ({summary})").format(
+		_("approved seller suggestion ({summary})").format(
 			summary=(sug.get("summary") if isinstance(sug, dict) else None) or "suggestion",
 		),
 	)
@@ -983,42 +981,69 @@ def confirm_creation_review(kind=None, name=None):
 		_assert_can_decide_seller_suggestion(get_pending_customer_suggestion(name))
 		applied = apply_pending_customer_suggestion(name)
 
-	frappe.db.set_value(doctype, name, FIELDNAME, STATUS_CONFIRMED)
-	# Notify the suggestion actor once (bell → dismiss after seen).
+	frappe.flags.approving_creation_review = True
 	try:
-		actor = ""
-		summary = ""
-		if isinstance(applied, dict):
-			actor = cstr(applied.get("actor") or "").strip()
-			summary = cstr(applied.get("summary") or "").strip()
-		if not actor:
-			# Creation without suggestion payload — use review_actor / owner when present.
+		frappe.db.set_value(doctype, name, FIELDNAME, STATUS_CONFIRMED)
+		# Notify the suggestion actor once (bell → dismiss after seen).
+		try:
+			actor = ""
+			summary = ""
+			if isinstance(applied, dict):
+				actor = cstr(applied.get("actor") or "").strip()
+				summary = cstr(applied.get("summary") or "").strip()
+			if not actor:
+				# Creation without suggestion payload — use review_actor / owner when present.
+				if kind == "order":
+					from erpnext.erpnext_integrations.ecommerce_api.api import (
+						_parse_remarks_tags,
+						_guest_preorder_tag_text,
+					)
+
+					tags = _parse_remarks_tags(
+						_guest_preorder_tag_text(frappe.get_doc("Sales Order", name))
+					)
+					actor = cstr(tags.get("review_actor") or tags.get("seller_ref") or "").strip()
+				else:
+					actor = cstr(frappe.db.get_value("Customer", name, "owner") or "").strip()
 			if kind == "order":
-				from erpnext.erpnext_integrations.ecommerce_api.api import (
-					_parse_remarks_tags,
-					_guest_preorder_tag_text,
+				from erpnext.erpnext_integrations.ecommerce_api.doc_activity import (
+					log_doc_activity_info,
+					resolve_activity_actor,
 				)
 
-				tags = _parse_remarks_tags(_guest_preorder_tag_text(frappe.get_doc("Sales Order", name)))
-				actor = cstr(tags.get("review_actor") or tags.get("seller_ref") or "").strip()
-			else:
-				actor = cstr(frappe.db.get_value("Customer", name, "owner") or "").strip()
-		if actor:
-			_record_my_outcome(
-				kind=kind,
-				name=name,
-				actor=actor,
-				status="approved",
-				summary=summary
-				or (
-					frappe.db.get_value("Customer", name, "customer_name")
-					if kind == "customer"
-					else name
-				),
-			)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "record my review outcome")
-	frappe.db.commit()
+				approver = resolve_activity_actor()
+				if actor and actor != approver:
+					log_doc_activity_info(
+						"Sales Order",
+						name,
+						_("approved this order (requested by {0})").format(actor),
+						user=approver,
+					)
+				else:
+					log_doc_activity_info(
+						"Sales Order",
+						name,
+						_("approved this order"),
+						user=approver,
+					)
+			if actor:
+				_record_my_outcome(
+					kind=kind,
+					name=name,
+					actor=actor,
+					status="approved",
+					summary=summary
+					or (
+						frappe.db.get_value("Customer", name, "customer_name")
+						if kind == "customer"
+						else name
+					),
+				)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "record my review outcome")
+		frappe.db.commit()
+	finally:
+		frappe.flags.approving_creation_review = False
 	return {
 		"ok": True,
 		"kind": kind,
