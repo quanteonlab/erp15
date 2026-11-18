@@ -1916,6 +1916,18 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_company_default_wh_guard",
+      "source": "regression",
+      "bug": "create_guest_preorder must not OperationalError 1054 when Company.custom_default_warehouse is missing — _default_company_warehouse uses has_column",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge company default warehouse column guard",
+        "guest_name": "Edge Depot Wh Guard"
+      },
+      "expect": "ok"
+    },
+    {
       "id": "create_guest_preorder_seller_ref_user",
       "source": "regression",
       "bug": "create_guest_preorder stamps seller_ref from salesman link cookie (null/\"\"/user must not crash)",

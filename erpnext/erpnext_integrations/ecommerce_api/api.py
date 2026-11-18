@@ -8848,9 +8848,11 @@ def _default_company_warehouse(company=None):
 	)
 	if not company:
 		return None
-	wh = cstr(frappe.db.get_value("Company", company, "custom_default_warehouse") or "").strip()
-	if wh:
-		return wh
+	# Patch ``add_tms_depot_fields`` may not have run on older/tenant sites yet.
+	if frappe.db.has_column("Company", "custom_default_warehouse"):
+		wh = cstr(frappe.db.get_value("Company", company, "custom_default_warehouse") or "").strip()
+		if wh:
+			return wh
 	rows = frappe.get_all(
 		"Warehouse",
 		filters={"company": company, "is_group": 0, "disabled": 0},
