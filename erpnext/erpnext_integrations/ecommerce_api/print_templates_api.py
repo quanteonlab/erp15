@@ -238,6 +238,31 @@ def _um_display(uom) -> str:
 	return "Uni"
 
 
+def _uom_print_label(uom) -> str:
+	"""Human Uni label for remitos — never raw catalog token ``WEIGHT``.
+
+	Spanish print sheets use ``Peso`` for sell-by-weight lines.
+	"""
+	raw = cstr(uom or "").strip()
+	if not raw:
+		return ""
+	n = _norm_uom(raw)
+	if n in _CATALOG_WEIGHT_TOKENS or n == "weight":
+		return "Peso"
+	if n in ("kg", "kgs", "kilogram", "kilograms", "kilogramo", "kilogramos"):
+		return "Kg"
+	if n in ("g", "gr", "gram", "grams", "gramo", "gramos"):
+		return "g"
+	if n in ("nos", "no", "unit", "units", "uni", "und", "unidad", "unidades", "u"):
+		return "Uni"
+	if n in ("caja", "cajas", "box", "boxes"):
+		return "Caja"
+	# Title-case unknown short codes (WEIGHT already returned above).
+	if raw.isupper() and len(raw) <= 6:
+		return raw.title()
+	return raw
+
+
 def _format_units_qty(raw) -> str:
 	"""Whole packs as integers; keep decimals when needed."""
 	if raw in (None, ""):
@@ -251,6 +276,26 @@ def _format_units_qty(raw) -> str:
 	if abs(v - round(v)) < 1e-6:
 		return str(int(round(v)))
 	return f"{v:.3f}".rstrip("0").rstrip(".")
+
+
+def _qty_display_for_print(qty, uom) -> str:
+	"""Cantidad cell: number only for WEIGHT lines (Uni/Peso col carries the label)."""
+	if qty is None:
+		return ""
+	try:
+		n = float(qty)
+	except (TypeError, ValueError):
+		return ""
+	if abs(n - round(n)) < 1e-6:
+		q = str(int(round(n)))
+	else:
+		q = f"{n:.2f}".rstrip("0").rstrip(".")
+	# WEIGHT / Kg / Peso: the Uni column carries the label, so Cantidad is the number only.
+	nu = _norm_uom(uom)
+	if _is_catalog_weight_uom(uom) or nu in ("peso", "weight", "kil", "kg"):
+		return q
+	label = _uom_print_label(uom)
+	return f"{q} {label}".strip() if label else q
 
 
 def _round_print_number(value, places: int):
@@ -272,16 +317,20 @@ def _round_print_number(value, places: int):
 	return n
 
 
+def _format_kg_text(value) -> str:
+	"""Short kg text: 10, 2.5, 1.038. Empty when the value is not a positive number."""
+	tw = _positive_float(value)
+	if tw is None:
+		return ""
+	return f"{tw:.3f}".rstrip("0").rstrip(".")
+
+
 def _format_peso_display(total_w, *, tx_uom) -> str:
-	"""Peso column: measured/est. kg, or '-' when the line is not sold by weight."""
+	"""Peso column: measured kg, or '-' when the line is not sold by weight."""
 	# Countable UM (Nos/Uni/CAJA) → always dash, even if Item.weight_uom is Kg.
 	if not (_is_mass_uom(tx_uom) or _is_catalog_weight_uom(tx_uom)):
 		return "-"
-	tw = _positive_float(total_w)
-	if tw is None:
-		return "-"
-	text = f"{tw:.3f}".rstrip("0").rstrip(".")
-	return text or "-"
+	return _format_kg_text(total_w) or "-"
 
 
 def _line_units_requested(row: dict, *, line_wpu: float, total_w) -> str:
@@ -344,25 +393,39 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 		)
 
 	tx_uom = out.get("uom") or stock_uom or line_wuom
+	# Catalog promedio is an estimate. Print it with "~" unless the shop setting
+	# says the client already declared that kg (then it is the real Peso).
+	client_knows_weight = _order_print_client_knows_weight()
+	estimate_w = None
+	if (
+		existing_tw is None
+		and line_wpu
+		and qty
+		and not _is_mass_uom(tx_uom)
+		and (_is_catalog_weight_uom(tx_uom) or weight_based)
+	):
+		estimate_w = _round_print_number(line_wpu * qty, 3)
 	if existing_tw is not None:
 		total_w = existing_tw
 	elif weight_based and qty and _is_mass_uom(tx_uom):
 		# Real mass UOM (kg/g): qty itself is the weight (wpu is only for Unid).
 		total_w = qty
-	elif line_wpu and qty:
-		# Catalog WEIGHT / Nos packs: estimate kg from pack count × wpu.
-		total_w = line_wpu * qty
+	elif client_knows_weight and estimate_w:
+		total_w = estimate_w
 	else:
-		# Catalog WEIGHT / Nos without measured kg or pack weight → blank.
 		total_w = None
 
 	# Remito "Peso" = line kg (matches Pedidos PESO), not unit count.
 	# Round before money so rate × kg cannot print 11.129999999999999.
 	if total_w is not None:
 		total_w = _round_print_number(total_w, 3)
-	weight_val = total_w
 
-	out["weight"] = weight_val if weight_val not in (None, 0) else ""
+	if total_w not in (None, 0):
+		out["weight"] = total_w
+	elif estimate_w and not client_knows_weight:
+		out["weight"] = f"~{_format_kg_text(estimate_w)}"
+	else:
+		out["weight"] = ""
 	out["weight_uom"] = line_wuom or (stock_uom if weight_based else "") or ""
 	out["total_weight"] = total_w if total_w not in (None, 0) else ""
 	aw = _positive_float(out.get("actual_weight"))
@@ -370,8 +433,15 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 	out["is_weight_based"] = 1 if weight_based else 0
 	# Factura-con-pesos columns: Unid / Peso / UM (3-letter Uni|Kil).
 	out["um_display"] = _um_display(tx_uom)
+	# Remito "Uni" column binds ``uom`` — never leave raw WEIGHT token.
+	out["uom"] = _uom_print_label(tx_uom) or out.get("uom") or ""
 	out["units_qty"] = _line_units_requested(out, line_wpu=line_wpu, total_w=total_w)
 	out["peso_display"] = _format_peso_display(total_w, tx_uom=tx_uom)
+	if isinstance(out.get("weight"), str) and str(out.get("weight")).startswith("~"):
+		out["peso_display"] = out["weight"]
+	# Refresh qty_display without appending WEIGHT.
+	if out.get("qty") is not None:
+		out["qty_display"] = _qty_display_for_print(out.get("qty"), tx_uom)
 	# Classic Factura Kg/U columns: show rate in Precio Kg. XOR Precio U.
 	rate = _positive_float(out.get("rate"))
 	sell_by_kg = bool(
@@ -390,7 +460,7 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 	if (
 		blank_unknown_weight_amount
 		and weight_based
-		and not _order_print_client_knows_weight()
+		and not client_knows_weight
 		and total_w is None
 	):
 		out["amount"] = ""
@@ -423,11 +493,11 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 	return out
 
 
-def _armado_missing_line_keys(so_name) -> set:
-	"""Sales Order Item names marked faltante in armado."""
+def _armado_progress_lines(so_name) -> dict:
+	"""Sales Order Item name → armado progress line state."""
 	so_name = cstr(so_name or "").strip()
 	if not so_name:
-		return set()
+		return {}
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
 			_load_armado_progress,
@@ -435,13 +505,90 @@ def _armado_missing_line_keys(so_name) -> set:
 
 		progress = _load_armado_progress(so_name) or {}
 	except Exception:
-		return set()
+		return {}
 	lines = progress.get("lines") if isinstance(progress.get("lines"), dict) else {}
+	return {str(k): v for k, v in lines.items() if isinstance(v, dict)}
+
+
+def _armado_missing_line_keys(so_name) -> set:
+	"""Sales Order Item names marked faltante in armado."""
 	return {
-		str(key)
-		for key, state in lines.items()
-		if isinstance(state, dict) and state.get("missing")
+		key
+		for key, state in _armado_progress_lines(so_name).items()
+		if state.get("missing")
 	}
+
+
+def _apply_armado_measured_print_fills(rows, so_name, so_items=None) -> None:
+	"""Fill Armado PDF write-in cols (peso medido / Uni / Cantidad) from progress + SO.
+
+	Once the picker has weighed/qty'd a line, the sheet should print those values
+	instead of empty hand-fill boxes. Faltante lines show FALTANTE.
+	"""
+	progress = _armado_progress_lines(so_name)
+	so_by_name = {}
+	for it in so_items or []:
+		name = cstr(getattr(it, "name", None) or "")
+		if name:
+			so_by_name[name] = it
+
+	for row in rows or []:
+		if not isinstance(row, dict):
+			continue
+		key = cstr(row.get("so_detail") or row.get("name") or "")
+		state = progress.get(key) or {}
+		so_it = so_by_name.get(key)
+		is_missing = bool(state.get("missing")) or frappe.utils.cint(row.get("armado_missing"))
+		if is_missing:
+			row["actual_weight"] = "FALTANTE"
+			row["confirm_uni"] = "FALTANTE"
+			row["confirm_qty"] = "FALTANTE"
+			row["peso_display"] = "FALTANTE"
+			continue
+
+		# Measured kg: prefer armado progress, then SO line total_weight.
+		tw = state.get("total_weight")
+		if tw is None and so_it is not None:
+			tw = getattr(so_it, "total_weight", None)
+		if tw is None:
+			tw = row.get("total_weight")
+		tw_pos = _positive_float(tw)
+
+		# Armado units: prefer progress qty, else SO qty when packed / weighed.
+		qty_raw = state.get("qty")
+		if qty_raw is None and so_it is not None:
+			# After pack/weigh the SO qty is the armado qty.
+			if state.get("packed") or tw_pos is not None:
+				qty_raw = getattr(so_it, "qty", None)
+		if qty_raw is None and (state.get("packed") or tw_pos is not None):
+			qty_raw = row.get("qty")
+		qty_pos = flt(qty_raw) if qty_raw is not None else None
+
+		if tw_pos is not None:
+			tw_print = _round_print_number(tw_pos, 3)
+			row["actual_weight"] = tw_print
+			row["total_weight"] = tw_print
+			# Keep remito-style peso column in sync when sold by weight.
+			tx_uom = row.get("uom") or row.get("stock_uom") or ""
+			row["peso_display"] = _format_peso_display(tw_print, tx_uom=tx_uom)
+			row["weight"] = tw_print
+
+		if qty_pos is not None:
+			uni = _format_units_qty(qty_pos)
+			row["confirm_uni"] = uni
+			raw_uom = cstr(row.get("uom") or row.get("stock_uom") or "").strip()
+			uom_label = _uom_print_label(raw_uom) or raw_uom
+			# Confirm box: number + Spanish label (never English WEIGHT).
+			if _is_catalog_weight_uom(raw_uom) or _norm_uom(raw_uom) in ("peso", "weight"):
+				row["confirm_qty"] = uni
+			else:
+				row["confirm_qty"] = f"{uni} {uom_label}".strip() if uom_label else uni
+			# Remito Cantidad: number only for weight lines; Uni col shows Peso.
+			if uni:
+				row["qty_display"] = _qty_display_for_print(qty_pos, raw_uom)
+				row["units_qty"] = uni
+				if raw_uom:
+					row["uom"] = uom_label
 
 
 def _print_totals_without_missing(data: dict, dropped_net: float) -> None:
@@ -1053,7 +1200,18 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		)
 	)
 
-	vendedor = getattr(so, "sales_person", None) or so.owner or ""
+	header = {
+		"customer": so.customer,
+		"horario": horario,
+		"customer_address": customer_address,
+		"zona": zona,
+		"vendedor": "",
+	}
+	_apply_order_print_header(header, so)
+	horario = header["horario"]
+	customer_address = header["customer_address"]
+	zona = header["zona"]
+	vendedor = header["vendedor"]
 	# MAT / fletero from the remito's Delivery Trip (empty when not on a MAT).
 	dn_name = frappe.db.get_value(
 		"Delivery Note Item",
@@ -1076,6 +1234,7 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 	provisional_by_sku = _item_provisional_paths(item_codes)
 	index = (map_payload or {}).get("_index") if map_payload else None
 	missing_keys = _armado_missing_line_keys(so.name)
+	armado_lines = _armado_progress_lines(so.name)
 	dropped_net = 0.0
 
 	for it in so.items or []:
@@ -1099,10 +1258,15 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 			code_display = f"{code_display} - {barcode}"
 		uom = it.uom or ""
 		qty = it.qty
-		qty_display = f"{flt(qty):.2f} {uom}".strip() if qty is not None else ""
+		qty_display = _qty_display_for_print(qty, uom) if qty is not None else ""
 		is_missing = str(it.name) in missing_keys
 		if is_missing:
 			dropped_net += flt(it.amount)
+		prog = armado_lines.get(str(it.name)) or {}
+		# Prefer measured kg already on the SO / armado progress for enrich.
+		line_tw = prog.get("total_weight")
+		if line_tw is None:
+			line_tw = getattr(it, "total_weight", None)
 		row = _enrich_print_line_item(
 			{
 				"so_detail": it.name,
@@ -1122,7 +1286,8 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 				"discount_percentage": getattr(it, "discount_percentage", None) or "",
 				"weight_per_unit": getattr(it, "weight_per_unit", None),
 				"weight_uom": getattr(it, "weight_uom", None),
-				"total_weight": getattr(it, "total_weight", None),
+				"total_weight": line_tw,
+				"actual_weight": line_tw,
 				"warehouse": it.warehouse or wh,
 				"location": loc,
 				"barcode": barcode,
@@ -1140,6 +1305,9 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 	rows.sort(key=lambda r: (r.get("_location_sort_key") or (1e12,), r.get("item_code") or ""))
 	for r in rows:
 		r.pop("_location_sort_key", None)
+
+	# After enrich: stamp Armado Uni / Cantidad / Peso medido from progress.
+	_apply_armado_measured_print_fills(rows, so.name, so.items)
 
 	# Factura A preview reuses checklist lines — fill % Alic from product IVA.
 	_apply_line_alicuotas(
@@ -1180,8 +1348,11 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"fletero": fletero,
 		"cajas": _armado_boxes_for_print(so.name),
 		"cargado": cargado,
-		"armado_flag": "SI" if has_dn else "NO",
-		"facturado_flag": "SI" if has_si else "NO",
+		# Printed as empty checkboxes on Armado sheets (hand-mark); not SI/NO text.
+		"armado_flag": "",
+		"facturado_flag": "",
+		"armado_done": 1 if has_dn else 0,
+		"facturado_done": 1 if has_si else 0,
 		"delivery_date": so.delivery_date,
 		"transaction_date": so.transaction_date,
 		"posting_date": so.transaction_date or so.delivery_date,
@@ -1195,11 +1366,119 @@ def _delivery_checklist_print_data(sales_order_name, warehouse=None, floor_id=No
 		"currency": getattr(so, "currency", None) or "",
 		"company": company,
 		"order_ean13": _armado_order_ean13(so.name),
+		# Remito / SI tabs reuse this checklist when no linked DN exists —
+		# Pedido: must show the Sales Order name (Remito badge may stay empty).
+		"pedido_ref": so.name,
 		"_map": map_out,
 	}
 	_print_totals_without_missing(doc, dropped_net)
 	return {"doc": doc, "lineItems": rows, "map": map_out}
 
+
+
+_GENERIC_PRINT_PEOPLE = frozenset({"administrator", "guest"})
+
+
+def _so_remark_tags(so) -> dict:
+	"""guest_* tags stored on the Sales Order remarks/terms pipe string."""
+	raw = ""
+	if so is not None:
+		raw = cstr(getattr(so, "remarks", None) or "") or cstr(getattr(so, "terms", None) or "")
+	tags = {}
+	for part in str(raw or "").split("|"):
+		part = part.strip()
+		if ":" in part:
+			key, val = part.split(":", 1)
+			tags[key.strip()] = val.strip()
+	return tags
+
+
+def _user_print_name(user) -> str:
+	user = cstr(user or "").strip()
+	if not user:
+		return ""
+	full = user
+	try:
+		if frappe.db.exists("User", user):
+			full = cstr(frappe.db.get_value("User", user, "full_name") or user)
+	except Exception:
+		full = user
+	# "Administrator Administrator" → Administrator (not "Administrator A.").
+	parts = [p for p in full.split() if p]
+	if len(parts) >= 2 and parts[0].lower() == parts[-1].lower():
+		return parts[0]
+	return _short_person_name(full) or full
+
+
+def _delivery_zone_label(customer) -> str:
+	"""Address.custom_zone when Customer.territory is still the ERP default."""
+	customer = cstr(customer or "").strip()
+	if not customer or not frappe.db.exists("Customer", customer):
+		return ""
+	if not frappe.db.has_column("Address", "custom_zone"):
+		return ""
+	addr = frappe.db.get_value("Customer", customer, "customer_primary_address")
+	if not addr:
+		return ""
+	return cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip()
+
+
+def _prefer_print_zona(customer, territory) -> str:
+	zone = cstr(territory or "").strip()
+	if zone and zone.lower() not in ("all territories", "todos los territorios"):
+		return zone
+	return _delivery_zone_label(customer) or zone
+
+
+def _vendedor_for_order(so, tags: dict | None = None) -> str:
+	tags = tags or {}
+	candidates = [
+		cstr(getattr(so, "sales_person", None) or "").strip(),
+		cstr(tags.get("seller_ref") or "").strip(),
+		cstr(tags.get("cashier") or "").strip(),
+		cstr(getattr(so, "owner", None) or "").strip(),
+	]
+	named = [c for c in candidates if c and c.lower() not in _GENERIC_PRINT_PEOPLE]
+	pick = (named or [c for c in candidates if c] or [""])[0]
+	return _user_print_name(pick)
+
+
+def _print_text_blank(value) -> bool:
+	return not cstr(value or "").strip(" ,—-\t")
+
+
+def _apply_order_print_header(target: dict, so) -> None:
+	"""Fill empty Horario / address / zona / Vend from the Sales Order."""
+	tags = _so_remark_tags(so)
+	if _print_text_blank(target.get("horario")):
+		hours = cstr(tags.get("guest_preferred_hours") or "").strip()
+		if hours:
+			target["horario"] = hours
+	if _print_text_blank(target.get("customer_address")):
+		addr = cstr(tags.get("guest_address") or "").strip()
+		if addr:
+			target["customer_address"] = addr
+	customer = target.get("customer") or getattr(so, "customer", None)
+	zona = _prefer_print_zona(customer, target.get("zona"))
+	if zona:
+		target["zona"] = zona
+	vend = cstr(target.get("vendedor") or "").strip().lower()
+	if not vend or vend in _GENERIC_PRINT_PEOPLE:
+		named = _vendedor_for_order(so, tags)
+		if named:
+			target["vendedor"] = named
+
+
+def _so_print_header_row(so_name):
+	"""Light Sales Order read for print header fills. None when the name is not an SO."""
+	so_name = cstr(so_name or "").strip()
+	if not so_name or not frappe.db.exists("Sales Order", so_name):
+		return None
+	fields = ["customer", "owner"]
+	for fn in ("sales_person", "remarks", "terms"):
+		if frappe.db.has_column("Sales Order", fn):
+			fields.append(fn)
+	return frappe.db.get_value("Sales Order", so_name, fields, as_dict=True)
 
 
 def _party_print_meta(party_type: str, party_name: str | None) -> dict:
@@ -1385,12 +1664,13 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 			r["code_display"] = f"{code} - {barcode}"
 		else:
 			r["code_display"] = code or barcode or r.get("code_display") or ""
-		uom = r.get("uom") or r.get("stock_uom") or ""
+		raw_uom = r.get("uom") or r.get("stock_uom") or ""
 		qty = r.get("qty")
-		if qty is not None and not r.get("qty_display"):
-			r["qty_display"] = f"{flt(qty):.2f} {uom}".strip()
-		if uom and not r.get("uom"):
-			r["uom"] = uom
+		# Always normalize qty_display / Uni label (strip English WEIGHT token).
+		if qty is not None:
+			r["qty_display"] = _qty_display_for_print(qty, raw_uom)
+		if raw_uom:
+			r["uom"] = _uom_print_label(raw_uom)
 
 	# Party meta
 	if source_doctype in ("Delivery Note", "Sales Invoice", "Sales Order"):
@@ -1464,6 +1744,19 @@ def _enrich_commercial_print_doc(source_doctype: str, data: dict, rows: list) ->
 			if ref:
 				break
 		data["pedido_ref"] = ref or data.get("against_sales_order") or ""
+	# Checklist reused as remito preview: name is the Sales Order.
+	if not cstr(data.get("pedido_ref") or "").strip():
+		nm = cstr(data.get("name") or "").strip()
+		if nm.startswith("SAL-ORD") or source_doctype == "Sales Order":
+			data["pedido_ref"] = nm
+
+	# Horario / zona / vendedor often live on the pedido, not the DN header.
+	so_for_header = cstr(data.get("pedido_ref") or "").strip()
+	if source_doctype == "Sales Order":
+		so_for_header = cstr(data.get("name") or so_for_header).strip()
+	so_hdr = _so_print_header_row(so_for_header)
+	if so_hdr is not None:
+		_apply_order_print_header(data, so_hdr)
 
 	# MAT = Delivery Trip (MAT-DT-…), not the remito (MAT-DN-…). Empty if unassigned.
 	dn_for_mat = None
@@ -2642,6 +2935,37 @@ def _compact_party_doc_header_elements(
 			]
 		)
 		meta_y += row_pitch
+	# Hand-mark boxes on printed Armado / remito sheets (never SI/NO text).
+	_checkbox_fields = frozenset({"armado_flag", "facturado_flag"})
+
+	def _meta_value(cell_id: str, x: float, y: float, field_path: str, label: str) -> dict:
+		if field_path in _checkbox_fields:
+			box = 3.4
+			return {
+				"id": cell_id,
+				"kind": "shape",
+				"x": x + 0.4,
+				"y": y + 0.55,
+				"width": box,
+				"height": box,
+				"shapeType": "rect",
+				"color": "#0f172a",
+				"filled": False,
+			}
+		return {
+			"id": cell_id,
+			"kind": "field",
+			"x": x,
+			"y": y,
+			"width": val_w,
+			"height": 4.5,
+			"fieldPath": field_path,
+			"label": label,
+			"fontSize": fs_sm,
+			"align": "left",
+			"textColor": "#0f172a",
+		}
+
 	max_rows = 4
 	for i, (l1, f1, l2, f2) in enumerate(rows[:max_rows]):
 		yy = meta_y + i * row_pitch
@@ -2661,19 +2985,7 @@ def _compact_party_doc_header_elements(
 					"align": "left",
 					"textColor": "#0f172a",
 				},
-				{
-					"id": f"{p}-m{i}a",
-					"kind": "field",
-					"x": xa + lbl_w + gap_lv,
-					"y": yy,
-					"width": val_w,
-					"height": 4.5,
-					"fieldPath": f1,
-					"label": l1,
-					"fontSize": fs_sm,
-					"align": "left",
-					"textColor": "#0f172a",
-				},
+				_meta_value(f"{p}-m{i}a", xa + lbl_w + gap_lv, yy, f1, l1),
 				{
 					"id": f"{p}-m{i}b-l",
 					"kind": "text",
@@ -2686,19 +2998,7 @@ def _compact_party_doc_header_elements(
 					"align": "left",
 					"textColor": "#0f172a",
 				},
-				{
-					"id": f"{p}-m{i}b",
-					"kind": "field",
-					"x": xb + lbl_w + gap_lv,
-					"y": yy,
-					"width": val_w,
-					"height": 4.5,
-					"fieldPath": f2,
-					"label": l2,
-					"fontSize": fs_sm,
-					"align": "left",
-					"textColor": "#0f172a",
-				},
+				_meta_value(f"{p}-m{i}b", xb + lbl_w + gap_lv, yy, f2, l2),
 			]
 		)
 	for el in els:
@@ -3101,16 +3401,15 @@ def _dn_remito_a4_elements(id_prefix: str = "starter-dnrem", *, layout: str = "c
 			("Cajas:", "cajas", "", ""),
 		],
 		columns=[
-			{"fieldPath": "code_display", "label": "Codigo", "width": 28},
-			{"fieldPath": "item_name", "label": "Detalle", "width": 64},
+			{"fieldPath": "code_display", "label": "Codigo", "width": 30},
+			{"fieldPath": "item_name", "label": "Detalle", "width": 72},
 			{"fieldPath": "qty_display", "label": "Cantidad", "width": 18},
-			{"fieldPath": "uom", "label": "Uni", "width": 10},
-			{"fieldPath": "weight", "label": "Peso", "width": 14},
-			{"fieldPath": "amount", "label": "Importe", "width": 20},
-			{"fieldPath": "warehouse", "label": "Desde", "width": 28},
+			{"fieldPath": "uom", "label": "Uni", "width": 12},
+			{"fieldPath": "weight", "label": "Peso", "width": 16},
+			{"fieldPath": "amount", "label": "Importe", "width": 22},
 		],
 		footer_kind="remito",
-		items_id_suffix="v4",
+		items_id_suffix="v5",
 		layout=layout,
 	)
 
@@ -5190,8 +5489,8 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		# v6: 50/50 CLIENTE|Pedido header so Cargado fits full datetime.
-		"resync_if_missing_id": "starter-peso-classic-v6",
+		# v7: Armado/Facturado as empty hand-mark checkboxes (not SI/NO).
+		"resync_if_missing_id": "starter-peso-classic-v7",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-peso",
@@ -5202,7 +5501,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-peso-classic-v6",
+				"id": "starter-peso-classic-v7",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -5221,7 +5520,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-alm-classic-v6",
+		"resync_if_missing_id": "starter-alm-classic-v7",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-alm",
@@ -5232,7 +5531,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-alm-classic-v6",
+				"id": "starter-alm-classic-v7",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -5251,7 +5550,7 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-almmap-classic-v6",
+		"resync_if_missing_id": "starter-almmap-classic-v7",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-almmap",
@@ -5262,7 +5561,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-almmap-classic-v6",
+				"id": "starter-almmap-classic-v7",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -5282,8 +5581,8 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		# v8: 50/50 header (Cargado) + tear strips near page bottom.
-		"resync_if_missing_id": "starter-pesotear-tear-cutbar-v8",
+		# v9: empty Armado/Facturado checkboxes + tear strips near page bottom.
+		"resync_if_missing_id": "starter-pesotear-tear-cutbar-v9",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _ar_entregas_checklist_a4_elements(
 			id_prefix="starter-pesotear",
@@ -5294,7 +5593,7 @@ _STARTER_TEMPLATES = [
 		)
 		+ [
 			{
-				"id": "starter-pesotear-tear-cutbar-v8",
+				"id": "starter-pesotear-tear-cutbar-v9",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -5314,13 +5613,13 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		# v9: 50/50 CLIENTE|Pedido header (Cargado datetime).
-		"resync_if_missing_id": "starter-dnrem-cajas-v10",
+		# v11: drop Desde col; Uni/Cantidad without English WEIGHT token.
+		"resync_if_missing_id": "starter-dnrem-nodesde-v11",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnrem", layout="classic")
 		+ [
 			{
-				"id": "starter-dnrem-cajas-v10",
+				"id": "starter-dnrem-nodesde-v11",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,
@@ -5340,12 +5639,12 @@ _STARTER_TEMPLATES = [
 		"is_default": False,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-dnremtear-cajas-v10",
+		"resync_if_missing_id": "starter-dnremtear-nodesde-v11",
 		"margin_mm": [8, 8, 8, 8],
 		"elements": _dn_remito_a4_elements(id_prefix="starter-dnremtear", layout="tearoff")
 		+ [
 			{
-				"id": "starter-dnremtear-cajas-v10",
+				"id": "starter-dnremtear-nodesde-v11",
 				"kind": "shape",
 				"x": 0,
 				"y": 0,

@@ -2168,6 +2168,43 @@
       "expect": "no_500"
     },
     {
+      "id": "issue_client_access_pin_consumidor_final_no_stamp",
+      "source": "regression",
+      "bug": "issue_client_access_pin must not stamp PIN/phone on Consumidor Final bucket (shared walk-in)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.issue_client_access_pin",
+      "args": {
+        "guest_phone": "+5491100000001",
+        "customer": "Consumidor Final",
+        "send": 0,
+        "force_new": 1
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_consultas_by_guest_browser_null",
+      "source": "regression",
+      "bug": "list_consultas_by_guest_browser null browser/secret is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.list_consultas_by_guest_browser",
+      "args": {
+        "browser_id": null,
+        "secret": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "register_guest_browser_session_short",
+      "source": "regression",
+      "bug": "register_guest_browser_session rejects short/invalid browser id without 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.register_guest_browser_session",
+      "args": {
+        "browser_id": "short",
+        "secret": "tooshort"
+      },
+      "expect": "no_500"
+    },
+
+
+    {
       "id": "resolve_client_access_pin_null",
       "source": "regression",
       "bug": "resolve_client_access_pin with null/empty pin returns ok:false reason=invalid, not TypeError",
@@ -3422,6 +3459,25 @@
       "expect": "no_500"
     },
     {
+      "id": "update_guest_preorder_items_wpu_no_autofill_total_weight",
+      "source": "regression",
+      "bug": "peso promedio (weight_per_unit) must not invent measured total_weight on item update",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_items",
+      "args": {
+        "preorder_name": "",
+        "items": [
+          {
+            "item_code": "",
+            "qty": 2,
+            "rate": 1,
+            "weight_per_unit": 1.25
+          }
+        ],
+        "additional_discount_amount": 0
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "reprice_guest_preorder_from_price_list_dirty",
       "source": "regression",
       "bug": "reprice_guest_preorder_from_price_list with empty/null name and price_list must not TypeError/500",
@@ -3619,6 +3675,52 @@
         "tax_category": null,
         "preferred_hours": null,
         "address_line1": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_customer_consumidor_final_blocked",
+      "source": "regression",
+      "bug": "update_customer on Consumidor Final must ValidationError — shared anonymous client cannot mutate address/profile",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": "Consumidor Final",
+        "address_line1": "should-not-save",
+        "mobile_no": "1199999999"
+      },
+      "expect": "error"
+    },
+    {
+      "id": "normalize_preferred_hour_slots_dirty",
+      "source": "regression",
+      "bug": "normalize_preferred_hour_slots must coerce null/garbage/JSON to '' or clean 0-23 list, never TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields.normalize_preferred_hour_slots",
+      "args": {
+        "raw": ["9", null, "99", "null", 10, "11.5", "foo"]
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "list_preferred_delivery_hours_includes_defaults",
+      "source": "regression",
+      "bug": "list_preferred_delivery_hours must return default_hours for Mañana (9-12) without 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields.list_preferred_delivery_hours",
+      "args": {
+        "include_disabled": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "upsert_customer_address_place_consumidor_final_blocked",
+      "source": "regression",
+      "bug": "upsert_customer_address_place on Consumidor Final must ValidationError not write shared bucket address",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.upsert_customer_address_place",
+      "args": {
+        "customer": "Consumidor Final",
+        "address_line1": "Calle falsa 123",
+        "city": "CABA",
+        "lat": -34.6,
+        "lng": -58.4
       },
       "expect": "error"
     },
@@ -8017,6 +8119,17 @@
       "expect": "error",
       "source": "regression",
       "bug": "armado progress read with null name is a controlled error"
+    },
+    {
+      "id": "get_print_data_dn_weight_uom_null_docname",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api.get_print_data",
+      "args": {
+        "source_doctype": "Delivery Note",
+        "docname": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "Remito print: null DN must controlled error (WEIGHT→Peso / no Desde / pedido_ref enrich path)"
     }
   ]
 }

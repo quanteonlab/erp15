@@ -62,6 +62,84 @@ _DEFAULT_HOURS = [
 	("Noche", 4),
 ]
 
+# Preset → default clock hours (0–23). Selecting the preset turns these on;
+# the client can still toggle freely while keeping the preset label.
+_PRESET_DEFAULT_SLOTS = {
+	"mañana": [9, 10, 11, 12],
+	"manana": [9, 10, 11, 12],
+	"mediodía": [12, 13, 14],
+	"mediodia": [12, 13, 14],
+	"tarde": [15, 16, 17, 18],
+	"noche": [19, 20, 21, 22],
+}
+
+
+def normalize_preferred_hour_slots(raw) -> str:
+	"""Comma-separated unique hours 0–23 (e.g. ``9,10,11,12``). Dirty → ``""``."""
+	from frappe.utils import cstr
+
+	if raw is None:
+		return ""
+	if isinstance(raw, (list, tuple, set)):
+		vals = list(raw)
+	else:
+		s = cstr(raw).strip()
+		if not s or s.lower() in ("null", "undefined", "none", "[]", "{}"):
+			return ""
+		# JSON list string
+		if s.startswith("["):
+			try:
+				parsed = frappe.parse_json(s)
+				vals = list(parsed) if isinstance(parsed, (list, tuple)) else []
+			except Exception:
+				vals = []
+		else:
+			vals = [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]
+	hours = []
+	seen = set()
+	for v in vals:
+		try:
+			h = int(float(v))
+		except (TypeError, ValueError):
+			continue
+		if h < 0 or h > 23 or h in seen:
+			continue
+		seen.add(h)
+		hours.append(h)
+	hours.sort()
+	return ",".join(str(h) for h in hours)
+
+
+def preferred_hour_slots_list(raw) -> list:
+	s = normalize_preferred_hour_slots(raw)
+	if not s:
+		return []
+	return [int(x) for x in s.split(",") if x != ""]
+
+
+def default_slots_for_preferred_hours(label=None) -> list:
+	"""Default hour toggles for a Mañana/Mediodía/Tarde/Noche (or custom) preset."""
+	from frappe.utils import cstr
+
+	key = cstr(label or "").strip().lower()
+	if not key:
+		return []
+	if key in _PRESET_DEFAULT_SLOTS:
+		return list(_PRESET_DEFAULT_SLOTS[key])
+	# Accent-stripped fallback
+	folded = (
+		key.replace("á", "a")
+		.replace("é", "e")
+		.replace("í", "i")
+		.replace("ó", "o")
+		.replace("ú", "u")
+	)
+	return list(_PRESET_DEFAULT_SLOTS.get(folded) or [])
+
+
+def serialize_preferred_hour_slots(hours) -> str:
+	return normalize_preferred_hour_slots(hours)
+
 # Argentina Empresa Cond. IVA (alícuotas) — Tax Category + Sales Taxes template per rate.
 _ARGENTINA_IVA_RATES = [
 	("IVA 21%", 21.0, "Standard — bienes y servicios generales"),
@@ -71,7 +149,7 @@ _ARGENTINA_IVA_RATES = [
 
 
 def ensure_preferred_delivery_hours():
-	"""Create DocType rows (Mañana…Noche) and Customer.custom_preferred_hours Link."""
+	"""Create DocType rows (Mañana…Noche) and Customer preferred-hours Link + hour slots."""
 	create_custom_fields(
 		{
 			"Customer": [
@@ -83,6 +161,13 @@ def ensure_preferred_delivery_hours():
 					"insert_after": "territory",
 					"in_list_view": 0,
 					"in_standard_filter": 1,
+				},
+				{
+					"fieldname": "custom_preferred_hour_slots",
+					"label": "Preferred Hour Slots",
+					"fieldtype": "Data",
+					"insert_after": "custom_preferred_hours",
+					"description": "Comma-separated clock hours 0–23 (e.g. 9,10,11,12). Preset Mañana seeds 9–12; client can toggle freely.",
 				},
 			]
 		},
@@ -270,6 +355,7 @@ def list_preferred_delivery_hours(include_disabled=0):
 				"label": r.label or r.name,
 				"priority": r.priority,
 				"disabled": int(r.disabled or 0),
+				"default_hours": default_slots_for_preferred_hours(r.label or r.name),
 			}
 			for r in rows
 		]

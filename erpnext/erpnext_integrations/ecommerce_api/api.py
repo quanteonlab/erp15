@@ -3077,6 +3077,18 @@ def create_customer(
 		customer.tax_category = cat_val
 	if hours_val and frappe.db.has_column("Customer", "custom_preferred_hours"):
 		customer.custom_preferred_hours = hours_val
+	if frappe.db.has_column("Customer", "custom_preferred_hour_slots"):
+		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+			default_slots_for_preferred_hours,
+			normalize_preferred_hour_slots,
+		)
+
+		slots_raw = kwargs.get("preferred_hour_slots", kwargs.get("custom_preferred_hour_slots"))
+		if slots_raw is None and hours_val:
+			slots_raw = default_slots_for_preferred_hours(hours_val)
+		slots_val = normalize_preferred_hour_slots(slots_raw)
+		if slots_val:
+			customer.custom_preferred_hour_slots = slots_val
 	if pin_val and frappe.db.has_column("Customer", "custom_client_access_pin"):
 		customer.custom_client_access_pin = pin_val
 	if cred_val and frappe.db.has_column("Customer", "custom_client_phone_e164"):
@@ -3412,6 +3424,8 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 		base_fields += ["custom_client_access_pin", "custom_client_phone_e164"]
 	if frappe.db.has_column("Customer", "custom_preferred_hours"):
 		base_fields.append("custom_preferred_hours")
+	if frappe.db.has_column("Customer", "custom_preferred_hour_slots"):
+		base_fields.append("custom_preferred_hour_slots")
 	if frappe.db.has_column("Customer", "custom_catalog_hide_prices"):
 		base_fields.append("custom_catalog_hide_prices")
 	if frappe.db.has_column("Customer", "custom_catalog_lang"):
@@ -3539,6 +3553,7 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"primary_address": r.primary_address,
 				"customer_primary_address": r.customer_primary_address,
 				"preferred_hours": getattr(r, "custom_preferred_hours", None),
+				"preferred_hour_slots": getattr(r, "custom_preferred_hour_slots", None) or "",
 				"client_access_pin": getattr(r, "custom_client_access_pin", None),
 				"client_phone_e164": getattr(r, "custom_client_phone_e164", None),
 				"default_price_list": cstr(getattr(r, "default_price_list", None) or "").strip()
@@ -3802,12 +3817,26 @@ def update_customer(customer_name, **kwargs):
 	if not frappe.db.exists("Customer", customer_name):
 		frappe.throw(_("Customer {0} not found").format(customer_name))
 
+	# Walk-in buckets are shared placeholders — never mutate profile / address here.
+	# Put receiver + direction to deliver on each Sales Order instead.
+	cname = frappe.db.get_value("Customer", customer_name, "customer_name")
+	if _is_bucket_customer(customer_name, cname):
+		frappe.throw(
+			_(
+				"Cannot edit Consumidor Final / Uncategorized — it is a shared anonymous client. "
+				"Set receiver and delivery address on each order instead."
+			),
+			frappe.ValidationError,
+		)
+
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
 			ensure_catalog_price_fields,
+			ensure_preferred_delivery_hours,
 		)
 
 		ensure_catalog_price_fields()
+		ensure_preferred_delivery_hours()
 	except Exception:
 		pass
 
@@ -3826,6 +3855,18 @@ def update_customer(customer_name, **kwargs):
 		# Frontend may send preferred_hours alias
 		if "preferred_hours" in kwargs and "custom_preferred_hours" not in kwargs:
 			kwargs["custom_preferred_hours"] = kwargs.get("preferred_hours")
+	if frappe.db.has_column("Customer", "custom_preferred_hour_slots"):
+		allowed_fields.append("custom_preferred_hour_slots")
+		if "preferred_hour_slots" in kwargs and "custom_preferred_hour_slots" not in kwargs:
+			kwargs["custom_preferred_hour_slots"] = kwargs.get("preferred_hour_slots")
+		if "custom_preferred_hour_slots" in kwargs:
+			from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+				normalize_preferred_hour_slots,
+			)
+
+			kwargs["custom_preferred_hour_slots"] = normalize_preferred_hour_slots(
+				kwargs.get("custom_preferred_hour_slots")
+			)
 	if frappe.db.has_column("Customer", "custom_client_access_pin"):
 		allowed_fields.append("custom_client_access_pin")
 		if "client_access_pin" in kwargs and "custom_client_access_pin" not in kwargs:
@@ -3917,6 +3958,8 @@ def update_customer(customer_name, **kwargs):
 		1 if cint(out.get("custom_catalog_hide_prices") or 0) else 0
 	)
 	out["default_price_list"] = cstr(out.get("default_price_list") or "").strip() or None
+	out["preferred_hours"] = cstr(out.get("custom_preferred_hours") or "") or None
+	out["preferred_hour_slots"] = cstr(out.get("custom_preferred_hour_slots") or "")
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
 			normalize_catalog_lang,
@@ -5302,13 +5345,12 @@ def _item_line_weight_fields(
 	}
 	is_weight_based = bool(uoms & weight_tokens)
 	# Prefer line-level pack weight / measured total (remeasure) over Item master.
+	# Never invent total_weight from peso promedio × qty — that is estimate-only (~ in UI).
 	line_wpu = flt(line_weight_per_unit) if line_weight_per_unit not in (None, "") else 0.0
 	if line_wpu > 0:
 		weight_per_unit = line_wpu
 	qty = flt(line_qty)
 	total_weight = flt(line_total_weight) if line_total_weight not in (None, "") else 0.0
-	if total_weight <= 0 and weight_per_unit > 0 and qty > 0:
-		total_weight = weight_per_unit * qty
 	# Soft band for weigh UIs (units × catalog min/max); never raises.
 	# Only attach when a real min/max band exists (ignore 0/0 DB defaults).
 	weight_band = None
@@ -5321,11 +5363,13 @@ def _item_line_weight_fields(
 		try:
 			from erpnext.erpnext_integrations.ecommerce_api.weight_api import validate_total_weight
 
-			check = validate_total_weight(
-				item_code, qty, total_weight if total_weight > 0 else weight_per_unit * qty
+			band_kg = total_weight if total_weight > 0 else (
+				weight_per_unit * qty if weight_per_unit > 0 else 0
 			)
-			weight_band = check.get("band")
-			weight_warning = check.get("warning")
+			if band_kg > 0:
+				check = validate_total_weight(item_code, qty, band_kg)
+				weight_band = check.get("band")
+				weight_warning = check.get("warning")
 		except Exception:
 			pass
 	out = {
@@ -5504,6 +5548,60 @@ def _calculate_guest_preorder_totals(so):
 		so.set_total_in_words()
 
 
+def _measured_total_weights_from_items(items) -> dict:
+	"""item_code → measured kg from a Pedidos/Armado payload (ignore estimates)."""
+	out = {}
+	for i in items or []:
+		if not isinstance(i, dict):
+			continue
+		code = cstr(i.get("item_code") or "")
+		if not code:
+			continue
+		tw = i.get("total_weight")
+		if tw not in (None, "") and flt(tw) > 0:
+			out[code] = flt(tw)
+	return out
+
+
+def _apply_measured_total_weights(so, measured_by_code=None) -> None:
+	"""Keep only explicitly measured kg; clear ERPNext wpu×qty autofill."""
+	measured = {
+		cstr(k): flt(v)
+		for k, v in (measured_by_code or {}).items()
+		if flt(v) > 0
+	}
+	for row in so.get("items") or []:
+		code = cstr(getattr(row, "item_code", "") or "")
+		keep = measured.get(code)
+		row.total_weight = flt(keep) if keep else 0
+
+
+@contextmanager
+def _keep_only_measured_total_weights(so, measured_by_code=None):
+	"""Undo ERPNext ``force_item_fields`` total_weight = weight_per_unit × stock_qty.
+
+	Peso promedio must stay estimate-only (~ in Pedidos / soft billable qty).
+	Wrap insert/save so validate's set_missing_values cannot re-invent measured kg.
+	"""
+	measured = {
+		cstr(k): flt(v)
+		for k, v in (measured_by_code or {}).items()
+		if flt(v) > 0
+	}
+	orig_validate = so.validate
+
+	def _validate():
+		orig_validate()
+		_apply_measured_total_weights(so, measured)
+
+	so.validate = _validate
+	_apply_measured_total_weights(so, measured)
+	try:
+		yield
+	finally:
+		so.validate = orig_validate
+
+
 def _repair_guest_preorder_weight_totals(so) -> bool:
 	"""Persist WEIGHT $/kg×kg totals when SO still has stale qty×rate money."""
 	est = _guest_preorder_estimated_total(so)
@@ -5665,6 +5763,8 @@ def create_guest_preorder(
 	send_client_pin=1,
 	initial_status=None,
 	coupon_code=None,
+	guest_browser_id=None,
+	guest_browser_secret=None,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -5674,6 +5774,9 @@ def create_guest_preorder(
 
 	Uses a valid SilkOS ``order_type`` (default ``Sales``). The flow is identified
 	via ``remarks`` containing ``guest_preorder=1``.
+
+	``guest_browser_id`` / ``guest_browser_secret``: optional temp browser session
+	(Chrome/local). Tags the SO and registers a secret *hash* only — not a Customer.
 
 	``customer``: optional Customer override for known parties (e.g. seed data,
 	a repeat order placed from the client tracking portal for a known
@@ -5815,6 +5918,21 @@ def create_guest_preorder(
 	so.flags.ignore_pricing_rule = True
 
 	remarks_parts = [GUEST_PREORDER_REMARKS_TAG, f"customer:{customer}"]
+	browser_id = cstr(guest_browser_id or "").strip()
+	browser_secret = cstr(guest_browser_secret or "").strip()
+	if browser_id and browser_secret:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+				GUEST_BROWSER_TAG_PREFIX,
+				ensure_guest_browser_session,
+			)
+
+			ensure_guest_browser_session(browser_id=browser_id, secret=browser_secret)
+			remarks_parts.append(
+				f"{GUEST_BROWSER_TAG_PREFIX}{_sanitize_guest_tag(browser_id)}"
+			)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "guest browser session register failed")
 	if guest_phone:
 		remarks_parts.append(f"guest_phone:{_sanitize_guest_tag(guest_phone)}")
 	if guest_name:
@@ -5897,13 +6015,17 @@ def create_guest_preorder(
 			"rate": rate,
 			"delivery_date": so.delivery_date,
 		}
-		# Soft pack weight for mayorista WEIGHT estimates (importe before armado remide).
+		# Catalog peso promedio for ~estimates only — do not auto-fill measured total_weight.
 		wpu = row.get("weight_per_unit")
 		if wpu is None and frappe.db.has_column("Item", "weight_per_unit"):
 			wpu = flt(frappe.db.get_value("Item", item_code, "weight_per_unit") or 0) or None
 		if wpu and flt(wpu) > 0:
 			line_kwargs["weight_per_unit"] = flt(wpu)
-			line_kwargs["total_weight"] = flt(wpu) * flt(qty)
+		# Explicit measured kg from client (armado / scale) only.
+		if row.get("total_weight") not in (None, ""):
+			tw = flt(row.get("total_weight"))
+			if tw > 0:
+				line_kwargs["total_weight"] = tw
 
 		so.append("items", line_kwargs)
 
@@ -5967,9 +6089,11 @@ def create_guest_preorder(
 	prev_mute = frappe.flags.get("mute_messages")
 	frappe.flags.skip_auto_insert_item_price = True
 	frappe.flags.mute_messages = True
+	measured_tw = _measured_total_weights_from_items(resolved_rows)
 	try:
-		with _allow_weight_fractional_stock_qty(so):
-			so.insert(ignore_permissions=True, ignore_mandatory=notes_only)
+		with _keep_only_measured_total_weights(so, measured_tw):
+			with _allow_weight_fractional_stock_qty(so):
+				so.insert(ignore_permissions=True, ignore_mandatory=notes_only)
 	finally:
 		frappe.flags.skip_auto_insert_item_price = prev_skip_price
 		frappe.flags.mute_messages = prev_mute
@@ -8119,12 +8243,14 @@ def update_guest_preorder_items(preorder_name, items, additional_discount_amount
 
 	# Draft + submitted: edit in place. Keep operator rate/qty/uom (WEIGHT) —
 	# do not re-price from rules. Submitted needs update-after-submit bypass.
+	measured_tw = _measured_total_weights_from_items(items)
 	_apply_item_changes(so, items, additional_discount_amount)
 	so.flags.ignore_pricing_rule = True
 	if so.docstatus == 1:
 		so.flags.ignore_validate_update_after_submit = True
-	with _allow_weight_fractional_stock_qty(so):
-		_save_guest_preorder_so(so)
+	with _keep_only_measured_total_weights(so, measured_tw):
+		with _allow_weight_fractional_stock_qty(so):
+			_save_guest_preorder_so(so)
 	so.reload()
 	_requeue_seller_amend_review(so.name, reason="seller_amend_items")
 	# Pedidos table edit after armado → drop Preparado so Armado shows it under Para armar.
@@ -8178,14 +8304,13 @@ def _apply_item_changes(so, items, additional_discount_amount):
 		if override.get("uom") is not None or override.get("stock_uom") is not None:
 			_apply_so_line_uom(row, override.get("uom") or override.get("stock_uom"))
 		# Measured pack weight (gondolas → kg after scale). Keep qty as units.
+		# Never invent total_weight from peso promedio × qty (that is estimate-only).
+		# Do not rewrite weight_per_unit from the scale reading — that field is the
+		# catalog promedio used for the "~" hint.
 		if "total_weight" in override and override.get("total_weight") is not None:
-			tw = flt(override.get("total_weight"))
-			row.total_weight = tw
-			if flt(row.qty) > 0:
-				row.weight_per_unit = tw / flt(row.qty)
+			row.total_weight = flt(override.get("total_weight"))
 		elif "weight_per_unit" in override and override.get("weight_per_unit") is not None:
 			row.weight_per_unit = flt(override.get("weight_per_unit"))
-			row.total_weight = flt(row.qty) * flt(row.weight_per_unit)
 		row.amount = row.rate * row.qty
 
 	# Add new items. Submitted SOs use ignore_validate_update_after_submit, so
@@ -8223,13 +8348,9 @@ def _apply_item_changes(so, items, additional_discount_amount):
 				_apply_so_line_uom(row, item_meta.get("stock_uom") or "Nos")
 			# total_weight / weight_per_unit on brand-new lines (same as update path)
 			if "total_weight" in item and item.get("total_weight") is not None:
-				tw = flt(item.get("total_weight"))
-				row.total_weight = tw
-				if flt(row.qty) > 0:
-					row.weight_per_unit = tw / flt(row.qty)
+				row.total_weight = flt(item.get("total_weight"))
 			elif "weight_per_unit" in item and item.get("weight_per_unit") is not None:
 				row.weight_per_unit = flt(item.get("weight_per_unit"))
-				row.total_weight = flt(row.qty) * flt(row.weight_per_unit)
 
 	so.apply_discount_on = "Grand Total"
 	so.additional_discount_amount = flt(additional_discount_amount)
@@ -8273,8 +8394,15 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 	so.additional_discount_amount = flt(additional_discount_amount)
 	_calculate_guest_preorder_totals(so)
 	so.flags.ignore_pricing_rule = True
-	with _allow_weight_fractional_stock_qty(so):
-		_save_guest_preorder_so(so)
+	# Price edits must not invent total_weight from peso promedio; keep measured kg.
+	measured_tw = {
+		cstr(row.item_code): flt(row.total_weight)
+		for row in (so.items or [])
+		if flt(getattr(row, "total_weight", None) or 0) > 0
+	}
+	with _keep_only_measured_total_weights(so, measured_tw):
+		with _allow_weight_fractional_stock_qty(so):
+			_save_guest_preorder_so(so)
 	so.reload()
 	_requeue_seller_amend_review(so.name, reason="seller_amend_prices")
 	return get_guest_preorder(preorder_name)

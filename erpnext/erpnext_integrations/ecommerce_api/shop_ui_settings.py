@@ -320,15 +320,22 @@ def _normalize_logo_url(val) -> str:
 def _normalize_pedidos_default_seller_scope(val) -> str:
 	"""Default Pedidos table toggle: assigned clients | seller link | all.
 
-	Unset / unknown → ``assigned`` (salesman's clients). Explicit ``all`` / ``todos`` → ``""``.
+	Unset / unknown / ``all`` → ``""`` (no Mis clientes chip on first open).
+	Explicit ``assigned`` / ``mine`` are kept when admin or the user saved them.
 	"""
 	s = str(val or "").strip().lower()
-	if s in ("all", "todos"):
-		return ""
+	if s in (
+		"assigned",
+		"clients",
+		"clientes",
+		"mis_clientes",
+		"my_clients",
+		"salesman_clients",
+	):
+		return "assigned"
 	if s in ("mine", "my", "seller_ref", "mi_enlace", "link"):
 		return "mine"
-	# assigned (default) — also treat empty/null as assigned so new tenants show clients.
-	return "assigned"
+	return ""
 
 
 def _normalize_qty_stepper_labels(val) -> str:

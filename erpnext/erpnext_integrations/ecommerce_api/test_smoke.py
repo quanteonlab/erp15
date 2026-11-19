@@ -1242,6 +1242,61 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_peso_promedio_does_not_autofill_total_weight():
+        """Catalog weight_per_unit must never invent measured total_weight on create/update/read."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 2, "rate": 10, "weight_per_unit": 1.25}],
+                guest_notes="smoke no autofill tw",
+                guest_name="Smoke No Autofill Tw",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name
+            detail = api.get_guest_preorder(so_name)
+            line = (detail.get("items") or [None])[0]
+            assert line, detail
+            assert abs(flt(line.get("weight_per_unit")) - 1.25) < 1e-9, line
+            assert not flt(line.get("total_weight") or 0), line
+            db_tw = frappe.db.get_value(
+                "Sales Order Item",
+                {"parent": so_name, "item_code": item_code},
+                "total_weight",
+            )
+            assert not flt(db_tw or 0), db_tw
+            detail2 = api.update_guest_preorder_items(
+                so_name,
+                [
+                    {
+                        "item_code": item_code,
+                        "qty": 3,
+                        "rate": 10,
+                        "weight_per_unit": 1.25,
+                    }
+                ],
+                0,
+            )
+            line2 = (detail2.get("items") or [None])[0]
+            assert line2, detail2
+            assert abs(flt(line2.get("weight_per_unit")) - 1.25) < 1e-9, line2
+            assert not flt(line2.get("total_weight") or 0), line2
+            db_tw2 = frappe.db.get_value(
+                "Sales Order Item",
+                {"parent": so_name, "item_code": item_code},
+                "total_weight",
+            )
+            assert not flt(db_tw2 or 0), db_tw2
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_create_returns_before_side_effects():
         """Create/Orden returns with side_effects_queued; remito can finish after."""
         so_name = None
@@ -1853,6 +1908,11 @@ def suite_5_9_master_data():
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
     _run("5.9.14a WEIGHT bills rate×kg", check_weight_line_bills_rate_times_kg, "S2")
     _run("5.9.14b measured kg no float drift", check_measured_total_weight_no_float_drift, "S2")
+    _run(
+        "5.9.14b2 peso promedio does not autofill total_weight",
+        check_peso_promedio_does_not_autofill_total_weight,
+        "S2",
+    )
     _run("5.9.14c create queues side effects", check_create_returns_before_side_effects, "S2")
     _run("5.9.15 Orden item edit in place (no amend)", check_orden_item_edit_inplace, "S2")
     _run("5.9.16 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
@@ -2209,6 +2269,47 @@ def suite_5_11_pos_session():
         assert res.get("ok") is False
         assert res.get("reason") in ("not_found", "invalid")
 
+    def check_consumidor_final_portal_does_not_leak_orders():
+        """PIN on Consumidor Final must not authenticate or list every walk-in SO."""
+        from erpnext.erpnext_integrations.ecommerce_api import api
+        from erpnext.erpnext_integrations.ecommerce_api import client_access_api as caa
+
+        frappe.set_user("Administrator")
+        cf = api._get_or_create_consumidor_final()
+        pin = caa._new_pin()
+        phone = "+5491100998877"
+        # Simulate legacy leak: credentials stamped on the shared bucket.
+        frappe.db.set_value(
+            "Customer",
+            cf,
+            {
+                "custom_client_access_pin": pin,
+                "custom_client_phone_e164": phone,
+            },
+            update_modified=False,
+        )
+        frappe.db.commit()
+        resolved = caa.resolve_client_access_pin(pin=pin)
+        assert resolved.get("ok") is False or not caa._customer_is_bucket(
+            resolved.get("customer"), resolved.get("customer_name")
+        ), resolved
+        try:
+            caa.list_consultas_by_client_access(phone=phone, pin=pin)
+            raise AssertionError("bucket PIN alone must not authenticate portal")
+        except Exception:
+            pass
+        # Stamp must be scrubbed / ignored going forward.
+        assert not frappe.db.get_value("Customer", cf, "custom_client_access_pin")
+        # Mint against CF must not persist credentials on the bucket.
+        issued = caa.issue_client_access_pin(
+            guest_phone="+5491100997766",
+            customer=cf,
+            send=0,
+            force_new=1,
+        )
+        assert issued.get("ok") is True, issued
+        assert not frappe.db.get_value("Customer", cf, "custom_client_access_pin")
+
     def check_ops_operator_empty_pin_uses_session():
         """Logged-in desk user may open Armado without re-entering PIN."""
         from erpnext.erpnext_integrations.ecommerce_api import ops_kiosk_api as oka
@@ -2267,6 +2368,11 @@ def suite_5_11_pos_session():
     _run("5.11.5 resolve_ops_pin shape", check_resolve_ops_pin_shape, "S3")
     _run("5.11.6 ensure_employee_ops_pins + resolve", check_ensure_ops_pin_roundtrip, "S2")
     _run("5.11.6a client PIN first digit + resolve", check_client_pin_first_digit_and_resolve, "S2")
+    _run(
+        "5.11.6a2 CF bucket PIN does not leak portal orders",
+        check_consumidor_final_portal_does_not_leak_orders,
+        "S2",
+    )
     _run("5.11.6b ops operator empty pin uses session", check_ops_operator_empty_pin_uses_session, "S2")
     def check_partial_armado_progress():
         """Partial pack + faltante + boxes stay on the order and survive confirm."""
@@ -3055,6 +3161,12 @@ def suite_5_12_modules_read():
         assert weighed.get("units_qty") == "4", weighed
         assert weighed.get("um_display") == "Kil", weighed
         assert weighed.get("peso_display") == "13.43", weighed
+        # Remito Uni/Cantidad: never English WEIGHT — Spanish Peso; qty is number-only.
+        assert weighed.get("uom") == "Peso", weighed
+        assert "WEIGHT" not in cstr(weighed.get("qty_display") or "").upper(), weighed
+        assert cstr(weighed.get("qty_display") or "") == "4", weighed
+        assert pta._uom_print_label("WEIGHT") == "Peso"
+        assert pta._qty_display_for_print(1.5, "WEIGHT") == "1.5"
         # Catalog WEIGHT without measured kg → blank (do not print unit count as kg).
         units_only = pta._enrich_print_line_item(
             {"item_code": "SMOKE-WT", "qty": 4, "uom": "WEIGHT", "total_weight": 0, "amount": 1}
@@ -3062,6 +3174,26 @@ def suite_5_12_modules_read():
         assert units_only.get("weight") in ("", None, 0, "0"), units_only
         assert units_only.get("peso_display") == "-", units_only
         assert units_only.get("units_qty") == "4", units_only
+        assert units_only.get("uom") == "Peso", units_only
+        assert cstr(units_only.get("qty_display") or "") == "4", units_only
+        # Peso promedio × qty must not print as a weighed Peso unless the shop
+        # setting says the client already declared the kg.
+        estimated = pta._enrich_print_line_item(
+            {
+                "item_code": "SMOKE-WT",
+                "qty": 4,
+                "uom": "WEIGHT",
+                "total_weight": 0,
+                "weight_per_unit": 2.5,
+                "amount": 1,
+            }
+        )
+        if pta._order_print_client_knows_weight():
+            assert abs(flt(estimated.get("weight")) - 10) < 1e-6, estimated
+        else:
+            assert str(estimated.get("weight")) == "~10", estimated
+            assert estimated.get("total_weight") in ("", None, 0), estimated
+            assert estimated.get("peso_display") == "~10", estimated
         # Real mass UOM: qty is the weight; Unid from weight_per_unit when known.
         mass = pta._enrich_print_line_item(
             {
@@ -3193,6 +3325,7 @@ def suite_5_12_modules_read():
         assert items_el, remito_els
         col_paths = [c.get("fieldPath") for c in (items_el.get("columns") or [])]
         assert "amount" in col_paths, col_paths
+        assert "warehouse" not in col_paths, col_paths  # no Desde on remito
         assert any(
             isinstance(e, dict) and e.get("fieldPath") == "grand_total" for e in remito_els
         ), remito_els

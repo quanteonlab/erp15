@@ -1,13 +1,17 @@
-"""Client access PIN (Twilio WhatsApp/SMS) for catalog guests — not ERP Users.
+"""Client access for catalog guests — not ERP Users.
 
-When a consulta arrives with a phone never seen before (and country is in the
-allow-list, default AR), we mint a 6-digit PIN, store it on Customer and/or Lead,
-and best-effort send it via Twilio. The guest portal uses phone+PIN only to
-prefill / track — no Frappe User is created.
+Two security flows:
+
+1. **Browser temp session** (default walk-in): id+secret live in the browser
+   (Chrome session / local). Server stores only a secret *hash* in Table Extra
+   Data and tags Sales Orders with ``guest_browser:<id>``. No Customer / PIN.
+2. **Phone + PIN** (cross-device claim): Twilio WhatsApp/SMS PIN on Lead or a
+   real Customer — never on the shared Consumidor Final bucket.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 
@@ -158,8 +162,15 @@ def _client_pin_in_use(pin: str) -> bool:
 	if not raw:
 		return False
 	if frappe.db.has_column("Customer", "custom_client_access_pin"):
-		if frappe.db.exists("Customer", {"custom_client_access_pin": raw}):
-			return True
+		for row in frappe.get_all(
+			"Customer",
+			filters={"custom_client_access_pin": raw},
+			fields=["name", "customer_name"],
+			limit_page_length=5,
+			ignore_permissions=True,
+		):
+			if not _customer_is_bucket(row.name, row.customer_name):
+				return True
 	if frappe.db.has_column("Lead", "custom_client_access_pin"):
 		if frappe.db.exists("Lead", {"custom_client_access_pin": raw}):
 			return True
@@ -283,8 +294,47 @@ def _send_pin_message(to_e164: str, pin: str, portal_url: str) -> dict:
 		return {"sent": False, "reason": "twilio_error"}
 
 
+def _customer_is_bucket(name=None, customer_name=None) -> bool:
+	"""Walk-in placeholders (Consumidor Final / Uncategorized) must not own PINs or shared order lists."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import _is_bucket_customer
+
+	cust = cstr(name or "").strip()
+	label = cstr(customer_name or "").strip()
+	if cust and not label and frappe.db.exists("Customer", cust):
+		label = cstr(frappe.db.get_value("Customer", cust, "customer_name") or "")
+	return _is_bucket_customer(cust or None, label or None)
+
+
+def _scrub_bucket_customer_credentials():
+	"""Drop portal PIN/phone stamped on shared walk-in Customers (legacy leak)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		CONSUMIDOR_FINAL_NAME,
+		UNCATEGORIZED_CUSTOMER_NAME,
+	)
+
+	if not frappe.db.has_column("Customer", "custom_client_access_pin"):
+		return
+	labels = (CONSUMIDOR_FINAL_NAME.lower(), UNCATEGORIZED_CUSTOMER_NAME.lower())
+	rows = frappe.db.sql(
+		"""
+		SELECT name FROM `tabCustomer`
+		WHERE LOWER(TRIM(customer_name)) IN %s
+		""",
+		(labels,),
+	)
+	for (name,) in rows or ():
+		updates = {"custom_client_access_pin": None}
+		if frappe.db.has_column("Customer", "custom_client_phone_e164"):
+			updates["custom_client_phone_e164"] = None
+		frappe.db.set_value("Customer", name, updates, update_modified=False)
+
+
 def _stamp_party(doctype: str, name: str, pin: str, e164: str):
 	if not name or not frappe.db.exists(doctype, name):
+		return
+	# Never put portal credentials on the shared walk-in Customer — every guest
+	# would overwrite the same PIN and list_consultas would leak all CF orders.
+	if doctype == "Customer" and _customer_is_bucket(name):
 		return
 	updates = {}
 	if doctype == "Supplier":
@@ -346,6 +396,9 @@ def issue_client_access_pin(
 
 	customer = cstr(customer or "").strip() or None
 	lead = cstr(lead or "").strip() or None
+	# Walk-in bucket is shared — never attach PIN/phone there.
+	if customer and _customer_is_bucket(customer):
+		customer = None
 
 	# Reuse existing PIN on linked party
 	existing_pin = None
@@ -449,7 +502,7 @@ def resolve_client_access_pin(pin=None):
 			cust_fields,
 			as_dict=True,
 		)
-		if row:
+		if row and not _customer_is_bucket(row.name, row.customer_name):
 			customer = row.name
 			customer_name = cstr(row.customer_name or row.name).strip() or row.name
 			phone_e164 = _normalize_e164(
@@ -458,6 +511,9 @@ def resolve_client_access_pin(pin=None):
 			default_price_list = cstr(getattr(row, "default_price_list", None) or "").strip() or None
 			catalog_hide_prices = 1 if cint(getattr(row, "custom_catalog_hide_prices", 0)) else 0
 			catalog_lang = normalize_catalog_lang(getattr(row, "custom_catalog_lang", None))
+		elif row and _customer_is_bucket(row.name, row.customer_name):
+			# Legacy PIN on Consumidor Final — scrub so it cannot gate the whole bucket.
+			_scrub_bucket_customer_credentials()
 
 	if not customer and frappe.db.has_column("Lead", "custom_client_access_pin"):
 		fields = ["name", "lead_name", "mobile_no", "whatsapp_no", "phone"]
@@ -504,6 +560,7 @@ def resolve_client_access_pin(pin=None):
 def _authenticate_client(phone=None, pin=None):
 	"""Match a guest portal session. Raises a controlled error on bad input."""
 	ensure_client_access_custom_fields()
+	_scrub_bucket_customer_credentials()
 	e164 = _normalize_e164(cstr(phone or ""))
 	pin = cstr(pin or "").strip()
 	if not e164 or not pin or len(pin) < 4:
@@ -526,6 +583,8 @@ def _authenticate_client(phone=None, pin=None):
 			limit_page_length=5,
 			ignore_permissions=True,
 		):
+			if _customer_is_bucket(row.name, row.customer_name):
+				continue
 			cred = _digits(row.custom_client_phone_e164 or row.mobile_no)
 			if cred and (cred == digits or cred.endswith(tail) or digits.endswith(cred)):
 				matched_customer = row.name
@@ -566,11 +625,17 @@ def _pin_taken_by_other(pin: str, customer=None, lead=None) -> bool:
 	if not raw:
 		return False
 	if frappe.db.has_column("Customer", "custom_client_access_pin"):
-		owner = frappe.db.get_value(
-			"Customer", {"custom_client_access_pin": raw}, "name"
-		)
-		if owner and owner != customer:
-			return True
+		for row in frappe.get_all(
+			"Customer",
+			filters={"custom_client_access_pin": raw},
+			fields=["name", "customer_name"],
+			limit_page_length=5,
+			ignore_permissions=True,
+		):
+			if _customer_is_bucket(row.name, row.customer_name):
+				continue
+			if row.name != customer:
+				return True
 	if frappe.db.has_column("Lead", "custom_client_access_pin"):
 		owner = frappe.db.get_value("Lead", {"custom_client_access_pin": raw}, "name")
 		if owner and owner != lead:
@@ -901,6 +966,23 @@ def update_client_account(
 	return payload
 
 
+def _so_tag_matches_client(tag_text: str, *, tail: str, e164: str, email: str = "") -> bool:
+	"""Match guest SO tags to the portal session (phone tail / e164 / email)."""
+	raw = cstr(tag_text or "")
+	if not raw:
+		return False
+	digits = _digits(raw)
+	e164_digits = _digits(e164)
+	if tail and tail in digits:
+		return True
+	if e164_digits and len(e164_digits) >= 8 and e164_digits in digits:
+		return True
+	em = cstr(email or "").strip().lower()
+	if em and f"guest_email:{em}" in raw.lower():
+		return True
+	return False
+
+
 @frappe.whitelist(allow_guest=True)
 def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 	"""Guest portal: list orders for phone+PIN (no ERP User)."""
@@ -908,6 +990,7 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 	tail = auth["tail"]
 	matched_customer = auth["customer"]
 	matched_lead = auth["lead"]
+	e164 = auth["e164"]
 
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		GUEST_PREORDER_REMARKS_TAG,
@@ -915,11 +998,17 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 		get_guest_preorders_list,
 	)
 
-	# Prefer customer-scoped list when available; fall back to recent guest list filter client-side.
+	# Real Customer → scope by customer. Bucket / Lead-only → guest tags + phone filter
+	# (Consumidor Final is shared; never return every walk-in SO).
 	tag_fn = _guest_preorder_tag_fieldname()
 	filters = {tag_fn: ["like", f"%{GUEST_PREORDER_REMARKS_TAG}%"]} if tag_fn else {}
-	if matched_customer:
+	customer_is_bucket = bool(matched_customer and _customer_is_bucket(matched_customer))
+	if matched_customer and not customer_is_bucket:
 		filters["customer"] = matched_customer
+
+	limit = max(1, min(cint(page_length) or 50, 100))
+	# Bucket / lead path may need a wider scan then filter by phone tag.
+	fetch_limit = limit if (matched_customer and not customer_is_bucket) else max(limit * 4, 100)
 
 	rows = frappe.get_all(
 		"Sales Order",
@@ -949,19 +1038,20 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 			"currency",
 		],
 		order_by="modified desc",
-		limit_page_length=max(1, min(cint(page_length) or 50, 100)),
+		limit_page_length=fetch_limit,
 		ignore_permissions=True,
 	)
 
-	# When only Lead matched (Consumidor Final), filter by guest_phone tag.
 	out = []
 	for r in rows:
 		tag_text = cstr(r.get(tag_fn) if tag_fn else "")
-		if matched_customer and r.customer == matched_customer:
+		if matched_customer and not customer_is_bucket and r.customer == matched_customer:
 			out.append(r)
 			continue
-		if tail and tail in _digits(tag_text):
+		if _so_tag_matches_client(tag_text, tail=tail, e164=e164):
 			out.append(r)
+		if len(out) >= limit:
+			break
 
 	# Enrich display_status lightly via list helper when cheap — else raw status.
 	try:
@@ -989,7 +1079,7 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 
 	return {
 		"ok": True,
-		"customer": matched_customer,
+		"customer": None if customer_is_bucket else matched_customer,
 		"lead": matched_lead,
 		"consultas": consultas,
 	}
@@ -1201,3 +1291,173 @@ def ensure_supplier_access_pin(supplier=None, rotate=0):
 		"phone_e164": e164 or None,
 		"rotated": bool(cint(rotate) or not existing),
 	}
+
+
+# ---------------------------------------------------------------------------
+# Temporary browser session (walk-in) — not a Customer account
+# ---------------------------------------------------------------------------
+
+GUEST_BROWSER_KV_SCOPE = "guest_browser_session"
+GUEST_BROWSER_TAG_PREFIX = "guest_browser:"
+_GUEST_BROWSER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+_GUEST_BROWSER_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{24,128}$")
+
+
+def _guest_browser_secret_hash(browser_id: str, secret: str) -> str:
+	return hashlib.sha256(f"{browser_id}:{secret}".encode("utf-8")).hexdigest()
+
+
+def _normalize_guest_browser_creds(browser_id=None, secret=None) -> tuple[str, str]:
+	bid = cstr(browser_id or "").strip()
+	sec = cstr(secret or "").strip()
+	if not _GUEST_BROWSER_ID_RE.match(bid) or not _GUEST_BROWSER_SECRET_RE.match(sec):
+		frappe.throw(_("Invalid browser session"), frappe.ValidationError)
+	return bid, sec
+
+
+def ensure_guest_browser_session(browser_id=None, secret=None):
+	"""Register (or verify) a temp browser session. Stores hash only — not the secret."""
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
+
+	bid, sec = _normalize_guest_browser_creds(browser_id, secret)
+	digest = _guest_browser_secret_hash(bid, sec)
+	_name, row = kv_get(GUEST_BROWSER_KV_SCOPE, bid)
+	if row.get("secret_hash"):
+		if not secrets.compare_digest(cstr(row.get("secret_hash")), digest):
+			frappe.throw(_("Invalid browser session"), frappe.AuthenticationError)
+		row["touched_at"] = frappe.utils.now_datetime().isoformat()
+		kv_set(GUEST_BROWSER_KV_SCOPE, bid, row)
+		frappe.db.commit()
+		return {"ok": True, "browser_id": bid, "created": False}
+	kv_set(
+		GUEST_BROWSER_KV_SCOPE,
+		bid,
+		{
+			"secret_hash": digest,
+			"created_at": frappe.utils.now_datetime().isoformat(),
+			"touched_at": frappe.utils.now_datetime().isoformat(),
+		},
+	)
+	frappe.db.commit()
+	return {"ok": True, "browser_id": bid, "created": True}
+
+
+@frappe.whitelist(allow_guest=True)
+def register_guest_browser_session(browser_id=None, secret=None):
+	"""Whitelist wrapper so the storefront can mint a temp session before checkout."""
+	return ensure_guest_browser_session(browser_id=browser_id, secret=secret)
+
+
+@frappe.whitelist(allow_guest=True)
+def list_consultas_by_guest_browser(browser_id=None, secret=None, page_length=50):
+	"""Guest portal (this device): orders tagged to this browser session only."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		GUEST_PREORDER_REMARKS_TAG,
+		_guest_preorder_tag_fieldname,
+		get_guest_preorders_list,
+	)
+
+	bid, sec = _normalize_guest_browser_creds(browser_id, secret)
+	ensure_guest_browser_session(browser_id=bid, secret=sec)
+
+	tag_fn = _guest_preorder_tag_fieldname()
+	needle = f"{GUEST_BROWSER_TAG_PREFIX}{bid}"
+	filters = {}
+	if tag_fn:
+		filters[tag_fn] = ["like", f"%{needle}%"]
+	else:
+		frappe.throw(_("Guest order tags unavailable"), frappe.ValidationError)
+
+	limit = max(1, min(cint(page_length) or 50, 100))
+	rows = frappe.get_all(
+		"Sales Order",
+		filters=filters,
+		fields=[
+			"name",
+			"customer",
+			"customer_name",
+			"transaction_date",
+			"delivery_date",
+			"status",
+			"docstatus",
+			"grand_total",
+			"currency",
+			tag_fn,
+		],
+		order_by="modified desc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+
+	# Defense in depth: require guest_preorder tag + exact browser id token.
+	out = []
+	for r in rows:
+		tag_text = cstr(r.get(tag_fn) or "")
+		if GUEST_PREORDER_REMARKS_TAG not in tag_text:
+			continue
+		if needle not in tag_text:
+			continue
+		out.append(r)
+
+	try:
+		listed = get_guest_preorders_list(page_length=limit, scope="admin")
+		by_name = {p.get("name"): p for p in (listed.get("preorders") or [])}
+	except Exception:
+		by_name = {}
+
+	consultas = []
+	for r in out:
+		extra = by_name.get(r.name) or {}
+		consultas.append(
+			{
+				"name": r.name,
+				"customer": r.customer,
+				"customer_name": r.customer_name,
+				"transaction_date": r.transaction_date,
+				"delivery_date": r.delivery_date,
+				"status": r.status,
+				"display_status": extra.get("display_status") or r.status,
+				"grand_total": r.grand_total,
+				"currency": r.currency,
+			}
+		)
+
+	return {
+		"ok": True,
+		"browser_id": bid,
+		"kind": "browser_session",
+		"consultas": consultas,
+	}
+
+
+def _selftest_guest_browser_isolation():
+	"""Dev helper: two browser sessions must not share walk-in orders."""
+	from erpnext.erpnext_integrations.ecommerce_api import api
+
+	frappe.set_user("Administrator")
+	bid = secrets.token_hex(16)
+	sec = secrets.token_hex(24)
+	ensure_guest_browser_session(browser_id=bid, secret=sec)
+	try:
+		list_consultas_by_guest_browser(browser_id=bid, secret=secrets.token_hex(24))
+		frappe.throw("wrong secret must fail")
+	except frappe.AuthenticationError:
+		pass
+	item = frappe.db.get_value("Item", {"disabled": 0, "is_sales_item": 1}, "name")
+	if not item:
+		frappe.throw("need a sales item")
+	created = api.create_guest_preorder(
+		items=[{"item_code": item, "qty": 1, "rate": 10}],
+		guest_name="Browser Session Smoke",
+		guest_browser_id=bid,
+		guest_browser_secret=sec,
+		send_client_pin=0,
+	)
+	name = cstr(created.get("preorder_name") or created.get("name") or "").strip()
+	listed = list_consultas_by_guest_browser(browser_id=bid, secret=sec)
+	assert name in [c["name"] for c in listed["consultas"]], listed
+	bid2, sec2 = secrets.token_hex(16), secrets.token_hex(24)
+	ensure_guest_browser_session(browser_id=bid2, secret=sec2)
+	listed2 = list_consultas_by_guest_browser(browser_id=bid2, secret=sec2)
+	assert name not in [c["name"] for c in listed2["consultas"]], listed2
+	return {"ok": True, "preorder": name, "browser_id": bid}
