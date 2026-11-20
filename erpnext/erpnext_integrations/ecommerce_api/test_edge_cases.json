@@ -3922,6 +3922,30 @@
       "expect": "error"
     },
     {
+      "id": "update_pending_delivery_address_empty",
+      "source": "regression",
+      "bug": "update_pending_delivery_address with empty address must controlled ValidationError not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_address",
+      "args": {
+        "delivery_note": null,
+        "sales_order": null,
+        "address": "",
+        "address_name": null
+      },
+      "expect": "error"
+    },
+    {
+      "id": "update_pending_delivery_address_null_street",
+      "source": "regression",
+      "bug": "update_pending_delivery_address with address null/\"null\" must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_address",
+      "args": {
+        "delivery_note": "null",
+        "address": "null"
+      },
+      "expect": "error"
+    },
+    {
       "id": "save_pricing_rule_item_code_empty_targets",
       "source": "regression",
       "bug": "save_pricing_rule apply_on Item Code with empty applicable_items must controlled error, not ERPNext 417 Item Code is not added in the table",

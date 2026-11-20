@@ -1111,12 +1111,12 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 
 		# Prefer street line for the Órdenes table / map — not the Address doc name
 		# (Frappe names look like "Title-City-…" and confuse dispatchers / geocoders).
-		street_bits = [
-			cstr(geo.get("address_line1") or "").strip(),
-			cstr(geo.get("address_line2") or "").strip(),
-			cstr(geo.get("city") or "").strip(),
-		]
+		line1 = cstr(geo.get("address_line1") or "").strip()
+		line2 = cstr(geo.get("address_line2") or "").strip()
+		city = cstr(geo.get("city") or "").strip()
+		street_bits = [line1, line2, city]
 		street_display = ", ".join(b for b in street_bits if b) or address_name
+		address_line = ", ".join(b for b in (line1, line2) if b) or street_display
 
 		assigned = trip_by_dn.get(n.name) or {}
 		out.append(
@@ -1127,6 +1127,7 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 				"customer": n.customer,
 				"customer_name": n.customer_name,
 				"address": street_display,
+				"address_line": address_line,
 				"address_name": address_name,
 				"grand_total": n.grand_total,
 				"posting_date": n.posting_date,
@@ -1182,12 +1183,12 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 			continue
 		addr_name = p.get("address_name")
 		geo = geo_by_address.get(addr_name) or {}
-		street_bits = [
-			cstr(geo.get("address_line1") or "").strip(),
-			cstr(geo.get("address_line2") or "").strip(),
-			cstr(geo.get("city") or "").strip(),
-		]
+		line1 = cstr(geo.get("address_line1") or "").strip()
+		line2 = cstr(geo.get("address_line2") or "").strip()
+		city = cstr(geo.get("city") or "").strip()
+		street_bits = [line1, line2, city]
 		street_display = ", ".join(b for b in street_bits if b) or p.get("address") or addr_name
+		address_line = ", ".join(b for b in (line1, line2) if b) or street_display
 		display = _rutas_order_display_status(
 			dn_status=None,
 			so_status=p.get("status"),
@@ -1202,6 +1203,7 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 				"customer": p.get("customer"),
 				"customer_name": p.get("customer_name"),
 				"address": street_display,
+				"address_line": address_line,
 				"address_name": addr_name,
 				"grand_total": p.get("grand_total"),
 				"posting_date": p.get("posting_date"),
@@ -1231,6 +1233,7 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 			r.get("delivery_note") or r.get("preorder_name") or "",
 		)
 	)
+	_stamp_pending_box_counts(out)
 	payload = {"deliveries": out, "as_of": str(as_of), "mode": "window" if window_mode else "ceiling"}
 	if window_mode:
 		payload["from_date"] = str(due_lo)
@@ -1431,6 +1434,158 @@ def update_pending_delivery_zone(delivery_note=None, zone=None):
 	frappe.db.set_value("Address", addr_name, "custom_zone", zone_label or None, update_modified=True)
 	frappe.db.commit()
 	return {"delivery_note": dn, "zone": zone_label or None, "address": addr_name}
+
+
+def _resolve_pending_shipping_address(delivery_note=None, sales_order=None, address_name=None):
+	"""Address doc for a planner row (DN shipping → SO shipping → explicit name)."""
+	explicit = cstr(address_name or "").strip()
+	if explicit and frappe.db.exists("Address", explicit):
+		return explicit
+	dn = cstr(delivery_note or "").strip()
+	if dn and frappe.db.exists("Delivery Note", dn):
+		addr = frappe.db.get_value("Delivery Note", dn, "shipping_address_name") or frappe.db.get_value(
+			"Delivery Note", dn, "customer_address"
+		)
+		if addr and frappe.db.exists("Address", addr):
+			return addr
+	so = cstr(sales_order or "").strip()
+	if so and frappe.db.exists("Sales Order", so):
+		addr = frappe.db.get_value("Sales Order", so, "shipping_address_name") or frappe.db.get_value(
+			"Sales Order", so, "customer_address"
+		)
+		if addr and frappe.db.exists("Address", addr):
+			return addr
+	return None
+
+
+@frappe.whitelist(allow_guest=True)
+def update_pending_delivery_address(
+	delivery_note=None,
+	sales_order=None,
+	address=None,
+	address_name=None,
+	lat=None,
+	lng=None,
+	city=None,
+	address_line2=None,
+):
+	"""Órdenes address edit / map-pin: set street (+ optional coords from AddressComplete)."""
+	street = cstr(address or "").strip()
+	if not street or street.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Address is required."))
+	dn = cstr(delivery_note or "").strip() or None
+	so = cstr(sales_order or "").strip() or None
+	if dn and dn.lower() in ("null", "undefined", "none"):
+		dn = None
+	if so and so.lower() in ("null", "undefined", "none"):
+		so = None
+	addr_name = _resolve_pending_shipping_address(
+		delivery_note=dn, sales_order=so, address_name=address_name
+	)
+	if not addr_name:
+		frappe.throw(_("No shipping address on this order."))
+	updates = {}
+	if frappe.db.has_column("Address", "address_line1"):
+		updates["address_line1"] = street
+	line2_raw = address_line2
+	if line2_raw is not None and cstr(line2_raw).strip().lower() not in ("null", "undefined", "none"):
+		if frappe.db.has_column("Address", "address_line2"):
+			updates["address_line2"] = cstr(line2_raw).strip()
+	elif frappe.db.has_column("Address", "address_line2") and "address_line2" not in updates:
+		# Text-only edit without pin: drop secondary line so display matches street.
+		updates["address_line2"] = ""
+	city_raw = cstr(city or "").strip()
+	if city_raw and city_raw.lower() not in ("null", "undefined", "none"):
+		if frappe.db.has_column("Address", "city"):
+			updates["city"] = city_raw
+
+	lat_f = None
+	lng_f = None
+	if lat not in (None, "", "null", "undefined", "none") and lng not in (
+		None,
+		"",
+		"null",
+		"undefined",
+		"none",
+	):
+		try:
+			lat_f = flt(lat)
+			lng_f = flt(lng)
+		except Exception:
+			lat_f = None
+			lng_f = None
+	has_coords = lat_f is not None and lng_f is not None and (abs(lat_f) > 0.0001 or abs(lng_f) > 0.0001)
+
+	if frappe.db.has_column("Address", "custom_latitude"):
+		updates["custom_latitude"] = lat_f if has_coords else None
+	if frappe.db.has_column("Address", "custom_longitude"):
+		updates["custom_longitude"] = lng_f if has_coords else None
+	if not updates:
+		frappe.throw(_("Address fields are not available on this site."))
+	frappe.db.set_value("Address", addr_name, updates, update_modified=True)
+	frappe.db.commit()
+	display_bits = [street]
+	if city_raw and city_raw.lower() not in ("null", "undefined", "none"):
+		display_bits.append(city_raw)
+	display = ", ".join(b for b in display_bits if b)
+	return {
+		"delivery_note": dn,
+		"sales_order": so,
+		"address_name": addr_name,
+		"address": display,
+		"address_line": street,
+		"geocoded": bool(has_coords),
+		"lat": lat_f if has_coords else None,
+		"lng": lng_f if has_coords else None,
+	}
+
+
+def _armado_box_counts_by_so(so_names):
+	"""Batch-read armado box counts from Table Extra Schema (ops.armado.progress::SO)."""
+	import json as _json
+
+	names = [cstr(n).strip() for n in (so_names or []) if cstr(n).strip()]
+	if not names:
+		return {}
+	scopes = [f"ops.armado.progress::{n}" for n in names]
+	rows = frappe.get_all(
+		"Table Extra Schema",
+		filters={"name": ["in", scopes]},
+		fields=["name", "columns_json"],
+		limit_page_length=len(scopes) + 10,
+		ignore_permissions=True,
+	)
+	out = {}
+	prefix = "ops.armado.progress::"
+	for row in rows or []:
+		scope = cstr(row.get("name") or "")
+		if not scope.startswith(prefix):
+			continue
+		so = scope[len(prefix) :]
+		try:
+			data = _json.loads(row.get("columns_json") or "{}")
+		except Exception:
+			data = {}
+		if not isinstance(data, dict):
+			continue
+		boxes = data.get("boxes") if isinstance(data.get("boxes"), dict) else {}
+		count = cint(boxes.get("count"))
+		if count > 0:
+			out[so] = count
+	return out
+
+
+def _stamp_pending_box_counts(rows):
+	"""Attach ``box_count`` from armado progress (0 when unset)."""
+	so_names = []
+	for r in rows or []:
+		so = cstr(r.get("sales_order") or r.get("preorder_name") or "").strip()
+		if so:
+			so_names.append(so)
+	counts = _armado_box_counts_by_so(so_names)
+	for r in rows or []:
+		so = cstr(r.get("sales_order") or r.get("preorder_name") or "").strip()
+		r["box_count"] = cint(counts.get(so) or 0)
 
 
 def _sales_orders_for_dn(dn):
