@@ -111,13 +111,35 @@ def _ensure_tms_address_geo_fields():
 
 
 def _address_fields_with_geo(base_fields):
-	"""Append geo columns only when present (safe after ensure, or soft-skip)."""
+	"""Append geo/zone columns only when present (safe after ensure, or soft-skip)."""
 	fields = list(base_fields)
 	if frappe.db.has_column("Address", "custom_latitude"):
 		fields.append("custom_latitude")
 	if frappe.db.has_column("Address", "custom_longitude"):
 		fields.append("custom_longitude")
+	if frappe.db.has_column("Address", "custom_zone"):
+		fields.append("custom_zone")
 	return fields
+
+
+def _load_addresses_by_name(names):
+	"""Batch Address rows for planner/map. Never SELECT missing geo columns."""
+	names = [cstr(n).strip() for n in (names or []) if cstr(n).strip()]
+	if not names:
+		return {}
+	_ensure_tms_address_geo_fields()
+	fields = _address_fields_with_geo(
+		["name", "address_line1", "address_line2", "city"]
+	)
+	out = {}
+	for row in frappe.get_all(
+		"Address",
+		filters={"name": ["in", names]},
+		fields=fields,
+		ignore_permissions=True,
+	):
+		out[row.name] = row
+	return out
 
 
 def _resolve_pickup_address(company, driver_doc=None, pickup_warehouse=None):
@@ -1039,21 +1061,7 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 	address_names = list(
 		{n.shipping_address_name or n.customer_address for n in notes if (n.shipping_address_name or n.customer_address)}
 	)
-	geo_by_address = {}
-	if address_names:
-		_ensure_tms_address_geo_fields()
-		addr_fields = _address_fields_with_geo(
-			["name", "address_line1", "address_line2", "city"]
-		)
-		if frappe.db.has_column("Address", "custom_zone"):
-			addr_fields.append("custom_zone")
-		for row in frappe.get_all(
-			"Address",
-			filters={"name": ["in", address_names]},
-			fields=addr_fields,
-			ignore_permissions=True,
-		):
-			geo_by_address[row.name] = row
+	geo_by_address = _load_addresses_by_name(address_names)
 
 	previous_attempts = set()
 	if names:
@@ -1151,22 +1159,8 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 	pre_addr_names = list(
 		{p.get("address_name") for p in preorders if p.get("address_name")}
 	)
-	if pre_addr_names:
-		for row in frappe.get_all(
-			"Address",
-			filters={"name": ["in", pre_addr_names]},
-			fields=[
-				"name",
-				"address_line1",
-				"address_line2",
-				"city",
-				"custom_latitude",
-				"custom_longitude",
-				"custom_zone",
-			],
-			ignore_permissions=True,
-		):
-			geo_by_address[row.name] = row
+	# Soft-skip missing geo cols — never hardcode custom_latitude (MySQL 1054).
+	geo_by_address.update(_load_addresses_by_name(pre_addr_names))
 
 	for p in preorders:
 		so_name = cstr(p.get("preorder_name") or "").strip()
@@ -8955,10 +8949,14 @@ def _warehouse_address_geo(warehouse_name):
 	lat = 0.0
 	lng = 0.0
 	if addr_name and frappe.db.exists("Address", addr_name):
+		_ensure_tms_address_geo_fields()
+		addr_fields = _address_fields_with_geo(
+			["address_line1", "address_line2", "city"]
+		)
 		row = frappe.db.get_value(
 			"Address",
 			addr_name,
-			["address_line1", "address_line2", "city", "custom_latitude", "custom_longitude"],
+			addr_fields,
 			as_dict=True,
 		) or {}
 		bits = [
