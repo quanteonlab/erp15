@@ -1,7 +1,8 @@
 """Per-group field ACL matrix for Operaciones (lectura / recomendacion / escritura).
 
 Settings UI + persistence only for now. Runtime enforcement on ops screens is deferred
-(see local_docs/proposals/i034_field_acl_matrix.md).
+(see local_docs/proposals/p12_permissions_acl.md;
+archive: local_docs/proposals/_archive/i034_field_acl_matrix.md).
 """
 
 from __future__ import annotations

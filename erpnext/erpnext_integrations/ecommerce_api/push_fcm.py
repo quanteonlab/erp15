@@ -77,7 +77,8 @@ def send_fcm_message(
 	if not sa:
 		frappe.throw(
 			"FCM is not configured. Set fcm_service_account in site_config.json "
-			"(see local_docs/proposals/i033_flutter_push_notifications.md)."
+			"(see local_docs/proposals/p18_notifications.md; "
+			"archive: local_docs/proposals/_archive/i033_flutter_push_notifications.md)."
 		)
 
 	project_id = (

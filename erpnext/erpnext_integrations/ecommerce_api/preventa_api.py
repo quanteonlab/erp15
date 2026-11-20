@@ -4,7 +4,8 @@ Per-salesperson Kanban of ERPNext `Lead`s, admin-configurable field layout +
 per-stage gates, a best-effort bridge from the guest catalog consulta into a
 Lead, seller share-link attribution, best-effort metrics, and an explicit
 Lead -> Customer conversion step. See
-local_docs/proposals/i033_preventa_sales_kanban.md for the product spec.
+local_docs/proposals/p08_preventa.md for the product spec
+(archive: local_docs/proposals/_archive/i033_preventa_sales_kanban.md).
 
 Settings and per-seller board columns reuse the "Table Extra Schema" doctype
 (scope -> JSON blob), the same pattern as tms_api.py / shop_ui_settings.py -

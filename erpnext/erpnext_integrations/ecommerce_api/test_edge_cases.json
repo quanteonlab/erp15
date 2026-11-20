@@ -3191,6 +3191,54 @@
       "expect": "fail"
     },
     {
+      "id": "tms_update_pending_delivery_boxes_null",
+      "source": "regression",
+      "bug": "update_pending_delivery_boxes with null SO/DN is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_boxes",
+      "args": {
+        "delivery_note": null,
+        "sales_order": null,
+        "box_count": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_pending_delivery_vehicle_null",
+      "source": "regression",
+      "bug": "update_pending_delivery_vehicle with null SO/DN is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_vehicle",
+      "args": {
+        "delivery_note": null,
+        "sales_order": null,
+        "license_plate": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_pending_delivery_boxes_dirty_count",
+      "source": "regression",
+      "bug": "update_pending_delivery_boxes with dirty box_count and missing SO is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_boxes",
+      "args": {
+        "delivery_note": "",
+        "sales_order": "",
+        "box_count": "undefined"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_pending_delivery_driver_missing_zone_no_throw",
+      "source": "regression",
+      "bug": "update_pending_delivery_driver with empty DN+driver is ValidationError (not the old hard-fail 'No TMS zone for driver')",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_pending_delivery_driver",
+      "args": {
+        "delivery_note": "",
+        "driver": "HR-DRI-2026-00001",
+        "due_date": "2026-11-20"
+      },
+      "expect": "fail"
+    },
+    {
       "id": "tms_claim_orders_to_trip_empty",
       "source": "regression",
       "bug": "claim_orders_to_trip with empty lists is controlled ValidationError (stock shortfalls no longer block via negative allow)",
@@ -3300,7 +3348,54 @@
         "driver": null,
         "full_name": null,
         "cell_number": null,
-        "license_plate": null
+        "license_plate": null,
+        "license_number": null,
+        "address": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_driver_address_dirty",
+      "source": "regression",
+      "bug": "update_driver with missing driver + dirty address/license is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_driver",
+      "args": {
+        "driver": "",
+        "address": "null",
+        "license_number": "undefined"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_driver_max_boxes_dirty",
+      "source": "regression",
+      "bug": "update_driver with null driver + dirty max_boxes is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_driver",
+      "args": {
+        "driver": null,
+        "max_boxes": "null"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_driver_bad_employee",
+      "source": "regression",
+      "bug": "update_driver with missing driver + bogus employee is controlled ValidationError (employee must exist)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_driver",
+      "args": {
+        "driver": "",
+        "employee": "EMP-DOES-NOT-EXIST"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_update_driver_null_employee",
+      "source": "regression",
+      "bug": "update_driver employee=null with missing driver is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.update_driver",
+      "args": {
+        "driver": null,
+        "employee": null
       },
       "expect": "fail"
     },
@@ -7907,6 +8002,30 @@
       "bug": "get_rutas_week_bundle must ensure Address custom_latitude or soft-skip — never MySQL 1054"
     },
     {
+      "id": "get_pending_deliveries_no_remarks_col_vehicle_stamp",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_pending_deliveries",
+      "args": {
+        "date": "2026-11-21",
+        "from_date": "2026-11-16",
+        "to_date": "2026-11-22"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "_stamp_pending_vehicle_plates must not SELECT Sales Order.remarks when column missing (MySQL 1054)"
+    },
+    {
+      "id": "get_rutas_week_bundle_no_remarks_col_vehicle_stamp",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_rutas_week_bundle",
+      "args": {
+        "date": "2026-11-21",
+        "auto_assign_zones": "0",
+        "include_master": "0"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "get_rutas_week_bundle vehicle plate stamp must not SELECT missing SO.remarks (MySQL 1054)"
+    },
+    {
       "id": "get_fleet_vehicle_null",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_fleet_vehicle",
       "args": {
@@ -8334,6 +8453,16 @@
       "bug": "get_armado_order empty name must not 500 (última revisión de pesajes path)"
     },
     {
+      "id": "get_armado_order_vehicle_from_zone_driver",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_order",
+      "args": {
+        "preorder_name": "SAL-ORD-2026-00148"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "get_armado_order must surface zone-driver / guest_vehicle patente for Armado sheet (never blank when Rutas shows plate)"
+    },
+    {
       "id": "get_armado_progress_null_name",
       "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_progress",
       "args": {
@@ -8409,6 +8538,33 @@
       "expect": "error",
       "source": "regression",
       "bug": "Remito print: null DN must controlled error (WEIGHT→Peso / no Desde / pedido_ref enrich path)"
+    },
+    {
+      "id": "tms_publish_fleet_mat_null_driver_date",
+      "source": "regression",
+      "bug": "publish_fleet_mat with null driver/date is controlled ValidationError, not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.publish_fleet_mat",
+      "args": {
+        "date": null,
+        "driver": null,
+        "vehicle": null,
+        "delivery_note_names": null,
+        "preorder_names": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_publish_fleet_mat_dirty_empty",
+      "source": "regression",
+      "bug": "publish_fleet_mat with dirty driver/date and empty dns fails controlled before trip create",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.publish_fleet_mat",
+      "args": {
+        "date": "undefined",
+        "driver": "",
+        "delivery_note_names": [],
+        "preorder_names": "null"
+      },
+      "expect": "fail"
     }
   ]
 }

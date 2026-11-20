@@ -1837,7 +1837,58 @@ def get_armado_order(preorder_name=None):
 	detail["ean13"] = armado_ean13_for_order(so.name)
 	detail["armado_notes"] = _load_armado_notes(so.name)
 	_stamp_armado_sheet(detail, so)
+	_fill_armado_vehicle_suggestion(detail, so)
 	return {"ok": True, "order": detail}
+
+
+def _fill_armado_vehicle_suggestion(detail: dict, so) -> None:
+	"""Pre-fill patente so Rutas Órdenes / zone-driver plates show on Armado.
+
+	Order: existing guest_vehicle / trip plate → SO tag → zone owning driver's
+	Vehicle. Display-only (no write); Guardar still persists via save_armado_vehicle.
+	"""
+	if cstr(
+		detail.get("vehicle_plate") or detail.get("guest_vehicle") or detail.get("vehicle") or ""
+	).strip():
+		return
+
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_guest_preorder_tag_text,
+		_parse_remarks_tags,
+		_resolve_vehicle_ref,
+	)
+
+	tags = _parse_remarks_tags(_guest_preorder_tag_text(so))
+	gv = cstr(tags.get("guest_vehicle") or "").strip()
+	if gv:
+		veh_name, plate = _resolve_vehicle_ref(gv)
+		detail["guest_vehicle"] = gv
+		if veh_name and not detail.get("vehicle"):
+			detail["vehicle"] = veh_name
+		detail["vehicle_plate"] = cstr(plate or gv).strip() or None
+		return
+
+	zone = cstr(detail.get("zone") or "").strip()
+	if not zone:
+		return
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+			_resolve_default_vehicle,
+			_zone_driver_map,
+		)
+
+		drv = _zone_driver_map().get(zone.upper()) or _zone_driver_map().get(zone)
+		if not drv:
+			return
+		veh = _resolve_default_vehicle(drv, None)
+		if not veh:
+			return
+		plate = cstr(frappe.db.get_value("Vehicle", veh, "license_plate") or veh).strip()
+		detail["vehicle"] = veh
+		detail["vehicle_plate"] = plate or veh
+		detail["guest_vehicle"] = veh or plate
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "fill_armado_vehicle_suggestion")
 
 
 def _armado_notes_scope(so_name: str) -> str:

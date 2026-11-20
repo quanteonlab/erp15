@@ -492,6 +492,58 @@ def _active_trip_names(exclude_trip=None):
 	return frappe.get_all("Delivery Trip", filters=filters, pluck="name", ignore_permissions=True)
 
 
+def _find_reusable_driver_day_trips(driver, day):
+	"""Active MAT for this driver on ``day`` — Draft first, then Scheduled / In Transit.
+
+	Used by ``create_trip`` / ``publish_fleet_mat`` so adding packages to a fleet
+	updates the existing plan instead of spawning a second trip.
+	"""
+	drv = cstr(driver or "").strip()
+	if not drv or drv.lower() in ("null", "undefined", "none"):
+		return []
+	day = getdate(day)
+	rows = frappe.get_all(
+		"Delivery Trip",
+		filters={
+			"driver": drv,
+			"docstatus": ["in", [0, 1]],
+			"departure_time": ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]],
+		},
+		fields=["name", "docstatus", "status", "creation"],
+		order_by="creation asc",
+		ignore_permissions=True,
+	)
+	usable = []
+	for r in rows:
+		st = cstr(r.get("status") or "").strip()
+		if cint(r.get("docstatus")) == 2 or st in ("Cancelled", "Completed"):
+			continue
+		usable.append(r)
+	rank = {"": 0, "Draft": 0, "Scheduled": 1, "In Transit": 2}
+	usable.sort(
+		key=lambda r: (
+			rank.get(cstr(r.get("status") or "").strip(), 9),
+			cstr(r.get("creation") or ""),
+			cstr(r.get("name") or ""),
+		)
+	)
+	return usable
+
+
+def _append_stops_to_trip_doc(trip, delivery_note_names):
+	"""Append DNs onto a Draft or published (Scheduled / In Transit) trip."""
+	if not delivery_note_names:
+		return 0
+	notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(delivery_note_names)
+	_append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name)
+	if cint(trip.docstatus) == 1:
+		trip.flags.ignore_validate_update_after_submit = True
+	_save_trip_doc(trip)
+	if cint(trip.docstatus) == 1:
+		_tms_update_delivery_notes_on_trip(trip)
+	return len(delivery_note_names)
+
+
 def _assigned_delivery_note_names(trip_names=None):
 	"""Delivery Notes already used as a stop on any active (docstatus != 2)
 	trip - same definition `get_pending_deliveries` needs, factored out so
@@ -828,6 +880,7 @@ def get_planner_context(company=None):
 		d["license_plate"] = plate_by_emp.get(d.employee)
 		d["user_id"] = user_by_emp.get(d.employee)
 		d["has_user"] = bool(d.get("user_id"))
+		d["max_boxes"] = _driver_max_boxes(d.name)
 
 	vehicles = frappe.get_all(
 		"Vehicle",
@@ -1234,6 +1287,7 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 		)
 	)
 	_stamp_pending_box_counts(out)
+	_stamp_pending_vehicle_plates(out)
 	payload = {"deliveries": out, "as_of": str(as_of), "mode": "window" if window_mode else "ceiling"}
 	if window_mode:
 		payload["from_date"] = str(due_lo)
@@ -1588,6 +1642,97 @@ def _stamp_pending_box_counts(rows):
 		r["box_count"] = cint(counts.get(so) or 0)
 
 
+def _stamp_pending_vehicle_plates(rows):
+	"""Attach ``vehicle_plate`` / ``guest_vehicle`` from SO tags (same as Armado).
+
+	Some sites have no Sales Order ``remarks`` DB column — only select columns
+	that exist (prefer ``_guest_preorder_tag_fieldname``, then terms).
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_guest_preorder_tag_fieldname,
+		_parse_remarks_tags,
+		_resolve_vehicle_ref,
+		_sales_order_table_columns,
+	)
+
+	so_names = []
+	for r in rows or []:
+		so = cstr(r.get("sales_order") or r.get("preorder_name") or "").strip()
+		if so:
+			so_names.append(so)
+	so_names = list({n for n in so_names if n})
+	if not so_names:
+		for r in rows or []:
+			r.setdefault("vehicle_plate", None)
+			r.setdefault("guest_vehicle", None)
+		return
+
+	cols = _sales_order_table_columns()
+	tag_fn = _guest_preorder_tag_fieldname()
+	fields = ["name"]
+	for fn in (tag_fn, "remarks", "terms"):
+		if fn and fn in cols and fn not in fields:
+			fields.append(fn)
+	if len(fields) == 1:
+		for r in rows or []:
+			r.setdefault("vehicle_plate", None)
+			r.setdefault("guest_vehicle", None)
+		return
+
+	so_rows = frappe.get_all(
+		"Sales Order",
+		filters={"name": ["in", so_names]},
+		fields=fields,
+		ignore_permissions=True,
+	)
+	by_so = {}
+	for row in so_rows or []:
+		raw = ""
+		for fn in (tag_fn, "remarks", "terms"):
+			if fn and fn in cols:
+				raw = cstr(row.get(fn) or "").strip()
+				if raw:
+					break
+		tags = _parse_remarks_tags(raw)
+		gv = cstr(tags.get("guest_vehicle") or "").strip()
+		if not gv:
+			by_so[row.name] = {"vehicle_plate": None, "guest_vehicle": None}
+			continue
+		_veh, plate = _resolve_vehicle_ref(gv)
+		by_so[row.name] = {
+			"vehicle_plate": cstr(plate or gv).strip().upper() or None,
+			"guest_vehicle": gv,
+		}
+
+	# Fallback: zone → owning driver → Vehicle plate (same as Rutas Órdenes
+	# display when guest_vehicle was never stamped). Keeps Flota cajas + Armado
+	# aligned with the patente column.
+	zone_driver = _zone_driver_map()
+	plate_by_driver = {}
+	for r in rows or []:
+		so = cstr(r.get("sales_order") or r.get("preorder_name") or "").strip()
+		hit = by_so.get(so) or {}
+		plate = hit.get("vehicle_plate")
+		gv = hit.get("guest_vehicle")
+		if not plate:
+			zone = cstr(r.get("zone") or "").strip()
+			drv = (
+				(zone_driver.get(zone.upper()) or zone_driver.get(zone) or None) if zone else None
+			)
+			if drv:
+				if drv not in plate_by_driver:
+					veh = _resolve_default_vehicle(drv, None)
+					if veh:
+						plate_by_driver[drv] = cstr(
+							frappe.db.get_value("Vehicle", veh, "license_plate") or veh
+						).strip().upper() or None
+					else:
+						plate_by_driver[drv] = None
+				plate = plate_by_driver.get(drv)
+		r["vehicle_plate"] = plate
+		r["guest_vehicle"] = gv
+
+
 def _sales_orders_for_dn(dn):
 	"""Unique against_sales_order values on a Delivery Note's items."""
 	so_names = frappe.get_all(
@@ -1642,18 +1787,14 @@ def _zone_visit_bases(visit_days):
 	return out
 
 
-def _snap_dn_zone_to_due_weekday(dn, due_d):
+def _snap_address_zone_to_due_weekday(addr, due_d):
 	"""Align Address.custom_zone to the due weekday within the same territory/driver.
 
 	Territory×day zones (T1-WED → T1-THU) keep geography + owning driver while the
-	visit day matches the promised due. No-op when the zone already visits that day
-	or no sibling day-zone exists.
+	visit day matches the promised due. Creates the sibling day-zone when missing.
 	"""
 	if not frappe.db.has_column("Address", "custom_zone"):
 		return None
-	addr = frappe.db.get_value("Delivery Note", dn, "shipping_address_name") or frappe.db.get_value(
-		"Delivery Note", dn, "customer_address"
-	)
 	if not addr or not frappe.db.exists("Address", addr):
 		return None
 	cur = cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip()
@@ -1662,9 +1803,7 @@ def _snap_dn_zone_to_due_weekday(dn, due_d):
 	tag = _weekday_tag_from_date(due_d)
 	if not tag:
 		return None
-	zones_blob = _load_tms_zones() or {}
-	zones = zones_blob.get("zones") if isinstance(zones_blob, dict) else zones_blob
-	zones = zones if isinstance(zones, list) else []
+	zones = list((_load_tms_zones() or {}).get("zones") or [])
 	cur_up = cur.upper()
 	cur_z = None
 	for z in zones:
@@ -1674,12 +1813,18 @@ def _snap_dn_zone_to_due_weekday(dn, due_d):
 			cur_z = z
 			break
 	if not cur_z:
+		# Bare T*-DAY label without a catalog row — still rewrite the day suffix.
+		base, _old = _split_territory_zone_code(cur)
+		if base:
+			new_code = f"{base}-{tag.upper()}"
+			return _assign_address_zone(addr, new_code) or new_code
 		return None
 	if tag in _zone_visit_bases(cur_z.get("visit_days")):
 		return cstr(cur_z.get("code") or cur)
 	drv = cstr(cur_z.get("driver") or "").strip()
 	code = cstr(cur_z.get("code") or "").strip()
-	prefix = code.rsplit("-", 1)[0] if "-" in code else None
+	terr_base, _ = _split_territory_zone_code(code)
+	prefix = terr_base or (code.rsplit("-", 1)[0] if "-" in code else None)
 	want = f"{prefix}-{tag}".upper() if prefix else None
 	candidates = []
 	for z in zones:
@@ -1693,21 +1838,51 @@ def _snap_dn_zone_to_due_weekday(dn, due_d):
 		same_terr = bool(prefix and zcode.upper().startswith(prefix.upper() + "-"))
 		if same_drv or same_terr:
 			candidates.append(z)
-	if not candidates:
-		return None
 	chosen = None
 	if want:
 		for z in candidates:
 			if cstr(z.get("code") or "").strip().upper() == want:
 				chosen = z
 				break
-	if not chosen:
+	if not chosen and candidates:
 		chosen = candidates[0]
+	if not chosen and want and drv:
+		# Create sibling day-zone for this territory/driver (due change must update agrupador).
+		new_code = _ensure_zone_code_for_driver_day(drv, due_d)
+		if new_code:
+			return _assign_address_zone(addr, new_code) or new_code
+	if not chosen and want and prefix:
+		t_no = cint(prefix[1:]) if prefix.startswith("T") and prefix[1:].isdigit() else 1
+		day_idx = _WEEKDAY_ORDER.index(tag) if tag in _WEEKDAY_ORDER else 0
+		incoming = _upsert_zone_into_list(
+			zones,
+			{
+				"code": want,
+				"name": f"{prefix} · {_WEEKDAY_SHORT.get(tag, tag)}",
+				"color": cur_z.get("color") or _territory_color(max(1, t_no) - 1, day_idx, 7),
+				"type": "delivery",
+				"visit_days": [tag],
+				"vehicles": list(cur_z.get("vehicles") or []),
+				"driver": drv or None,
+				"notes": "auto day-zone (due snap)",
+			},
+		)
+		_save_tms_zones(zones, commit=False)
+		chosen = incoming
+	if not chosen:
+		return None
 	new_code = cstr(chosen.get("code") or "").strip()
 	if not new_code or new_code.upper() == cur_up:
 		return cstr(cur_z.get("code") or cur)
-	frappe.db.set_value("Address", addr, "custom_zone", new_code, update_modified=True)
-	return new_code
+	return _assign_address_zone(addr, new_code) or new_code
+
+
+def _snap_dn_zone_to_due_weekday(dn, due_d):
+	"""Align Delivery Note shipping address zone to the due weekday."""
+	addr = frappe.db.get_value("Delivery Note", dn, "shipping_address_name") or frappe.db.get_value(
+		"Delivery Note", dn, "customer_address"
+	)
+	return _snap_address_zone_to_due_weekday(addr, due_d)
 
 
 def _zone_code_for_driver_day(driver, due_d):
@@ -1738,6 +1913,109 @@ def _zone_code_for_driver_day(driver, due_d):
 		if code.upper().endswith(want_suffix):
 			return code
 	return cstr(cands[0].get("code") or "").strip() or None
+
+
+def _ensure_zone_code_for_driver_day(driver, due_d):
+	"""Return (creating if needed) a zone owned by ``driver`` for ``due_d``'s weekday.
+
+	Force-assigning a remito to a conductor must not hard-fail when that person
+	has no day-zone yet — create/extend one so Address.custom_zone can snap.
+	"""
+	existing = _zone_code_for_driver_day(driver, due_d)
+	if existing:
+		return existing
+
+	drv = cstr(driver or "").strip()
+	tag = _weekday_tag_from_date(due_d)
+	if not drv or not tag:
+		return None
+
+	zones = list((_load_tms_zones() or {}).get("zones") or [])
+	owned = [
+		z
+		for z in zones
+		if isinstance(z, dict) and cstr(z.get("driver") or "").strip() == drv
+	]
+
+	# Territory×day sibling: T1-MON owned → upsert T1-FRI for this weekday.
+	template = None
+	territory = None
+	for z in owned:
+		base, _day = _split_territory_zone_code(z.get("code"))
+		if base:
+			territory = base
+			template = z
+			break
+
+	if territory:
+		new_code = f"{territory}-{tag.upper()}"
+		t_no = cint(territory[1:]) if territory.startswith("T") and territory[1:].isdigit() else 1
+		day_idx = _WEEKDAY_ORDER.index(tag) if tag in _WEEKDAY_ORDER else 0
+		incoming = _upsert_zone_into_list(
+			zones,
+			{
+				"code": new_code,
+				"name": f"{territory} · {_WEEKDAY_SHORT.get(tag, tag)}",
+				"color": (template or {}).get("color") or _territory_color(max(1, t_no) - 1, day_idx, 7),
+				"type": "delivery",
+				"visit_days": [tag],
+				"vehicles": list((template or {}).get("vehicles") or []),
+				"driver": drv,
+				"notes": "auto day-zone (driver assign)",
+			},
+		)
+		_save_tms_zones(zones, commit=False)
+		return incoming.get("code")
+
+	# Multi-day zone without T*-DAY code: add this weekday to visit_days.
+	if owned:
+		z = owned[0]
+		visits = list(z.get("visit_days") or [])
+		bases = _zone_visit_bases(visits)
+		if tag not in bases:
+			visits.append(tag)
+		incoming = _upsert_zone_into_list(
+			zones,
+			{
+				**z,
+				"visit_days": visits,
+				"driver": drv,
+			},
+		)
+		_save_tms_zones(zones, commit=False)
+		return incoming.get("code")
+
+	# No zone at all — allocate next free T{n}-{DAY}.
+	used = set()
+	for z in zones:
+		base, _ = _split_territory_zone_code(cstr(z.get("code") or ""))
+		if base and base.startswith("T") and base[1:].isdigit():
+			used.add(cint(base[1:]))
+		# Also reserve plain T{n} codes if present.
+		code_up = cstr(z.get("code") or "").strip().upper()
+		if code_up.startswith("T") and code_up[1:].isdigit():
+			used.add(cint(code_up[1:]))
+	n = 1
+	while n in used:
+		n += 1
+	t_code = f"T{n}"
+	new_code = f"{t_code}-{tag.upper()}"
+	day_idx = _WEEKDAY_ORDER.index(tag) if tag in _WEEKDAY_ORDER else 0
+	incoming = _upsert_zone_into_list(
+		zones,
+		{
+			"code": new_code,
+			"name": f"{t_code} · {_WEEKDAY_SHORT.get(tag, tag)}",
+			"color": _territory_color(n - 1, day_idx, 7),
+			"type": "delivery",
+			"visit_days": [tag],
+			"vehicles": [],
+			"driver": drv,
+			"notes": "auto day-zone (driver assign)",
+		},
+	)
+	_save_tms_zones(zones, commit=False)
+	return incoming.get("code")
 
 
 def _assign_dn_zone(dn, zone_code):
@@ -1795,12 +2073,13 @@ def _apply_pending_delivery_due(dn, due_d, driver=None):
 	try:
 		drv = cstr(driver or "").strip() or None
 		if drv:
-			code = _zone_code_for_driver_day(drv, due_d)
+			code = _ensure_zone_code_for_driver_day(drv, due_d)
 			if code:
 				snapped = _assign_dn_zone(dn, code)
 		if not snapped:
 			snapped = _snap_dn_zone_to_due_weekday(dn, due_d)
 	except Exception:
+		frappe.log_error(frappe.get_traceback(), "apply_pending_delivery_due zone")
 		snapped = None
 	return {
 		"sales_orders": so_names if via == "sales_order" else [],
@@ -1814,23 +2093,25 @@ def _apply_preorder_due(so_name, due_d, driver=None):
 	"""Planning due for an Orden/Preparado Sales Order that has no remito yet.
 
 	Same contract as ``_apply_pending_delivery_due``: SO (and line) delivery_date,
-	and with ``driver`` the shipping address gets that driver's day-zone so the
-	planner/armado lists show who carries it.
+	and snap/ensure Address.custom_zone to the due weekday (agrupador follows date).
 	"""
 	frappe.db.set_value("Sales Order", so_name, "delivery_date", due_d, update_modified=True)
 	frappe.db.sql("UPDATE `tabSales Order Item` SET delivery_date=%s WHERE parent=%s", (due_d, so_name))
 	zone = None
 	drv = cstr(driver or "").strip() or None
-	if drv:
-		try:
-			code = _zone_code_for_driver_day(drv, due_d)
+	addr = frappe.db.get_value("Sales Order", so_name, "shipping_address_name") or frappe.db.get_value(
+		"Sales Order", so_name, "customer_address"
+	)
+	try:
+		if drv:
+			code = _ensure_zone_code_for_driver_day(drv, due_d)
 			if code:
-				addr = frappe.db.get_value("Sales Order", so_name, "shipping_address_name") or frappe.db.get_value(
-					"Sales Order", so_name, "customer_address"
-				)
 				zone = _assign_address_zone(addr, code)
-		except Exception:
-			zone = None
+		if not zone:
+			zone = _snap_address_zone_to_due_weekday(addr, due_d)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "apply_preorder_due zone")
+		zone = None
 	return {"sales_orders": [so_name], "via": "sales_order", "zone": zone, "driver": drv}
 
 
@@ -1881,6 +2162,128 @@ def update_pending_delivery_due(
 
 
 @frappe.whitelist(allow_guest=True)
+def update_pending_delivery_vehicle(
+	delivery_note=None,
+	sales_order=None,
+	preorder_name=None,
+	vehicle=None,
+	license_plate=None,
+):
+	"""Set order patente from Rutas Órdenes — same ``guest_vehicle`` tag Armado reads.
+
+	No Armado PIN required (dispatcher). Ensures Vehicle exists and pushes onto
+	linked MAT when present.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_apply_guest_vehicle_tag,
+		_guest_preorder_tag_fieldname,
+		_resolve_vehicle_ref,
+	)
+
+	dn = cstr(delivery_note or "").strip()
+	so = cstr(sales_order or preorder_name or "").strip()
+	if not so and dn and frappe.db.exists("Delivery Note", dn):
+		sos = _sales_orders_for_dn(dn)
+		so = sos[0] if sos else ""
+	if not so:
+		frappe.throw(_("Sales Order is required to set patente."))
+	if not frappe.db.exists("Sales Order", so):
+		frappe.throw(_("Sales Order {0} not found").format(so), frappe.DoesNotExistError)
+
+	raw = license_plate if license_plate is not None else vehicle
+	if isinstance(raw, dict):
+		raw = raw.get("license_plate") or raw.get("vehicle") or raw.get("name")
+	plate_in = _dirty_str(raw)
+
+	frappe.flags.ignore_permissions = True
+	so_doc = frappe.get_doc("Sales Order", so)
+	frappe.flags.ignore_permissions = False
+	_apply_guest_vehicle_tag(so_doc, plate_in or "")
+	tag_fn = _guest_preorder_tag_fieldname()
+	if tag_fn:
+		frappe.db.set_value("Sales Order", so, tag_fn, getattr(so_doc, tag_fn, None), update_modified=False)
+	frappe.db.commit()
+
+	veh_name, plate = _resolve_vehicle_ref(plate_in)
+	out_plate = cstr(plate or plate_in or "").strip().upper() or None
+	return {
+		"ok": True,
+		"sales_order": so,
+		"delivery_note": dn or None,
+		"vehicle": veh_name,
+		"vehicle_plate": out_plate,
+		"guest_vehicle": veh_name or out_plate,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def update_pending_delivery_boxes(
+	delivery_note=None,
+	sales_order=None,
+	preorder_name=None,
+	box_count=None,
+):
+	"""Set armado box count from Rutas Órdenes (double-click Cajas). Soft — no pack PIN.
+
+	Writes the same ``ops.armado.progress::{SO}`` blob Armado uses so Flota
+	cajas current/max stays in sync. ``box_count`` 0 clears; 1–99 sets.
+	"""
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api import (
+		_load_armado_progress,
+		_save_armado_progress,
+	)
+
+	dn = cstr(delivery_note or "").strip()
+	so = cstr(sales_order or preorder_name or "").strip()
+	if not so and dn and frappe.db.exists("Delivery Note", dn):
+		sos = _sales_orders_for_dn(dn)
+		so = sos[0] if sos else ""
+	if not so:
+		frappe.throw(_("Sales Order is required to set boxes."))
+	if not frappe.db.exists("Sales Order", so):
+		frappe.throw(_("Sales Order {0} not found").format(so), frappe.DoesNotExistError)
+
+	raw = box_count
+	if isinstance(raw, dict):
+		raw = raw.get("count")
+	if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none")):
+		count = 0
+	else:
+		try:
+			count = cint(raw)
+		except Exception:
+			frappe.throw(_("Invalid box count"))
+		if count < 0 or count > 99:
+			frappe.throw(_("Box count must be between 0 and 99"))
+
+	progress = _load_armado_progress(so)
+	progress["boxes"] = {
+		"count": int(count),
+		"by": cstr(frappe.session.user or "rutas"),
+		"at": cstr(now_datetime()),
+	}
+	events = progress.setdefault("events", [])
+	if isinstance(events, list):
+		events.append(
+			{
+				"at": cstr(now_datetime()),
+				"by": cstr(frappe.session.user or "rutas"),
+				"via": "rutas_boxes",
+				"action": "boxes",
+				"detail": str(int(count)),
+			}
+		)
+	_save_armado_progress(so, progress)
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"sales_order": so,
+		"delivery_note": dn or None,
+		"box_count": int(count),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
 def update_pending_delivery_driver(delivery_note=None, driver=None, due_date=None):
 	"""Force-assign a remito to a driver's territory for its due day.
 
@@ -1922,11 +2325,12 @@ def update_pending_delivery_driver(delivery_note=None, driver=None, due_date=Non
 			due_d = getdate(frappe.db.get_value("Delivery Note", dn, "posting_date") or getdate())
 
 	meta = _apply_pending_delivery_due(dn, due_d, driver=drv)
+	# Soft: due + driver stick even if address has no custom_zone column / no geo.
+	# Zone is auto-ensured above; missing zone is a warning, not a hard fail.
 	if not meta.get("zone"):
-		frappe.throw(
-			_("No TMS zone for driver {0} on {1}. Assign the driver to a zone that visits that weekday.").format(
-				drv, str(due_d)
-			)
+		frappe.log_error(
+			f"update_pending_delivery_driver: no zone after ensure for {drv} on {due_d} (dn={dn})",
+			"pending_driver_no_zone",
 		)
 	frappe.db.commit()
 	return {
@@ -2665,13 +3069,18 @@ def reverse_geocode_query(lat=None, lng=None):
 def _resolve_default_vehicle(driver=None, vehicle=None):
 	"""Pick a Vehicle for Delivery Trip (core field is reqd=1).
 
-	Order: explicit → driver's Employee vehicle → sole Vehicle in site → None.
+	Order: explicit name/plate → driver's Employee vehicle → sole Vehicle in site → None.
 	"""
 	veh = cstr(vehicle or "").strip() or None
-	if veh and veh.lower() in ("null", "undefined", "none"):
+	if veh and veh.lower() in ("null", "undefined", "none", "—", "-"):
 		veh = None
-	if veh and frappe.db.exists("Vehicle", veh):
-		return veh
+	if veh:
+		# Plate text from Flota often equals license_plate, not always Vehicle.name.
+		resolved = _fleet_resolve_vehicle_name(veh)
+		if resolved:
+			return resolved
+		if frappe.db.exists("Vehicle", veh):
+			return veh
 	drv = cstr(driver or "").strip() or None
 	if drv and drv.lower() in ("null", "undefined", "none"):
 		drv = None
@@ -2978,53 +3387,53 @@ def create_trip(
 
 	day = getdate(date)
 
-	# Reuse today's Draft for this driver instead of spawning a second trip.
+	# Reuse today's Draft / Scheduled / In Transit MAT for this driver — new
+	# packages sync onto the existing plan instead of spawning a second trip.
 	if driver:
-		existing_drafts = frappe.get_all(
-			"Delivery Trip",
-			filters={
-				"driver": driver,
-				"docstatus": 0,
-				"departure_time": ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]],
-			},
-			pluck="name",
-			order_by="creation asc",
-			ignore_permissions=True,
-		)
-		if existing_drafts:
-			primary = existing_drafts[0]
+		existing = _find_reusable_driver_day_trips(driver, day)
+		if existing:
+			primary = existing[0].name
 			frappe.flags.ignore_permissions = True
 			trip = frappe.get_doc("Delivery Trip", primary)
 			frappe.flags.ignore_permissions = False
 			already = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
 			to_add = [n for n in delivery_note_names if n not in already]
+			added = 0
 			if to_add:
+				_assert_trip_unlocked(trip, _("adding stops"))
 				conflicts = [n for n in to_add if n in _assigned_delivery_note_names()]
 				if conflicts:
 					frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
-				notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(to_add)
-				_append_delivery_stops(trip, to_add, notes_by_name, address_display_by_name)
-				_save_trip_doc(trip)
+				added = _append_stops_to_trip_doc(trip, to_add)
 			# Collapse newer duplicate drafts for the same driver/day (empty or subset).
-			for extra in existing_drafts[1:]:
+			for extra in existing[1:]:
+				if cint(extra.get("docstatus")) != 0:
+					continue
 				try:
 					frappe.flags.ignore_permissions = True
-					extra_doc = frappe.get_doc("Delivery Trip", extra)
+					extra_doc = frappe.get_doc("Delivery Trip", extra.name)
 					frappe.flags.ignore_permissions = False
 					extra_dns = {s.delivery_note for s in extra_doc.delivery_stops if s.delivery_note}
 					if not extra_dns or extra_dns.issubset(already | set(delivery_note_names)):
-						frappe.delete_doc("Delivery Trip", extra, ignore_permissions=True, force=True)
+						frappe.delete_doc("Delivery Trip", extra.name, ignore_permissions=True, force=True)
 						frappe.db.commit()
 				except Exception:
 					frappe.log_error(frappe.get_traceback(), "create_trip collapse draft")
-			try:
-				optimize_trip(primary)
-			except Exception:
-				frappe.log_error(frappe.get_traceback(), "create_trip auto optimize_trip")
+			if added or cint(trip.docstatus) == 0:
+				try:
+					optimize_trip(primary)
+				except Exception:
+					frappe.log_error(frappe.get_traceback(), "create_trip auto optimize_trip")
 			frappe.flags.ignore_permissions = True
 			trip = frappe.get_doc("Delivery Trip", primary)
 			frappe.flags.ignore_permissions = False
-			return {"trip": trip.name, "status": trip.status, "stop_count": len(trip.delivery_stops)}
+			return {
+				"trip": trip.name,
+				"status": trip.status,
+				"stop_count": len(trip.delivery_stops),
+				"added": added,
+				"reused": 1,
+			}
 
 	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
 	if conflicts:
@@ -3210,6 +3619,79 @@ def publish_trip(trip_name):
 		frappe.log_error(frappe.get_traceback(), "webhook planned")
 
 	return {"trip": trip.name, "status": trip.status}
+
+
+@frappe.whitelist(allow_guest=True)
+@idempotent_request
+def publish_fleet_mat(
+	date,
+	driver,
+	vehicle=None,
+	delivery_note_names=None,
+	preorder_names=None,
+	company=None,
+	pickup_warehouse=None,
+):
+	"""Create or sync this driver's day MAT from assigned orders, then publish.
+
+	- No MAT yet → ``create_trip`` + ``publish_trip`` (Scheduled).
+	- Draft MAT → append missing stops, then publish.
+	- Already Scheduled / In Transit → append missing stops onto the same MAT
+	  (Flota package adds stay on the existing plan).
+	"""
+	drv = cstr(driver or "").strip()
+	if not drv or drv.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Driver is required"))
+	day_raw = cstr(date or "").strip()
+	if not day_raw or day_raw.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Date is required"))
+	try:
+		day = getdate(day_raw)
+	except Exception:
+		frappe.throw(_("Invalid date: {0}").format(date))
+
+	veh = cstr(vehicle or "").strip() or None
+	if veh and veh.lower() in ("null", "undefined", "none", "—", "-"):
+		veh = None
+	elif veh:
+		veh = _fleet_resolve_vehicle_name(veh) or veh
+
+	created = create_trip(
+		date=str(day),
+		driver=drv,
+		vehicle=veh,
+		delivery_note_names=delivery_note_names,
+		preorder_names=preorder_names,
+		company=company,
+		pickup_warehouse=pickup_warehouse,
+	)
+	trip_name = created.get("trip")
+	if not trip_name:
+		frappe.throw(_("Could not create MAT for this fleet."))
+
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+
+	published = 0
+	if cint(trip.docstatus) == 0:
+		pub = publish_trip(trip_name)
+		published = 1
+		status = pub.get("status") or "Scheduled"
+	else:
+		status = trip.status
+
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", trip_name)
+	frappe.flags.ignore_permissions = False
+	return {
+		"trip": trip.name,
+		"status": status or trip.status,
+		"stop_count": len(trip.delivery_stops or []),
+		"added": cint(created.get("added") or 0),
+		"reused": cint(created.get("reused") or 0),
+		"published": published,
+	}
 
 
 @frappe.whitelist(allow_guest=True)
@@ -3774,8 +4256,10 @@ def add_stops_to_trip(trip_name, delivery_note_names, allow_steal=0, preorder_na
 	frappe.flags.ignore_permissions = True
 	trip = frappe.get_doc("Delivery Trip", trip_name)
 	frappe.flags.ignore_permissions = False
-	if trip.docstatus != 0:
-		frappe.throw(_("Stops can only be added to a Draft trip."))
+	status = cstr(trip.status or "").strip()
+	if cint(trip.docstatus) == 2 or status in ("Cancelled", "Completed"):
+		frappe.throw(_("Stops cannot be added to a {0} trip.").format(status or "cancelled"))
+	# Draft, Scheduled, or In Transit — keep fleet package adds on the same MAT.
 	_assert_trip_unlocked(trip, _("adding stops"))
 
 	already_on_trip = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
@@ -3809,10 +4293,7 @@ def add_stops_to_trip(trip_name, delivery_note_names, allow_steal=0, preorder_na
 			remove_stops_from_trip(src_name, dns)
 			stolen_from.append({"trip": src_name, "delivery_notes": dns})
 
-	notes_by_name, address_display_by_name = _load_delivery_notes_for_stops(delivery_note_names)
-	_append_delivery_stops(trip, delivery_note_names, notes_by_name, address_display_by_name)
-
-	_save_trip_doc(trip)
+	_append_stops_to_trip_doc(trip, delivery_note_names)
 
 	try:
 		map_data = optimize_trip(trip_name)
@@ -4289,6 +4770,31 @@ def _set_vehicle_plate_for_employee(employee, license_plate):
 	return veh_name
 
 
+def _employee_person_fields(employee):
+	"""Name / phone / license owned by Employee (Driver mirrors these)."""
+	emp = cstr(employee or "").strip()
+	if not emp or not frappe.db.exists("Employee", emp):
+		return {"employee_name": None, "cell_number": None, "license_number": None}
+	row = frappe.db.get_value(
+		"Employee",
+		emp,
+		["employee_name", "cell_number"],
+		as_dict=True,
+	) or {}
+	license_number = None
+	# Optional custom / HR license columns when present on the site.
+	for col in ("license_number", "custom_license_number", "driving_license_number"):
+		if frappe.db.has_column("Employee", col):
+			license_number = cstr(frappe.db.get_value("Employee", emp, col) or "").strip() or None
+			if license_number:
+				break
+	return {
+		"employee_name": cstr(row.get("employee_name") or "").strip() or None,
+		"cell_number": cstr(row.get("cell_number") or "").strip() or None,
+		"license_number": license_number,
+	}
+
+
 def _serialize_driver(driver_name, *, ensure_ops_pin=True):
 	frappe.flags.ignore_permissions = True
 	d = frappe.get_doc("Driver", driver_name)
@@ -4311,20 +4817,84 @@ def _serialize_driver(driver_name, *, ensure_ops_pin=True):
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "serialize_driver ops_pin")
 			ops_pin = None
+	addr_name = d.address
+	addr_line = None
+	if addr_name and frappe.db.exists("Address", addr_name):
+		addr_line = frappe.db.get_value("Address", addr_name, "address_line1")
+	person = _employee_person_fields(emp) if emp else {}
+	# Person fields prefer Employee; Driver.license_number is fallback when Emp has none.
+	full_name = person.get("employee_name") or d.full_name
+	cell = person.get("cell_number") if emp else d.cell_number
+	if cell is None:
+		cell = d.cell_number
+	license_number = person.get("license_number") or d.license_number
 	return {
 		"name": d.name,
-		"full_name": d.full_name,
-		"cell_number": d.cell_number,
-		"address": d.address,
-		"license_number": d.license_number,
+		"full_name": full_name,
+		"cell_number": cell,
+		# Prefer street text for the edit modal; keep link name separately.
+		"address": addr_line or addr_name,
+		"address_name": addr_name,
+		"license_number": license_number,
 		"license_plate": _vehicle_plate_for_employee(emp),
+		"max_boxes": _driver_max_boxes(d.name),
 		"employee": emp,
+		"employee_name": person.get("employee_name") or full_name,
 		"user_id": user_id,
 		"has_user": bool(user_id and frappe.db.exists("User", user_id)),
 		"user_enabled": user_enabled,
 		"status": d.status,
 		"ops_pin": ops_pin,
 	}
+
+
+FLEET_DRIVER_SCOPE = "fleet.driver"
+# Soft van capacity default (Flota cajas). Over-cap is allowed — UI marks red only.
+DEFAULT_DRIVER_MAX_BOXES = 55
+
+
+def _driver_extra_blob(driver_name):
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	_name, data = kv_get(FLEET_DRIVER_SCOPE, cstr(driver_name or "").strip())
+	return data if isinstance(data, dict) else {}
+
+
+def _driver_max_boxes(driver_name):
+	"""Effective soft max boxes (stored override, else DEFAULT_DRIVER_MAX_BOXES)."""
+	raw = _driver_extra_blob(driver_name).get("max_boxes")
+	if raw in (None, "", "null", "undefined"):
+		return DEFAULT_DRIVER_MAX_BOXES
+	try:
+		n = cint(raw)
+	except Exception:
+		return DEFAULT_DRIVER_MAX_BOXES
+	return n if n > 0 else DEFAULT_DRIVER_MAX_BOXES
+
+
+def _driver_set_max_boxes(driver_name, max_boxes):
+	"""Persist soft box capacity on ``fleet.driver`` KV (no Vehicle migrate)."""
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	name = cstr(driver_name or "").strip()
+	if not name:
+		return None
+	data = dict(_driver_extra_blob(name))
+	if max_boxes is None:
+		data.pop("max_boxes", None)
+	else:
+		raw = _dirty_str(max_boxes)
+		if raw is None:
+			data.pop("max_boxes", None)
+		else:
+			n = cint(raw)
+			if n > 0:
+				data["max_boxes"] = n
+			else:
+				data.pop("max_boxes", None)
+	data["updated_at"] = str(now_datetime())
+	kv_set(FLEET_DRIVER_SCOPE, name, data)
+	return data.get("max_boxes")
 
 
 def _ensure_driver_staff_group():
@@ -4370,8 +4940,17 @@ def update_driver(
 	code=None,
 	license_plate=None,
 	license_number=None,
+	address=None,
+	max_boxes=None,
+	employee=None,
 ):
-	"""Update Driver name/phone/plate; optional rename via ``code``."""
+	"""Update Driver plate/address/max_boxes; person fields come from linked Employee.
+
+	``employee`` (required when set) must be an existing Employee — name/phone
+	(and license when the Employee has a license column) are pulled from that
+	record. ``address`` is free-text street on the Driver Address link.
+	``max_boxes`` is soft van capacity in ``fleet.driver`` KV.
+	"""
 	name = _dirty_str(driver)
 	if not name:
 		frappe.throw(_("Driver is required."))
@@ -4382,28 +4961,95 @@ def update_driver(
 	doc = frappe.get_doc("Driver", name)
 	frappe.flags.ignore_permissions = False
 
-	new_full = _dirty_str(full_name)
-	if new_full is not None:
-		doc.full_name = new_full
-		if doc.employee and frappe.db.exists("Employee", doc.employee):
-			parts = new_full.split()
-			frappe.db.set_value(
-				"Employee",
-				doc.employee,
-				{
-					"employee_name": new_full,
-					"first_name": parts[0],
-					"last_name": " ".join(parts[1:]) or parts[0],
-				},
-				update_modified=False,
+	# Link / re-link Employee — person identity must exist in HR.
+	if employee is not None:
+		emp = _dirty_str(employee)
+		if not emp:
+			frappe.throw(_("Employee is required."))
+		if not frappe.db.exists("Employee", emp):
+			frappe.throw(_("Employee {0} not found").format(emp), frappe.DoesNotExistError)
+		other = frappe.db.get_value(
+			"Driver",
+			{"employee": emp, "name": ["!=", doc.name]},
+			"name",
+		)
+		if other:
+			frappe.throw(
+				_("Employee {0} is already linked to driver {1}").format(emp, other)
 			)
+		doc.employee = emp
+		_ensure_driver_group_membership(emp)
+		person = _employee_person_fields(emp)
+		if person.get("employee_name"):
+			doc.full_name = person["employee_name"]
+		if person.get("cell_number") is not None:
+			doc.cell_number = person.get("cell_number") or ""
+		if person.get("license_number"):
+			doc.license_number = person["license_number"]
 
-	# Always allow clearing phone when key present as empty-after-dirty
-	if cell_number is not None:
-		doc.cell_number = _dirty_str(cell_number) or ""
+	# Legacy callers may still pass full_name/cell — only apply when no employee link.
+	if not doc.employee:
+		new_full = _dirty_str(full_name)
+		if new_full is not None:
+			doc.full_name = new_full
+		if cell_number is not None:
+			doc.cell_number = _dirty_str(cell_number) or ""
+	else:
+		# Keep Driver mirror in sync with Employee on every save.
+		person = _employee_person_fields(doc.employee)
+		if person.get("employee_name"):
+			doc.full_name = person["employee_name"]
+		if person.get("cell_number") is not None:
+			doc.cell_number = person.get("cell_number") or ""
 
+	# License: prefer Employee column; else allow Driver.license_number update.
 	if license_number is not None:
-		doc.license_number = _dirty_str(license_number) or ""
+		lic = _dirty_str(license_number) or ""
+		doc.license_number = lic
+		if doc.employee:
+			for col in ("license_number", "custom_license_number", "driving_license_number"):
+				if frappe.db.has_column("Employee", col):
+					frappe.db.set_value(
+						"Employee",
+						doc.employee,
+						col,
+						lic or None,
+						update_modified=False,
+					)
+					break
+
+	if address is not None:
+		street = _dirty_str(address) or ""
+		if street:
+			if doc.address and frappe.db.exists("Address", doc.address):
+				frappe.db.set_value(
+					"Address",
+					doc.address,
+					"address_line1",
+					street,
+					update_modified=False,
+				)
+			else:
+				addr = frappe.get_doc(
+					{
+						"doctype": "Address",
+						"address_title": cstr(doc.full_name or doc.name)[:140],
+						"address_type": "Other",
+						"address_line1": street,
+						"city": "Buenos Aires",
+						"country": "Argentina",
+					}
+				)
+				if doc.employee:
+					addr.append(
+						"links",
+						{"link_doctype": "Employee", "link_name": doc.employee},
+					)
+				addr.flags.ignore_mandatory = True
+				addr.insert(ignore_permissions=True)
+				doc.address = addr.name
+		else:
+			doc.address = None
 
 	doc.save(ignore_permissions=True)
 
@@ -4417,6 +5063,18 @@ def update_driver(
 			frappe.throw(_("Driver code {0} already exists.").format(new_code))
 		frappe.rename_doc("Driver", doc.name, new_code, force=True, merge=False)
 		final_name = new_code
+		# Move fleet.driver KV when the Driver is renamed.
+		prev_extra = _driver_extra_blob(name)
+		if prev_extra:
+			from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get, kv_set
+
+			kv_set(FLEET_DRIVER_SCOPE, final_name, {**prev_extra, "updated_at": str(now_datetime())})
+			old_row, _prev_blob = kv_get(FLEET_DRIVER_SCOPE, name)
+			if old_row:
+				frappe.delete_doc("Table Extra Data", old_row, ignore_permissions=True, force=True)
+
+	if max_boxes is not None:
+		_driver_set_max_boxes(final_name, max_boxes)
 
 	frappe.db.commit()
 	return _serialize_driver(final_name)
