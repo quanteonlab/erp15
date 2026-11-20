@@ -358,6 +358,56 @@ def _stamp_party(doctype: str, name: str, pin: str, e164: str):
 
 
 @frappe.whitelist(allow_guest=True)
+def _existing_pin_for_e164(e164: str) -> str | None:
+	"""Return an admin/party PIN already linked to this phone, if any."""
+	tail = _digits(e164)[-8:]
+	if len(tail) < 8:
+		return None
+	if frappe.db.has_column("Customer", "custom_client_access_pin"):
+		fields = ["name", "customer_name", "custom_client_access_pin", "mobile_no"]
+		if frappe.db.has_column("Customer", "custom_client_phone_e164"):
+			fields.append("custom_client_phone_e164")
+		or_filters = [["mobile_no", "like", f"%{tail}%"]]
+		if frappe.db.has_column("Customer", "custom_client_phone_e164"):
+			or_filters.append(["custom_client_phone_e164", "like", f"%{tail}%"])
+		for row in frappe.get_all(
+			"Customer",
+			or_filters=or_filters,
+			fields=fields,
+			limit_page_length=20,
+			ignore_permissions=True,
+		):
+			if _customer_is_bucket(row.name, row.customer_name):
+				continue
+			cred = _digits(getattr(row, "custom_client_phone_e164", None) or row.mobile_no)
+			if not cred.endswith(tail):
+				continue
+			pin = cstr(getattr(row, "custom_client_access_pin", None) or "").strip()
+			if pin:
+				return pin
+	if frappe.db.has_column("Lead", "custom_client_access_pin"):
+		fields = ["name", "mobile_no", "custom_client_access_pin"]
+		if frappe.db.has_column("Lead", "custom_client_phone_e164"):
+			fields.append("custom_client_phone_e164")
+		or_filters = [["mobile_no", "like", f"%{tail}%"]]
+		if frappe.db.has_column("Lead", "custom_client_phone_e164"):
+			or_filters.append(["custom_client_phone_e164", "like", f"%{tail}%"])
+		for row in frappe.get_all(
+			"Lead",
+			or_filters=or_filters,
+			fields=fields,
+			limit_page_length=20,
+			ignore_permissions=True,
+		):
+			cred = _digits(getattr(row, "custom_client_phone_e164", None) or row.mobile_no)
+			if not cred.endswith(tail):
+				continue
+			pin = cstr(getattr(row, "custom_client_access_pin", None) or "").strip()
+			if pin:
+				return pin
+	return None
+
+
 def issue_client_access_pin(
 	guest_phone=None,
 	guest_name=None,
@@ -367,12 +417,16 @@ def issue_client_access_pin(
 	allowed_countries=None,
 	send=1,
 	force_new=0,
+	mint_if_missing=1,
 ):
 	"""Mint (or reuse) a 6-digit PIN for a guest phone.
 
 	Only issues a *new* PIN + outbound message when the number was never seen
 	and its country ISO is in ``allowed_countries`` (default ``["AR"]``).
 	Always returns the PIN when one already exists for this party.
+
+	``mint_if_missing=0``: Consulta-only path — return an admin/party PIN if one
+	already exists, but never mint a new one.
 	"""
 	ensure_client_access_custom_fields()
 	e164 = _normalize_e164(cstr(guest_phone or ""))
@@ -400,18 +454,28 @@ def issue_client_access_pin(
 	if customer and _customer_is_bucket(customer):
 		customer = None
 
-	# Reuse existing PIN on linked party
+	# Reuse existing PIN on linked party (or any party already tied to this phone).
 	existing_pin = None
 	if customer and frappe.db.exists("Customer", customer):
 		existing_pin = frappe.db.get_value("Customer", customer, "custom_client_access_pin")
 	if not existing_pin and lead and frappe.db.exists("Lead", lead):
 		existing_pin = frappe.db.get_value("Lead", lead, "custom_client_access_pin")
+	if not existing_pin:
+		existing_pin = _existing_pin_for_e164(e164)
 
 	seen = _phone_seen_before(e164)
 	is_new = (not seen) or cint(force_new)
 
 	pin = cstr(existing_pin or "").strip()
 	issued_new = False
+	if not pin and not cint(mint_if_missing):
+		return {
+			"ok": False,
+			"reason": "no_existing_pin",
+			"phone_e164": e164,
+			"country": iso,
+			"portal_path": "/cliente",
+		}
 	if not pin and is_new:
 		pin = _new_pin()
 		issued_new = True

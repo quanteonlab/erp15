@@ -1403,6 +1403,34 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_consulta_does_not_mint_client_pin():
+        """Consulta-only guest must not get a new portal PIN (unless admin already assigned one)."""
+        so_name = None
+        phone = "+5491188776655"
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 11}],
+                guest_notes="smoke consulta no pin",
+                guest_name="Smoke Consulta No Pin",
+                guest_phone=phone,
+                send_client_pin=0,
+                # default status = Consulta
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name, out
+            access = out.get("client_access")
+            assert not access or not access.get("pin"), access
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_create_returns_before_side_effects():
         """Create/Orden returns with side_effects_queued; remito can finish after."""
         so_name = None
@@ -2025,6 +2053,7 @@ def suite_5_9_master_data():
         check_peso_promedio_does_not_autofill_total_weight,
         "S2",
     )
+    _run("5.9.14b consulta does not mint client PIN", check_consulta_does_not_mint_client_pin, "S2")
     _run("5.9.14c create queues side effects", check_create_returns_before_side_effects, "S2")
     _run("5.9.15 Orden item edit in place (no amend)", check_orden_item_edit_inplace, "S2")
     _run("5.9.16 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")

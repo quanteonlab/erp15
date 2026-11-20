@@ -4602,6 +4602,8 @@ def _run_create_guest_preorder_side_effects(
 		frappe.log_error(frappe.get_traceback(), f"Inquiry email failed for {so_name}")
 
 	# Twilio PIN send when mint already happened in the request (send=0 there).
+	# Never mint here for Consulta-only (send_client_pin=0) — that would give a
+	# guest a portal PIN before they complete an Orden.
 	client_access = None
 	pin = cstr(client_access_pin or "").strip()
 	e164 = cstr(phone_e164 or guest_phone or "").strip()
@@ -4617,8 +4619,8 @@ def _run_create_guest_preorder_side_effects(
 			client_access = {"pin": pin, "phone_e164": e164, "send": send_result}
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"Client access PIN send failed for {so_name}")
-	elif cstr(guest_phone or "").strip() and not pin:
-		# No PIN minted in-request (e.g. no phone path) — full issue+send.
+	elif cint(send_client_pin) and cstr(guest_phone or "").strip() and not pin:
+		# Orden path asked to send, but in-request mint missed — issue+send now.
 		try:
 			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
 				issue_client_access_pin,
@@ -4631,7 +4633,8 @@ def _run_create_guest_preorder_side_effects(
 				guest_email=guest_email,
 				customer=customer,
 				allowed_countries=pin_allowed_countries,
-				send=cint(send_client_pin),
+				send=1,
+				mint_if_missing=1,
 			)
 			pin = cstr((client_access or {}).get("pin") or "").strip()
 			e164 = cstr((client_access or {}).get("phone_e164") or guest_phone or "").strip()
@@ -6301,8 +6304,12 @@ def create_guest_preorder(
 		cap = flt(so.grand_total)
 		so.db_set("advance_paid", min(paid, cap) if cap > 0 else paid)
 
-	# Mint PIN in-request (fast DB) so catalog can stash it locally; Twilio send
-	# + email + Preventa + remito run after the HTTP response (see side effects).
+	# Operaciones → Orden: submit now; remito/geocode deferred (was the long stall).
+	# Sellers may create Orden here; later edits stay suggestion-only.
+	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
+
+	# PIN: mint only when the guest completes an Orden. Consulta-only guests keep
+	# the browser session; an admin-assigned PIN is still returned (reuse-only).
 	client_access = None
 	if cstr(guest_phone or "").strip():
 		try:
@@ -6317,13 +6324,11 @@ def create_guest_preorder(
 				customer=so.customer,
 				allowed_countries=pin_allowed_countries,
 				send=0,
+				mint_if_missing=1 if want_orden else 0,
 			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so.name}")
 
-	# Operaciones → Orden: submit now; remito/geocode deferred (was the long stall).
-	# Sellers may create Orden here; later edits stay suggestion-only.
-	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
 	promoted = None
 	if want_orden and resolved_rows:
 		frappe.flags.creating_guest_preorder = True

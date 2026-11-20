@@ -1890,6 +1890,20 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_consulta_phone_no_pin_mint",
+      "source": "regression",
+      "bug": "Consulta-only create_guest_preorder with guest_phone must not mint a new client_access PIN (no TypeError; client_access omitted or without pin)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge consulta phone no pin",
+        "guest_name": "edge",
+        "guest_phone": "+5491199887766",
+        "send_client_pin": 0
+      },
+      "expect": "ok"
+    },
+    {
       "id": "create_guest_preorder_empty_no_notes",
       "source": "regression",
       "bug": "create_guest_preorder with empty items and no notes is controlled empty-cart error",
