@@ -880,6 +880,45 @@
       "expect": "no_500"
     },
     {
+      "id": "airtable_oferta_pack_total_xcaja_caja6u",
+      "source": "regression",
+      "bug": "Oferta > Efectivo with xCaja + Caja 6u must store unit Rate=Oferta/6 (pack total), not Rate=Oferta which never beats list",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.import_catalog_csv_products",
+      "args": {
+        "csv_text": "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\nEDGE-PACKTOT,Edge Pack Total / Caja 6u,EdgeLeafPt,EdgeParentPt,,En Stock,13000,14000,70000,xCaja,\n",
+        "source": "airtable",
+        "price_list": "Standard Selling",
+        "cash_price_list": "Efectivo",
+        "transfer_price_list": "Transferencia",
+        "update_existing": 1,
+        "create_missing_groups": 1,
+        "import_promotions": 1,
+        "image_mode": "none",
+        "start": 0,
+        "batch_size": 10,
+        "file_name": "edge-oferta-pack-total.csv"
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "apply_cart_legacy_pack_total_rate_without_reimport",
+      "source": "regression",
+      "bug": "Legacy AT Oferta with Rate=pack total and wrong min_qty=4 must still discount at apply time (no CSV re-import)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.apply_cart_promotions",
+      "args": {
+        "items": [
+          {
+            "item_code": "EDGE-PACKTOT",
+            "qty": 6,
+            "rate": 13000,
+            "amount": 78000
+          }
+        ],
+        "price_list": "Standard Selling"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",
@@ -8201,6 +8240,18 @@
       "expect": "error",
       "source": "regression",
       "bug": "guest account save with empty phone/PIN is a controlled validation error"
+    },
+    {
+      "id": "update_client_account_self_pin_change_rejected",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.update_client_account",
+      "args": {
+        "phone": "+5491100000000",
+        "pin": "012345",
+        "client_access_pin": "043210"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "clients cannot create/update their own access PIN via update_client_account — system/admin rotate only (auth fails or PIN-change ValidationError)"
     },
     {
       "id": "update_armado_items_packed_number",

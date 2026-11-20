@@ -3992,6 +3992,52 @@ def suite_5_12_modules_read():
         lines_caja = cart_caja.get("line_discounts") or []
         assert lines_caja, cart_caja
         assert abs(flt(lines_caja[0].get("discount_amount")) - 500) < 0.01, cart_caja
+        # Pack-total Oferta: Efectivo 13000, Oferta 70000, xCaja + "Caja 6u"
+        # → min_qty=6, Rate=70000/6 (not 70000 unit which would never beat list).
+        sku_pack_tot = f"SMOKE-APT-{frappe.generate_hash(length=6)}"
+        pack_tot_csv = (
+            "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\n"
+            f"{sku_pack_tot},Smoke Pack Total / Caja 6u,{leaf_promo},{parent_promo},"
+            "SmokeBrand,En Stock,13000,14000,70000,xCaja,\n"
+        )
+        pack_tot_report = ecommerce_api.import_catalog_csv_products(
+            csv_text=pack_tot_csv,
+            price_list="Standard Selling",
+            cash_price_list="Efectivo",
+            transfer_price_list="Transferencia",
+            default_item_group="Products",
+            update_existing=1,
+            create_missing_groups=1,
+            start=0,
+            batch_size=10,
+            source="airtable",
+            import_promotions=1,
+            image_mode="none",
+            file_name="smoke-airtable-oferta-pack-total.csv",
+        )
+        assert cint(pack_tot_report.get("promo_updates") or 0) >= 1, pack_tot_report
+        rule_pack_tot = f"AT-{sku_pack_tot}"
+        assert flt(frappe.db.get_value("Pricing Rule", rule_pack_tot, "min_qty")) == 6, rule_pack_tot
+        rate_pack = flt(frappe.db.get_value("Pricing Rule", rule_pack_tot, "rate"))
+        assert abs(rate_pack - (70000.0 / 6.0)) < 0.02, rate_pack
+        desc_pack = cstr(frappe.db.get_value("Pricing Rule", rule_pack_tot, "rule_description") or "")
+        assert "pack_total=70000" in desc_pack, desc_pack
+        if frappe.db.has_column("Item", "custom_pack_qty"):
+            assert flt(frappe.db.get_value("Item", sku_pack_tot, "custom_pack_qty")) == 6, sku_pack_tot
+        # qty 6 @ 13000 → all units @ 70000/6 → savings = 13000*6 - 70000
+        expected_save = 13000.0 * 6.0 - 70000.0
+        cart_pt = ecommerce_api.apply_cart_promotions(
+            items=[{
+                "item_code": sku_pack_tot,
+                "qty": 6,
+                "rate": 13000,
+                "amount": 78000,
+            }],
+            price_list="Standard Selling",
+        )
+        lines_pt = cart_pt.get("line_discounts") or []
+        assert lines_pt, cart_pt
+        assert abs(flt(lines_pt[0].get("discount_amount")) - expected_save) < 0.05, cart_pt
         # Clear Oferta → disable rule
         clear_csv = (
             "TAG,Producto,Etiquetas,Clase,Marca,Estado,Efectivo,Transferencia,Oferta,Cantidad,Imagen\n"
@@ -4012,10 +4058,10 @@ def suite_5_12_modules_read():
         assert cint(clear_report.get("promo_disabled") or 0) >= 1, clear_report
         assert cint(frappe.db.get_value("Pricing Rule", rule_name, "disable")) == 1
         # cleanup promo items + rules
-        for rn in (rule_name, rule_caja):
+        for rn in (rule_name, rule_caja, rule_pack_tot):
             if frappe.db.exists("Pricing Rule", rn):
                 frappe.delete_doc("Pricing Rule", rn, ignore_permissions=True, force=1)
-        for sk in (sku_promo, sku_caja):
+        for sk in (sku_promo, sku_caja, sku_pack_tot):
             for pl in ("Standard Selling", "Efectivo", "Transferencia"):
                 pname = frappe.db.get_value(
                     "Item Price", {"item_code": sk, "price_list": pl, "selling": 1}, "name"

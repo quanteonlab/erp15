@@ -1702,7 +1702,6 @@ def _compute_cart_promotions_local(items, price_list=None):
 				continue
 			if not _rule_applies_to_item(rule, item_code):
 				continue
-			min_qty = flt(rule.get("min_qty") or 0)
 			min_amt = flt(rule.get("min_amt") or 0)
 			promo_style = _promo_style_from_rule(rule)
 			rod = (rule.get("rate_or_discount") or "").strip().lower()
@@ -1711,6 +1710,20 @@ def _compute_cart_promotions_local(items, price_list=None):
 				and not flt(rule.get("discount_percentage") or 0)
 				and not flt(rule.get("discount_amount") or 0)
 			)
+			unit_rate = flt(item.get("rate") or 0)
+			if is_rate_rule:
+				item_pack = None
+				item_name = None
+				if item_code and frappe.db.exists("Item", item_code):
+					item_name = frappe.db.get_value("Item", item_code, "item_name")
+					if frappe.db.has_column("Item", "custom_pack_qty"):
+						item_pack = frappe.db.get_value("Item", item_code, "custom_pack_qty")
+				offer, min_qty = _resolve_rate_rule_offer(
+					rule, unit_rate, item_pack_qty=item_pack, item_name=item_name
+				)
+			else:
+				offer = flt(rule.get("rate") or 0)
+				min_qty = flt(rule.get("min_qty") or 0)
 			# Pack Rate: upsell toward next complete pack (not "all units once N").
 			if is_rate_rule and promo_style == "pack" and min_qty > 1:
 				packs = int(qty // min_qty) if min_qty else 0
@@ -1718,7 +1731,6 @@ def _compute_cart_promotions_local(items, price_list=None):
 					needed = min_qty - qty
 					thresh = flt(rule.get("threshold_percentage") or 80)
 					progress = (qty / min_qty) * 100 if min_qty else 0
-					offer = flt(rule.get("rate") or 0)
 					if needed > 0 and progress >= thresh:
 						upsell_hints.append({
 							"rule_name": rule["name"],
@@ -1735,7 +1747,6 @@ def _compute_cart_promotions_local(items, price_list=None):
 				progress = (qty / min_qty) * 100 if min_qty else 0
 				if needed > 0 and progress >= thresh:
 					pct = flt(rule.get("discount_percentage") or 0)
-					offer = flt(rule.get("rate") or 0)
 					if pct:
 						disc_label = f"{int(pct)}% OFF"
 					elif offer > 0:
@@ -1760,17 +1771,23 @@ def _compute_cart_promotions_local(items, price_list=None):
 				discount = flt(rule.get("discount_amount"))
 			elif is_rate_rule:
 				# Fixed unit rate (Airtable Oferta): pack or threshold savings.
-				unit_rate = flt(item.get("rate") or 0)
-				offer = flt(rule.get("rate") or 0)
 				discount = _rate_rule_discount(unit_rate, offer, qty, min_qty, promo_style)
 			if discount > best_discount:
 				best_discount = discount
 				best_rule = rule
 		if best_rule and best_discount > 0:
 			pct = flt(best_rule.get("discount_percentage") or 0)
-			offer = flt(best_rule.get("rate") or 0)
+			unit_rate = flt(item.get("rate") or 0)
+			item_pack = None
+			item_name = None
+			if item_code and frappe.db.exists("Item", item_code):
+				item_name = frappe.db.get_value("Item", item_code, "item_name")
+				if frappe.db.has_column("Item", "custom_pack_qty"):
+					item_pack = frappe.db.get_value("Item", item_code, "custom_pack_qty")
+			offer, mq = _resolve_rate_rule_offer(
+				best_rule, unit_rate, item_pack_qty=item_pack, item_name=item_name
+			)
 			style = _promo_style_from_rule(best_rule)
-			mq = flt(best_rule.get("min_qty") or 0)
 			if pct:
 				label = f"{int(pct)}%"
 			elif offer > 0 and style == "pack" and mq > 1:
@@ -14724,8 +14741,38 @@ def _promo_style_from_rule(rule) -> str:
 	return "threshold"
 
 
-def _parse_airtable_offer_min_qty(cantidad, item_code=None) -> float:
-	"""Cantidad labels → Pricing Rule.min_qty (x2→2, xCaja→4 or Item pack, xc/unidad→1)."""
+_CAJA_PACK_RE = re.compile(
+	r"(?:^|[/\s,-])(?:caja|box)\s*[x×]?\s*(\d+(?:\.\d+)?)\s*u?\b",
+	re.I,
+)
+
+
+def _pack_qty_from_item_name(item_name=None) -> float:
+	"""Parse 'Caja 6u' / 'Caja 24u' / '/ Caja 12u' from Airtable product titles."""
+	raw = cstr(item_name or "").strip()
+	if not raw:
+		return 0.0
+	m = _CAJA_PACK_RE.search(raw)
+	if not m:
+		return 0.0
+	return flt(m.group(1)) or 0.0
+
+
+def _resolve_airtable_xcaja_pack_qty(item_code=None, item_name=None) -> float:
+	"""Prefer Item.custom_pack_qty, then 'Caja Nu' in the title, else default 4."""
+	pack = 0.0
+	code = cstr(item_code or "").strip()
+	if code and frappe.db.exists("Item", code) and frappe.db.has_column("Item", "custom_pack_qty"):
+		pack = flt(frappe.db.get_value("Item", code, "custom_pack_qty") or 0)
+	if pack <= 1:
+		pack = _pack_qty_from_item_name(item_name)
+	if pack <= 1 and code and frappe.db.exists("Item", code):
+		pack = _pack_qty_from_item_name(frappe.db.get_value("Item", code, "item_name"))
+	return pack if pack > 1 else _AIRTABLE_XCAJA_DEFAULT_QTY
+
+
+def _parse_airtable_offer_min_qty(cantidad, item_code=None, item_name=None) -> float:
+	"""Cantidad labels → Pricing Rule.min_qty (x2→2, xCaja→pack from Item/name, xc/unidad→1)."""
 	raw = cstr(cantidad or "").strip().lower().replace(" ", "")
 	if not raw:
 		return 1.0
@@ -14735,14 +14782,77 @@ def _parse_airtable_offer_min_qty(cantidad, item_code=None) -> float:
 	if m:
 		return flt(m.group(1)) or 1.0
 	if raw in ("xcaja", "caja", "xbox", "box"):
-		pack = 0.0
-		if item_code and frappe.db.exists("Item", item_code) and frappe.db.has_column(
-			"Item", "custom_pack_qty"
-		):
-			pack = flt(frappe.db.get_value("Item", item_code, "custom_pack_qty") or 0)
-		# Default caja = 4; use Item pack when already set (>1); editable later on the Oferta rule.
-		return pack if pack > 1 else _AIRTABLE_XCAJA_DEFAULT_QTY
+		return _resolve_airtable_xcaja_pack_qty(item_code=item_code, item_name=item_name)
 	return 1.0
+
+
+def _pack_total_from_rule_description(rule) -> float:
+	desc = cstr((rule or {}).get("rule_description") or "")
+	m = re.search(r"pack_total\s*=\s*(\d+(?:\.\d+)?)", desc, re.I)
+	return flt(m.group(1)) if m else 0.0
+
+
+def _resolve_rate_rule_offer(rule, unit_list_rate, item_pack_qty=None, item_name=None) -> tuple:
+	"""Return (unit_offer_rate, min_qty) healing Airtable pack-total Rates.
+
+	Legacy imports stored Oferta as caja total (Rate ≥ list) often with wrong
+	min_qty=4. Dividing by 4 can still leave Rate ≥ list — try title/item pack,
+	then ceil(total/list) so existing rules apply without CSV re-import.
+	"""
+	rule = rule or {}
+	raw = flt(rule.get("rate") or 0)
+	min_qty = flt(rule.get("min_qty") or 0)
+	pack_hints = []
+	for candidate in (
+		_pack_qty_from_item_name(rule.get("title")),
+		_pack_qty_from_item_name(item_name),
+		flt(item_pack_qty or 0),
+	):
+		if candidate > 1:
+			pack_hints.append(candidate)
+			min_qty = max(min_qty, candidate)
+	list_rate = flt(unit_list_rate)
+	pack_total_marked = _pack_total_from_rule_description(rule)
+	total = pack_total_marked if pack_total_marked > 0 else raw
+
+	def _try_divisors(candidates):
+		seen = set()
+		for n in sorted({flt(c) for c in candidates if flt(c) > 1}, reverse=True):
+			if n in seen:
+				continue
+			seen.add(n)
+			unit = total / n
+			if list_rate > 0:
+				if unit < list_rate * 0.999:
+					return unit, max(min_qty, n)
+			elif unit > 0:
+				return unit, max(min_qty, n)
+		return None
+
+	if pack_total_marked > 0 and min_qty > 1:
+		hit = _try_divisors([min_qty] + pack_hints)
+		if hit:
+			return hit
+
+	if list_rate > 0 and raw > list_rate * 1.01:
+		blob = f"{cstr(rule.get('title') or '')} {cstr(rule.get('rule_description') or '')}"
+		looks_pack = min_qty > 1 or bool(pack_hints) or bool(
+			re.search(r"xcaja|\bcaja\b|\bbox\b", blob, re.I)
+		)
+		if looks_pack:
+			hit = _try_divisors(pack_hints + [min_qty])
+			if hit:
+				return hit
+			from math import ceil as _ceil
+
+			# 70000/13000 → 6 so unit rate beats list.
+			need_n = cint(_ceil(raw / list_rate - 1e-9)) if list_rate else 0
+			if 2 <= need_n <= 48:
+				hit = _try_divisors([need_n])
+				if hit:
+					return hit
+
+	return raw, min_qty
 
 
 def _rate_rule_discount(unit_rate, offer, qty, min_qty, promo_style) -> float:
@@ -14769,38 +14879,56 @@ def _rate_rule_discount(unit_rate, offer, qty, min_qty, promo_style) -> float:
 	return (unit_rate - offer) * qty
 
 
-def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qty, promo_style="threshold"):
+def _upsert_airtable_oferta_promotion(
+	item_code,
+	item_name,
+	offer_rate,
+	offer_qty,
+	promo_style="threshold",
+	unit_list_rate=None,
+):
 	"""Create/update/disable Pricing Rule from Airtable Oferta + Cantidad.
 
 	promo_style:
 	- threshold (default): once qty >= N, every unit at Oferta (x2 / x10 tiers stack via best rule)
 	- pack: N units at Oferta per complete pack; remainder list price
 
-	Stored as Price + Rate with [promo_style=…] in rule_description for cart/catalog.
+	Airtable Oferta is often a **caja/pack total** (e.g. Efectivo 13000, Oferta 70000,
+	Cantidad xCaja, title "… / Caja 6u"). Catalog compares Rate to the unit list, so we
+	store Rate as Oferta/N and keep ``pack_total=`` in rule_description for badges.
+
 	Returns: created | updated | disabled | skipped
 	"""
 	code = cstr(item_code or "").strip()
 	if not code:
 		return "skipped"
 	rule_name = _airtable_oferta_rule_name(code)
-	rate = flt(offer_rate)
+	raw_offer = flt(offer_rate)
 	exists = bool(frappe.db.exists("Pricing Rule", rule_name))
 	style = _normalize_catalog_promo_style(promo_style)
 
-	if rate <= 0:
+	if raw_offer <= 0:
 		if exists:
 			frappe.db.set_value("Pricing Rule", rule_name, "disable", 1, update_modified=True)
 			return "disabled"
 		return "skipped"
 
-	min_qty = _parse_airtable_offer_min_qty(offer_qty, code)
+	name = cstr(item_name or "").strip()
+	min_qty = _parse_airtable_offer_min_qty(offer_qty, code, name)
 	qty_label = cstr(offer_qty or "").strip() or "x1"
+	list_rate = flt(unit_list_rate)
+	# Pack/caja total when Oferta is clearly above the unit list (Importados pattern).
+	pack_total = 0.0
+	rate = raw_offer
+	if min_qty > 1 and list_rate > 0 and raw_offer > list_rate * 1.01:
+		pack_total = raw_offer
+		rate = raw_offer / min_qty
 	if style == "pack" and min_qty > 1:
-		title = f"Oferta {cint(min_qty)}x — {(cstr(item_name) or code)[:90]}"
+		title = f"Oferta {cint(min_qty)}x — {(name or code)[:90]}"
 	elif style == "threshold" and min_qty > 1:
-		title = f"Oferta desde {qty_label} — {(cstr(item_name) or code)[:90]}"
+		title = f"Oferta desde {qty_label} — {(name or code)[:90]}"
 	else:
-		title = f"Oferta {qty_label} — {(cstr(item_name) or code)[:90]}"
+		title = f"Oferta {qty_label} — {(name or code)[:90]}"
 	currency, company = _default_pricing_currency()
 
 	if exists:
@@ -14830,8 +14958,10 @@ def _upsert_airtable_oferta_promotion(item_code, item_name, offer_rate, offer_qt
 	doc.currency = currency
 	if company:
 		doc.company = company
+	pack_bit = f" pack_total={pack_total:g}" if pack_total > 0 else ""
 	doc.rule_description = (
-		f"Airtable Oferta {qty_label} @ {rate:g} (min_qty={min_qty:g}) [promo_style={style}]"
+		f"Airtable Oferta {qty_label} @ {raw_offer:g} (min_qty={min_qty:g}"
+		f"{pack_bit}) [promo_style={style}]"
 	)
 	doc.threshold_percentage = 80
 	doc.set("items", [])
@@ -15563,8 +15693,10 @@ def import_catalog_csv_products(
 	image_mode: blank (only empty Item.image) | all (always override) | none.
 	import_promotions: when 1, Airtable Oferta+Cantidad (or custom offer_rate/
 	offer_qty) upsert Pricing Rules (Rate + min_qty).
-	promo_style: threshold (default, all units at Oferta once qty >= N; xCaja→4)
-	| pack (Nx complete packs at Oferta).
+	promo_style: threshold (default, all units at Oferta once qty >= N;
+	xCaja→Item pack / "Caja Nu" in title / default 4). When Oferta > unit list
+	(Efectivo), Rate is stored as Oferta/N (pack total kept in rule_description).
+	| pack (Nx complete packs at Oferta unit rate).
 	force_update_uom: when 1, overwrite Item.stock_uom from CSV for existing
 	SKUs even when already set (e.g. Nos → WEIGHT). When 0 (default), keep
 	existing stock_uom on update; new Items always get the CSV UOM.
@@ -15811,6 +15943,16 @@ def import_catalog_csv_products(
 				# Keep catalog display title = Producto (not Etiquetas/Clase).
 				item_doc.custom_normalized_title = item_name
 
+			# Airtable titles often embed caja size ("… / Caja 6u") — keep on Item so
+			# xCaja Ofertas resolve min_qty from pack, not the hard-coded default 4.
+			pack_from_name = _pack_qty_from_item_name(item_name)
+			if (
+				pack_from_name > 1
+				and frappe.db.has_column("Item", "custom_pack_qty")
+				and (source == "airtable" or source == "custom")
+			):
+				item_doc.custom_pack_qty = pack_from_name
+
 			# Defer remote images until after insert/save so we can materialize
 			# a local 256×256 thumb (same as Product Manager). Broken links
 			# fall back to the remote URL + a warning — never abort the row.
@@ -15996,12 +16138,16 @@ def import_catalog_csv_products(
 				source == "airtable" or (source == "custom" and resolved_map.get("offer_rate"))
 			):
 				try:
+					# Efectivo (cash_price) is the unit list Airtable compares Oferta to;
+					# Transferencia (price) is payment-list only.
+					unit_list = flt(row.get("cash_price") or 0) or flt(row.get("price") or 0)
 					promo_action = _upsert_airtable_oferta_promotion(
 						item_doc.item_code,
 						item_doc.item_name,
 						row.get("offer_rate"),
 						row.get("offer_qty"),
 						promo_style=promo_style,
+						unit_list_rate=unit_list,
 					)
 					if promo_action in ("created", "updated"):
 						report["promo_updates"] += 1

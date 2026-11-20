@@ -925,19 +925,21 @@ def update_client_account(
 	zone=None,
 	catalog_lang=None,
 ):
-	"""Guest portal: edit own contact fields, including the access PIN and map locality."""
+	"""Guest portal: edit own contact / locality fields.
+
+	Access PIN is mint/rotate-only (system or admin) — clients cannot set or
+	change it here. ``client_access_pin`` is ignored; a different value is rejected.
+	"""
 	auth = _authenticate_client(phone, pin)
 	customer = auth.get("customer")
 	lead = auth.get("lead")
-	new_pin = cstr(client_access_pin or "").strip()
-	if new_pin and new_pin != auth.get("pin"):
-		if not new_pin.isdigit() or len(new_pin) != CLIENT_ACCESS_PIN_LEN or new_pin[0] not in CLIENT_ACCESS_PIN_FIRST_DIGITS:
-			frappe.throw(
-				_("PIN must be 6 digits and start with 0–4"),
-				frappe.ValidationError,
-			)
-		if _pin_taken_by_other(new_pin, customer=customer, lead=lead):
-			frappe.throw(_("That PIN is already in use"), frappe.ValidationError)
+	# Keep auth PIN; never accept a self-service PIN rewrite.
+	requested_pin = cstr(client_access_pin or "").strip()
+	if requested_pin and requested_pin != cstr(auth.get("pin") or "").strip():
+		frappe.throw(
+			_("PIN can only be changed by an administrator"),
+			frappe.ValidationError,
+		)
 
 	phone_raw = client_phone_e164 if client_phone_e164 is not None else mobile_no
 	new_e164 = None
@@ -964,8 +966,6 @@ def update_client_account(
 			patch["client_phone_e164"] = new_e164
 		elif mobile_no is not None:
 			patch["mobile_no"] = cstr(mobile_no).strip()
-		if new_pin:
-			patch["client_access_pin"] = new_pin
 		if tax_id is not None:
 			patch["tax_id"] = cstr(tax_id).strip()
 		if tax_category is not None:
@@ -1007,14 +1007,12 @@ def update_client_account(
 			doc.mobile_no = new_e164
 			if frappe.db.has_column("Lead", "custom_client_phone_e164"):
 				doc.custom_client_phone_e164 = new_e164
-		if new_pin and frappe.db.has_column("Lead", "custom_client_access_pin"):
-			doc.custom_client_access_pin = new_pin
 		doc.save(ignore_permissions=True)
 		frappe.flags.ignore_permissions = False
 		frappe.db.commit()
 
 	next_phone = new_e164 or auth.get("e164")
-	next_pin = new_pin or auth.get("pin")
+	next_pin = auth.get("pin")
 	payload = _account_payload(_authenticate_client(next_phone, next_pin))
 	# Leads have no Customer catalog_lang column; keep the choice on the response
 	# so the portal can store it locally until the account becomes a customer.
