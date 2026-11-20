@@ -2211,6 +2211,30 @@
     },
 
     {
+      "id": "ensure_client_access_pin_null_customer",
+      "source": "regression",
+      "bug": "ensure_client_access_pin with null customer/lead must controlled ValidationError, not AttributeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.ensure_client_access_pin",
+      "args": {
+        "customer": null,
+        "lead": null,
+        "rotate": 0
+      },
+      "expect": "error"
+    },
+    {
+      "id": "ensure_client_access_pin_empty_customer",
+      "source": "regression",
+      "bug": "ensure_client_access_pin with '' customer must controlled error",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.ensure_client_access_pin",
+      "args": {
+        "customer": "",
+        "lead": "",
+        "rotate": null
+      },
+      "expect": "error"
+    },
+    {
       "id": "issue_client_access_pin_null_phone",
       "source": "regression",
       "bug": "issue_client_access_pin with null phone returns controlled ok:false, no TypeError",

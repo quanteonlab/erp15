@@ -1153,6 +1153,112 @@ def _require_users_table_perm():
 	_require_app_permission("tables.employees")
 
 
+def _require_client_pin_staff():
+	"""Admin / Usuarios / CRM / Pedidos staff may reveal or mint a client PIN."""
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import _can_app
+
+	for pid in (
+		"tables.employees",
+		"tables.crm",
+		"tables.orders.all",
+		"tables.orders",
+		"tables.orders.own",
+	):
+		if _can_app(pid):
+			return
+	frappe.throw(_("Not permitted to manage client PIN"))
+
+
+def _assert_staff_can_touch_customer(customer: str) -> None:
+	"""Respect sales visibility: assigned-only sellers cannot mint for others' clients."""
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_acting_username,
+		_assigned_customer_names,
+		sales_visibility_scope,
+	)
+
+	scope = sales_visibility_scope()
+	if scope in (None, "", "all"):
+		return
+	if scope == "none":
+		frappe.throw(_("Not permitted for this customer"))
+	uid = _acting_username() or ""
+	assigned = set(_assigned_customer_names(uid)) if uid else set()
+	if customer not in assigned:
+		frappe.throw(_("Not permitted for this customer"))
+
+
+@frappe.whitelist()
+def ensure_client_access_pin(customer=None, lead=None, rotate=0):
+	"""CRM / sales: return existing client PIN, or mint one if missing.
+
+	``rotate=1`` always issues a new PIN (same as Usuarios → Rotar).
+	Does not require tables.employees — tables.crm / Pedidos staff may call it
+	so a vendedor can copy or generate a PIN for the client in Relaciones.
+	"""
+	_require_client_pin_staff()
+	ensure_client_access_custom_fields()
+	customer = cstr(customer or "").strip() or None
+	lead = cstr(lead or "").strip() or None
+	if not customer and not lead:
+		frappe.throw(_("customer or lead is required"))
+	if customer and _customer_is_bucket(customer):
+		frappe.throw(_("Cannot assign a PIN to the walk-in customer"))
+	if customer:
+		if not frappe.db.exists("Customer", customer):
+			frappe.throw(_("Customer not found"))
+		_assert_staff_can_touch_customer(customer)
+	if lead and not frappe.db.exists("Lead", lead):
+		frappe.throw(_("Lead not found"))
+
+	existing = ""
+	if customer and frappe.db.has_column("Customer", "custom_client_access_pin"):
+		existing = cstr(
+			frappe.db.get_value("Customer", customer, "custom_client_access_pin") or ""
+		).strip()
+	if not existing and lead and frappe.db.has_column("Lead", "custom_client_access_pin"):
+		existing = cstr(
+			frappe.db.get_value("Lead", lead, "custom_client_access_pin") or ""
+		).strip()
+
+	pin = existing
+	minted = False
+	if cint(rotate) or not pin:
+		pin = _new_pin()
+		minted = True
+
+	e164 = ""
+	if customer:
+		e164 = cstr(
+			frappe.db.get_value("Customer", customer, "custom_client_phone_e164")
+			or frappe.db.get_value("Customer", customer, "mobile_no")
+			or ""
+		)
+	if not e164 and lead:
+		e164 = cstr(
+			frappe.db.get_value("Lead", lead, "custom_client_phone_e164")
+			or frappe.db.get_value("Lead", lead, "mobile_no")
+			or ""
+		)
+	e164 = _normalize_e164(e164) or e164
+	if customer:
+		_stamp_party("Customer", customer, pin, e164)
+	if lead:
+		_stamp_party("Lead", lead, pin, e164)
+	frappe.db.commit()
+	return {
+		"ok": True,
+		"pin": pin,
+		"customer": customer,
+		"lead": lead,
+		"phone_e164": e164 or None,
+		"minted": minted,
+		"rotated": bool(cint(rotate) and minted),
+		"portal_path": "/cliente",
+		"portal_url": f"{_portal_base_url()}/cliente",
+	}
+
+
 @frappe.whitelist()
 def list_users_clients(search=None, page=1, page_length=100):
 	"""Usuarios → Clientes: identity + PIN (not full Relaciones CRM)."""
