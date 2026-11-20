@@ -238,29 +238,59 @@ def _um_display(uom) -> str:
 	return "Uni"
 
 
-def _uom_print_label(uom) -> str:
+def _uom_print_label(uom, locale: str | None = None) -> str:
 	"""Human Uni label for remitos — never raw catalog token ``WEIGHT``.
 
+	Countable lines print localized ``Unidad`` / ``Caja`` (not ``NOS`` / ``Uni``).
 	Spanish print sheets use ``Peso`` for sell-by-weight lines.
 	"""
 	raw = cstr(uom or "").strip()
 	if not raw:
 		return ""
 	n = _norm_uom(raw)
-	if n in _CATALOG_WEIGHT_TOKENS or n == "weight":
-		return "Peso"
+	loc = (locale or "es").lower()
+	if loc.startswith("zh"):
+		unidad, caja, peso = "件", "箱", "称重"
+	elif loc.startswith("en"):
+		unidad, caja, peso = "Unit", "Box", "Weight"
+	else:
+		unidad, caja, peso = "Unidad", "Caja", "Peso"
+	if n in _CATALOG_WEIGHT_TOKENS or n == "weight" or n == "peso":
+		return peso
 	if n in ("kg", "kgs", "kilogram", "kilograms", "kilogramo", "kilogramos"):
 		return "Kg"
 	if n in ("g", "gr", "gram", "grams", "gramo", "gramos"):
 		return "g"
-	if n in ("nos", "no", "unit", "units", "uni", "und", "unidad", "unidades", "u"):
-		return "Uni"
+	if n in ("nos", "no", "unit", "units", "uni", "und", "unidad", "unidades", "u", "nos (single)"):
+		return unidad
 	if n in ("caja", "cajas", "box", "boxes"):
-		return "Caja"
+		return caja
 	# Title-case unknown short codes (WEIGHT already returned above).
 	if raw.isupper() and len(raw) <= 6:
 		return raw.title()
 	return raw
+
+
+def _line_needs_measured_weight(row: dict, so_it=None) -> bool:
+	"""True when Armado / Peso medido expects a scale reading (not Unidad/Caja only)."""
+	if not isinstance(row, dict):
+		row = {}
+	tx = row.get("uom") or row.get("stock_uom") or ""
+	if _is_catalog_weight_uom(tx) or _is_mass_uom(tx):
+		return True
+	if frappe.utils.cint(row.get("is_weight_based")):
+		return True
+	wpu = row.get("weight_per_unit")
+	if wpu is None and so_it is not None:
+		wpu = getattr(so_it, "weight_per_unit", None)
+	if _positive_float(wpu):
+		return True
+	stock = ""
+	if so_it is not None:
+		stock = cstr(getattr(so_it, "stock_uom", None) or "")
+	if _is_catalog_weight_uom(stock) or _is_mass_uom(stock):
+		return True
+	return False
 
 
 def _format_units_qty(raw) -> str:
@@ -428,13 +458,22 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 		out["weight"] = ""
 	out["weight_uom"] = line_wuom or (stock_uom if weight_based else "") or ""
 	out["total_weight"] = total_w if total_w not in (None, 0) else ""
+	needs_measure = weight_based or _is_catalog_weight_uom(tx_uom) or _line_needs_measured_weight(out)
 	aw = _positive_float(out.get("actual_weight"))
-	out["actual_weight"] = aw if aw is not None else ""
+	# Non-weight lines: Peso medido is always a dash (nothing to weigh).
+	if not needs_measure:
+		out["actual_weight"] = "-"
+	else:
+		out["actual_weight"] = aw if aw is not None else ""
 	out["is_weight_based"] = 1 if weight_based else 0
 	# Factura-con-pesos columns: Unid / Peso / UM (3-letter Uni|Kil).
 	out["um_display"] = _um_display(tx_uom)
-	# Remito "Uni" column binds ``uom`` — never leave raw WEIGHT token.
-	out["uom"] = _uom_print_label(tx_uom) or out.get("uom") or ""
+	# Remito "Uni" column binds ``uom`` — never leave raw WEIGHT / NOS tokens.
+	uom_label = _uom_print_label(tx_uom) or out.get("uom") or ""
+	out["uom"] = uom_label
+	# Prefill Armado Uni write-in with Unidad / Caja / Peso when still empty.
+	if not cstr(out.get("confirm_uni") or "").strip():
+		out["confirm_uni"] = uom_label
 	out["units_qty"] = _line_units_requested(out, line_wpu=line_wpu, total_w=total_w)
 	out["peso_display"] = _format_peso_display(total_w, tx_uom=tx_uom)
 	if isinstance(out.get("weight"), str) and str(out.get("weight")).startswith("~"):
@@ -546,21 +585,45 @@ def _apply_armado_measured_print_fills(rows, so_name, so_items=None) -> None:
 			row["peso_display"] = "FALTANTE"
 			continue
 
+		raw_uom = ""
+		if so_it is not None:
+			raw_uom = cstr(
+				getattr(so_it, "uom", None) or getattr(so_it, "stock_uom", None) or ""
+			).strip()
+		if not raw_uom:
+			# Prefer catalog token before enrich rewrote ``uom`` to a display label.
+			raw_uom = cstr(row.get("stock_uom") or row.get("uom") or "").strip()
+		uom_label = _uom_print_label(raw_uom) or raw_uom
+		needs_measure = _line_needs_measured_weight(row, so_it)
+
+		# Countable (Unidad / Caja): Peso medido is always "-"; Uni shows the UOM word.
+		if not needs_measure:
+			row["actual_weight"] = "-"
+			row["peso_display"] = "-"
+			row["confirm_uni"] = uom_label or row.get("confirm_uni") or "Unidad"
+			if uom_label:
+				row["uom"] = uom_label
+
 		# Measured kg: prefer armado progress, then SO line total_weight.
 		tw = state.get("total_weight")
 		if tw is None and so_it is not None:
 			tw = getattr(so_it, "total_weight", None)
 		if tw is None:
 			tw = row.get("total_weight")
-		tw_pos = _positive_float(tw)
+		tw_pos = _positive_float(tw) if needs_measure else None
 
 		# Armado units: prefer progress qty, else SO qty when packed / weighed.
 		qty_raw = state.get("qty")
 		if qty_raw is None and so_it is not None:
 			# After pack/weigh the SO qty is the armado qty.
-			if state.get("packed") or tw_pos is not None:
+			if state.get("packed") or tw_pos is not None or (not needs_measure and state.get("packed")):
 				qty_raw = getattr(so_it, "qty", None)
 		if qty_raw is None and (state.get("packed") or tw_pos is not None):
+			qty_raw = row.get("qty")
+		# Countable packed lines: fill Cantidad from SO qty even without progress weight.
+		if qty_raw is None and not needs_measure and so_it is not None:
+			qty_raw = getattr(so_it, "qty", None)
+		if qty_raw is None and not needs_measure:
 			qty_raw = row.get("qty")
 		qty_pos = flt(qty_raw) if qty_raw is not None else None
 
@@ -569,25 +632,20 @@ def _apply_armado_measured_print_fills(rows, so_name, so_items=None) -> None:
 			row["actual_weight"] = tw_print
 			row["total_weight"] = tw_print
 			# Keep remito-style peso column in sync when sold by weight.
-			tx_uom = row.get("uom") or row.get("stock_uom") or ""
-			row["peso_display"] = _format_peso_display(tw_print, tx_uom=tx_uom)
+			row["peso_display"] = _format_peso_display(tw_print, tx_uom=raw_uom)
 			row["weight"] = tw_print
 
 		if qty_pos is not None:
 			uni = _format_units_qty(qty_pos)
-			row["confirm_uni"] = uni
-			raw_uom = cstr(row.get("uom") or row.get("stock_uom") or "").strip()
-			uom_label = _uom_print_label(raw_uom) or raw_uom
-			# Confirm box: number + Spanish label (never English WEIGHT).
-			if _is_catalog_weight_uom(raw_uom) or _norm_uom(raw_uom) in ("peso", "weight"):
-				row["confirm_qty"] = uni
-			else:
-				row["confirm_qty"] = f"{uni} {uom_label}".strip() if uom_label else uni
+			# Uni column = Unidad / Caja / Peso (not the pack count).
+			row["confirm_uni"] = uom_label or uni
+			# Confirm Cantidad: number only (label lives in Uni).
+			row["confirm_qty"] = uni
 			# Remito Cantidad: number only for weight lines; Uni col shows Peso.
 			if uni:
 				row["qty_display"] = _qty_display_for_print(qty_pos, raw_uom)
 				row["units_qty"] = uni
-				if raw_uom:
+				if uom_label:
 					row["uom"] = uom_label
 
 
@@ -5605,6 +5663,90 @@ _STARTER_TEMPLATES = [
 			}
 		],
 	},
+	# Empaque caja label — Thermal 80mm ticket (matches ArmadoBoxLabelTicket UI).
+	{
+		"template_name": "Armado Caja (80mm)",
+		"source_doctype": "Delivery Checklist",
+		"paper_kind": "Thermal 80mm",
+		"is_default": True,
+		"gift": True,
+		"resync": True,
+		"resync_if_missing_id": "starter-armcaja-ean-v1",
+		"margin_mm": [3, 3, 3, 3],
+		"elements": [
+			{
+				"id": "starter-armcaja-kicker",
+				"kind": "text",
+				"x": 3,
+				"y": 3,
+				"width": 74,
+				"height": 6,
+				"staticText": "CAJA · ARMADO",
+				"fontSize": 9,
+				"bold": True,
+				"align": "left",
+			},
+			{
+				"id": "starter-armcaja-name",
+				"kind": "field",
+				"x": 3,
+				"y": 11,
+				"width": 74,
+				"height": 10,
+				"fieldPath": "name",
+				"label": "Pedido",
+				"fontSize": 14,
+				"bold": True,
+				"align": "left",
+			},
+			{
+				"id": "starter-armcaja-customer",
+				"kind": "field",
+				"x": 3,
+				"y": 22,
+				"width": 74,
+				"height": 10,
+				"fieldPath": "customer_name",
+				"label": "Cliente",
+				"fontSize": 11,
+				"align": "left",
+			},
+			{
+				"id": "starter-armcaja-cajas",
+				"kind": "field",
+				"x": 3,
+				"y": 34,
+				"width": 36,
+				"height": 8,
+				"fieldPath": "cajas",
+				"label": "Cajas",
+				"fontSize": 12,
+				"bold": True,
+				"align": "left",
+			},
+			{
+				"id": "starter-armcaja-ean-v1",
+				"kind": "field",
+				"x": 3,
+				"y": 44,
+				"width": 74,
+				"height": 8,
+				"fieldPath": "order_ean13",
+				"label": "EAN",
+				"fontSize": 12,
+				"align": "left",
+			},
+			{
+				"id": "starter-armcaja-barcode",
+				"kind": "barcode",
+				"x": 8,
+				"y": 54,
+				"width": 64,
+				"height": 18,
+				"fieldPath": "order_ean13",
+			},
+		],
+	},
 	# ── Delivery Note · A4 remito (compact Armado header) ───────────────
 	{
 		"template_name": "Remito (A4)",
@@ -5855,7 +5997,11 @@ def _localize_print_text(text: str, locale: str) -> str:
 		"Importe total": ("Importe total", "金额合计"),
 		"Ubic.": ("Ubic.", "库位"),
 		"Barras": ("Barras", "条码"),
-		"Uni": ("Uni", "单位"),
+		"Uni": ("Unidad", "单位"),
+		"Unidad": ("Unidad", "单位"),
+		"Unit": ("Unidad", "件"),
+		"Caja": ("Caja", "箱"),
+		"Box": ("Caja", "箱"),
 		"Vend:": ("Vend:", "销售："),
 		"Zona:": ("Zona:", "区域："),
 		"Horario:": ("Horario:", "时段："),

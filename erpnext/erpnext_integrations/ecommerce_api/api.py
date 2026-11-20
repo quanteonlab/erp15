@@ -4796,6 +4796,145 @@ def _sanitize_guest_tag(value) -> str:
 	return str(value or "").replace("|", " ").strip()[:240]
 
 
+def _resolve_vehicle_ref(raw) -> tuple[str | None, str | None]:
+	"""Map free patente text → (Vehicle name or None, display plate).
+
+	Accepts Vehicle ``name`` or ``license_plate``. Unmatched text is kept as
+	display-only (no Vehicle link) so packers can note a plate before MAT.
+	"""
+	val = cstr(raw or "").strip()
+	if not val or val.lower() in ("null", "undefined", "none", "—", "-"):
+		return None, None
+	if frappe.db.exists("Vehicle", val):
+		plate = (
+			frappe.db.get_value("Vehicle", val, "license_plate")
+			if frappe.db.has_column("Vehicle", "license_plate")
+			else None
+		)
+		return val, cstr(plate or val).strip() or val
+	if frappe.db.has_column("Vehicle", "license_plate"):
+		hit = frappe.db.get_value(
+			"Vehicle",
+			{"license_plate": val},
+			"name",
+		)
+		if hit:
+			return hit, val
+		# Case-insensitive / trimmed plate match
+		rows = frappe.get_all(
+			"Vehicle",
+			filters={"license_plate": ["like", val]},
+			fields=["name", "license_plate"],
+			limit=5,
+			ignore_permissions=True,
+		)
+		for r in rows or []:
+			if cstr(r.license_plate or "").strip().lower() == val.lower():
+				return r.name, cstr(r.license_plate or r.name).strip() or val
+	return None, val
+
+
+def _apply_guest_vehicle_tag(so, raw) -> None:
+	"""Persist optional patente suggestion; push onto MAT trip when linked + resolvable."""
+	veh_name, plate = _resolve_vehicle_ref(raw)
+	store = veh_name or plate or ""
+	_update_guest_preorder_tag(so, "guest_vehicle", store or None)
+	if not veh_name:
+		return
+	# If a MAT is already linked, keep trip.vehicle in sync.
+	so_name = cstr(getattr(so, "name", None) or "")
+	if not so_name:
+		return
+	lg = (_tms_logistics_map_for_orders([so_name]) or {}).get(so_name) or {}
+	trip = cstr(lg.get("trip_name") or "").strip()
+	if not trip or not frappe.db.exists("Delivery Trip", trip):
+		return
+	try:
+		docstatus = cint(frappe.db.get_value("Delivery Trip", trip, "docstatus") or 0)
+		if docstatus == 0:
+			from erpnext.erpnext_integrations.ecommerce_api import tms_api
+
+			try:
+				tms_api.update_trip_assignment(trip, vehicle=veh_name)
+			except Exception:
+				frappe.db.set_value("Delivery Trip", trip, "vehicle", veh_name)
+		else:
+			frappe.db.set_value("Delivery Trip", trip, "vehicle", veh_name)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "apply guest_vehicle to MAT")
+
+
+def _customer_preferred_delivery_prefs(customer: str | None) -> tuple[str, str]:
+	"""Return (preferred_hours label, normalized hour slots) from Customer CRM fields."""
+	cid = cstr(customer or "").strip()
+	if not cid or not frappe.db.exists("Customer", cid):
+		return "", ""
+	fields = []
+	if frappe.db.has_column("Customer", "custom_preferred_hours"):
+		fields.append("custom_preferred_hours")
+	if frappe.db.has_column("Customer", "custom_preferred_hour_slots"):
+		fields.append("custom_preferred_hour_slots")
+	if not fields:
+		return "", ""
+	row = frappe.db.get_value("Customer", cid, fields, as_dict=True) or {}
+	hours = cstr(row.get("custom_preferred_hours") or "").strip()
+	slots = ""
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+			default_slots_for_preferred_hours,
+			normalize_preferred_hour_slots,
+		)
+
+		slots = normalize_preferred_hour_slots(row.get("custom_preferred_hour_slots"))
+		if not slots and hours:
+			slots = normalize_preferred_hour_slots(default_slots_for_preferred_hours(hours))
+	except Exception:
+		slots = cstr(row.get("custom_preferred_hour_slots") or "").strip()
+	return hours, slots
+
+
+def _coalesce_preferred_delivery_from_customer(
+	customer,
+	*,
+	guest_preferred_hours=None,
+	guest_preferred_hour_slots=None,
+) -> tuple[str | None, str | None]:
+	"""Fill missing pedido horario/slots from the linked Customer."""
+	hours = cstr(guest_preferred_hours or "").strip()
+	slots = cstr(guest_preferred_hour_slots or "").strip()
+	if hours.lower() in ("null", "undefined", "none"):
+		hours = ""
+	if slots.lower() in ("null", "undefined", "none"):
+		slots = ""
+	if hours and slots:
+		return hours, slots
+	cust_hours, cust_slots = _customer_preferred_delivery_prefs(customer)
+	if not hours:
+		hours = cust_hours
+	if not slots:
+		slots = cust_slots
+		if not slots and hours:
+			try:
+				from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+					default_slots_for_preferred_hours,
+					normalize_preferred_hour_slots,
+				)
+
+				slots = normalize_preferred_hour_slots(default_slots_for_preferred_hours(hours))
+			except Exception:
+				slots = ""
+	else:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+				normalize_preferred_hour_slots,
+			)
+
+			slots = normalize_preferred_hour_slots(slots)
+		except Exception:
+			pass
+	return (hours or None), (slots or None)
+
+
 def _parse_remarks_tags(raw) -> dict:
 	tags = {}
 	for part in str(raw or "").split("|"):
@@ -5528,11 +5667,28 @@ def _guest_preorder_line_amount(row) -> float:
 	return flt(getattr(row, "amount", None) or 0)
 
 
+def _so_doc_discount_amount(so) -> float:
+	"""Sales Order document-level discount (ERPNext field is ``discount_amount``).
+
+	Staff/API payloads historically used ``additional_discount_amount`` (Quotation /
+	Sales Invoice naming). Never read that attr directly — Document.__getattr__
+	raises AttributeError on Sales Order.
+	"""
+	return flt(getattr(so, "additional_discount_amount", None) or 0) or flt(
+		getattr(so, "discount_amount", None) or 0
+	)
+
+
+def _set_so_doc_discount_amount(so, amount) -> None:
+	"""Write document-level discount onto the real Sales Order field."""
+	so.apply_discount_on = "Grand Total"
+	so.discount_amount = flt(amount)
+
+
 def _guest_preorder_estimated_total(so) -> float:
 	total = sum(_guest_preorder_line_amount(d) for d in (so.items or []))
-	# Document-level discount. ERPNext's own field is `discount_amount` (storefront coupons set it);
-	# `additional_discount_amount` is the name the staff-edit path uses, so honour whichever is set.
-	disc = flt(getattr(so, "additional_discount_amount", None) or 0) or flt(getattr(so, "discount_amount", None) or 0)
+	# Document-level discount — see ``_so_doc_discount_amount``.
+	disc = _so_doc_discount_amount(so)
 	return max(flt(total) - disc, 0.0)
 
 
@@ -5751,6 +5907,7 @@ def create_guest_preorder(
 	guest_notes=None,
 	guest_cuil=None,
 	guest_preferred_hours=None,
+	guest_preferred_hour_slots=None,
 	guest_observation=None,
 	is_delivery=0,
 	paid_amount=None,
@@ -5880,6 +6037,14 @@ def create_guest_preorder(
 	# Sellers with sales.see_assigned must not place Orden for another seller's client
 	# (search is assigned-only; also block direct customer= API bypass).
 	_require_customer_visible_to_seller(customer)
+
+	# Copy CRM horario + hour blocks onto the pedido when the caller did not send them
+	# (Traditional POS / Nueva Orden only passes customer).
+	guest_preferred_hours, guest_preferred_hour_slots = _coalesce_preferred_delivery_from_customer(
+		customer,
+		guest_preferred_hours=guest_preferred_hours,
+		guest_preferred_hour_slots=guest_preferred_hour_slots,
+	)
 	company_currency = frappe.db.get_value("Company", company, "default_currency") or "ARS"
 	price_list_currency = (
 		frappe.db.get_value("Price List", price_list, "currency") if price_list else None
@@ -5950,6 +6115,10 @@ def create_guest_preorder(
 	if guest_preferred_hours:
 		remarks_parts.append(
 			f"guest_preferred_hours:{_sanitize_guest_tag(guest_preferred_hours)}"
+		)
+	if guest_preferred_hour_slots:
+		remarks_parts.append(
+			f"guest_preferred_hour_slots:{_sanitize_guest_tag(guest_preferred_hour_slots)}"
 		)
 	if guest_observation:
 		remarks_parts.append(f"guest_observation:{_sanitize_guest_tag(guest_observation)}")
@@ -6867,6 +7036,7 @@ def get_guest_preorder(preorder_name):
 		"name": so.name,
 		"order_type": so.order_type,
 		"customer": so.customer,
+		"modified": cstr(getattr(so, "modified", None) or "") or None,
 		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
 		"customer_stage": client_state.get("stage"),
 		"customer_stage_label": client_state.get("stage_label"),
@@ -6890,6 +7060,8 @@ def get_guest_preorder(preorder_name):
 		"guest_notes": tags.get("guest_notes") or None,
 		"guest_cuil": tags.get("guest_cuil") or None,
 		"guest_preferred_hours": tags.get("guest_preferred_hours") or None,
+		"guest_preferred_hour_slots": tags.get("guest_preferred_hour_slots") or None,
+		"guest_vehicle": tags.get("guest_vehicle") or None,
 		"guest_observation": tags.get("guest_observation") or None,
 		"is_delivery": tags.get("delivery") == "1",
 		"transaction_date": so.transaction_date,
@@ -6909,8 +7081,7 @@ def get_guest_preorder(preorder_name):
 		"currency": so.currency,
 		"remarks": getattr(so, "remarks", None),
 		"terms": getattr(so, "terms", None),
-		"additional_discount_amount": flt(getattr(so, "additional_discount_amount", 0))
-		or flt(getattr(so, "discount_amount", 0)),
+		"additional_discount_amount": _so_doc_discount_amount(so),
 		"advance_paid": flt(getattr(so, "advance_paid", 0)),
 		"amended_from": so.amended_from or None,
 		"delivery_note": _delivery_note_for_sales_order(preorder_name),
@@ -6949,6 +7120,14 @@ def get_guest_preorder(preorder_name):
 	payload["stop_idx"] = lg.get("stop_idx")
 	payload["vehicle"] = lg.get("vehicle")
 	payload["vehicle_plate"] = lg.get("vehicle_plate")
+	# Optional patente suggestion (before / without MAT) — fill plate display if trip has none.
+	gv = cstr(tags.get("guest_vehicle") or "").strip()
+	if gv:
+		veh_name, plate = _resolve_vehicle_ref(gv)
+		if not payload.get("vehicle") and veh_name:
+			payload["vehicle"] = veh_name
+		if not payload.get("vehicle_plate"):
+			payload["vehicle_plate"] = plate or gv
 	payload["driver"] = lg.get("driver")
 	payload["driver_name"] = lg.get("driver_name")
 	payload["delivery_at"] = lg.get("delivery_at")
@@ -7933,6 +8112,158 @@ def cancel_guest_preorder(preorder_name=None):
 	return {"ok": True, "name": name, "status": "Cancelled", "display_status": "Archivado"}
 
 
+def _coerce_preorder_name_list(raw) -> list[str]:
+	"""Dirty-safe list of Sales Order names for merge / bulk ops."""
+	import json as _json
+
+	if raw is None:
+		return []
+	if isinstance(raw, str):
+		text = raw.strip()
+		if text.lower() in ("", "null", "undefined", "none"):
+			return []
+		if text.startswith("["):
+			try:
+				raw = _json.loads(text)
+			except Exception:
+				frappe.throw(_("Invalid order list"))
+		else:
+			raw = [text]
+	if isinstance(raw, dict):
+		frappe.throw(_("Invalid order list"))
+	if not isinstance(raw, (list, tuple)):
+		frappe.throw(_("Invalid order list"))
+	out = []
+	seen = set()
+	for entry in raw:
+		name = cstr(entry or "").strip()
+		if not name or name.lower() in ("null", "undefined", "none"):
+			continue
+		if name in seen:
+			continue
+		seen.add(name)
+		out.append(name)
+	return out
+
+
+@frappe.whitelist()
+def merge_guest_preorders(preorder_names=None):
+	"""
+	Merge two or more guest preorders for the same Customer into the oldest SO.
+
+	Line items are combined by ``item_code`` (qty and measured ``total_weight``
+	summed; rate/uom kept from the survivor when present). Donor orders are
+	archived. Only ``Consulta`` / ``Orden`` sheets may merge — Preparado /
+	Delivery / Completado / Archivado are rejected.
+	"""
+	names = _coerce_preorder_name_list(preorder_names)
+	if len(names) < 2:
+		frappe.throw(_("Select at least two orders to merge"))
+
+	docs = []
+	for name in names:
+		if not frappe.db.exists("Sales Order", name):
+			frappe.throw(_("Sales Order {0} not found").format(name))
+		frappe.flags.ignore_permissions = True
+		so = frappe.get_doc("Sales Order", name)
+		frappe.flags.ignore_permissions = False
+		if not _is_guest_preorder_sales_order(so):
+			frappe.throw(_("Not a Guest Preorder"))
+		_require_guest_preorder_live_mutate(preorder_name=name, so=so)
+		_require_guest_preorder_visible(so)
+		if cint(so.docstatus) == 2:
+			frappe.throw(_("Cannot merge archived order {0}").format(name))
+		disp = _display_status(so)
+		base = "Completado" if cstr(disp).startswith("Completado") else disp
+		if base not in ("Consulta", "Orden", "Draft", ""):
+			frappe.throw(
+				_("Only Consulta/Orden orders can merge ({0} is {1})").format(name, disp or base)
+			)
+		docs.append(so)
+
+	cust_keys = []
+	for so in docs:
+		cid = cstr(so.customer or "").strip()
+		if cid:
+			cust_keys.append(("id", cid))
+		else:
+			cname = cstr(so.customer_name or "").strip().lower()
+			if not cname:
+				frappe.throw(_("Orders must belong to the same customer to merge"))
+			cust_keys.append(("name", cname))
+	if len(set(cust_keys)) != 1:
+		frappe.throw(_("Orders must belong to the same customer to merge"))
+
+	# Oldest creation wins (stable id for the customer).
+	docs.sort(key=lambda so: (cstr(so.creation or ""), cstr(so.name)))
+	survivor = docs[0]
+	donors = docs[1:]
+
+	merged: dict[str, dict] = {}
+	for so in docs:
+		for row in so.items or []:
+			code = cstr(getattr(row, "item_code", None) or "").strip()
+			if not code:
+				continue
+			qty = flt(getattr(row, "qty", 0))
+			rate = flt(getattr(row, "rate", 0))
+			uom = cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or "").strip()
+			tw = getattr(row, "total_weight", None)
+			tw_f = flt(tw) if tw is not None and cstr(tw).strip() not in ("", "None") else None
+			hit = merged.get(code)
+			if not hit:
+				merged[code] = {
+					"item_code": code,
+					"qty": qty,
+					"rate": rate,
+					"uom": uom or None,
+					"total_weight": tw_f,
+				}
+				continue
+			hit["qty"] = flt(hit.get("qty")) + qty
+			if tw_f is not None:
+				prev_tw = hit.get("total_weight")
+				hit["total_weight"] = (flt(prev_tw) if prev_tw is not None else 0) + tw_f
+			# Keep survivor rate if already set; otherwise take first non-zero donor rate
+			if not flt(hit.get("rate")) and rate:
+				hit["rate"] = rate
+			if not hit.get("uom") and uom:
+				hit["uom"] = uom
+
+	if not merged:
+		frappe.throw(_("No items to merge"))
+
+	items_payload = list(merged.values())
+	measured_tw = _measured_total_weights_from_items(items_payload)
+	# Keep survivor document discount (field is discount_amount, not additional_discount_amount).
+	_apply_item_changes(survivor, items_payload, _so_doc_discount_amount(survivor))
+	survivor.flags.ignore_pricing_rule = True
+	if cint(survivor.docstatus) == 1:
+		survivor.flags.ignore_validate_update_after_submit = True
+	donor_names = [d.name for d in donors]
+	try:
+		_update_guest_preorder_tag(survivor, "merged_from", ",".join(donor_names)[:400])
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "merge_guest_preorders tag")
+
+	with _keep_only_measured_total_weights(survivor, measured_tw):
+		with _allow_weight_fractional_stock_qty(survivor):
+			_save_guest_preorder_so(survivor)
+
+	archived = []
+	for donor in donors:
+		cancel_guest_preorder(donor.name)
+		archived.append(donor.name)
+
+	detail = get_guest_preorder(survivor.name)
+	return {
+		"ok": True,
+		"survivor": survivor.name,
+		"archived": archived,
+		"order": detail,
+	}
+
+
 @frappe.whitelist()
 def update_guest_preorder_details(preorder_name, data=None):
 	"""
@@ -8048,6 +8379,20 @@ def update_guest_preorder_details(preorder_name, data=None):
 		so.customer = customer
 		_update_guest_preorder_tag(so, "customer", customer)
 		_resync_so_party_links(so)
+		# Linking a known client: fill horario/slots when the pedido still has none.
+		tags_now = _parse_remarks_tags(_guest_preorder_tag_text(so))
+		hours_now = cstr(tags_now.get("guest_preferred_hours") or "").strip()
+		slots_now = cstr(tags_now.get("guest_preferred_hour_slots") or "").strip()
+		if "guest_preferred_hours" not in data and "guest_preferred_hour_slots" not in data:
+			fill_h, fill_s = _coalesce_preferred_delivery_from_customer(
+				customer,
+				guest_preferred_hours=hours_now or None,
+				guest_preferred_hour_slots=slots_now or None,
+			)
+			if fill_h and not hours_now:
+				_update_guest_preorder_tag(so, "guest_preferred_hours", fill_h)
+			if fill_s and not slots_now:
+				_update_guest_preorder_tag(so, "guest_preferred_hour_slots", fill_s)
 
 	guest_tag_keys = (
 		("guest_name", "guest_name"),
@@ -8057,13 +8402,45 @@ def update_guest_preorder_details(preorder_name, data=None):
 		("guest_notes", "guest_notes"),
 		("guest_cuil", "guest_cuil"),
 		("guest_preferred_hours", "guest_preferred_hours"),
+		("guest_preferred_hour_slots", "guest_preferred_hour_slots"),
+		("guest_vehicle", "guest_vehicle"),
 		("guest_observation", "guest_observation"),
 	)
 	guest_tags_touched = False
 	for data_key, tag_key in guest_tag_keys:
 		if data_key in data:
-			_update_guest_preorder_tag(so, tag_key, str(data.get(data_key) or "").strip())
+			val = str(data.get(data_key) or "").strip()
+			if data_key == "guest_preferred_hour_slots":
+				try:
+					from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+						normalize_preferred_hour_slots,
+					)
+
+					val = normalize_preferred_hour_slots(val)
+				except Exception:
+					pass
+			if data_key == "guest_vehicle":
+				_apply_guest_vehicle_tag(so, val)
+			else:
+				_update_guest_preorder_tag(so, tag_key, val)
 			guest_tags_touched = True
+	# Changing horario without slots → seed preset blocks (same as CRM).
+	if "guest_preferred_hours" in data and "guest_preferred_hour_slots" not in data:
+		hours_val = str(data.get("guest_preferred_hours") or "").strip()
+		tags_now = _parse_remarks_tags(_guest_preorder_tag_text(so))
+		if hours_val and not cstr(tags_now.get("guest_preferred_hour_slots") or "").strip():
+			try:
+				from erpnext.erpnext_integrations.ecommerce_api.crm_customer_fields import (
+					default_slots_for_preferred_hours,
+					normalize_preferred_hour_slots,
+				)
+
+				seeded = normalize_preferred_hour_slots(default_slots_for_preferred_hours(hours_val))
+				if seeded:
+					_update_guest_preorder_tag(so, "guest_preferred_hour_slots", seeded)
+					guest_tags_touched = True
+			except Exception:
+				pass
 
 	# Auto-relate when still on a bucket customer and email/phone/local now match someone.
 	if not data.get("customer"):
@@ -8352,8 +8729,7 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			elif "weight_per_unit" in item and item.get("weight_per_unit") is not None:
 				row.weight_per_unit = flt(item.get("weight_per_unit"))
 
-	so.apply_discount_on = "Grand Total"
-	so.additional_discount_amount = flt(additional_discount_amount)
+	_set_so_doc_discount_amount(so, additional_discount_amount)
 	_calculate_guest_preorder_totals(so)
 
 
@@ -8390,8 +8766,7 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 				_apply_so_line_uom(row, override.get("uom") or override.get("stock_uom"))
 			row.amount = row.rate * row.qty
 
-	so.apply_discount_on = "Grand Total"
-	so.additional_discount_amount = flt(additional_discount_amount)
+	_set_so_doc_discount_amount(so, additional_discount_amount)
 	_calculate_guest_preorder_totals(so)
 	so.flags.ignore_pricing_rule = True
 	# Price edits must not invent total_weight from peso promedio; keep measured kg.
@@ -9867,17 +10242,40 @@ def update_guest_preorder_logistics(
 		elif frappe.db.has_column("Delivery Trip", "custom_pickup_warehouse"):
 			frappe.db.set_value("Delivery Trip", target_trip, "custom_pickup_warehouse", wh_in)
 
-	if veh_in is not None and target_trip:
-		if veh_in and not frappe.db.exists("Vehicle", veh_in):
-			frappe.throw(_("Vehicle {0} not found").format(veh_in))
-		docstatus = cint(frappe.db.get_value("Delivery Trip", target_trip, "docstatus") or 0)
-		if docstatus == 0 and veh_in:
-			try:
-				tms_api.update_trip_assignment(target_trip, vehicle=veh_in)
-			except Exception:
-				frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
-		else:
-			frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_in or None)
+	# Patente is optional: store suggestion even without MAT; apply to trip when linked.
+	if veh_in is not None:
+		veh_name, _plate = _resolve_vehicle_ref(veh_in)
+		_update_guest_preorder_tag(so, "guest_vehicle", (veh_name or veh_in or "") or None)
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn:
+			frappe.db.set_value("Sales Order", name, tag_fn, getattr(so, tag_fn, None))
+		if target_trip:
+			apply_veh = veh_name or (veh_in if frappe.db.exists("Vehicle", veh_in) else None)
+			if veh_in and not apply_veh:
+				frappe.throw(_("Vehicle {0} not found").format(veh_in))
+			docstatus = cint(frappe.db.get_value("Delivery Trip", target_trip, "docstatus") or 0)
+			if docstatus == 0 and apply_veh:
+				try:
+					tms_api.update_trip_assignment(target_trip, vehicle=apply_veh)
+				except Exception:
+					frappe.db.set_value("Delivery Trip", target_trip, "vehicle", apply_veh or None)
+			else:
+				frappe.db.set_value("Delivery Trip", target_trip, "vehicle", apply_veh or None)
+	elif target_trip:
+		# Newly linked MAT: push any prior guest_vehicle suggestion onto the trip.
+		tags_now = _parse_remarks_tags(_guest_preorder_tag_text(so))
+		gv = cstr(tags_now.get("guest_vehicle") or "").strip()
+		if gv and not frappe.db.get_value("Delivery Trip", target_trip, "vehicle"):
+			veh_name, _plate = _resolve_vehicle_ref(gv)
+			if veh_name:
+				docstatus = cint(frappe.db.get_value("Delivery Trip", target_trip, "docstatus") or 0)
+				if docstatus == 0:
+					try:
+						tms_api.update_trip_assignment(target_trip, vehicle=veh_name)
+					except Exception:
+						frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_name)
+				else:
+					frappe.db.set_value("Delivery Trip", target_trip, "vehicle", veh_name)
 
 	if drv_in is not None and target_trip:
 		if drv_in and not frappe.db.exists("Driver", drv_in):

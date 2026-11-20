@@ -1894,6 +1894,60 @@ def save_armado_notes(preorder_name=None, notes=None, pin=None):
 
 
 @frappe.whitelist(allow_guest=True)
+def save_armado_vehicle(preorder_name=None, vehicle=None, pin=None):
+	"""Optional patente on the armado sheet (suggestion; applied to MAT when linked)."""
+	identity = _require_ops_operator(pin)
+	preorder_name = str(preorder_name or "").strip()
+	if (
+		not preorder_name
+		or preorder_name.lower() in ("null", "undefined", "none")
+		or not frappe.db.exists("Sales Order", preorder_name)
+	):
+		frappe.throw(_("Order not found"))
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_apply_guest_vehicle_tag,
+		_guest_preorder_tag_fieldname,
+		_is_guest_preorder_sales_order,
+		_resolve_vehicle_ref,
+		_save_guest_preorder_so,
+		get_guest_preorder,
+	)
+
+	frappe.flags.ignore_permissions = True
+	so = frappe.get_doc("Sales Order", preorder_name)
+	frappe.flags.ignore_permissions = False
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"))
+	_require_armado_writable(so)
+	_apply_guest_vehicle_tag(so, vehicle)
+	tag_fn = _guest_preorder_tag_fieldname()
+	if tag_fn:
+		# Tag-only write — avoid full SO validate for a suggestion field.
+		frappe.db.set_value("Sales Order", preorder_name, tag_fn, getattr(so, tag_fn, None))
+	else:
+		_save_guest_preorder_so(so)
+	frappe.db.commit()
+	_log_armado_operator(preorder_name, identity, via="armado_vehicle")
+	veh_name, plate = _resolve_vehicle_ref(vehicle)
+	detail = None
+	try:
+		detail = get_guest_preorder(preorder_name)
+	except Exception:
+		detail = None
+	return {
+		"ok": True,
+		"vehicle": (detail or {}).get("vehicle") or veh_name,
+		"vehicle_plate": (detail or {}).get("vehicle_plate") or plate or cstr(vehicle or "").strip() or None,
+		"guest_vehicle": (detail or {}).get("guest_vehicle") or (veh_name or plate or cstr(vehicle or "").strip() or None),
+		"operator": {
+			"kind": identity.get("kind"),
+			"employee": identity.get("employee"),
+			"employee_name": identity.get("employee_name"),
+		},
+	}
+
+
+@frappe.whitelist(allow_guest=True)
 def save_armado_boxes(preorder_name=None, box_count=None, pin=None):
 	"""Store how many boxes were used to pack this order. Does not promote pipeline."""
 	identity = _require_ops_operator(pin)

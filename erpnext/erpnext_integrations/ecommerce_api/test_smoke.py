@@ -1094,6 +1094,112 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_create_copies_customer_preferred_hours():
+        """Nueva Orden for a CRM client copies horario + hour blocks onto the pedido."""
+        so_name = None
+        cust = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1},
+            "name",
+        )
+        assert item_code, "need a stock item"
+        try:
+            if not frappe.db.has_column("Customer", "custom_preferred_hours"):
+                return  # site without CRM hours columns — skip soft
+            cust = api.create_customer(
+                customer_name=f"Smoke Horario {frappe.generate_hash(length=6)}",
+                preferred_hours="Mediodía",
+                preferred_hour_slots="10,11,12,13,14,15",
+            )
+            cust_name = cust.get("name") if isinstance(cust, dict) else cust
+            assert cust_name and frappe.db.exists("Customer", cust_name)
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 10}],
+                customer=cust_name,
+                guest_name="Smoke Horario Guest",
+                initial_status="Orden",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name, out
+            detail = api.get_guest_preorder(so_name)
+            assert (detail.get("guest_preferred_hours") or "") == "Mediodía", detail
+            slots = str(detail.get("guest_preferred_hour_slots") or "")
+            for h in ("10", "11", "12", "13", "14", "15"):
+                assert h in slots.split(","), (slots, detail)
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                try:
+                    ds = cint(frappe.db.get_value("Sales Order", so_name, "docstatus"))
+                    if ds == 1:
+                        so = frappe.get_doc("Sales Order", so_name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+                except Exception:
+                    pass
+            if cust:
+                cname = cust.get("name") if isinstance(cust, dict) else cust
+                if cname and frappe.db.exists("Customer", cname):
+                    frappe.delete_doc("Customer", cname, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_merge_guest_preorders_same_client():
+        """Merge two Consultas for the same client without AttributeError on discount_amount."""
+        so_a = so_b = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1},
+            "name",
+        )
+        assert item_code, "need a stock item"
+        guest = f"Smoke Merge {frappe.generate_hash(length=6)}"
+        try:
+            a = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 10}],
+                guest_name=guest,
+                guest_notes="smoke merge a",
+            )
+            b = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 2, "rate": 10}],
+                guest_name=guest,
+                guest_notes="smoke merge b",
+            )
+            so_a = a.get("preorder_name") or a.get("name")
+            so_b = b.get("preorder_name") or b.get("name")
+            assert so_a and so_b and so_a != so_b, (a, b)
+            # Touch discount_amount so merge must read the real SO field (not additional_discount_*).
+            frappe.db.set_value("Sales Order", so_a, "discount_amount", 1.5)
+            frappe.db.commit()
+            merged = api.merge_guest_preorders([so_a, so_b])
+            assert isinstance(merged, dict) and merged.get("ok"), merged
+            survivor = merged.get("survivor")
+            archived = merged.get("archived") or []
+            assert survivor in (so_a, so_b), merged
+            assert so_b in archived or so_a in archived, merged
+            assert len(archived) == 1, merged
+            detail = merged.get("order") or api.get_guest_preorder(survivor)
+            lines = detail.get("items") or []
+            hit = next((r for r in lines if r.get("item_code") == item_code), None)
+            assert hit and abs(flt(hit.get("qty")) - 3) < 0.001, detail
+            assert abs(flt(detail.get("additional_discount_amount") or 0) - 1.5) < 0.01 or survivor != so_a, detail
+        finally:
+            for name in (so_a, so_b):
+                if not name or not frappe.db.exists("Sales Order", name):
+                    continue
+                docstatus = cint(frappe.db.get_value("Sales Order", name, "docstatus"))
+                try:
+                    if docstatus == 1:
+                        so = frappe.get_doc("Sales Order", name)
+                        so.flags.ignore_permissions = True
+                        so.cancel()
+                    elif docstatus == 2:
+                        pass
+                    frappe.delete_doc("Sales Order", name, ignore_permissions=True, force=True)
+                except Exception:
+                    pass
+            frappe.db.commit()
+
     def check_weight_uom_fractional_qty():
         """Selecting WEIGHT on a Nos item must set SO line UOM so fractional qty saves."""
         so_name = None
@@ -1905,6 +2011,12 @@ def suite_5_9_master_data():
         "S2",
     )
     _run("5.9.13 empty-items Consulta header update", check_empty_items_consulta_update, "S2")
+    _run(
+        "5.9.13a create copies customer horario+slots",
+        check_create_copies_customer_preferred_hours,
+        "S2",
+    )
+    _run("5.9.13b merge same-client Consultas", check_merge_guest_preorders_same_client, "S2")
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
     _run("5.9.14a WEIGHT bills rate×kg", check_weight_line_bills_rate_times_kg, "S2")
     _run("5.9.14b measured kg no float drift", check_measured_total_weight_no_float_drift, "S2")

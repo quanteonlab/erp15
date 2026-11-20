@@ -1916,6 +1916,19 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_hour_slots_null",
+      "source": "regression",
+      "bug": "create_guest_preorder guest_preferred_hour_slots null/\"null\" must not 500; customer horario copy is soft",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge preferred hour slots null",
+        "guest_preferred_hours": "null",
+        "guest_preferred_hour_slots": null
+      },
+      "expect": "ok"
+    },
+    {
       "id": "create_guest_preorder_company_default_wh_guard",
       "source": "regression",
       "bug": "create_guest_preorder must not OperationalError 1054 when Company.custom_default_warehouse is missing — _default_company_warehouse uses has_column",
@@ -3549,6 +3562,46 @@
       "expect": "fail"
     },
     {
+      "id": "preorder_merge_null_list",
+      "source": "regression",
+      "bug": "merge_guest_preorders with null list returns controlled error, not TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.merge_guest_preorders",
+      "args": {
+        "preorder_names": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "preorder_merge_empty_list",
+      "source": "regression",
+      "bug": "merge_guest_preorders with empty list is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.merge_guest_preorders",
+      "args": {
+        "preorder_names": []
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "preorder_merge_single_name",
+      "source": "regression",
+      "bug": "merge_guest_preorders with one name requires at least two orders",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.merge_guest_preorders",
+      "args": {
+        "preorder_names": ["SAL-ORD-MISSING"]
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "preorder_merge_missing_pair",
+      "source": "regression",
+      "bug": "merge_guest_preorders must not AttributeError on SalesOrder.additional_discount_amount; missing SO is controlled fail (happy merge covered by smoke 5.9.13b)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.merge_guest_preorders",
+      "args": {
+        "preorder_names": ["SAL-ORD-MISSING-A", "SAL-ORD-MISSING-B"]
+      },
+      "expect": "fail"
+    },
+    {
       "id": "preorder_unarchive_null_name",
       "source": "regression",
       "bug": "unarchive_guest_preorder with null name returns controlled error, not TypeError/500",
@@ -5118,6 +5171,30 @@
         "preorder_name": null,
         "notes": null,
         "pin": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "ops_save_armado_vehicle_dirty",
+      "source": "regression",
+      "bug": "save_armado_vehicle with null preorder/vehicle/pin must controlled-fail (no TypeError/500)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.save_armado_vehicle",
+      "args": {
+        "preorder_name": null,
+        "vehicle": null,
+        "pin": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "ops_save_armado_vehicle_empty_strings",
+      "source": "regression",
+      "bug": "save_armado_vehicle with empty strings must controlled-fail AuthenticationError / Order not found",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.save_armado_vehicle",
+      "args": {
+        "preorder_name": "",
+        "vehicle": "",
+        "pin": ""
       },
       "expect": "fail"
     },
