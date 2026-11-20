@@ -7783,6 +7783,95 @@
       "bug": "search_vehicles null q/limit must not TypeError"
     },
     {
+      "id": "list_fleet_vehicles_null_q",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_fleet_vehicles",
+      "args": {
+        "q": null,
+        "limit": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "list_fleet_vehicles null q/limit must not TypeError"
+    },
+    {
+      "id": "get_rutas_week_bundle_null_date_missing_geo_cols",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_rutas_week_bundle",
+      "args": {
+        "date": null,
+        "auto_assign_zones": "0",
+        "include_master": "0"
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "get_rutas_week_bundle must ensure Address custom_latitude or soft-skip — never MySQL 1054"
+    },
+    {
+      "id": "get_fleet_vehicle_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_fleet_vehicle",
+      "args": {
+        "vehicle": null
+      },
+      "expect": "controlled_error",
+      "source": "regression",
+      "bug": "get_fleet_vehicle null must not 500"
+    },
+    {
+      "id": "ensure_fleet_vehicle_null_plate",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.ensure_fleet_vehicle",
+      "args": {
+        "license_plate": null
+      },
+      "expect": "controlled_error",
+      "source": "regression",
+      "bug": "ensure_fleet_vehicle null plate must not 500"
+    },
+    {
+      "id": "set_fleet_vehicle_members_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.set_fleet_vehicle_members",
+      "args": {
+        "vehicle": null,
+        "members": null
+      },
+      "expect": "controlled_error",
+      "source": "regression",
+      "bug": "set_fleet_vehicle_members null must not 500"
+    },
+    {
+      "id": "add_fleet_vehicle_member_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.add_fleet_vehicle_member",
+      "args": {
+        "vehicle": null,
+        "employee": null
+      },
+      "expect": "controlled_error",
+      "source": "regression",
+      "bug": "add_fleet_vehicle_member null must not 500"
+    },
+    {
+      "id": "remove_fleet_vehicle_member_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.remove_fleet_vehicle_member",
+      "args": {
+        "vehicle": null,
+        "employee": null
+      },
+      "expect": "controlled_error",
+      "source": "regression",
+      "bug": "remove_fleet_vehicle_member null must not 500"
+    },
+    {
+      "id": "upsert_fleet_vehicle_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.upsert_fleet_vehicle",
+      "args": {
+        "vehicle": null,
+        "license_plate": null,
+        "make": null,
+        "model": null
+      },
+      "expect": "controlled_error",
+      "source": "regression",
+      "bug": "upsert_fleet_vehicle all-null must not 500"
+    },
+    {
       "id": "list_pending_vehicle_returns_null_vehicle",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_pending_vehicle_returns",
       "args": {

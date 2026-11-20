@@ -4835,8 +4835,21 @@ def _resolve_vehicle_ref(raw) -> tuple[str | None, str | None]:
 
 
 def _apply_guest_vehicle_tag(so, raw) -> None:
-	"""Persist optional patente suggestion; push onto MAT trip when linked + resolvable."""
+	"""Persist optional patente suggestion; create fleet Vehicle if missing (i031).
+
+	Push onto MAT trip when linked + resolvable.
+	"""
 	veh_name, plate = _resolve_vehicle_ref(raw)
+	# Create-on-assign: unknown plate → ensure_fleet_vehicle (idempotent).
+	if plate and not veh_name:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api import tms_api
+
+			ensured = tms_api.ensure_fleet_vehicle(license_plate=plate)
+			veh_name = cstr((ensured or {}).get("name") or "").strip() or None
+			plate = cstr((ensured or {}).get("license_plate") or plate).strip() or plate
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "ensure_fleet_vehicle on guest_vehicle")
 	store = veh_name or plate or ""
 	_update_guest_preorder_tag(so, "guest_vehicle", store or None)
 	if not veh_name:
@@ -9799,6 +9812,12 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 			)
 			if geo and geo.custom_latitude:
 				lat, lng = flt(geo.custom_latitude), flt(geo.custom_longitude)
+		tags = _parse_remarks_tags(_guest_preorder_tag_text(so))
+		gv = cstr(tags.get("guest_vehicle") or "").strip()
+		plate_key = ""
+		if gv:
+			vn, vp = _resolve_vehicle_ref(gv)
+			plate_key = cstr(vn or vp or gv).strip().upper()
 		order_rows.append(
 			{
 				"name": so_name,
@@ -9806,21 +9825,34 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 				"lat": lat,
 				"lng": lng,
 				"customer": so.customer,
+				"plate": plate_key,
 			}
 		)
-	order_rows.sort(key=lambda r: (r["day"], r["name"]))
+	order_rows.sort(key=lambda r: (0 if r.get("plate") else 1, r["day"], r["name"]))
 
 	def _dist(olat, olng, tlat, tlng):
 		if olat is None or olng is None or tlat is None or tlng is None:
 			return 1e12
 		return tms_api._haversine_km(olat, olng, tlat, tlng)
 
-	def _pick_trip(day, olat, olng):
+	def _pick_trip(day, olat, olng, plate=None):
 		cands = [
 			t
 			for t in trip_state.values()
 			if t["day"] == day and t["stop_count"] < max_orders
 		]
+		if plate:
+			plate_u = cstr(plate).strip().upper()
+			plate_cands = [
+				t
+				for t in cands
+				if cstr(t.get("vehicle") or "").strip().upper() == plate_u
+			]
+			if plate_cands:
+				cands = plate_cands
+			else:
+				# Prefer creating a new MAT for this plate over mixing into another car.
+				return None
 		if not cands:
 			return None
 		cands.sort(
@@ -9873,19 +9905,21 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 	created_trips = []
 	for row in order_rows:
 		day = row["day"]
-		picked = _pick_trip(day, row["lat"], row["lng"])
+		plate = cstr(row.get("plate") or "").strip() or None
+		picked = _pick_trip(day, row["lat"], row["lng"], plate=plate)
 		created_new = False
 		if picked:
 			detail = update_guest_preorder_logistics(
 				preorder_name=row["name"],
 				trip_name=picked["name"],
-				vehicle=picked.get("vehicle"),
+				vehicle=picked.get("vehicle") or plate,
 				driver=picked.get("driver"),
 				warehouse=picked.get("warehouse"),
 			)
 			trip_name = picked["name"]
 		else:
 			# No open MAT with capacity → create remito + new trip for next driver (greedy).
+			# Suggested plate → bind that Vehicle on the new MAT (i031 plate buckets).
 			dn = _delivery_note_for_sales_order(row["name"])
 			if not dn:
 				created_dn = create_delivery_note_for_preorder(row["name"])
@@ -9895,9 +9929,21 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 			if not dn:
 				frappe.throw(_("Could not create remito for {0}").format(row["name"]))
 			drv = _next_driver_for_day(day)
+			# Prefer primary driver of the fleet plate when present.
+			veh_arg = None
+			if plate:
+				try:
+					ensured = tms_api.ensure_fleet_vehicle(license_plate=plate)
+					veh_arg = cstr((ensured or {}).get("name") or plate).strip() or plate
+					prim_drv = cstr((ensured or {}).get("primary_driver") or "").strip()
+					if prim_drv:
+						drv = prim_drv
+				except Exception:
+					veh_arg = plate
 			created = tms_api.create_trip(
 				date=day,
 				driver=drv,
+				vehicle=veh_arg,
 				delivery_note_names=[dn],
 				company=company,
 			)

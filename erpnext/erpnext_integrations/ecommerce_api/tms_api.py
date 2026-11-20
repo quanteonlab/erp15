@@ -89,6 +89,37 @@ def _ensure_tms_depot_fields():
 		frappe.clear_cache(doctype="Delivery Trip")
 
 
+def _ensure_tms_address_geo_fields():
+	"""Idempotent — Address.custom_latitude / custom_longitude (+ geocoded_on).
+
+	Patch ``add_tms_custom_fields`` may have been skipped on lean tenants; Rutas
+	``get_rutas_week_bundle`` / fleet maps then 500 with MySQL 1054 Unknown column.
+	"""
+	need_lat = not frappe.db.has_column("Address", "custom_latitude")
+	need_lng = not frappe.db.has_column("Address", "custom_longitude")
+	if not need_lat and not need_lng:
+		return
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+	from erpnext.patches.v15_0.add_tms_custom_fields import CUSTOM_FIELDS
+
+	# Only Address geocode fields — Delivery Stop PoD fields are separate.
+	addr_fields = CUSTOM_FIELDS.get("Address") or []
+	if not addr_fields:
+		return
+	create_custom_fields({"Address": addr_fields}, update=True)
+	frappe.clear_cache(doctype="Address")
+
+
+def _address_fields_with_geo(base_fields):
+	"""Append geo columns only when present (safe after ensure, or soft-skip)."""
+	fields = list(base_fields)
+	if frappe.db.has_column("Address", "custom_latitude"):
+		fields.append("custom_latitude")
+	if frappe.db.has_column("Address", "custom_longitude"):
+		fields.append("custom_longitude")
+	return fields
+
+
 def _resolve_pickup_address(company, driver_doc=None, pickup_warehouse=None):
 	"""Depot/pickup address resolution for a trip, in priority order:
 
@@ -567,7 +598,10 @@ def _stop_detail_meta(stops):
 		):
 			customer_meta[row.name] = row
 	if address_names:
-		addr_fields = ["name", "address_line1", "address_line2", "city", "custom_latitude", "custom_longitude"]
+		_ensure_tms_address_geo_fields()
+		addr_fields = _address_fields_with_geo(
+			["name", "address_line1", "address_line2", "city"]
+		)
 		if frappe.db.has_column("Address", "phone"):
 			addr_fields.append("phone")
 		for row in frappe.get_all(
@@ -1007,18 +1041,16 @@ def get_pending_deliveries(date=None, company=None, from_date=None, to_date=None
 	)
 	geo_by_address = {}
 	if address_names:
+		_ensure_tms_address_geo_fields()
+		addr_fields = _address_fields_with_geo(
+			["name", "address_line1", "address_line2", "city"]
+		)
+		if frappe.db.has_column("Address", "custom_zone"):
+			addr_fields.append("custom_zone")
 		for row in frappe.get_all(
 			"Address",
 			filters={"name": ["in", address_names]},
-			fields=[
-				"name",
-				"address_line1",
-				"address_line2",
-				"city",
-				"custom_latitude",
-				"custom_longitude",
-				"custom_zone",
-			],
+			fields=addr_fields,
 			ignore_permissions=True,
 		):
 			geo_by_address[row.name] = row
@@ -1238,6 +1270,10 @@ def get_rutas_week_bundle(
 	data is already cached client-side.
 	"""
 	from frappe.utils import add_days, date_diff
+
+	# Lean tenants may miss Address geo columns (patch skipped) — create before SELECT.
+	_ensure_tms_address_geo_fields()
+	_ensure_tms_depot_fields()
 
 	today_d = getdate()
 	as_of = _coerce_opt_date(date, today_d) or today_d
@@ -1916,17 +1952,14 @@ def list_claimable_orders(date=None, company=None):
 	address_names = list({p["address"] for p in preorders if p.get("address")})
 	geo_by_address = {}
 	if address_names:
+		_ensure_tms_address_geo_fields()
+		addr_fields = _address_fields_with_geo(
+			["name", "address_line1", "address_line2", "city"]
+		)
 		for row in frappe.get_all(
 			"Address",
 			filters={"name": ["in", address_names]},
-			fields=[
-				"name",
-				"address_line1",
-				"address_line2",
-				"city",
-				"custom_latitude",
-				"custom_longitude",
-			],
+			fields=addr_fields,
 			ignore_permissions=True,
 		):
 			geo_by_address[row.name] = row
@@ -2089,6 +2122,9 @@ def geocode_address(address_name, force=0):
 	name = cstr(address_name or "").strip()
 	if not name or name.lower() in ("null", "undefined", "none"):
 		frappe.throw(_("Address is required"), frappe.ValidationError)
+	_ensure_tms_address_geo_fields()
+	if not frappe.db.has_column("Address", "custom_latitude"):
+		frappe.throw(_("Address geocode fields are not available on this site."))
 	address = frappe.db.get_value(
 		"Address", name, ["custom_latitude", "custom_longitude"], as_dict=True
 	)
@@ -2952,10 +2988,12 @@ def get_trip_map_data(trip_name):
 	address_names = list({s.address for s in trip.delivery_stops if s.address})
 	geo_by_address = {}
 	if address_names:
+		_ensure_tms_address_geo_fields()
+		fields = _address_fields_with_geo(["name"])
 		for row in frappe.get_all(
 			"Address",
 			filters={"name": ["in", address_names]},
-			fields=["name", "custom_latitude", "custom_longitude"],
+			fields=fields,
 			ignore_permissions=True,
 		):
 			geo_by_address[row.name] = row
@@ -3309,7 +3347,8 @@ def list_fleet_day_routes(date=None, horizon_days=1, company=None, include_open_
 	addr_names = list({a for a in addr_names if a})
 	geo_by_address = {}
 	if addr_names:
-		fields = ["name", "custom_latitude", "custom_longitude", "address_line1", "city"]
+		_ensure_tms_address_geo_fields()
+		fields = _address_fields_with_geo(["name", "address_line1", "city"])
 		for row in frappe.get_all(
 			"Address",
 			filters={"name": ["in", addr_names]},
@@ -4378,6 +4417,406 @@ def create_vehicle_quick(license_plate, make=None, model=None):
 	frappe.db.commit()
 
 	return {"name": veh.name, "license_plate": veh.license_plate}
+
+
+# ---------------------------------------------------------------------------
+# Patente-centric fleet (i031 Scenario 4)
+#
+# Vehicle = stable unit. Members (many employees/drivers) stored in
+# Table Extra Data scope ``fleet.vehicle`` / row_key = Vehicle name.
+# Vehicle.employee = primary member for trip defaults.
+# ---------------------------------------------------------------------------
+
+FLEET_VEHICLE_SCOPE = "fleet.vehicle"
+
+
+def _fleet_resolve_vehicle_name(raw):
+	"""Return Vehicle name for plate/name text, or None."""
+	val = cstr(raw or "").strip()
+	if not val or val.lower() in ("null", "undefined", "none", "—", "-"):
+		return None
+	if frappe.db.exists("Vehicle", val):
+		return val
+	if frappe.db.has_column("Vehicle", "license_plate"):
+		hit = frappe.db.get_value("Vehicle", {"license_plate": val}, "name")
+		if hit:
+			return hit
+		rows = frappe.get_all(
+			"Vehicle",
+			filters={"license_plate": ["like", val]},
+			fields=["name", "license_plate"],
+			limit=5,
+			ignore_permissions=True,
+		)
+		for r in rows or []:
+			if cstr(r.license_plate or "").strip().lower() == val.lower():
+				return r.name
+	return None
+
+
+def _fleet_members_blob(vehicle_name):
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
+
+	_name, data = kv_get(FLEET_VEHICLE_SCOPE, vehicle_name)
+	members = data.get("members") if isinstance(data, dict) else None
+	if not isinstance(members, list):
+		members = []
+	out = []
+	for m in members:
+		if not isinstance(m, dict):
+			continue
+		emp = cstr(m.get("employee") or "").strip()
+		if not emp:
+			continue
+		out.append(
+			{
+				"employee": emp,
+				"driver": cstr(m.get("driver") or "").strip() or None,
+				"primary": 1 if cint(m.get("primary")) else 0,
+			}
+		)
+	return out
+
+
+def _fleet_save_members(vehicle_name, members):
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	clean = []
+	seen = set()
+	primary_emp = None
+	for m in members or []:
+		if not isinstance(m, dict):
+			continue
+		emp = cstr(m.get("employee") or "").strip()
+		if not emp or emp in seen:
+			continue
+		if not frappe.db.exists("Employee", emp):
+			continue
+		seen.add(emp)
+		drv = cstr(m.get("driver") or "").strip() or None
+		if not drv:
+			drv = frappe.db.get_value("Driver", {"employee": emp}, "name")
+		is_primary = 1 if cint(m.get("primary")) else 0
+		if is_primary and not primary_emp:
+			primary_emp = emp
+		clean.append({"employee": emp, "driver": drv, "primary": is_primary})
+	if clean and not primary_emp:
+		clean[0]["primary"] = 1
+		primary_emp = clean[0]["employee"]
+	elif primary_emp:
+		for m in clean:
+			m["primary"] = 1 if m["employee"] == primary_emp else 0
+	kv_set(
+		FLEET_VEHICLE_SCOPE,
+		vehicle_name,
+		{"members": clean, "updated_at": str(now_datetime())},
+	)
+	# Keep Vehicle.employee as primary for trip defaults / legacy reads.
+	if frappe.db.has_column("Vehicle", "employee"):
+		frappe.db.set_value(
+			"Vehicle",
+			vehicle_name,
+			"employee",
+			primary_emp,
+			update_modified=False,
+		)
+	return clean
+
+
+def _fleet_enrich_members(members):
+	"""Attach display fields + ops_pin for QR deep links."""
+	from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+		_issue_ops_pin_for_employee,
+	)
+
+	out = []
+	for m in members or []:
+		emp = m.get("employee")
+		emp_name = (
+			frappe.db.get_value("Employee", emp, "employee_name") if emp else None
+		)
+		drv = m.get("driver")
+		drv_name = frappe.db.get_value("Driver", drv, "full_name") if drv else None
+		ops_pin = None
+		if emp:
+			try:
+				ops_pin = _issue_ops_pin_for_employee(emp, rotate=False)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "fleet member ops_pin")
+		out.append(
+			{
+				**m,
+				"employee_name": emp_name or emp,
+				"driver_name": drv_name,
+				"ops_pin": ops_pin,
+			}
+		)
+	return out
+
+
+def _fleet_serialize_vehicle(vehicle_name, *, with_pins=True):
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Vehicle", vehicle_name)
+	frappe.flags.ignore_permissions = False
+	members = _fleet_members_blob(vehicle_name)
+	# Seed members from Vehicle.employee when blob empty (legacy single link).
+	if not members and getattr(doc, "employee", None):
+		emp = cstr(doc.employee).strip()
+		if emp and frappe.db.exists("Employee", emp):
+			drv = frappe.db.get_value("Driver", {"employee": emp}, "name")
+			members = [{"employee": emp, "driver": drv, "primary": 1}]
+			_fleet_save_members(vehicle_name, members)
+	if with_pins:
+		members = _fleet_enrich_members(members)
+	else:
+		members = [
+			{
+				**m,
+				"employee_name": frappe.db.get_value("Employee", m["employee"], "employee_name")
+				or m["employee"],
+				"driver_name": (
+					frappe.db.get_value("Driver", m["driver"], "full_name")
+					if m.get("driver")
+					else None
+				),
+			}
+			for m in members
+		]
+	plate = cstr(doc.license_plate or doc.name).strip()
+	primary = next((m for m in members if cint(m.get("primary"))), None)
+	return {
+		"name": doc.name,
+		"license_plate": plate,
+		"make": doc.make,
+		"model": doc.model,
+		"employee": getattr(doc, "employee", None),
+		"primary_employee": (primary or {}).get("employee"),
+		"primary_driver": (primary or {}).get("driver"),
+		"members": members,
+		"member_count": len(members),
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_fleet_vehicles(q=None, limit=100):
+	"""List Vehicles as fleet units (plate + make/model + member counts)."""
+	limit = max(1, min(200, cint(limit) or 100))
+	q = cstr(q or "").strip()
+	filters = {}
+	or_filters = None
+	if q and q.lower() not in ("null", "undefined", "none"):
+		like = f"%{q}%"
+		or_filters = [
+			["license_plate", "like", like],
+			["name", "like", like],
+			["make", "like", like],
+			["model", "like", like],
+		]
+	fields = ["name", "license_plate", "make", "model"]
+	has_emp = frappe.db.has_column("Vehicle", "employee")
+	if has_emp:
+		fields.append("employee")
+	rows = frappe.get_all(
+		"Vehicle",
+		filters=filters,
+		or_filters=or_filters,
+		fields=fields,
+		order_by="license_plate asc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	out = []
+	for r in rows or []:
+		members = _fleet_members_blob(r.name)
+		emp = getattr(r, "employee", None) if has_emp else None
+		if not members and emp:
+			members = [{"employee": emp, "primary": 1}]
+		out.append(
+			{
+				"name": r.name,
+				"license_plate": cstr(r.license_plate or r.name).strip(),
+				"make": r.make,
+				"model": r.model,
+				"employee": emp,
+				"member_count": len(members),
+				"primary_employee": next(
+					(m["employee"] for m in members if cint(m.get("primary"))),
+					(members[0]["employee"] if members else None),
+				),
+			}
+		)
+	return {"vehicles": out}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_fleet_vehicle(vehicle=None):
+	"""Fleet unit detail: plate, make/model, members (+ ops_pin for QR)."""
+	name = _fleet_resolve_vehicle_name(vehicle)
+	if not name:
+		frappe.throw(_("Vehicle is required."))
+	return _fleet_serialize_vehicle(name, with_pins=True)
+
+
+@frappe.whitelist(allow_guest=True)
+@idempotent_request
+def ensure_fleet_vehicle(license_plate=None, make=None, model=None):
+	"""Idempotent create-or-get Vehicle by plate (Pedidos assign / Flotas)."""
+	plate = cstr(license_plate or "").strip()
+	if not plate or plate.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("License plate is required."))
+	existing = _fleet_resolve_vehicle_name(plate)
+	created = False
+	if existing:
+		name = existing
+		# Optional make/model update when placeholders.
+		if make or model:
+			frappe.flags.ignore_permissions = True
+			doc = frappe.get_doc("Vehicle", name)
+			frappe.flags.ignore_permissions = False
+			changed = False
+			if make and cstr(doc.make or "").strip() in ("", "N/A"):
+				doc.make = cstr(make).strip()
+				changed = True
+			if model and cstr(doc.model or "").strip() in ("", "N/A"):
+				doc.model = cstr(model).strip()
+				changed = True
+			if changed:
+				doc.save(ignore_permissions=True)
+				frappe.db.commit()
+	else:
+		veh = frappe.get_doc(
+			{
+				"doctype": "Vehicle",
+				"license_plate": plate,
+				"make": cstr(make or "").strip() or "N/A",
+				"model": cstr(model or "").strip() or "N/A",
+				"fuel_type": "Petrol",
+				"last_odometer": 0,
+				"uom": "Unit",
+			}
+		)
+		veh.insert(ignore_permissions=True)
+		frappe.db.commit()
+		name = veh.name
+		created = True
+	detail = _fleet_serialize_vehicle(name, with_pins=False)
+	detail["created"] = 1 if created else 0
+	return detail
+
+
+@frappe.whitelist(allow_guest=True)
+def upsert_fleet_vehicle(vehicle=None, license_plate=None, make=None, model=None):
+	"""Create or update plate / make / model on a fleet Vehicle."""
+	name = _fleet_resolve_vehicle_name(vehicle or license_plate)
+	plate = cstr(license_plate or "").strip() or None
+	if not name:
+		if not plate:
+			frappe.throw(_("License plate is required."))
+		return ensure_fleet_vehicle(license_plate=plate, make=make, model=model)
+	frappe.flags.ignore_permissions = True
+	doc = frappe.get_doc("Vehicle", name)
+	frappe.flags.ignore_permissions = False
+	if plate and plate != cstr(doc.license_plate or "").strip():
+		# Plate rename is rare; update field when free.
+		conflict = frappe.db.get_value("Vehicle", {"license_plate": plate}, "name")
+		if conflict and conflict != name:
+			frappe.throw(_("A vehicle with plate {0} already exists.").format(plate))
+		doc.license_plate = plate
+	if make is not None:
+		doc.make = cstr(make).strip() or doc.make or "N/A"
+	if model is not None:
+		doc.model = cstr(model).strip() or doc.model or "N/A"
+	doc.save(ignore_permissions=True)
+	frappe.db.commit()
+	return _fleet_serialize_vehicle(name, with_pins=True)
+
+
+@frappe.whitelist(allow_guest=True)
+def set_fleet_vehicle_members(vehicle=None, members=None, primary_employee=None):
+	"""Replace the member list for a patente (many employees per car)."""
+	name = _fleet_resolve_vehicle_name(vehicle)
+	if not name:
+		frappe.throw(_("Vehicle is required."))
+	raw = members
+	if isinstance(raw, str):
+		try:
+			raw = frappe.parse_json(raw)
+		except Exception:
+			raw = []
+	if not isinstance(raw, (list, tuple)):
+		raw = []
+	parsed = []
+	for m in raw:
+		if isinstance(m, str):
+			emp = cstr(m).strip()
+			if emp:
+				parsed.append({"employee": emp, "primary": 0})
+		elif isinstance(m, dict):
+			parsed.append(m)
+	prim = cstr(primary_employee or "").strip()
+	if prim:
+		for m in parsed:
+			m["primary"] = 1 if cstr(m.get("employee") or "").strip() == prim else 0
+		if not any(cint(m.get("primary")) for m in parsed) and parsed:
+			# primary_employee not in list — append
+			parsed.append({"employee": prim, "primary": 1})
+	_fleet_save_members(name, parsed)
+	frappe.db.commit()
+	return _fleet_serialize_vehicle(name, with_pins=True)
+
+
+@frappe.whitelist(allow_guest=True)
+def add_fleet_vehicle_member(vehicle=None, employee=None, driver=None, make_primary=0):
+	"""Add one employee (or resolve from Driver) to a patente's access list."""
+	name = _fleet_resolve_vehicle_name(vehicle)
+	if not name:
+		frappe.throw(_("Vehicle is required."))
+	emp = cstr(employee or "").strip()
+	drv = cstr(driver or "").strip() or None
+	if not emp and drv and frappe.db.exists("Driver", drv):
+		emp = cstr(frappe.db.get_value("Driver", drv, "employee") or "").strip()
+	if not emp:
+		frappe.throw(_("Employee is required."))
+	if not frappe.db.exists("Employee", emp):
+		frappe.throw(_("Employee {0} not found").format(emp))
+	if not drv:
+		drv = frappe.db.get_value("Driver", {"employee": emp}, "name")
+	members = _fleet_members_blob(name)
+	found = False
+	for m in members:
+		if m["employee"] == emp:
+			found = True
+			if drv:
+				m["driver"] = drv
+			if cint(make_primary):
+				m["primary"] = 1
+			break
+	if not found:
+		members.append(
+			{
+				"employee": emp,
+				"driver": drv,
+				"primary": 1 if cint(make_primary) or not members else 0,
+			}
+		)
+	if cint(make_primary):
+		for m in members:
+			m["primary"] = 1 if m["employee"] == emp else 0
+	_fleet_save_members(name, members)
+	frappe.db.commit()
+	return _fleet_serialize_vehicle(name, with_pins=True)
+
+
+@frappe.whitelist(allow_guest=True)
+def remove_fleet_vehicle_member(vehicle=None, employee=None):
+	name = _fleet_resolve_vehicle_name(vehicle)
+	emp = cstr(employee or "").strip()
+	if not name or not emp:
+		frappe.throw(_("Vehicle and employee are required."))
+	members = [m for m in _fleet_members_blob(name) if m["employee"] != emp]
+	_fleet_save_members(name, members)
+	frappe.db.commit()
+	return _fleet_serialize_vehicle(name, with_pins=True)
 
 
 # ---------------------------------------------------------------------------
