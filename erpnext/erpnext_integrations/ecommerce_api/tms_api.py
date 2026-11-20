@@ -664,6 +664,8 @@ def _stop_detail_meta(stops):
 			fields.append("custom_client_phone_e164")
 		if frappe.db.has_column("Customer", "custom_preferred_hours"):
 			fields.append("custom_preferred_hours")
+		if frappe.db.has_column("Customer", "custom_preferred_hour_slots"):
+			fields.append("custom_preferred_hour_slots")
 		for row in frappe.get_all(
 			"Customer",
 			filters={"name": ["in", customer_names]},
@@ -795,6 +797,7 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 		"address": stop.address,
 		"address_line": _clean_address_display(addr_line) if addr_line else _clean_address_display(stop.customer_address),
 		"preferred_hours": cust.get("custom_preferred_hours") or None,
+		"preferred_hour_slots": cstr(cust.get("custom_preferred_hour_slots") or "").strip() or None,
 		"comments": cust.get("customer_details") or None,
 		"delivery_note": stop.delivery_note,
 		"sales_order": sales_order,
