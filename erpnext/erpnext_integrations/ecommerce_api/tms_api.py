@@ -11331,13 +11331,17 @@ def _build_trip_delivery_summary(trip):
 				continue
 			items = []
 			for row in dn.items or []:
+				code = cstr(row.item_code or "").strip()
+				if not code:
+					continue
 				qty = flt(row.qty)
 				if qty <= 0:
 					continue
 				items.append(
 					{
-						"item_code": cstr(row.item_code),
-						"item_name": cstr(row.item_name or row.item_code),
+						"idx": cint(getattr(row, "idx", None) or 0),
+						"item_code": code,
+						"item_name": cstr(row.item_name or code),
 						"qty": qty,
 						"uom": cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or ""),
 					}
@@ -11398,13 +11402,35 @@ def _build_trip_delivery_summary(trip):
 		planned = list(dn_items_by_name.get(dn) or [])
 		outcome = cstr(s.get("outcome") or "")
 		visited = bool(s.get("visited"))
-		delivered = []
-		if visited and outcome in ("Delivered", "Partial"):
-			delivered = [dict(it) for it in planned]
 		returned_groups = returns_by_stop.get(cint(s.get("idx")), [])
 		returned_flat = []
 		for g in returned_groups:
 			returned_flat.extend(g.get("lines") or [])
+
+		# Returned qty by item_code (sum) so Partial delivered = planned − returned,
+		# without dropping product rows from either list.
+		returned_by_code = {}
+		for r in returned_flat:
+			code = cstr(r.get("item_code") or "").strip()
+			if not code:
+				continue
+			returned_by_code[code] = flt(returned_by_code.get(code)) + flt(r.get("qty"))
+
+		delivered = []
+		if visited and outcome == "Delivered":
+			delivered = [dict(it) for it in planned]
+		elif visited and outcome == "Partial":
+			# Allocate returned qty against planned rows in order (same item can repeat).
+			remain = dict(returned_by_code)
+			for it in planned:
+				row = dict(it)
+				code = cstr(row.get("item_code") or "")
+				cut = min(flt(row.get("qty")), flt(remain.get(code) or 0))
+				row["qty"] = max(0.0, flt(row.get("qty")) - cut)
+				if code in remain:
+					remain[code] = max(0.0, flt(remain[code]) - cut)
+				if flt(row.get("qty")) > 0:
+					delivered.append(row)
 
 		planned_qty = sum(flt(i.get("qty")) for i in planned)
 		delivered_qty = sum(flt(i.get("qty")) for i in delivered)
@@ -12657,6 +12683,18 @@ def _record_stop_outcome_impl(
 			credit_note = _process_partial_credit_note(
 				stop, verify_shortfall_items=raw_items, notes=notes, settings=settings
 			)
+			# Record shortfall as Mobile Return Capture so Recepción expects the cargo
+			# (Returned → restock, Damaged → temp hold). Idempotent via client_request_id on outcome.
+			try:
+				_record_shortfall_return_capture(
+					trip,
+					stop,
+					raw_items,
+					notes=notes,
+					signature_base64=signature_base64,
+				)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "shortfall return capture")
 			has_returns = True
 	elif outcome == "Refused":
 		has_returns = True
@@ -13060,6 +13098,7 @@ def get_delivery_print_data(trip_name, stop_idx):
 # Stable English codes — keep in sync with erpnext-ecommerce/lib/return-reasons.ts
 # and Mobile Return Capture Item.reason Select options.
 RETURN_REASON_OPTIONS = (
+	"Returned",
 	"Damaged",
 	"Expired",
 	"Wrong item",
@@ -13068,6 +13107,12 @@ RETURN_REASON_OPTIONS = (
 	"Excess",
 	"Other",
 )
+
+# Restock sellable vs temporary damaged hold (p09 Completar Entrega / Recepción).
+RESTOCK_RETURN_REASONS = frozenset({"Returned", "Excess", "Wrong item"})
+DAMAGED_HOLD_RETURN_REASONS = frozenset({"Damaged", "Expired", "Quality issue"})
+DAMAGED_RETURN_WAREHOUSE = "Devoluciones Dañadas"
+DAMAGED_HOLD_DAYS = 30
 
 
 def _delivery_note_line_map(dn_name):
@@ -13206,6 +13251,123 @@ def _capture_set(capture_name, **kwargs):
 			continue
 		if frappe.db.has_column("Mobile Return Capture", field):
 			frappe.db.set_value("Mobile Return Capture", capture_name, field, value, update_modified=False)
+
+
+def _return_disposition(reason: str | None) -> str:
+	"""restock | damaged_hold | other — drives Recepción warehouse target."""
+	r = cstr(reason or "").strip()
+	if r in DAMAGED_HOLD_RETURN_REASONS:
+		return "damaged_hold"
+	if r in RESTOCK_RETURN_REASONS or not r:
+		return "restock"
+	return "other"
+
+
+def _ensure_damaged_return_warehouse(company=None):
+	"""Temporary hold for damaged/expired returns (purged after DAMAGED_HOLD_DAYS)."""
+	label = DAMAGED_RETURN_WAREHOUSE
+	if frappe.db.exists("Warehouse", label):
+		return label
+	by_title = frappe.db.get_value("Warehouse", {"warehouse_name": label}, "name")
+	if by_title:
+		return by_title
+	company = cstr(company or "").strip() or frappe.defaults.get_global_default("company")
+	if not company:
+		companies = frappe.get_all("Company", pluck="name", limit=1, ignore_permissions=True)
+		company = companies[0] if companies else None
+	if not company:
+		return None
+	parent = frappe.db.get_value("Warehouse", {"is_group": 1, "company": company}, "name")
+	doc = frappe.get_doc(
+		{
+			"doctype": "Warehouse",
+			"warehouse_name": label,
+			"company": company,
+			"parent_warehouse": parent,
+			"is_group": 0,
+		}
+	)
+	doc.insert(ignore_permissions=True)
+	frappe.db.commit()
+	return doc.name
+
+
+def _record_shortfall_return_capture(trip, stop, shortfall_items, notes=None, signature_base64=None):
+	"""Create Mobile Return Capture from Partial shortfall so Recepción expects cargo."""
+	if not frappe.db.exists("DocType", "Mobile Return Capture"):
+		return None
+	# Keep every shortfall row (do not collapse same item_code) so duplicate remito
+	# lines each create a recepción-expected unit.
+	lines = []
+	for raw in shortfall_items or []:
+		if not isinstance(raw, dict):
+			continue
+		code = cstr(raw.get("item_code") or "").strip()
+		qty = abs(flt(raw.get("qty")))
+		if not code or qty <= 0:
+			continue
+		reason = cstr(raw.get("reason") or "Returned").strip() or "Returned"
+		if reason not in RETURN_REASON_OPTIONS:
+			reason = "Returned"
+		lines.append(
+			{
+				"item_code": code,
+				"description": cstr(raw.get("item_name") or code),
+				"qty": qty,
+				"reason": reason,
+			}
+		)
+	if not lines:
+		return None
+
+	# Always tag notes so idempotent replays find this capture (user notes are appended).
+	note_body = cstr(notes or "").strip()
+	capture_notes = f"[shortfall] {note_body}".strip() if note_body else "[shortfall]"
+
+	# Avoid duplicate capture for the same trip/stop when outcome is replayed.
+	existing = frappe.get_all(
+		"Mobile Return Capture",
+		filters={"delivery_trip": trip.name, "stop_idx": cint(stop.idx)},
+		fields=["name", "notes"],
+		ignore_permissions=True,
+		limit=20,
+	)
+	for row in existing or []:
+		if cstr(row.notes or "").startswith("[shortfall]"):
+			return row.name
+
+	capture = frappe.get_doc(
+		{
+			"doctype": "Mobile Return Capture",
+			"delivery_trip": trip.name,
+			"stop_idx": cint(stop.idx),
+			"customer": stop.customer,
+			"status": "Captured",
+			"captured_at": now_datetime(),
+			"notes": capture_notes,
+			"lines": lines,
+			**(
+				{"delivery_note": stop.delivery_note}
+				if stop.delivery_note and frappe.db.has_column("Mobile Return Capture", "delivery_note")
+				else {}
+			),
+		}
+	)
+	capture.insert(ignore_permissions=True)
+	if signature_base64:
+		try:
+			sig_file = save_file(
+				f"shortfall-signature-{capture.name}.png",
+				signature_base64,
+				"Mobile Return Capture",
+				capture.name,
+				decode=True,
+				is_private=1,
+			)
+			capture.db_set("signature", sig_file.file_url, update_modified=False)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "shortfall return signature")
+	return capture.name
 
 
 def _process_return_accounting(capture, stop, settings=None):
@@ -13712,6 +13874,8 @@ def list_pending_vehicle_returns(vehicle=None, days=30):
 			cap_lines.append(
 				{"item_code": code, "item_name": name, "qty": qty, "reason": cstr(row.reason or "")}
 			)
+			reason = cstr(row.reason or "")
+			disposition = _return_disposition(reason)
 			bucket = agg.get(code)
 			if not bucket:
 				uom = frappe.db.get_value("Item", code, "stock_uom") if frappe.db.exists("Item", code) else None
@@ -13725,11 +13889,19 @@ def list_pending_vehicle_returns(vehicle=None, days=30):
 					"stock_uom": uom,
 					"weight_per_unit": wpu,
 					"capture_names": [cap.name],
+					"reason": reason,
+					"disposition": disposition,
+					"target_warehouse": DAMAGED_RETURN_WAREHOUSE if disposition == "damaged_hold" else None,
 				}
 			else:
 				bucket["qty"] = flt(bucket["qty"]) + qty
 				if cap.name not in bucket["capture_names"]:
 					bucket["capture_names"].append(cap.name)
+				# Prefer damaged_hold if any line for this item is damaged.
+				if disposition == "damaged_hold":
+					bucket["disposition"] = "damaged_hold"
+					bucket["reason"] = reason or bucket.get("reason")
+					bucket["target_warehouse"] = DAMAGED_RETURN_WAREHOUSE
 		if not cap_lines:
 			continue
 		captures_out.append(
@@ -13812,7 +13984,12 @@ def _absent_cargo_for_vehicle(vehicle, since=None):
 
 @frappe.whitelist(allow_guest=True)
 def mark_vehicle_returns_received(capture_names=None):
-	"""Mark Mobile Return Capture docs as warehouse-received after Recepción commit."""
+	"""Mark Mobile Return Capture docs as warehouse-received after Recepción commit.
+
+	Damaged/expired/quality lines ensure the temporary ``Devoluciones Dañadas``
+	warehouse exists (ReceivingView should already have posted stock there via
+	``target_warehouse``). Restock lines use the normal sellable receive path.
+	"""
 	if isinstance(capture_names, str):
 		capture_names = frappe.parse_json(capture_names)
 	if not isinstance(capture_names, list) or not capture_names:
@@ -13823,16 +14000,100 @@ def mark_vehicle_returns_received(capture_names=None):
 		return {"ok": True, "updated": [], "skipped": "no warehouse_received column — run migrate"}
 
 	updated = []
+	needs_damaged_wh = False
 	for raw in capture_names:
 		name = cstr(raw or "").strip()
 		if not name or not frappe.db.exists("Mobile Return Capture", name):
 			continue
+		frappe.flags.ignore_permissions = True
+		try:
+			doc = frappe.get_doc("Mobile Return Capture", name)
+		except Exception:
+			continue
+		finally:
+			frappe.flags.ignore_permissions = False
+		for row in doc.lines or []:
+			if _return_disposition(getattr(row, "reason", None)) == "damaged_hold":
+				needs_damaged_wh = True
+				break
 		frappe.db.set_value(
 			"Mobile Return Capture", name, "warehouse_received", 1, update_modified=True
 		)
 		updated.append(name)
+	if needs_damaged_wh:
+		_ensure_damaged_return_warehouse()
 	frappe.db.commit()
+	# Opportunistic purge of aged damaged hold stock.
+	try:
+		purge_damaged_return_stock()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "purge damaged return stock")
 	return {"ok": True, "updated": updated}
+
+
+@frappe.whitelist(allow_guest=True)
+def purge_damaged_return_stock(days=None):
+	"""Write off stock in Devoluciones Dañadas older than ``days`` (default 30).
+
+	Uses Stock Reconciliation to zero bins that have not moved recently.
+	Best-effort — missing warehouse / empty bins are no-ops.
+	"""
+	days = max(1, min(365, cint(days) if days not in (None, "") else DAMAGED_HOLD_DAYS))
+	wh = _ensure_damaged_return_warehouse()
+	if not wh or not frappe.db.exists("Warehouse", wh):
+		return {"ok": True, "purged": [], "skipped": "no warehouse"}
+	cutoff = frappe.utils.add_days(frappe.utils.nowdate(), -days)
+	bins = frappe.get_all(
+		"Bin",
+		filters={"warehouse": wh, "actual_qty": [">", 0]},
+		fields=["item_code", "actual_qty", "stock_uom", "modified"],
+		ignore_permissions=True,
+	)
+	to_clear = []
+	for b in bins or []:
+		mod = cstr(b.get("modified") or "")[:10]
+		if mod and mod > cutoff:
+			continue
+		qty = flt(b.get("actual_qty"))
+		if qty <= 0:
+			continue
+		to_clear.append({"item_code": b.item_code, "qty": qty, "uom": b.get("stock_uom")})
+	if not to_clear:
+		return {"ok": True, "purged": [], "warehouse": wh, "days": days}
+
+	company = frappe.db.get_value("Warehouse", wh, "company")
+	try:
+		sr = frappe.get_doc(
+			{
+				"doctype": "Stock Reconciliation",
+				"purpose": "Stock Reconciliation",
+				"company": company,
+				"posting_date": frappe.utils.nowdate(),
+				"posting_time": frappe.utils.nowtime(),
+				"items": [
+					{
+						"item_code": row["item_code"],
+						"warehouse": wh,
+						"qty": 0,
+						"valuation_rate": 0,
+					}
+					for row in to_clear
+				],
+			}
+		)
+		sr.insert(ignore_permissions=True)
+		sr.submit()
+		frappe.db.commit()
+		return {
+			"ok": True,
+			"purged": [r["item_code"] for r in to_clear],
+			"stock_reconciliation": sr.name,
+			"warehouse": wh,
+			"days": days,
+		}
+	except Exception as exc:
+		frappe.log_error(frappe.get_traceback(), "purge_damaged_return_stock")
+		return {"ok": False, "error": cstr(exc)[:300], "warehouse": wh}
 
 
 def _omit_dirty(val):

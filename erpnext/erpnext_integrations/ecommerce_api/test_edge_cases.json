@@ -8113,6 +8113,26 @@
       "bug": "mark_vehicle_returns_received null capture_names is controlled error"
     },
     {
+      "id": "purge_damaged_return_stock_null_days",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.purge_damaged_return_stock",
+      "args": {
+        "days": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "purge_damaged_return_stock null days uses default 30d and must not crash"
+    },
+    {
+      "id": "purge_damaged_return_stock_blank_days",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.purge_damaged_return_stock",
+      "args": {
+        "days": ""
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "purge_damaged_return_stock blank days uses default 30d and must not crash"
+    },
+    {
       "id": "list_return_captures_null_filters",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_return_captures",
       "args": {

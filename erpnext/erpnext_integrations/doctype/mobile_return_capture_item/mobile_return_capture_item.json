@@ -36,7 +36,7 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Reason",
-   "options": "\nDamaged\nExpired\nWrong item\nQuality issue\nCustomer refusal\nExcess\nOther"
+   "options": "\nReturned\nDamaged\nExpired\nWrong item\nQuality issue\nCustomer refusal\nExcess\nOther"
   }
  ],
  "index_web_pages_for_search": 0,

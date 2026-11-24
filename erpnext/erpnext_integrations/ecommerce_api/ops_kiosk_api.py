@@ -2477,6 +2477,9 @@ def get_delivery_check_items(delivery_note=None):
 	frappe.flags.ignore_permissions = False
 	items = []
 	for d in dn.items or []:
+		code = cstr(getattr(d, "item_code", None) or "").strip()
+		if not code:
+			continue
 		qty = flt(d.qty)
 		rate = flt(getattr(d, "rate", None) or 0)
 		# Agreed line total: WEIGHT is rate×kg (total_weight), never rate×units.
@@ -2493,7 +2496,9 @@ def get_delivery_check_items(delivery_note=None):
 		)
 		items.append(
 			{
-				"item_code": d.item_code,
+				# Stable per DN child-row — same item_code can appear on multiple lines.
+				"idx": cint(getattr(d, "idx", None) or 0),
+				"item_code": code,
 				"item_name": d.item_name,
 				"qty": qty,
 				"uom": d.uom,
