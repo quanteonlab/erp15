@@ -8585,6 +8585,76 @@
         "preorder_names": "null"
       },
       "expect": "fail"
+    },
+    {
+      "id": "tms_ensure_schema_all_patches",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api._ensure_tms_schema",
+      "args": {
+        "force": 1
+      },
+      "expect": "no_500",
+      "bug": "Skipped TMS patch → MySQL 1054 Unknown column 'tabDelivery Stop.custom_outcome' on every TMS screen; _ensure_tms_schema (before_request) must create all TMS patch columns"
+    },
+    {
+      "id": "tms_lean_site_fields_covers_outcome",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.ensure_tms_lean_site_fields",
+      "args": {},
+      "expect": {
+        "ok": true
+      },
+      "bug": "ensure_tms_lean_site_fields (after_migrate) must also cover outcome / PoD / payment / tracking / zone fields"
+    },
+    {
+      "id": "geocode_address_null",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.geocode_address",
+      "args": {
+        "address_name": null
+      },
+      "expect": "fail",
+      "bug": "geocode_address must not 500 'Enter API key in Google Settings' — null address is a controlled ValidationError"
+    },
+    {
+      "id": "set_address_coordinates_null",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.set_address_coordinates",
+      "args": {
+        "address_name": null,
+        "coords_text": null
+      },
+      "expect": "fail",
+      "bug": "Manual pin (no-Google fallback) with null address → controlled ValidationError"
+    },
+    {
+      "id": "set_address_coordinates_missing_address",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.set_address_coordinates",
+      "args": {
+        "address_name": "__no_such_address__",
+        "coords_text": "-34.6, -58.38"
+      },
+      "expect": "fail",
+      "bug": "Manual pin on unknown Address → DoesNotExistError, not TypeError"
+    },
+    {
+      "id": "planner_context_capabilities",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_planner_context",
+      "args": {},
+      "expect": "ok",
+      "bug": "get_planner_context exposes capabilities (server_geocode / road_distances) so UI degrades without Google"
+    },
+    {
+      "id": "auto_assign_tms_zones_reports_ungeocoded",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.auto_assign_tms_zones",
+      "args": {
+        "only_missing": 1
+      },
+      "expect": "no_500",
+      "bug": "Zone auto-assign without geo must report ungeocoded count, never crash"
     }
   ]
 }

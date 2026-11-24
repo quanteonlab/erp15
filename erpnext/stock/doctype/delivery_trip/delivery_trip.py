@@ -127,6 +127,15 @@ class DeliveryTrip(Document):
 		Args:
 		        optimize (bool): True if route needs to be optimized, else False
 		"""
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+			_resolve_maps_geocode_api_key,
+			process_route_without_google,
+		)
+
+		# No Maps key: local TSP order + haversine distances/ETAs instead of a 500.
+		if not _resolve_maps_geocode_api_key():
+			process_route_without_google(self, optimize)
+			return
 
 		departure_datetime = get_datetime(self.departure_time)
 		route_list = self.form_route_list(optimize)
@@ -247,13 +256,16 @@ class DeliveryTrip(Document):
 		Returns:
 		        (dict): Route legs and, if `optimize` is `True`, optimized waypoint order
 		"""
-		if not frappe.db.get_single_value("Google Settings", "api_key"):
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import _resolve_maps_geocode_api_key
+
+		api_key = _resolve_maps_geocode_api_key()
+		if not api_key:
 			frappe.throw(_("Enter API key in Google Settings."))
 
 		import googlemaps
 
 		try:
-			maps_client = googlemaps.Client(key=frappe.db.get_single_value("Google Settings", "api_key"))
+			maps_client = googlemaps.Client(key=api_key)
 		except Exception as e:
 			frappe.throw(e)
 

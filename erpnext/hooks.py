@@ -60,6 +60,9 @@ before_install = [
 	"erpnext.setup.install.check_frappe_version",
 ]
 after_install = "erpnext.setup.install.after_install"
+before_request = [
+	"erpnext.erpnext_integrations.ecommerce_api.tms_api.ensure_tms_schema_before_request",
+]
 after_migrate = [
 	"erpnext.erpnext_integrations.ecommerce_api.product_manager.ensure_product_manager_custom_fields",
 	"erpnext.erpnext_integrations.ecommerce_api.api.ensure_product_bundle_promo_fields",

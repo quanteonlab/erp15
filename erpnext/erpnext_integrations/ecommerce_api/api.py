@@ -9719,6 +9719,22 @@ def _mat_day_centroid(trip_name):
 	return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
 
 
+def _mat_trip_zones(trip_name):
+	"""Upper-cased Address.custom_zone values of a trip's stops (no-geo affinity)."""
+	if not frappe.db.has_column("Address", "custom_zone"):
+		return set()
+	rows = frappe.db.sql(
+		"""
+		SELECT DISTINCT addr.custom_zone
+		FROM `tabDelivery Stop` ds
+		INNER JOIN `tabAddress` addr ON addr.name = ds.address
+		WHERE ds.parent = %s AND IFNULL(addr.custom_zone, '') != ''
+		""",
+		(trip_name,),
+	)
+	return {cstr(r[0]).strip().upper() for r in rows if r and r[0]}
+
+
 @frappe.whitelist(allow_guest=True)
 def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 	"""Greedy MAT assign for Pedidos: same Entrega day → fill nearest open MAT to cap → next driver / new MAT.
@@ -9797,6 +9813,7 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 		)
 		clat, clng = _mat_day_centroid(t.name)
 		trip_state[t.name] = {
+			"zones": _mat_trip_zones(t.name),
 			"name": t.name,
 			"day": day,
 			"driver": cstr(t.driver or "").strip() or None,
@@ -9834,6 +9851,9 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 			)
 			if geo and geo.custom_latitude:
 				lat, lng = flt(geo.custom_latitude), flt(geo.custom_longitude)
+		zone = None
+		if addr and frappe.db.has_column("Address", "custom_zone"):
+			zone = cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip().upper() or None
 		tags = _parse_remarks_tags(_guest_preorder_tag_text(so))
 		gv = cstr(tags.get("guest_vehicle") or "").strip()
 		plate_key = ""
@@ -9846,6 +9866,7 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 				"day": str(due_d),
 				"lat": lat,
 				"lng": lng,
+				"zone": zone,
 				"customer": so.customer,
 				"plate": plate_key,
 			}
@@ -9857,7 +9878,7 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 			return 1e12
 		return tms_api._haversine_km(olat, olng, tlat, tlng)
 
-	def _pick_trip(day, olat, olng, plate=None):
+	def _pick_trip(day, olat, olng, plate=None, zone=None):
 		cands = [
 			t
 			for t in trip_state.values()
@@ -9877,9 +9898,12 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 				return None
 		if not cands:
 			return None
+		# No geo (no Maps key / unlocated address): distance ties at 1e12, so same
+		# zone wins, then the least-loaded MAT — still a sensible manual-free assign.
 		cands.sort(
 			key=lambda t: (
 				_dist(olat, olng, t["lat"], t["lng"]),
+				0 if zone and zone in (t.get("zones") or ()) else 1,
 				t["stop_count"],
 				t["name"],
 			)
@@ -9910,6 +9934,7 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 		doc = frappe.get_doc("Delivery Trip", trip_name)
 		frappe.flags.ignore_permissions = False
 		trip_state[trip_name] = {
+			"zones": set(),
 			"name": trip_name,
 			"day": day,
 			"driver": cstr(doc.driver or "").strip() or None,
@@ -9928,7 +9953,7 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 	for row in order_rows:
 		day = row["day"]
 		plate = cstr(row.get("plate") or "").strip() or None
-		picked = _pick_trip(day, row["lat"], row["lng"], plate=plate)
+		picked = _pick_trip(day, row["lat"], row["lng"], plate=plate, zone=row.get("zone"))
 		created_new = False
 		if picked:
 			detail = update_guest_preorder_logistics(
@@ -9990,6 +10015,8 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 			)
 		# Refresh capacity + centroid after assign.
 		st = trip_state.get(trip_name)
+		if st and row.get("zone"):
+			st.setdefault("zones", set()).add(row["zone"])
 		if st and not created_new:
 			st["stop_count"] = cint(st.get("stop_count") or 0) + 1
 			if row["lat"] is not None and row["lng"] is not None:
@@ -10006,6 +10033,7 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 				"day": day,
 				"created_trip": created_new,
 				"driver": (picked or {}).get("driver"),
+				"geocoded": row["lat"] is not None and row["lng"] is not None,
 				"detail": detail,
 			}
 		)
@@ -10019,6 +10047,7 @@ def auto_assign_preorders_to_mats(preorder_names=None, company=None):
 				"day": a["day"],
 				"created_trip": a["created_trip"],
 				"driver": a.get("driver"),
+				"geocoded": a.get("geocoded"),
 				"display_status": (a.get("detail") or {}).get("display_status"),
 				"delivery_note": (a.get("detail") or {}).get("delivery_note"),
 				"vehicle": (a.get("detail") or {}).get("vehicle"),
@@ -10543,6 +10572,9 @@ def _try_geocode_address_soft(address_name):
 		# Prefer Google when configured; Nominatim via geocode_query fallback.
 		try:
 			geo = tms_api.geocode_address(name)
+			if not geo.get("geocoded", True):
+				# Full address had no match — retry below with address_line1 only.
+				raise ValueError("not geocoded")
 			return {
 				"geocoded": True,
 				"lat": geo.get("lat"),

@@ -4925,6 +4925,15 @@ def suite_5_12_modules_read():
     else:
         _skip("5.12.5c catalog import reviews + permissive enqueue", "Catalog Import Session DocType not migrated", "S2")
     _run("5.12.6 tms planner context + settings", check_tms, "S3")
+
+    def check_tms_no_google():
+        # TMS must never 500 without a Google key / geocoder (and with skipped patches).
+        from erpnext.erpnext_integrations.ecommerce_api import test_tms_no_google as tng
+
+        out = tng.run()
+        assert out["failed"] == 0, out["failures"]
+
+    _run("5.12.6c tms without Google (schema heal, soft geocode, local ETAs)", check_tms_no_google, "S2")
     _run("5.12.6b return capture registry (Revisar devoluciones)", check_return_capture_registry, "S2")
     _run("5.12.7 get_shop_ui_settings", check_shop_ui, "S3")
     _run("5.12.8 search_tags", check_tags, "S3")

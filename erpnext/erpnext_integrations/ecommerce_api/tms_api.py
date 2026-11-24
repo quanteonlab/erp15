@@ -110,6 +110,90 @@ def _ensure_tms_address_geo_fields():
 	frappe.clear_cache(doctype="Address")
 
 
+# Every patch that adds TMS columns, in patches.txt order (insert_after chains
+# depend on it). A site that skipped any of these used to 500 with MySQL 1054
+# (e.g. "Unknown column 'tabDelivery Stop.custom_outcome'") on every TMS screen.
+_TMS_SCHEMA_PATCHES = (
+	"add_tms_custom_fields",
+	"add_tms_depot_fields",
+	"add_tms_route_lock_field",
+	"add_tms_outcome_fields",
+	"add_tms_payment_fields",
+	"add_tms_late_penalty_fields",
+	"add_tms_delivery_payment_split_fields",
+	"add_tms_tracking_code_field",
+	"add_tms_zone_field",
+	"add_tms_delivery_frequency_field",
+)
+_NO_COLUMN_FIELDTYPES = {"Section Break", "Column Break", "Tab Break", "HTML", "Button", "Heading"}
+# Sites (per worker process) whose TMS columns were verified present.
+_tms_schema_ok_sites: set = set()
+
+
+def _tms_schema_patch_fields(patch_name):
+	import importlib
+
+	return importlib.import_module(f"erpnext.patches.v15_0.{patch_name}").CUSTOM_FIELDS
+
+
+def _missing_tms_columns(custom_fields):
+	missing = []
+	for doctype, fields in custom_fields.items():
+		for f in fields:
+			if f.get("fieldtype") in _NO_COLUMN_FIELDTYPES:
+				continue
+			if not frappe.db.has_column(doctype, f["fieldname"]):
+				missing.append(f"{doctype}.{f['fieldname']}")
+	return missing
+
+
+def _ensure_tms_schema(force=False):
+	"""Idempotent — create every TMS custom field whose column is missing.
+
+	Cheap after the first call: memoized per site per worker. Returns the list of
+	``Doctype.fieldname`` columns that had to be created.
+	"""
+	site = cstr(getattr(frappe.local, "site", None) or "")
+	if not force and site in _tms_schema_ok_sites:
+		return []
+	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+	created = []
+	for patch_name in _TMS_SCHEMA_PATCHES:
+		custom_fields = _tms_schema_patch_fields(patch_name)
+		missing = _missing_tms_columns(custom_fields)
+		if not missing:
+			continue
+		create_custom_fields(custom_fields, update=True)
+		for doctype in custom_fields:
+			frappe.clear_cache(doctype=doctype)
+		created.extend(missing)
+	if created:
+		frappe.db.commit()
+	_tms_schema_ok_sites.add(site)
+	return created
+
+
+_ECOMMERCE_API_PREFIX = "/api/method/erpnext.erpnext_integrations.ecommerce_api."
+
+
+def ensure_tms_schema_before_request():
+	"""``before_request`` hook — self-heal TMS columns before any ecommerce_api call.
+
+	Never raises: a failure here is logged and the request proceeds as before.
+	"""
+	try:
+		path = cstr(getattr(getattr(frappe.local, "request", None), "path", "") or "")
+		if not path.startswith(_ECOMMERCE_API_PREFIX):
+			return
+		if cstr(getattr(frappe.local, "site", "") or "") in _tms_schema_ok_sites:
+			return
+		_ensure_tms_schema()
+	except Exception:
+		frappe.db.rollback()
+		frappe.log_error(frappe.get_traceback(), "ensure_tms_schema_before_request")
+
+
 def _address_fields_with_geo(base_fields):
 	"""Append geo/zone columns only when present (safe after ensure, or soft-skip)."""
 	fields = list(base_fields)
@@ -571,6 +655,63 @@ def _assigned_delivery_note_names(trip_names=None):
 	return {r[0] for r in rows if r and r[0]}
 
 
+def _assignment_conflict_message(conflicts):
+	"""'DN → trip (driver, status)' so the planner knows where to free each order."""
+	rows = frappe.db.sql(
+		"""
+		select ds.delivery_note, dt.name, dt.driver_name, dt.status
+		from `tabDelivery Stop` ds
+		inner join `tabDelivery Trip` dt on dt.name = ds.parent
+		where ds.delivery_note in %(dns)s and dt.docstatus != 2
+		  and ifnull(ds.custom_outcome, '') != 'Not Home'
+		""",
+		{"dns": list(conflicts) or [""]},
+		as_dict=True,
+	)
+	where = {}
+	for r in rows:
+		where.setdefault(r.delivery_note, f"{r.name} ({r.driver_name or _('no driver')}, {r.status or 'Draft'})")
+	parts = [f"{dn} → {where[dn]}" if dn in where else dn for dn in conflicts]
+	return _("Already assigned to another trip: {0}").format("; ".join(parts))
+
+
+def _release_dns_from_other_draft_trips(delivery_note_names, keep_trips=(), dry_run=False):
+	"""Assigning an order to a driver wins over a stale, unpublished plan.
+
+	Removes the DNs from other *Draft*, unlocked trips where the stop was never
+	visited / attempted (a Draft trip with no stops left is deleted). Stops on
+	published (Scheduled / In Transit) or locked trips stay put — those still
+	raise the "Already assigned" error. Returns ``{trip_name: [dn, ...]}`` moved
+	(``dry_run`` only reports what would move).
+	"""
+	dns = [cstr(d).strip() for d in (delivery_note_names or []) if cstr(d).strip()]
+	if not dns:
+		return {}
+	has_lock = frappe.db.has_column("Delivery Trip", "custom_locked")
+	rows = frappe.db.sql(
+		f"""
+		select ds.parent, ds.delivery_note
+		from `tabDelivery Stop` ds
+		inner join `tabDelivery Trip` dt on dt.name = ds.parent
+		where ds.delivery_note in %(dns)s
+		  and dt.docstatus = 0
+		  and dt.name not in %(keep)s
+		  and ifnull(ds.visited, 0) = 0
+		  and ifnull(ds.custom_outcome, '') = ''
+		  {"and ifnull(dt.custom_locked, 0) = 0" if has_lock else ""}
+		""",
+		{"dns": dns, "keep": list(keep_trips) or [""]},
+		as_dict=True,
+	)
+	by_trip = {}
+	for r in rows:
+		by_trip.setdefault(r.parent, []).append(r.delivery_note)
+	if not dry_run:
+		for trip_name, trip_dns in by_trip.items():
+			remove_stops_from_trip(trip_name, trip_dns)
+	return by_trip
+
+
 def _load_delivery_notes_for_stops(delivery_note_names):
 	"""Fetch DN fields + resolved address-display text needed to build
 	Delivery Stop rows. Shared by create_trip and add_stops_to_trip."""
@@ -922,7 +1063,8 @@ def get_planner_context(company=None):
 		"warehouses": warehouses,
 		"default_warehouse": default_warehouse,
 		"depot": _default_depot_latlng(company),
-		"google_maps_configured": bool(frappe.db.get_single_value("Google Settings", "api_key")),
+		"google_maps_configured": bool(_resolve_maps_geocode_api_key()),
+		"capabilities": _tms_capabilities(),
 		"today": str(getdate()),
 	}
 
@@ -1426,7 +1568,8 @@ def get_rutas_week_bundle(
 		except Exception:
 			out["zones"] = []
 		try:
-			clients = list_delivery_clients(limit=2000, only_geocoded=1)
+			# Include ungeocoded clients — planners must see everyone (map skips no-geo rows).
+			clients = list_delivery_clients(limit=2000, only_geocoded=0)
 			out["clients"] = clients.get("clients") or []
 		except Exception:
 			out["clients"] = []
@@ -2695,10 +2838,6 @@ def geocode_address(address_name, force=0):
 	):
 		return {"lat": address.custom_latitude, "lng": address.custom_longitude, "cached": True}
 
-	api_key = frappe.db.get_single_value("Google Settings", "api_key")
-	if not api_key:
-		frappe.throw(_("Enter API key in Google Settings."))
-
 	frappe.flags.ignore_permissions = True
 	address_doc = frappe.get_doc("Address", name)
 	frappe.flags.ignore_permissions = False
@@ -2708,18 +2847,22 @@ def geocode_address(address_name, force=0):
 	if not address_str:
 		frappe.throw(_("Address {0} has no address lines to geocode").format(name))
 
-	import googlemaps
+	location, provider = _geocode_address_str(address_str, _address_country_code(address_doc))
+	if not location:
+		# No Maps key / geocoder down / no match: not an error — the stop stays
+		# routable by hand (manual order, manual pin) and sorts after geocoded ones.
+		return {
+			"lat": None,
+			"lng": None,
+			"geocoded": False,
+			"cached": False,
+			"forced": do_force,
+			"reason": _(
+				"Could not locate this address automatically. Set the pin on the map "
+				"or enter coordinates manually."
+			),
+		}
 
-	maps_client = googlemaps.Client(key=api_key)
-	try:
-		results = maps_client.geocode(address_str)
-	except Exception as e:
-		frappe.throw(_(str(e)))
-
-	if not results:
-		frappe.throw(_("Could not geocode address {0}").format(name))
-
-	location = results[0]["geometry"]["location"]
 	frappe.db.set_value(
 		"Address",
 		name,
@@ -2739,8 +2882,119 @@ def geocode_address(address_name, force=0):
 	return {
 		"lat": location["lat"],
 		"lng": location["lng"],
+		"geocoded": True,
 		"cached": False,
 		"forced": do_force,
+		"provider": provider,
+		"zone": (assigned or {}).get("zone"),
+	}
+
+
+def _address_country_code(address_doc):
+	country = cstr(getattr(address_doc, "country", None) or "").strip()
+	code = frappe.db.get_value("Country", country, "code") if country else None
+	return cstr(code or "ar").lower()
+
+
+def _geocode_address_str(address_str, country_code="ar"):
+	"""Best-effort geocode → (``{"lat","lng"}``, provider) or (None, None). Never raises.
+
+	Google Geocoding when a Maps key is set, else / on failure OpenStreetMap
+	Nominatim (skipped when ``frappe.flags.tms_no_network_geocode``).
+	"""
+	api_key = _resolve_maps_geocode_api_key()
+	if api_key:
+		try:
+			import googlemaps
+
+			results = googlemaps.Client(key=api_key).geocode(address_str)
+			if results:
+				return results[0]["geometry"]["location"], "google"
+		except Exception as e:
+			frappe.log_error(title="geocode_address Google failed", message=cstr(e))
+	if frappe.flags.get("tms_no_network_geocode"):
+		return None, None
+	try:
+		hit = _geocode_via_nominatim(address_str, country_code=country_code)
+	except Exception as e:
+		frappe.clear_messages()
+		frappe.log_error(title="geocode_address Nominatim failed", message=cstr(e))
+		return None, None
+	if hit:
+		return {"lat": hit["lat"], "lng": hit["lng"]}, "nominatim"
+	return None, None
+
+
+# "lat, lng" text, or coordinates embedded in a pasted Google Maps / OSM link.
+_COORD_PATTERNS = (
+	r"!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)",  # Google place data (exact pin)
+	r"[?&]mlat=(-?\d+(?:\.\d+)?)&mlon=(-?\d+(?:\.\d+)?)",  # OpenStreetMap marker
+	r"[?&](?:q|query|ll|destination)=(-?\d+(?:\.\d+)?)(?:,|%2C)\s*(-?\d+(?:\.\d+)?)",
+	r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)",  # Google viewport center
+	r"#map=\d+/(-?\d+(?:\.\d+)?)/(-?\d+(?:\.\d+)?)",  # OSM viewport
+	r"^\s*(-?\d+(?:\.\d+)?)\s*[,; ]\s*(-?\d+(?:\.\d+)?)\s*$",  # plain "lat, lng"
+)
+
+
+def _parse_coords_text(text):
+	"""(lat, lng) from "lat, lng" or a maps URL, else (None, None)."""
+	raw = cstr(text or "").strip()
+	if not raw:
+		return None, None
+	for pat in _COORD_PATTERNS:
+		m = re.search(pat, raw)
+		if m:
+			return flt(m.group(1)), flt(m.group(2))
+	return None, None
+
+
+@frappe.whitelist(allow_guest=True)
+def set_address_coordinates(address_name=None, lat=None, lng=None, coords_text=None):
+	"""Manually pin an existing Address (no geocoder / map needed).
+
+	Pass ``lat`` + ``lng``, or ``coords_text`` = "lat, lng" or a pasted Google
+	Maps / OpenStreetMap link. Syncs Delivery Stop pins and auto-assigns a zone
+	when the address had none — same effects as a successful geocode.
+	"""
+	name = cstr(address_name or "").strip()
+	if not name or name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Address is required"), frappe.ValidationError)
+	if not frappe.db.exists("Address", name):
+		frappe.throw(_("Address {0} not found").format(name), frappe.DoesNotExistError)
+
+	lat_v = _valid_map_coord(lat)
+	lng_v = _valid_map_coord(lng)
+	if (lat_v is None or lng_v is None) and coords_text:
+		lat_v, lng_v = _parse_coords_text(coords_text)
+		lat_v, lng_v = _valid_map_coord(lat_v), _valid_map_coord(lng_v)
+	if lat_v is None or lng_v is None:
+		frappe.throw(
+			_("Enter coordinates as \"lat, lng\" (e.g. -34.6037, -58.3816) or paste a map link."),
+			frappe.ValidationError,
+		)
+	if not (-90 <= lat_v <= 90 and -180 <= lng_v <= 180):
+		frappe.throw(_("Coordinates out of range: {0}, {1}").format(lat_v, lng_v), frappe.ValidationError)
+
+	_ensure_tms_address_geo_fields()
+	frappe.db.set_value(
+		"Address",
+		name,
+		{
+			"custom_latitude": lat_v,
+			"custom_longitude": lng_v,
+			"custom_geocoded_on": now_datetime(),
+		},
+		update_modified=False,
+	)
+	_sync_delivery_stop_geo(name, lat_v, lng_v)
+	assigned = _auto_assign_zone_if_missing(name)
+	frappe.db.commit()
+	return {
+		"address_name": name,
+		"lat": lat_v,
+		"lng": lng_v,
+		"geocoded": True,
+		"provider": "manual",
 		"zone": (assigned or {}).get("zone"),
 	}
 
@@ -2766,6 +3020,19 @@ def _sync_delivery_stop_geo(address_name, lat, lng):
 		(lat_f, lng_f, addr),
 	)
 	return 1
+
+
+_nominatim_last_call = [0.0]
+
+
+def _nominatim_throttle():
+	"""Nominatim usage policy: at most 1 request/second (batch geocodes loop)."""
+	import time
+
+	wait = 1.1 - (time.monotonic() - _nominatim_last_call[0])
+	if wait > 0:
+		time.sleep(wait)
+	_nominatim_last_call[0] = time.monotonic()
 
 
 def _nominatim_headers():
@@ -2822,6 +3089,7 @@ def _geocode_via_nominatim(address_str, country_code="ar"):
 			"addressdetails": "1",
 		}
 	)
+	_nominatim_throttle()
 	req = urllib.request.Request(
 		f"https://nominatim.openstreetmap.org/search?{params}",
 		headers=_nominatim_headers(),
@@ -2878,6 +3146,7 @@ def _reverse_geocode_via_nominatim(lat, lng):
 			"zoom": "18",
 		}
 	)
+	_nominatim_throttle()
 	req = urllib.request.Request(
 		f"https://nominatim.openstreetmap.org/reverse?{params}",
 		headers=_nominatim_headers(),
@@ -2911,8 +3180,35 @@ def _reverse_geocode_via_nominatim(lat, lng):
 	}
 
 
+def _tms_capabilities():
+	"""What TMS can automate on this site. Everything manual works regardless.
+
+	- ``server_geocode``: ``google`` | ``nominatim`` | ``none``
+	- ``road_distances``: Google Directions available (else local estimates)
+	- ``distance_source``: ``google`` | ``estimate``
+	The browser map key (NEXT_PUBLIC_GOOGLE_MAPS_API_KEY) is checked client-side.
+	"""
+	has_key = bool(_resolve_maps_geocode_api_key())
+	if has_key:
+		geocode = "google"
+	elif frappe.flags.get("tms_no_network_geocode"):
+		geocode = "none"
+	else:
+		geocode = "nominatim"
+	return {
+		"server_geocode": geocode,
+		"road_distances": has_key,
+		"distance_source": "google" if has_key else "estimate",
+	}
+
+
 def _resolve_maps_geocode_api_key():
-	"""Google Settings first, then site_config google_maps_api_key."""
+	"""Google Settings first, then site_config google_maps_api_key.
+
+	``frappe.flags.tms_no_google`` forces "" (no-Google test mode).
+	"""
+	if frappe.flags.get("tms_no_google"):
+		return ""
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.google_api import get_google_maps_api_key
 
@@ -3406,7 +3702,7 @@ def create_trip(
 				_assert_trip_unlocked(trip, _("adding stops"))
 				conflicts = [n for n in to_add if n in _assigned_delivery_note_names()]
 				if conflicts:
-					frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+					frappe.throw(_assignment_conflict_message(conflicts))
 				added = _append_stops_to_trip_doc(trip, to_add)
 			# Collapse newer duplicate drafts for the same driver/day (empty or subset).
 			for extra in existing[1:]:
@@ -3440,7 +3736,7 @@ def create_trip(
 
 	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
 	if conflicts:
-		frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+		frappe.throw(_assignment_conflict_message(conflicts))
 
 	driver_doc = None
 	if driver:
@@ -3521,21 +3817,35 @@ def optimize_trip(trip_name):
 	# Draft: rewrite idx via save. Submitted: allow idx-only reorder (driver mid-route).
 	_apply_trip_stop_order(trip, ordered)
 
-	# Optional: fill Google leg distances without changing order (ignore failures).
+	frappe.flags.ignore_permissions = True
+	trip = frappe.get_doc("Delivery Trip", name)
+	frappe.flags.ignore_permissions = False
+
+	# Leg distances / ETAs: Google Directions when a key is set, else (or on any
+	# Google failure) a local haversine estimate — never blocks the reorder.
 	# process_route() ends in Document.save() — ensure Vehicle is set / mandatory
 	# skipped so Google-maps enrichment never resurfaces "Value missing … Vehicle".
-	try:
-		frappe.flags.ignore_permissions = True
-		trip = frappe.get_doc("Delivery Trip", name)
-		trip.flags.ignore_permissions = True
-		_ensure_trip_vehicle(trip)
-		if not cstr(getattr(trip, "vehicle", None) or "").strip():
-			trip.flags.ignore_mandatory = True
-		if trip.driver_address:
+	used_google = False
+	if _resolve_maps_geocode_api_key() and trip.driver_address:
+		try:
+			trip.flags.ignore_permissions = True
+			_ensure_trip_vehicle(trip)
+			if not cstr(getattr(trip, "vehicle", None) or "").strip():
+				trip.flags.ignore_mandatory = True
 			trip.process_route(optimize=False)
-		frappe.flags.ignore_permissions = False
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "optimize_trip process_route")
+			used_google = True
+		except Exception:
+			frappe.db.rollback()
+			frappe.log_error(frappe.get_traceback(), "optimize_trip process_route")
+	if not used_google:
+		try:
+			frappe.flags.ignore_permissions = True
+			trip = frappe.get_doc("Delivery Trip", name)
+			frappe.flags.ignore_permissions = False
+			_estimate_trip_legs_local(trip)
+		except Exception:
+			frappe.db.rollback()
+			frappe.log_error(frappe.get_traceback(), "optimize_trip local estimate")
 
 	return get_trip_map_data(name)
 
@@ -3659,12 +3969,33 @@ def publish_fleet_mat(
 	elif veh:
 		veh = _fleet_resolve_vehicle_name(veh) or veh
 
+	dn_names = (
+		frappe.parse_json(delivery_note_names)
+		if isinstance(delivery_note_names, str)
+		else list(delivery_note_names or [])
+	)
+	if preorder_names:
+		dn_names = list(dict.fromkeys([*dn_names, *_materialize_dns_for_preorders(preorder_names)]))
+	# Fleet assignment is the planner's latest decision: pull these orders off
+	# other drivers' never-published drafts (e.g. an old day's Draft MAT) instead
+	# of failing with "Already assigned to another trip".
+	keep = [t.name for t in _find_reusable_driver_day_trips(drv, day)]
+	movable = {
+		dn for dns in _release_dns_from_other_draft_trips(dn_names, keep, dry_run=True).values() for dn in dns
+	}
+	on_keep = _assigned_delivery_note_names(keep) if keep else set()
+	assigned = _assigned_delivery_note_names()
+	# Fail before moving anything when an order sits on a published / locked trip.
+	hard = [dn for dn in dn_names if dn in assigned and dn not in movable and dn not in on_keep]
+	if hard:
+		frappe.throw(_assignment_conflict_message(hard))
+	released = _release_dns_from_other_draft_trips(dn_names, keep_trips=keep)
+
 	created = create_trip(
 		date=str(day),
 		driver=drv,
 		vehicle=veh,
-		delivery_note_names=delivery_note_names,
-		preorder_names=preorder_names,
+		delivery_note_names=dn_names,
 		company=company,
 		pickup_warehouse=pickup_warehouse,
 	)
@@ -3694,6 +4025,7 @@ def publish_fleet_mat(
 		"added": cint(created.get("added") or 0),
 		"reused": cint(created.get("reused") or 0),
 		"published": published,
+		"moved_from": released,
 	}
 
 
@@ -4273,7 +4605,7 @@ def add_stops_to_trip(trip_name, delivery_note_names, allow_steal=0, preorder_na
 
 	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
 	if conflicts and not steal:
-		frappe.throw(_("Already assigned to another trip: {0}").format(", ".join(conflicts)))
+		frappe.throw(_assignment_conflict_message(conflicts))
 
 	stolen_from = []
 	if conflicts and steal:
@@ -6040,7 +6372,13 @@ def list_delivery_clients(limit=2000, only_geocoded=1):
 	has_freq = frappe.db.has_column("Address", "custom_delivery_frequency")
 	has_wh = frappe.db.has_column("Customer", "custom_delivery_warehouse")
 	if not has_lat or not has_lng:
-		return {"clients": [], "total": 0, "geocoded": 0}
+		_ensure_tms_address_geo_fields()
+		has_lat = frappe.db.has_column("Address", "custom_latitude")
+		has_lng = has_lat and frappe.db.has_column("Address", "custom_longitude")
+	lat_sel = "addr.custom_latitude AS lat" if has_lat else "NULL AS lat"
+	lng_sel = "addr.custom_longitude AS lng" if has_lng else "NULL AS lng"
+	if not has_lat or not has_lng:
+		geo_only = False
 
 	zone_sel = "addr.custom_zone AS zone" if has_zone else "NULL AS zone"
 	freq_sel = (
@@ -6063,8 +6401,8 @@ def list_delivery_clients(limit=2000, only_geocoded=1):
 			addr.name AS address_name,
 			addr.address_line1 AS address_line1,
 			addr.city AS city,
-			addr.custom_latitude AS lat,
-			addr.custom_longitude AS lng,
+			{lat_sel},
+			{lng_sel},
 			{zone_sel},
 			{freq_sel},
 			{wh_sel},
@@ -6535,6 +6873,15 @@ def remediate_far_delivery_geocodes(
 			addr = c["address_name"]
 			try:
 				geo = geocode_address(addr, force=1)
+				if not geo.get("geocoded"):
+					errors.append(
+						{
+							"address_name": addr,
+							"customer": c.get("customer"),
+							"error": cstr(geo.get("reason") or _("Could not geocode")),
+						}
+					)
+					continue
 				nlat, nlng = flt(geo.get("lat")), flt(geo.get("lng"))
 				new_km = round(_haversine_km(nlat, nlng, wlat, wlng), 3)
 				row = {
@@ -6744,6 +7091,109 @@ def _tsp_closed_tour_order(depot, points):
 	return order
 
 
+# Straight-line → road distance multiplier and average urban speed used when
+# Google Directions is unavailable. Override per site in site_config.json.
+_DEFAULT_ROAD_FACTOR = 1.3
+_DEFAULT_AVG_SPEED_KMH = 25.0
+
+
+def _stop_latlng(stop, geo_by_address=None):
+	lat = _valid_map_coord(getattr(stop, "lat", None))
+	lng = _valid_map_coord(getattr(stop, "lng", None))
+	if lat is not None and lng is not None:
+		return lat, lng
+	addr = cstr(getattr(stop, "address", None) or "").strip()
+	geo = (geo_by_address or {}).get(addr) if geo_by_address is not None else _address_latlng(addr)
+	if geo:
+		return geo["lat"], geo["lng"]
+	return None, None
+
+
+def _meter_to_trip_uom():
+	"""(uom, factor) converting meters → the site's default distance UOM."""
+	uom = frappe.db.get_single_value("Global Defaults", "default_distance_unit") or "Meter"
+	if uom == "Meter":
+		return uom, 1.0
+	factor = frappe.db.get_value(
+		"UOM Conversion Factor", {"from_uom": "Meter", "to_uom": uom}, "value"
+	)
+	if factor:
+		return uom, flt(factor)
+	return ("Meter", 1.0) if frappe.db.exists("UOM", "Meter") else (None, 1.0)
+
+
+def _estimate_trip_legs_local(trip):
+	"""Fill stop distance / ETA + trip total_distance without Google.
+
+	Leg distance = haversine × road factor; time = distance / average speed, plus
+	Delivery Settings ``stop_delay`` minutes per stop. Stops without coordinates
+	keep empty distance/ETA and don't advance the clock. Writes via db so it works
+	on Draft and Submitted trips.
+	"""
+	import datetime
+
+	road_factor = flt(frappe.conf.get("tms_road_factor")) or _DEFAULT_ROAD_FACTOR
+	speed_kmh = flt(frappe.conf.get("tms_avg_speed_kmh")) or _DEFAULT_AVG_SPEED_KMH
+	stop_delay = cint(frappe.db.get_single_value("Delivery Settings", "stop_delay") or 0)
+	uom, factor = _meter_to_trip_uom()
+
+	depot, _addr, _wh = _trip_depot_latlng(trip)
+	prev = (flt(depot.get("lat")), flt(depot.get("lng"))) if depot else None
+	if prev and not prev[0] and not prev[1]:
+		prev = None
+	cursor = get_datetime(trip.departure_time) if trip.departure_time else now_datetime()
+
+	total_m = 0.0
+	estimated = 0
+	for stop in sorted(trip.delivery_stops or [], key=lambda r: cint(r.idx) or 0):
+		lat, lng = _stop_latlng(stop)
+		# distance is NOT NULL (Float) — 0 means "not estimated" for unlocated stops.
+		values = {"distance": 0, "estimated_arrival": None}
+		if lat is not None and lng is not None:
+			# No depot pin: the first located stop is the route start (ETA = departure).
+			if prev:
+				leg_m = _haversine_km(prev[0], prev[1], lat, lng) * road_factor * 1000.0
+				cursor = cursor + datetime.timedelta(hours=(leg_m / 1000.0) / speed_kmh)
+				total_m += leg_m
+				values["distance"] = round(leg_m * factor, 3)
+			values["estimated_arrival"] = cursor
+			cursor = cursor + datetime.timedelta(minutes=stop_delay)
+			estimated += 1
+			prev = (lat, lng)
+		if uom:
+			values["uom"] = uom
+		frappe.db.set_value("Delivery Stop", stop.name, values, update_modified=False)
+
+	if prev and depot and (flt(depot.get("lat")) or flt(depot.get("lng"))):
+		total_m += (
+			_haversine_km(prev[0], prev[1], flt(depot.get("lat")), flt(depot.get("lng")))
+			* road_factor
+			* 1000.0
+		)
+	trip_values = {"total_distance": round(total_m * factor, 3)}
+	if uom:
+		trip_values["uom"] = uom
+	frappe.db.set_value("Delivery Trip", trip.name, trip_values, update_modified=False)
+	frappe.db.commit()
+	return {
+		"distance_source": "estimate",
+		"estimated_stops": estimated,
+		"total_km": round(total_m / 1000.0, 2),
+	}
+
+
+def process_route_without_google(trip, optimize):
+	"""Local replacement for ``DeliveryTrip.process_route`` when no Maps key is set."""
+	if cint(optimize) and trip.docstatus != 2:
+		ordered = _delivery_note_order_tsp(trip)
+		if ordered:
+			_apply_trip_stop_order(trip, ordered)
+			frappe.flags.ignore_permissions = True
+			trip = frappe.get_doc("Delivery Trip", trip.name)
+			frappe.flags.ignore_permissions = False
+	return _estimate_trip_legs_local(trip)
+
+
 def _delivery_note_order_tsp(trip):
 	"""Compute DN order for trip stops via warehouse-closed TSP.
 
@@ -6856,6 +7306,25 @@ def auto_assign_tms_zones(only_missing=1):
 		""",
 		as_dict=True,
 	)
+	ungeocoded = cint(
+		(
+			frappe.db.sql(
+				"""
+				SELECT COUNT(DISTINCT addr.name)
+				FROM `tabAddress` addr
+				INNER JOIN `tabDynamic Link` dl
+					ON dl.parent = addr.name AND dl.parenttype = 'Address'
+					AND dl.link_doctype = 'Customer'
+				INNER JOIN `tabDelivery Note` dn
+					ON dn.customer = dl.link_name AND dn.docstatus < 2
+				WHERE (IFNULL(addr.custom_latitude, 0) = 0 OR IFNULL(addr.custom_longitude, 0) = 0)
+					AND IFNULL(addr.disabled, 0) = 0
+					AND IFNULL(addr.custom_zone, '') = ''
+				"""
+			)
+			or [[0]]
+		)[0][0]
+	)
 	assigned = 0
 	skipped = 0
 	for row in rows:
@@ -6875,7 +7344,8 @@ def auto_assign_tms_zones(only_missing=1):
 		assigned += 1
 	if assigned:
 		frappe.db.commit()
-	return {"assigned": assigned, "skipped": skipped, "zones": len(zones)}
+	# ``ungeocoded``: zoneless addresses with no location — set a zone or pin by hand.
+	return {"assigned": assigned, "skipped": skipped, "zones": len(zones), "ungeocoded": ungeocoded}
 
 
 # ---------------------------------------------------------------------------
@@ -11912,6 +12382,7 @@ def ensure_tms_lean_site_fields():
 	- Delivery Trip.custom_locked
 	- Delivery Stop / SO payment-split fields
 	- Delivery Stop late-penalty fields
+	- Every other TMS patch field (``_TMS_SCHEMA_PATCHES``)
 	"""
 	_ensure_tms_depot_fields()
 	_ensure_customer_delivery_warehouse_field()
@@ -11919,8 +12390,10 @@ def ensure_tms_lean_site_fields():
 	_ensure_trip_locked_field()
 	_ensure_delivery_payment_split_fields()
 	_ensure_late_penalty_fields()
+	created = _ensure_tms_schema(force=True)
 	return {
 		"ok": True,
+		"created": created,
 		"fields": [
 			"Company.custom_default_warehouse",
 			"Delivery Trip.custom_pickup_warehouse",
@@ -11929,6 +12402,7 @@ def ensure_tms_lean_site_fields():
 			"Delivery Trip.custom_locked",
 			"Delivery Stop payment-split + Sales Order surcharge fields",
 			"Delivery Stop late-penalty fields",
+			"All TMS patch fields (outcome, PoD, payment, tracking, zone)",
 		],
 	}
 
