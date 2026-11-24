@@ -2537,12 +2537,45 @@ def suite_5_11_pos_session():
                 guest_notes="partial armado",
             )
             so_name = out.get("preorder_name") or out.get("name")
+            from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
+
+            # Consulta sheet must already allow weight edits (no promote-to-Orden first).
+            sheet_consulta = oka.get_armado_order(so_name)
+            od_consulta = sheet_consulta.get("order") or {}
+            assert not cint(od_consulta.get("armado_readonly")), (
+                f"expected writable on Consulta, got readonly={od_consulta.get('armado_readonly')} "
+                f"disp={od_consulta.get('display_status')}"
+            )
+            rows_c = od_consulta.get("items") or []
+            assert rows_c, sheet_consulta
+            oka.update_armado_items(
+                preorder_name=so_name,
+                items=[
+                    {
+                        "item_code": rows_c[0]["item_code"],
+                        "qty": rows_c[0].get("qty") or 1,
+                        "rate": rows_c[0].get("rate") or 10,
+                        "total_weight": 0.55,
+                    }
+                ]
+                + [
+                    {
+                        "item_code": r["item_code"],
+                        "qty": r.get("qty") or 1,
+                        "rate": r.get("rate") or 10,
+                    }
+                    for r in rows_c[1:]
+                ],
+            )
+            so_c = frappe.get_doc("Sales Order", so_name)
+            assert _display_status(so_c) == "Consulta", _display_status(so_c)
+            tw_c = flt(getattr(so_c.items[0], "total_weight", 0) or 0)
+            assert abs(tw_c - 0.55) < 0.001, f"expected Consulta total_weight 0.55, got {tw_c}"
             api.set_guest_preorder_status(so_name, "Orden")
             sheet = oka.get_armado_order(so_name)
             rows = (sheet.get("order") or {}).get("items") or []
             assert rows and rows[0].get("line_key"), sheet
             assert isinstance(rows[0].get("barcodes"), list), rows[0]
-            from erpnext.erpnext_integrations.ecommerce_api.api import _display_status
 
             try:
                 oka.update_armado_items(

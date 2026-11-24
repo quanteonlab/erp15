@@ -10071,10 +10071,13 @@ def _mat_trailing_int(name: str):
 
 
 @frappe.whitelist(allow_guest=True)
-def list_available_mats(search=None, limit=50, include_completed=0):
-	"""Searchable Delivery Trips (MAT-DT-…) for Pedidos assignment.
+def list_available_mats(search=None, limit=50, include_completed=0, date=None):
+	"""Searchable Delivery Trips (MAT-DT-…) for Pedidos assignment / reassign.
 
-	Returns open MAT plans (Draft / Scheduled / In Transit) with driver + vehicle.
+	Returns open MAT plans (Draft / Scheduled / In Transit) with driver + vehicle
+	+ stop_count. Optional ``date`` (YYYY-MM-DD) filters departure day so the
+	AssignMatModal MAT browser can show relevant same-day trips first.
+
 	Search matches trip name, trailing trip number (``001`` → ``…-00001``),
 	driver, vehicle id, and license plate.
 	"""
@@ -10083,6 +10086,15 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 	if q.lower() in ("null", "undefined", "none"):
 		q = ""
 	digit_q = q.isdigit()
+	day = None
+	day_raw = cstr(date or "").strip()
+	if day_raw and day_raw.lower() not in ("null", "undefined", "none", "all"):
+		try:
+			from frappe.utils import getdate
+
+			day = getdate(day_raw)
+		except Exception:
+			day = None
 	# Available = Draft/Scheduled. Any typed search also surfaces In Transit.
 	if cint(include_completed):
 		statuses = ["Draft", "Scheduled", "In Transit", "Completed"]
@@ -10091,6 +10103,8 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 	else:
 		statuses = ["Draft", "Scheduled"]
 	filters = {"docstatus": ["!=", 2], "status": ["in", statuses]}
+	if day:
+		filters["departure_time"] = ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]]
 
 	# Resolve vehicles whose plate/name match so short codes like "001" find the MAT.
 	plate_hit_vehicles: list[str] = []
@@ -10203,8 +10217,24 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 		ranked.append((score, r, plate))
 	ranked.sort(key=lambda x: (-x[0], cstr(getattr(x[1], "modified", "") or "")))
 
+	picked = ranked[:limit]
+	trip_names = [r.name for _score, r, _plate in picked]
+	stop_counts = {}
+	if trip_names:
+		for row in frappe.db.sql(
+			"""
+			select parent, count(*) as n
+			from `tabDelivery Stop`
+			where parent in %(parents)s
+			group by parent
+			""",
+			{"parents": trip_names},
+			as_dict=True,
+		):
+			stop_counts[row.parent] = cint(row.n)
+
 	out = []
-	for _score, r, plate in ranked[:limit]:
+	for _score, r, plate in picked:
 		out.append(
 			{
 				"name": r.name,
@@ -10217,6 +10247,7 @@ def list_available_mats(search=None, limit=50, include_completed=0):
 				"warehouse": getattr(r, "custom_pickup_warehouse", None),
 				"departure_time": str(r.departure_time) if r.departure_time else None,
 				"company": r.company,
+				"stop_count": stop_counts.get(r.name, 0),
 			}
 		)
 	return {"rows": out, "total": len(out)}

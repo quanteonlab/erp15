@@ -576,6 +576,195 @@ def _active_trip_names(exclude_trip=None):
 	return frappe.get_all("Delivery Trip", filters=filters, pluck="name", ignore_permissions=True)
 
 
+def _usable_day_trips(rows):
+	"""Filter + rank Draft → Scheduled → In Transit for driver/vehicle day reuse."""
+	usable = []
+	for r in rows or []:
+		st = cstr(r.get("status") or "").strip()
+		if cint(r.get("docstatus")) == 2 or st in ("Cancelled", "Completed"):
+			continue
+		usable.append(r)
+	rank = {"": 0, "Draft": 0, "Scheduled": 1, "In Transit": 2}
+	usable.sort(
+		key=lambda r: (
+			rank.get(cstr(r.get("status") or "").strip(), 9),
+			cstr(r.get("creation") or ""),
+			cstr(r.get("name") or ""),
+		)
+	)
+	return usable
+
+
+def _index_customer_mats_on_day(day, customers=None):
+	"""Map customer → first active MAT that already has a stop for them that day.
+
+	Used to keep the same client on one driver/MAT (avoid multi-driver splits).
+	"""
+	day = getdate(day)
+	cust_filter = None
+	if customers is not None:
+		raw = customers
+		if isinstance(raw, str):
+			try:
+				raw = frappe.parse_json(raw)
+			except Exception:
+				raw = [raw]
+		if not isinstance(raw, (list, tuple)):
+			raw = [raw] if raw else []
+		cust_filter = {
+			cstr(c).strip()
+			for c in raw
+			if cstr(c).strip() and cstr(c).strip().lower() not in ("null", "undefined", "none")
+		}
+		if not cust_filter:
+			return {}
+
+	trips = frappe.get_all(
+		"Delivery Trip",
+		filters={
+			"docstatus": ["in", [0, 1]],
+			"departure_time": ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]],
+		},
+		fields=["name", "driver", "driver_name", "vehicle", "status", "docstatus", "creation"],
+		order_by="creation asc",
+		ignore_permissions=True,
+	)
+	usable = _usable_day_trips(trips) if trips else []
+	if not usable:
+		return {}
+	trip_by_name = {t.name: t for t in usable}
+	trip_names = list(trip_by_name.keys())
+	stop_filters = {"parent": ["in", trip_names], "parenttype": "Delivery Trip"}
+	if cust_filter:
+		stop_filters["customer"] = ["in", list(cust_filter)]
+	stops = frappe.get_all(
+		"Delivery Stop",
+		filters=stop_filters,
+		fields=["parent", "customer", "customer_address", "delivery_note", "idx"],
+		order_by="idx asc",
+		ignore_permissions=True,
+	)
+	index = {}
+	for s in stops or []:
+		cust = cstr(s.get("customer") or "").strip()
+		if not cust or cust in index:
+			continue
+		trip = trip_by_name.get(s.parent)
+		if not trip:
+			continue
+		index[cust] = {
+			"customer": cust,
+			"trip": trip.name,
+			"driver": cstr(trip.driver or "").strip() or None,
+			"driver_name": cstr(trip.driver_name or "").strip() or None,
+			"vehicle": cstr(trip.vehicle or "").strip() or None,
+			"status": cstr(trip.status or "").strip() or None,
+			"delivery_note": cstr(s.get("delivery_note") or "").strip() or None,
+		}
+	return index
+
+
+def _dns_customers_map(delivery_note_names):
+	"""DN name → customer for colocation checks."""
+	names = [cstr(n).strip() for n in (delivery_note_names or []) if cstr(n).strip()]
+	if not names:
+		return {}
+	rows = frappe.get_all(
+		"Delivery Note",
+		filters={"name": ["in", names]},
+		fields=["name", "customer", "customer_name"],
+		ignore_permissions=True,
+	)
+	return {
+		cstr(r.name): {
+			"customer": cstr(r.customer or "").strip() or None,
+			"customer_name": cstr(r.customer_name or "").strip() or None,
+		}
+		for r in (rows or [])
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_customer_day_mats(date=None, customers=None):
+	"""Which customers already sit on a MAT that calendar day (multi-driver guard).
+
+	Returns ``{date, rows:[{customer, trip, driver, driver_name, vehicle, ...}]}``.
+	Dirty date → empty list (controlled), never TypeError.
+	"""
+	raw = cstr(date or "").strip()
+	if not raw or raw.lower() in ("null", "undefined", "none"):
+		return {"date": None, "rows": []}
+	try:
+		day = getdate(raw)
+	except Exception:
+		return {"date": None, "rows": []}
+	index = _index_customer_mats_on_day(day, customers=customers)
+	rows = list(index.values())
+	rows.sort(key=lambda r: (cstr(r.get("customer") or ""), cstr(r.get("trip") or "")))
+	return {"date": str(day), "rows": rows}
+
+
+def _plan_customer_colocation(delivery_note_names, day, requested_driver=None, requested_vehicle=None):
+	"""Bucket DNs so the same customer stays on one MAT/driver that day.
+
+	When a customer already has a stop on another reusable MAT, those DNs are
+	redirected there (default). Returns buckets + alert events for the UI.
+	"""
+	dns = [cstr(n).strip() for n in (delivery_note_names or []) if cstr(n).strip()]
+	req_drv = cstr(requested_driver or "").strip()
+	req_veh = cstr(requested_vehicle or "").strip()
+	empty = {
+		"buckets": [{"driver": req_drv or None, "vehicle": req_veh or None, "dns": dns}],
+		"events": [],
+		"redirected": False,
+	}
+	if not dns:
+		return empty
+
+	dn_meta = _dns_customers_map(dns)
+	index = _index_customer_mats_on_day(day)
+	buckets_map = {}
+	order = []
+	events = []
+
+	for dn in dns:
+		meta = dn_meta.get(dn) or {}
+		cust = cstr(meta.get("customer") or "").strip()
+		hit = index.get(cust) if cust else None
+		hit_drv = cstr((hit or {}).get("driver") or "").strip()
+		hit_veh = cstr((hit or {}).get("vehicle") or "").strip()
+		hit_trip = cstr((hit or {}).get("trip") or "").strip()
+		# Redirect only when an existing MAT for this customer is a *different* driver.
+		if hit_trip and hit_drv and req_drv and hit_drv != req_drv:
+			key = ("trip", hit_trip, hit_drv, hit_veh)
+			events.append(
+				{
+					"delivery_note": dn,
+					"customer": cust or None,
+					"customer_name": meta.get("customer_name"),
+					"from_driver": req_drv,
+					"to_driver": hit_drv,
+					"to_driver_name": (hit or {}).get("driver_name"),
+					"to_trip": hit_trip,
+					"to_vehicle": hit_veh or None,
+				}
+			)
+			drv, veh = hit_drv, hit_veh or req_veh
+		else:
+			key = ("fleet", req_drv, req_veh)
+			drv, veh = req_drv, req_veh
+		if key not in buckets_map:
+			buckets_map[key] = {"driver": drv or None, "vehicle": veh or None, "dns": []}
+			order.append(key)
+		buckets_map[key]["dns"].append(dn)
+
+	return {
+		"buckets": [buckets_map[k] for k in order],
+		"events": events,
+		"redirected": bool(events),
+	}
+
+
 def _find_reusable_driver_day_trips(driver, day):
 	"""Active MAT for this driver on ``day`` — Draft first, then Scheduled / In Transit.
 
@@ -597,21 +786,50 @@ def _find_reusable_driver_day_trips(driver, day):
 		order_by="creation asc",
 		ignore_permissions=True,
 	)
-	usable = []
-	for r in rows:
-		st = cstr(r.get("status") or "").strip()
-		if cint(r.get("docstatus")) == 2 or st in ("Cancelled", "Completed"):
-			continue
-		usable.append(r)
-	rank = {"": 0, "Draft": 0, "Scheduled": 1, "In Transit": 2}
-	usable.sort(
-		key=lambda r: (
-			rank.get(cstr(r.get("status") or "").strip(), 9),
-			cstr(r.get("creation") or ""),
-			cstr(r.get("name") or ""),
-		)
+	return _usable_day_trips(rows)
+
+
+def _find_reusable_vehicle_day_trips(vehicle, day):
+	"""Active MAT for this vehicle/plate on ``day`` when driver is unknown."""
+	veh = _fleet_resolve_vehicle_name(vehicle) or cstr(vehicle or "").strip()
+	if not veh or veh.lower() in ("null", "undefined", "none", "—", "-"):
+		return []
+	day = getdate(day)
+	rows = frappe.get_all(
+		"Delivery Trip",
+		filters={
+			"vehicle": veh,
+			"docstatus": ["in", [0, 1]],
+			"departure_time": ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]],
+		},
+		fields=["name", "docstatus", "status", "creation", "driver"],
+		order_by="creation asc",
+		ignore_permissions=True,
 	)
-	return usable
+	return _usable_day_trips(rows)
+
+
+def _resolve_driver_from_vehicle(vehicle):
+	"""Primary Driver linked to a Vehicle (fleet member / Vehicle.employee)."""
+	veh = _fleet_resolve_vehicle_name(vehicle) or cstr(vehicle or "").strip()
+	if not veh or veh.lower() in ("null", "undefined", "none", "—", "-"):
+		return None
+	try:
+		members = _fleet_members_blob(veh)
+	except Exception:
+		members = []
+	for m in members or []:
+		if cint(m.get("primary")) and m.get("driver"):
+			return m["driver"]
+	for m in members or []:
+		if m.get("driver"):
+			return m["driver"]
+	emp = None
+	if frappe.db.has_column("Vehicle", "employee"):
+		emp = frappe.db.get_value("Vehicle", veh, "employee")
+	if not emp:
+		return None
+	return frappe.db.get_value("Driver", {"employee": emp}, "name")
 
 
 def _append_stops_to_trip_doc(trip, delivery_note_names):
@@ -3656,6 +3874,41 @@ def _materialize_dns_for_preorders(preorder_names):
 	return dns
 
 
+def _split_so_names_from_dns(delivery_note_names):
+	"""Peel Sales Order names mistakenly sent as delivery_note_names (AssignMat UI).
+
+	Returns ``(real_dns, so_names)``. Names that exist as DN stay; names that exist
+	only as Sales Order (or SO-looking with no DN) move to so_names for materialize.
+	"""
+	raw = delivery_note_names or []
+	if isinstance(raw, str):
+		try:
+			raw = frappe.parse_json(raw)
+		except Exception:
+			raw = [raw] if cstr(raw).strip() else []
+	if not isinstance(raw, (list, tuple)):
+		raw = [raw] if raw else []
+	dns, sos = [], []
+	for item in raw:
+		name = cstr(item or "").strip()
+		if not name or name.lower() in ("null", "undefined", "none"):
+			continue
+		if frappe.db.exists("Delivery Note", name):
+			dns.append(name)
+			continue
+		if frappe.db.exists("Sales Order", name):
+			sos.append(name)
+			continue
+		# AssignMat / Pedidos often send SAL-ORD-… in the DN list — coerce to SO path
+		# so materialize raises "Sales Order not found" instead of "Delivery Note(s) not found".
+		upper = name.upper()
+		if upper.startswith("SAL-ORD-") or upper.startswith("SO-"):
+			sos.append(name)
+			continue
+		dns.append(name)
+	return dns, sos
+
+
 @frappe.whitelist(allow_guest=True)
 @idempotent_request
 def create_trip(
@@ -3666,17 +3919,34 @@ def create_trip(
 	company=None,
 	pickup_warehouse=None,
 	preorder_names=None,
+	colocate_same_customer=None,
+	force_split=None,
 ):
-	delivery_note_names = frappe.parse_json(delivery_note_names) if isinstance(delivery_note_names, str) else (delivery_note_names or [])
-	if preorder_names:
+	delivery_note_names, so_from_dns = _split_so_names_from_dns(delivery_note_names)
+	pre_list = preorder_names or []
+	if isinstance(pre_list, str):
+		try:
+			pre_list = frappe.parse_json(pre_list)
+		except Exception:
+			pre_list = [pre_list] if cstr(pre_list).strip() else []
+	if not isinstance(pre_list, (list, tuple)):
+		pre_list = [pre_list] if pre_list else []
+	pre_list = list(dict.fromkeys([*(pre_list or []), *so_from_dns]))
+	if pre_list:
 		delivery_note_names = list(
-			dict.fromkeys([*(delivery_note_names or []), *_materialize_dns_for_preorders(preorder_names)])
+			dict.fromkeys([*(delivery_note_names or []), *_materialize_dns_for_preorders(pre_list)])
 		)
 	if not delivery_note_names:
 		frappe.throw(_("Select at least one order to plan a route."))
 
 	company = company or frappe.defaults.get_user_default("Company")
+	day = getdate(date)
 
+	# Resolve plate → Vehicle early so we can derive driver and reuse day MAT.
+	vehicle = _resolve_default_vehicle(driver, vehicle)
+
+	if not driver:
+		driver = _resolve_driver_from_vehicle(vehicle)
 	if not driver:
 		active_drivers = frappe.get_all(
 			"Driver", filters={"status": "Active"}, fields=["name", "full_name", "address"], ignore_permissions=True
@@ -3684,59 +3954,101 @@ def create_trip(
 		if len(active_drivers) == 1:
 			driver = active_drivers[0].name
 
-	day = getdate(date)
+	# Same client → same MAT/driver that day (default). FE can force_split=1 to override.
+	do_colocate = True if colocate_same_customer is None else _truthy_flag(
+		colocate_same_customer, default=True
+	)
+	do_force_split = _truthy_flag(force_split, default=False)
+	if do_colocate and not do_force_split:
+		plan = _plan_customer_colocation(delivery_note_names, day, driver, vehicle)
+		if plan.get("redirected") or len(plan.get("buckets") or []) > 1:
+			results = []
+			for bucket in plan["buckets"]:
+				sub = create_trip(
+					date=date,
+					driver=bucket.get("driver") or driver,
+					vehicle=bucket.get("vehicle") or vehicle,
+					delivery_note_names=bucket.get("dns") or [],
+					company=company,
+					pickup_warehouse=pickup_warehouse,
+					preorder_names=None,
+					colocate_same_customer=0,
+					force_split=1,
+				)
+				results.append(sub)
+			primary = dict(results[0] or {})
+			primary["colocated"] = plan.get("events") or []
+			primary["split_prevented"] = 1 if plan.get("events") else 0
+			primary["trips"] = [cstr(r.get("trip") or "") for r in results if r.get("trip")]
+			primary["stop_count"] = sum(cint(r.get("stop_count") or 0) for r in results)
+			primary["added"] = sum(cint(r.get("added") or 0) for r in results)
+			return primary
 
-	# Reuse today's Draft / Scheduled / In Transit MAT for this driver — new
-	# packages sync onto the existing plan instead of spawning a second trip.
+	# Date+plate Confirm / Pedidos reassign: steal from other Draft unlocked MATs
+	# (same as publish_fleet_mat). If no matching day MAT exists, create one below.
+	existing = []
 	if driver:
 		existing = _find_reusable_driver_day_trips(driver, day)
-		if existing:
-			primary = existing[0].name
-			frappe.flags.ignore_permissions = True
-			trip = frappe.get_doc("Delivery Trip", primary)
-			frappe.flags.ignore_permissions = False
-			already = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
-			to_add = [n for n in delivery_note_names if n not in already]
-			added = 0
-			if to_add:
-				_assert_trip_unlocked(trip, _("adding stops"))
-				conflicts = [n for n in to_add if n in _assigned_delivery_note_names()]
-				if conflicts:
-					frappe.throw(_assignment_conflict_message(conflicts))
-				added = _append_stops_to_trip_doc(trip, to_add)
-			# Collapse newer duplicate drafts for the same driver/day (empty or subset).
-			for extra in existing[1:]:
-				if cint(extra.get("docstatus")) != 0:
-					continue
-				try:
-					frappe.flags.ignore_permissions = True
-					extra_doc = frappe.get_doc("Delivery Trip", extra.name)
-					frappe.flags.ignore_permissions = False
-					extra_dns = {s.delivery_note for s in extra_doc.delivery_stops if s.delivery_note}
-					if not extra_dns or extra_dns.issubset(already | set(delivery_note_names)):
-						frappe.delete_doc("Delivery Trip", extra.name, ignore_permissions=True, force=True)
-						frappe.db.commit()
-				except Exception:
-					frappe.log_error(frappe.get_traceback(), "create_trip collapse draft")
-			if added or cint(trip.docstatus) == 0:
-				try:
-					optimize_trip(primary)
-				except Exception:
-					frappe.log_error(frappe.get_traceback(), "create_trip auto optimize_trip")
-			frappe.flags.ignore_permissions = True
-			trip = frappe.get_doc("Delivery Trip", primary)
-			frappe.flags.ignore_permissions = False
-			return {
-				"trip": trip.name,
-				"status": trip.status,
-				"stop_count": len(trip.delivery_stops),
-				"added": added,
-				"reused": 1,
-			}
+	if not existing and vehicle:
+		existing = _find_reusable_vehicle_day_trips(vehicle, day)
+		if existing and not driver:
+			driver = cstr(existing[0].get("driver") or "").strip() or driver
 
-	conflicts = [n for n in delivery_note_names if n in _assigned_delivery_note_names()]
-	if conflicts:
-		frappe.throw(_assignment_conflict_message(conflicts))
+	keep = [t.name for t in existing]
+	movable = {
+		dn
+		for dns in _release_dns_from_other_draft_trips(delivery_note_names, keep, dry_run=True).values()
+		for dn in dns
+	}
+	on_keep = _assigned_delivery_note_names(keep) if keep else set()
+	assigned = _assigned_delivery_note_names()
+	hard = [dn for dn in delivery_note_names if dn in assigned and dn not in movable and dn not in on_keep]
+	if hard:
+		frappe.throw(_assignment_conflict_message(hard))
+	_release_dns_from_other_draft_trips(delivery_note_names, keep_trips=keep)
+
+	# Reuse today's Draft / Scheduled / In Transit MAT for this driver/vehicle —
+	# new packages sync onto the existing plan instead of spawning a second trip.
+	if existing:
+		primary = existing[0].name
+		frappe.flags.ignore_permissions = True
+		trip = frappe.get_doc("Delivery Trip", primary)
+		frappe.flags.ignore_permissions = False
+		already = {s.delivery_note for s in trip.delivery_stops if s.delivery_note}
+		to_add = [n for n in delivery_note_names if n not in already]
+		added = 0
+		if to_add:
+			_assert_trip_unlocked(trip, _("adding stops"))
+			added = _append_stops_to_trip_doc(trip, to_add)
+		# Collapse newer duplicate drafts for the same driver/day (empty or subset).
+		for extra in existing[1:]:
+			if cint(extra.get("docstatus")) != 0:
+				continue
+			try:
+				frappe.flags.ignore_permissions = True
+				extra_doc = frappe.get_doc("Delivery Trip", extra.name)
+				frappe.flags.ignore_permissions = False
+				extra_dns = {s.delivery_note for s in extra_doc.delivery_stops if s.delivery_note}
+				if not extra_dns or extra_dns.issubset(already | set(delivery_note_names)):
+					frappe.delete_doc("Delivery Trip", extra.name, ignore_permissions=True, force=True)
+					frappe.db.commit()
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "create_trip collapse draft")
+		if added or cint(trip.docstatus) == 0:
+			try:
+				optimize_trip(primary)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "create_trip auto optimize_trip")
+		frappe.flags.ignore_permissions = True
+		trip = frappe.get_doc("Delivery Trip", primary)
+		frappe.flags.ignore_permissions = False
+		return {
+			"trip": trip.name,
+			"status": trip.status,
+			"stop_count": len(trip.delivery_stops),
+			"added": added,
+			"reused": 1,
+		}
 
 	driver_doc = None
 	if driver:
@@ -3750,8 +4062,6 @@ def create_trip(
 			pickup_warehouse = derived
 
 	driver_address, resolved_warehouse = _resolve_pickup_address(company, driver_doc, pickup_warehouse)
-
-	vehicle = _resolve_default_vehicle(driver, vehicle)
 
 	trip = frappe.get_doc(
 		{
@@ -9387,6 +9697,7 @@ def _load_active_trip_capacity_stops(as_of, horizon_days, drivers):
 		out.append(
 			{
 				"delivery_note": s.delivery_note,
+				"customer": cstr(s.customer or "").strip() or None,
 				"address_name": s.address,
 				"lat": flt(s.lat) if s.lat else None,
 				"lng": flt(s.lng) if s.lng else None,
@@ -9462,6 +9773,14 @@ def _pack_remitos_core(
 		seed(r)
 	for r in fixed or []:
 		seed(r)
+
+	# Same customer → same driver that day (multi-driver guard for greedy auto).
+	customer_driver_by_day = {}
+	for (day_str, drv), stops in buckets.items():
+		for s in stops or []:
+			cust = cstr(s.get("customer") or "").strip()
+			if cust and (day_str, cust) not in customer_driver_by_day:
+				customer_driver_by_day[(day_str, cust)] = drv
 
 	# Soft-lock movable that stay put (Q10)
 	locked = []
@@ -9553,6 +9872,8 @@ def _pack_remitos_core(
 
 		for day_str in ordered_days:
 			pref = r.get("preferred_driver")
+			cust = cstr(r.get("customer") or "").strip()
+			same_cust_drv = customer_driver_by_day.get((day_str, cust)) if cust else None
 			cands = _drivers_nearby_for_stop(
 				r, drivers, driver_centroids, preferred=pref, max_km=nearby_km
 			)
@@ -9560,9 +9881,14 @@ def _pack_remitos_core(
 			if not cands:
 				cands = [d for d in drivers if d != "__unassigned__"] or ["__unassigned__"]
 
-			# Q7: prefer zone.driver exclusively first — only use others if pref cannot fit this day
+			# Same client already on this day → keep them on that driver when it still fits.
 			day_cands = []
-			if pref and pref in drivers:
+			if same_cust_drv and same_cust_drv in drivers:
+				ok_sc, cnt_sc, mins_sc = try_fit(r, day_str, same_cust_drv)
+				if ok_sc:
+					day_cands = [(cnt_sc, mins_sc, same_cust_drv)]
+			# Q7: prefer zone.driver exclusively first — only use others if pref cannot fit this day
+			if not day_cands and pref and pref in drivers:
 				ok_p, cnt_p, mins_p = try_fit(r, day_str, pref)
 				if ok_p:
 					day_cands = [(cnt_p, mins_p, pref)]
@@ -9573,7 +9899,7 @@ def _pack_remitos_core(
 						ok, cnt, mins = try_fit(r, day_str, drv)
 						if ok:
 							day_cands.append((cnt, mins, drv))
-			else:
+			elif not day_cands:
 				for drv in cands:
 					ok, cnt, mins = try_fit(r, day_str, drv)
 					if ok:
@@ -9585,6 +9911,8 @@ def _pack_remitos_core(
 			cnt, mins, drv = day_cands[0]
 			# Sticky day wins immediately
 			buckets.setdefault((day_str, drv), []).append(r)
+			if cust and (day_str, cust) not in customer_driver_by_day:
+				customer_driver_by_day[(day_str, cust)] = drv
 			unassigned = drv == "__unassigned__" or not drv
 			assignments.append(
 				{
@@ -9602,6 +9930,7 @@ def _pack_remitos_core(
 					"estimated_day_orders": cnt,
 					"estimated_day_minutes": round(mins, 1),
 					"limiting": _limiting_resource(cnt, max_orders, mins, max_minutes),
+					"colocated_customer": bool(same_cust_drv and drv == same_cust_drv),
 				}
 			)
 			placed = True
@@ -12457,6 +12786,254 @@ def _append_so_payment_note(so_name: str, text: str):
 		frappe.log_error(frappe.get_traceback(), "delivery payment SO comment")
 
 
+def _list_open_return_invoices(customer, limit=40):
+	"""FIFO open credit notes (return SI with negative outstanding) for a customer."""
+	customer = cstr(customer or "").strip()
+	if not customer:
+		return []
+	rows = frappe.get_all(
+		"Sales Invoice",
+		filters={
+			"customer": customer,
+			"docstatus": 1,
+			"is_return": 1,
+			"outstanding_amount": ["<", -0.005],
+		},
+		fields=["name", "outstanding_amount", "grand_total", "posting_date", "company", "currency"],
+		order_by="posting_date asc, creation asc",
+		limit_page_length=cint(limit) or 40,
+		ignore_permissions=True,
+	)
+	return rows or []
+
+
+def _apply_open_credit_notes_to_delivery(
+	customer,
+	max_amount,
+	*,
+	company=None,
+	so_names=None,
+	remarks=None,
+):
+	"""Auto-apply open NCs FIFO up to ``max_amount`` and close the applied portion.
+
+	Professional settlement (ERPNext-native): zero-cash Receive PE that allocates
+	+take to Sales Order and −take to each Credit Note. Leftover NC stays open.
+	Returns ``{"applied": float, "rows": [{"name", "amount", "payment_entry"}]}``.
+	"""
+	out = {"applied": 0.0, "rows": []}
+	customer = cstr(customer or "").strip()
+	max_amount = flt(max_amount)
+	if not customer or max_amount <= 0.005:
+		return out
+
+	so_names = [cstr(n).strip() for n in (so_names or []) if cstr(n).strip()]
+	so_names = [n for n in so_names if frappe.db.exists("Sales Order", n)]
+
+	company = cstr(company or "").strip()
+	if not company and so_names:
+		company = cstr(frappe.db.get_value("Sales Order", so_names[0], "company") or "")
+	if not company:
+		company = cstr(
+			frappe.defaults.get_user_default("Company")
+			or frappe.db.get_single_value("Global Defaults", "default_company")
+			or ""
+		)
+	if not company:
+		return out
+
+	from erpnext.erpnext_integrations.ecommerce_api.api import _resolve_preorder_payment_accounts
+
+	try:
+		receivable_account, cash_account, _mop = _resolve_preorder_payment_accounts(
+			company, "Cash", customer
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "TMS NC apply accounts")
+		receivable_account, cash_account = None, None
+	if not receivable_account or not cash_account:
+		return out
+
+	currency = None
+	if so_names:
+		currency = frappe.db.get_value("Sales Order", so_names[0], "currency")
+	remaining = max_amount
+	note = cstr(remarks or "").strip() or _("NC aplicada en entrega {0}").format(nowdate())
+
+	for cn in _list_open_return_invoices(customer):
+		if remaining <= 0.005:
+			break
+		avail = abs(flt(cn.outstanding_amount))
+		if avail <= 0.005:
+			continue
+
+		# Prefer SO still owing so +take / −take PE nets to zero cash.
+		so_name = None
+		so_outstanding = 0.0
+		so_total = 0.0
+		for candidate in so_names:
+			row = frappe.db.get_value(
+				"Sales Order",
+				candidate,
+				["name", "grand_total", "advance_paid", "currency"],
+				as_dict=True,
+			)
+			if not row:
+				continue
+			outst = max(0.0, flt(row.grand_total) - flt(row.advance_paid))
+			if outst > 0.005:
+				so_name = row.name
+				so_outstanding = outst
+				so_total = flt(row.grand_total)
+				currency = currency or row.currency
+				break
+
+		take = min(remaining, avail)
+		if so_name:
+			take = min(take, so_outstanding)
+		# Remito/stop due can still absorb NC when SO is fully advanced or DN-only.
+		if take <= 0.005:
+			take = min(remaining, avail)
+			so_name = None
+			so_outstanding = 0.0
+		if take <= 0.005:
+			break
+
+		applied_ok = False
+		pe_name = None
+		je_name = None
+		if so_name:
+			try:
+				pe = frappe.new_doc("Payment Entry")
+				pe.payment_type = "Receive"
+				pe.company = company
+				pe.party_type = "Customer"
+				pe.party = customer
+				pe.mode_of_payment = "Cash"
+				pe.paid_from = receivable_account
+				pe.paid_to = cash_account
+				if currency:
+					pe.paid_from_account_currency = currency
+					pe.paid_to_account_currency = currency
+				pe.paid_amount = 0
+				pe.received_amount = 0
+				pe.reference_date = nowdate()
+				pe.reference_no = f"TMS-NC-{cn.name}"
+				pe.remarks = note
+				pe.append(
+					"references",
+					{
+						"reference_doctype": "Sales Order",
+						"reference_name": so_name,
+						"total_amount": so_total,
+						"outstanding_amount": so_outstanding,
+						"allocated_amount": take,
+					},
+				)
+				pe.append(
+					"references",
+					{
+						"reference_doctype": "Sales Invoice",
+						"reference_name": cn.name,
+						"total_amount": flt(cn.grand_total),
+						"outstanding_amount": flt(cn.outstanding_amount),
+						"allocated_amount": -take,
+					},
+				)
+				pe.insert(ignore_permissions=True)
+				pe.submit()
+				pe_name = pe.name
+				applied_ok = True
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "TMS apply open credit note PE")
+
+		if not applied_ok:
+			# JE: debit Debtors against CN (closes credit) + credit Debtors unallocated
+			# (net party AR unchanged). Stop amount_due still drops by ``take``.
+			try:
+				import erpnext
+
+				cc = erpnext.get_default_cost_center(company)
+				je = frappe.new_doc("Journal Entry")
+				je.voucher_type = "Journal Entry"
+				je.company = company
+				je.posting_date = nowdate()
+				je.user_remark = note
+				je.append(
+					"accounts",
+					{
+						"account": receivable_account,
+						"party_type": "Customer",
+						"party": customer,
+						"debit_in_account_currency": take,
+						"debit": take,
+						"reference_type": "Sales Invoice",
+						"reference_name": cn.name,
+						"cost_center": cc,
+					},
+				)
+				je.append(
+					"accounts",
+					{
+						"account": receivable_account,
+						"party_type": "Customer",
+						"party": customer,
+						"credit_in_account_currency": take,
+						"credit": take,
+						"cost_center": cc,
+					},
+				)
+				je.insert(ignore_permissions=True)
+				je.submit()
+				je_name = je.name
+				applied_ok = True
+				# Best-effort SO advance when PE path unavailable (DN-only / PE failed).
+				left = take
+				for candidate in so_names:
+					if left <= 0.005:
+						break
+					row = frappe.db.get_value(
+						"Sales Order",
+						candidate,
+						["name", "grand_total", "advance_paid"],
+						as_dict=True,
+					)
+					if not row:
+						continue
+					room = max(0.0, flt(row.grand_total) - flt(row.advance_paid))
+					alloc = min(left, room) if room > 0.005 else 0.0
+					if alloc <= 0.005:
+						continue
+					frappe.db.set_value(
+						"Sales Order",
+						row.name,
+						"advance_paid",
+						flt(row.advance_paid) + alloc,
+						update_modified=True,
+					)
+					left -= alloc
+					so_name = so_name or row.name
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "TMS apply open credit note JE")
+				continue
+
+		if not applied_ok:
+			continue
+		out["rows"].append(
+			{
+				"name": cn.name,
+				"amount": take,
+				"payment_entry": pe_name,
+				"journal_entry": je_name,
+				"sales_order": so_name,
+			}
+		)
+		out["applied"] = flt(out["applied"]) + take
+		remaining -= take
+
+	return out
+
+
 def _record_so_receive_payment(so_name: str, paid_amount, mode_of_payment=None) -> str | None:
 	"""Create a Receive Payment Entry allocated to the Sales Order. Returns PE name."""
 	paid_amount = flt(paid_amount)
@@ -13024,6 +13601,8 @@ def _record_stop_outcome_impl(
 	# Payment: only relevant once something changed hands (Delivered/Partial).
 	# "separate_collector" mode means someone else collects later, so the
 	# driver isn't asked for these fields at all - ignore anything sent.
+	credit_applied = 0.0
+	nc_apply = {"applied": 0.0, "rows": []}
 	claim_rows = _normalize_delivery_claims(claims)
 	if claim_rows:
 		missing = [c for c in claim_rows if not c.get("note") or c.get("new_amount") is None]
@@ -13068,7 +13647,27 @@ def _record_stop_outcome_impl(
 			goods_total=goods_total,
 			settings=settings,
 		)
-		amount_due = goods_total + flt(surch_amt)
+		gross_due = goods_total + flt(surch_amt)
+		# Auto-apply open NCs FIFO against this delivery only; close applied portion.
+		# Prior pend.cobrar is never pulled into amount_due — unpaid current → new debe.
+		dn_for_so = cstr(getattr(stop, "delivery_note", None) or "").strip()
+		so_for_nc = _sales_orders_for_dn(dn_for_so) if dn_for_so else []
+		company_for_nc = None
+		if so_for_nc:
+			company_for_nc = frappe.db.get_value("Sales Order", so_for_nc[0], "company")
+		if not company_for_nc:
+			company_for_nc = getattr(trip, "company", None)
+		nc_apply = _apply_open_credit_notes_to_delivery(
+			getattr(stop, "customer", None),
+			gross_due,
+			company=company_for_nc,
+			so_names=so_for_nc,
+			remarks=_("NC aplicada en entrega {0} / {1}").format(
+				cstr(getattr(trip, "name", None) or ""), cint(stop_idx)
+			),
+		)
+		credit_applied = flt(nc_apply.get("applied") or 0)
+		amount_due = max(0.0, gross_due - credit_applied)
 		summary = _write_stop_payment_snapshot(
 			stop,
 			payments=pay_rows,
@@ -13078,6 +13677,14 @@ def _record_stop_outcome_impl(
 			surcharge_amount=surch_amt,
 			surcharge_rule=surch_rule,
 		)
+		if credit_applied > 0.005:
+			nc_bits = ", ".join(
+				f"{r.get('name')}={flt(r.get('amount')):.2f}" for r in (nc_apply.get("rows") or [])
+			)
+			nc_line = _("NC aplicada {0}: {1}").format(credit_applied, nc_bits)
+			summary = f"{summary}\n{nc_line}".strip() if summary else nc_line
+			prev_notes = cstr(getattr(stop, "custom_pod_notes", None) or "")
+			stop.custom_pod_notes = (prev_notes + "\n" + nc_line).strip() if prev_notes else nc_line
 		has_collection_input = (
 			amount_collected is not None
 			or payments is not None
@@ -13234,6 +13841,8 @@ def _record_stop_outcome_impl(
 	payload = get_trip_map_data(trip_name)
 	payload["tracking_code"] = tracking_code
 	payload["credit_note"] = credit_note
+	payload["credit_applied"] = flt(credit_applied)
+	payload["credits_applied"] = list(nc_apply.get("rows") or [])
 	return payload
 
 
@@ -13388,14 +13997,22 @@ def driver_mark_cliente_debe(trip_name, stop_idx, amount, note=None):
 
 @frappe.whitelist(allow_guest=True)
 def list_cliente_debe_stops(date=None):
-	"""Stops flagged 'cliente debe' with an outstanding balance - the
-	"collector" view. Scoped by company only (no separate Collector identity
-	exists in this system yet)."""
+	"""Stops with unpaid balance after a *completed* delivery (Delivered / Partial).
+
+	Undelivered / Not Home / Refused / empty-outcome stops never appear — only
+	money still owed from orders that were actually delivered. Scoped by
+	company only (no separate Collector identity exists in this system yet).
+	"""
 	filters = {"custom_cliente_debe": 1}
 	trip_filters = {"docstatus": 1}
-	if date:
-		day = getdate(date)
-		trip_filters["departure_time"] = ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]]
+	raw_date = cstr(date or "").strip()
+	if raw_date and raw_date.lower() not in ("null", "undefined", "none"):
+		try:
+			day = getdate(raw_date)
+			trip_filters["departure_time"] = ["between", [f"{day} 00:00:00", f"{day} 23:59:59"]]
+		except Exception:
+			# Dirty Flutter/Next date — ignore filter, return all unpaid completed stops.
+			pass
 
 	trip_names = frappe.get_all("Delivery Trip", filters=trip_filters, pluck="name", ignore_permissions=True)
 	if not trip_names:
@@ -13407,6 +14024,8 @@ def list_cliente_debe_stops(date=None):
 		"customer",
 		"customer_address",
 		"delivery_note",
+		"visited",
+		"custom_outcome",
 		"custom_amount_due",
 		"custom_amount_collected",
 		"custom_balance_after_stop",
@@ -13427,7 +14046,18 @@ def list_cliente_debe_stops(date=None):
 		fields=fields,
 		ignore_permissions=True,
 	)
-	return {"stops": rows}
+	# Delivered / Partial only — never undelivered, refused, or not-home.
+	allowed = {"Delivered", "Partial"}
+	out = []
+	for r in rows or []:
+		outcome = cstr(r.get("custom_outcome") or "").strip()
+		if outcome not in allowed:
+			continue
+		bal = flt(r.get("custom_balance_after_stop"))
+		if bal <= 0.005:
+			continue
+		out.append(r)
+	return {"stops": out}
 
 
 @frappe.whitelist()

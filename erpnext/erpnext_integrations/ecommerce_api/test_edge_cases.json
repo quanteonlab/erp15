@@ -8536,6 +8536,18 @@
       "bug": "get_armado_order empty name must not 500 (última revisión de pesajes path)"
     },
     {
+      "id": "update_armado_items_consulta_weight_null_pin",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.update_armado_items",
+      "args": {
+        "preorder_name": null,
+        "items": [{"item_code": null, "qty": null, "total_weight": null}],
+        "pin": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Consulta weight edits allowed in armado; null pin/name still controlled (smoke covers Consulta writable)"
+    },
+    {
       "id": "get_armado_order_vehicle_from_zone_driver",
       "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_order",
       "args": {
@@ -8732,6 +8744,124 @@
       },
       "expect": "fail",
       "bug": "Flota publish 417 'Already assigned to another trip' when the order sat on another driver's stale Draft MAT — now released before create_trip; null driver stays a controlled ValidationError"
+    },
+    {
+      "id": "tms_create_trip_date_plate_empty_dns",
+      "source": "regression",
+      "bug": "Date+plate assign Confirm with empty dns/preorders is controlled ValidationError (AssignMatModal upsert path)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": "2026-11-24",
+        "driver": null,
+        "vehicle": "undefined",
+        "delivery_note_names": [],
+        "preorder_names": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_list_trips_for_date_dirty",
+      "source": "regression",
+      "bug": "list_trips_for_date with dirty date string does not 500 (AssignMatModal day fleet cards)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_trips_for_date",
+      "args": {
+        "date": "undefined",
+        "horizon_days": "null",
+        "include_open_backlog": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_create_trip_so_name_as_dn_missing",
+      "source": "regression",
+      "bug": "create_trip with Sales Order name in delivery_note_names (no DN) coerces via materialize or controlled ValidationError — never DoesNotExistError Delivery Note(s) not found: SAL-ORD-…",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": "2026-11-24",
+        "driver": null,
+        "vehicle": null,
+        "delivery_note_names": ["SAL-ORD-2099-NOEXIST"],
+        "preorder_names": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_create_trip_plate_only_empty_dns",
+      "source": "regression",
+      "bug": "Date+plate Confirm with vehicle/plate but no matching MAT and empty dns is controlled ValidationError (create if none only after orders exist; never TypeError resolving driver from plate)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": "2026-11-24",
+        "driver": null,
+        "vehicle": "ZZ-TEST-PLATE-NONE",
+        "delivery_note_names": [],
+        "preorder_names": []
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "list_available_mats_dirty_date_search",
+      "source": "regression",
+      "bug": "list_available_mats with dirty date/search for AssignMat MAT browser never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.list_available_mats",
+      "args": {
+        "search": "undefined",
+        "limit": "null",
+        "include_completed": "",
+        "date": "not-a-date"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_cliente_debe_stops_dirty_date",
+      "source": "regression",
+      "bug": "list_cliente_debe_stops only returns Delivered/Partial unpaid; dirty date never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_cliente_debe_stops",
+      "args": {
+        "date": "undefined"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_apply_open_credit_notes_dirty",
+      "source": "regression",
+      "bug": "Completar Entrega NC auto-apply: dirty customer/amount never TypeError; empty customer returns applied=0",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api._apply_open_credit_notes_to_delivery",
+      "args": {
+        "customer": "",
+        "max_amount": "null",
+        "company": "undefined",
+        "so_names": null,
+        "remarks": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_customer_day_mats_dirty",
+      "source": "regression",
+      "bug": "list_customer_day_mats dirty date/customers returns empty rows never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_customer_day_mats",
+      "args": {
+        "date": "undefined",
+        "customers": "null"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_create_trip_colocate_dirty_flags",
+      "source": "regression",
+      "bug": "create_trip with dirty colocate/force_split flags never TypeError; missing dns controlled throw",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": "undefined",
+        "driver": "",
+        "vehicle": null,
+        "delivery_note_names": [],
+        "preorder_names": "null",
+        "colocate_same_customer": "undefined",
+        "force_split": "null"
+      },
+      "expect": "fail"
     }
   ]
 }

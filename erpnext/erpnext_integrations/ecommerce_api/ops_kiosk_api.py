@@ -868,10 +868,11 @@ def _demote_to_orden_for_armado(so) -> bool:
 
 
 def _require_armado_writable(so) -> str:
-	"""Ensure SO is Orden-stage for writes.
+	"""Ensure SO can accept Armado qty/weight writes.
 
+	Consulta (draft) stays editable so packers can weigh before promoting to Orden.
 	Preparado / Delivery are demoted to Orden on write (re-pack after pipeline move).
-	Completado / Consulta / Archivado stay blocked.
+	Completado / Archivado stay blocked. Confirm→Preparado still requires Orden.
 
 	Returns display status after any reopen. Throws if still not writable.
 	"""
@@ -879,7 +880,7 @@ def _require_armado_writable(so) -> str:
 
 	disp = _display_status(so)
 	base = "Completado" if str(disp).startswith("Completado") else disp
-	if base == "Orden":
+	if base in ("Orden", "Consulta"):
 		return disp
 	if base in ("Preparado", "Delivery"):
 		# Prefer the existing "changed Preparado" path first, then force demote.
@@ -893,7 +894,9 @@ def _require_armado_writable(so) -> str:
 		if _demote_to_orden_for_armado(so):
 			return _display_status(so)
 	frappe.throw(
-		_("Only Orden-stage orders can be updated in armado (current: {0})").format(base)
+		_("Only Orden/Consulta-stage orders can be updated in armado (current: {0})").format(
+			base
+		)
 	)
 
 
@@ -1070,11 +1073,12 @@ def _stamp_armado_sheet(detail: dict, so) -> dict:
 	detail["armado_write_locked"] = 1 if _armado_trip_in_route(so.name) else 0
 	disp = _display_status(so)
 	detail["display_status"] = disp
-	# Orden always writable. Preparado / Delivery stay editable so Guardar works when
-	# ops moves Delivery → Armado (write path demotes back to Orden). Completado /
-	# Consulta / Archivado stay read-only. Trip in-route locks packers (admin override).
+	# Orden + Consulta writable (weigh before promote). Preparado / Delivery stay
+	# editable so Guardar works when ops moves Delivery → Armado (write path demotes
+	# back to Orden). Completado / Archivado stay read-only. Trip in-route locks
+	# packers (admin override).
 	base = "Completado" if str(disp).startswith("Completado") else disp
-	writable = base in ("Orden", "Preparado", "Delivery") or changed
+	writable = base in ("Orden", "Consulta", "Preparado", "Delivery") or changed
 	if detail["armado_write_locked"]:
 		# Sheet still viewable; writes gated in update path via admin PIN.
 		pass
