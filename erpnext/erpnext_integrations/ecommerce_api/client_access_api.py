@@ -1056,6 +1056,7 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		GUEST_PREORDER_REMARKS_TAG,
+		_display_status_from_row,
 		_guest_preorder_tag_fieldname,
 		get_guest_preorders_list,
 	)
@@ -1115,7 +1116,7 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 		if len(out) >= limit:
 			break
 
-	# Enrich display_status lightly via list helper when cheap — else raw status.
+	# Enrich display_status lightly via list helper when cheap — else compute from row.
 	try:
 		listed = get_guest_preorders_list(page_length=cint(page_length) or 50, scope="admin")
 		by_name = {p.get("name"): p for p in (listed.get("preorders") or [])}
@@ -1125,6 +1126,9 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 	consultas = []
 	for r in out:
 		extra = by_name.get(r.name) or {}
+		display = extra.get("display_status") or _display_status_from_row(
+			r.docstatus, r.status, r.grand_total, 0
+		)
 		consultas.append(
 			{
 				"name": r.name,
@@ -1133,7 +1137,9 @@ def list_consultas_by_client_access(phone=None, pin=None, page_length=50):
 				"transaction_date": r.transaction_date,
 				"delivery_date": r.delivery_date,
 				"status": r.status,
-				"display_status": extra.get("display_status") or r.status,
+				"docstatus": r.docstatus,
+				"display_status": display,
+				"editable": cint(r.docstatus) == 0,
 				"grand_total": r.grand_total,
 				"currency": r.currency,
 			}
@@ -1521,6 +1527,7 @@ def list_consultas_by_guest_browser(browser_id=None, secret=None, page_length=50
 	"""Guest portal (this device): orders tagged to this browser session only."""
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		GUEST_PREORDER_REMARKS_TAG,
+		_display_status_from_row,
 		_guest_preorder_tag_fieldname,
 		get_guest_preorders_list,
 	)
@@ -1576,6 +1583,9 @@ def list_consultas_by_guest_browser(browser_id=None, secret=None, page_length=50
 	consultas = []
 	for r in out:
 		extra = by_name.get(r.name) or {}
+		display = extra.get("display_status") or _display_status_from_row(
+			r.docstatus, r.status, r.grand_total, 0
+		)
 		consultas.append(
 			{
 				"name": r.name,
@@ -1584,7 +1594,9 @@ def list_consultas_by_guest_browser(browser_id=None, secret=None, page_length=50
 				"transaction_date": r.transaction_date,
 				"delivery_date": r.delivery_date,
 				"status": r.status,
-				"display_status": extra.get("display_status") or r.status,
+				"docstatus": r.docstatus,
+				"display_status": display,
+				"editable": cint(r.docstatus) == 0,
 				"grand_total": r.grand_total,
 				"currency": r.currency,
 			}
@@ -1596,6 +1608,248 @@ def list_consultas_by_guest_browser(browser_id=None, secret=None, page_length=50
 		"kind": "browser_session",
 		"consultas": consultas,
 	}
+
+
+def _so_tag_text(so) -> str:
+	from erpnext.erpnext_integrations.ecommerce_api.api import _guest_preorder_tag_fieldname
+
+	tag_fn = _guest_preorder_tag_fieldname()
+	parts = []
+	if tag_fn and hasattr(so, tag_fn):
+		parts.append(cstr(getattr(so, tag_fn, None) or ""))
+	for fn in ("remarks", "terms"):
+		parts.append(cstr(getattr(so, fn, None) or ""))
+	return " | ".join(p for p in parts if p)
+
+
+def _assert_consulta_owned_by_client(so, auth) -> None:
+	"""Raise if this Sales Order is not visible to the authenticated portal client."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		GUEST_PREORDER_REMARKS_TAG,
+		_is_guest_preorder_sales_order,
+	)
+
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"), frappe.PermissionError)
+
+	matched_customer = auth.get("customer")
+	customer_is_bucket = bool(matched_customer and _customer_is_bucket(matched_customer))
+	if matched_customer and not customer_is_bucket and cstr(so.customer) == cstr(matched_customer):
+		return
+
+	tag_text = _so_tag_text(so)
+	if GUEST_PREORDER_REMARKS_TAG not in tag_text:
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	if _so_tag_matches_client(
+		tag_text,
+		tail=cstr(auth.get("tail") or ""),
+		e164=cstr(auth.get("e164") or ""),
+	):
+		return
+	frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+
+def _assert_consulta_owned_by_browser(so, browser_id: str) -> None:
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		GUEST_PREORDER_REMARKS_TAG,
+		_is_guest_preorder_sales_order,
+	)
+
+	if not _is_guest_preorder_sales_order(so):
+		frappe.throw(_("Not a Guest Preorder"), frappe.PermissionError)
+	tag_text = _so_tag_text(so)
+	needle = f"{GUEST_BROWSER_TAG_PREFIX}{browser_id}"
+	if GUEST_PREORDER_REMARKS_TAG not in tag_text or needle not in tag_text:
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+
+def _portal_consulta_detail(so) -> dict:
+	"""Client-portal detail: quantities only (no rates / totals — often weighed later)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_display_status,
+		_item_line_weight_fields,
+	)
+
+	display = _display_status(so)
+	editable = cint(so.docstatus) == 0
+	items = []
+	for d in so.items or []:
+		weight = _item_line_weight_fields(
+			d.item_code,
+			line_uom=getattr(d, "uom", None),
+			line_weight_per_unit=getattr(d, "weight_per_unit", None),
+			line_total_weight=getattr(d, "total_weight", None),
+			line_qty=flt(d.qty),
+		)
+		items.append(
+			{
+				"item_code": d.item_code,
+				"item_name": d.item_name,
+				"qty": flt(d.qty),
+				"uom": cstr(getattr(d, "uom", None) or "") or None,
+				"stock_uom": weight.get("stock_uom") or weight.get("item_stock_uom"),
+				"is_weight_based": bool(weight.get("is_weight_based")),
+			}
+		)
+	return {
+		"ok": True,
+		"name": so.name,
+		"transaction_date": so.transaction_date,
+		"delivery_date": so.delivery_date,
+		"status": so.status,
+		"docstatus": so.docstatus,
+		"display_status": display,
+		"editable": editable,
+		"items": items,
+	}
+
+
+def _load_owned_consulta(preorder_name):
+	name = cstr(preorder_name or "").strip()
+	if not name:
+		frappe.throw(_("preorder_name is required"), frappe.ValidationError)
+	if not frappe.db.exists("Sales Order", name):
+		frappe.throw(_("Sales Order {0} not found").format(name))
+	frappe.flags.ignore_permissions = True
+	try:
+		so = frappe.get_doc("Sales Order", name)
+	finally:
+		frappe.flags.ignore_permissions = False
+	return so
+
+
+def _merge_portal_item_updates(so, items):
+	"""Build rate-preserving item payloads from portal qty edits (no client rates)."""
+	import json as _json
+
+	from erpnext.erpnext_integrations.ecommerce_api.api import get_item_price
+
+	if isinstance(items, str):
+		items = _json.loads(items)
+	if not isinstance(items, (list, tuple)):
+		frappe.throw(_("Items must be a list"), frappe.ValidationError)
+
+	existing = {cstr(row.item_code): row for row in (so.items or [])}
+	selling_pl = getattr(so, "selling_price_list", None) or "Standard Selling"
+	merged = []
+	seen = set()
+	for it in items:
+		if not isinstance(it, dict):
+			continue
+		code = cstr(it.get("item_code") or "").strip()
+		if not code or code in seen:
+			continue
+		qty = flt(it.get("qty") or 0)
+		if qty <= 0:
+			continue
+		seen.add(code)
+		row = existing.get(code)
+		if row is not None:
+			rate = flt(row.rate)
+			payload = {
+				"item_code": code,
+				"qty": qty,
+				"rate": rate,
+				"item_name": cstr(getattr(row, "item_name", None) or "") or None,
+			}
+			uom = cstr(it.get("uom") or getattr(row, "uom", None) or "").strip()
+			if uom:
+				payload["uom"] = uom
+			if getattr(row, "weight_per_unit", None) is not None:
+				payload["weight_per_unit"] = flt(row.weight_per_unit)
+			if getattr(row, "total_weight", None) is not None:
+				payload["total_weight"] = flt(row.total_weight)
+			if getattr(row, "discount_percentage", None) is not None:
+				payload["discount_percentage"] = flt(row.discount_percentage)
+			merged.append(payload)
+			continue
+		rate = flt(get_item_price(code, selling_pl) or 0)
+		payload = {
+			"item_code": code,
+			"qty": qty,
+			"rate": rate,
+			"item_name": cstr(it.get("item_name") or "").strip() or None,
+		}
+		uom = cstr(it.get("uom") or it.get("stock_uom") or "").strip()
+		if uom:
+			payload["uom"] = uom
+		if it.get("weight_per_unit") is not None:
+			payload["weight_per_unit"] = flt(it.get("weight_per_unit"))
+		merged.append(payload)
+
+	if not merged:
+		frappe.throw(_("Items list cannot be empty"), frappe.ValidationError)
+	return merged
+
+
+def _update_owned_consulta_items(so, items):
+	"""Consulta-only (docstatus 0) item replace for the client portal."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_allow_weight_fractional_stock_qty,
+		_apply_item_changes,
+		_keep_only_measured_total_weights,
+		_measured_total_weights_from_items,
+		_save_guest_preorder_so,
+	)
+
+	if cint(so.docstatus) != 0:
+		frappe.throw(
+			_("Only Consulta (draft) orders can be edited"),
+			frappe.ValidationError,
+		)
+
+	merged = _merge_portal_item_updates(so, items)
+	measured_tw = _measured_total_weights_from_items(merged)
+	_apply_item_changes(so, merged, 0)
+	so.flags.ignore_pricing_rule = True
+	with _keep_only_measured_total_weights(so, measured_tw):
+		with _allow_weight_fractional_stock_qty(so):
+			_save_guest_preorder_so(so)
+	frappe.db.commit()
+	so.reload()
+	return _portal_consulta_detail(so)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_consulta_by_client_access(phone=None, pin=None, preorder_name=None):
+	"""Portal: load one owned order — quantities only, no prices."""
+	auth = _authenticate_client(phone, pin)
+	so = _load_owned_consulta(preorder_name)
+	_assert_consulta_owned_by_client(so, auth)
+	return _portal_consulta_detail(so)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_consulta_by_guest_browser(browser_id=None, secret=None, preorder_name=None):
+	"""This-device portal: load one browser-tagged order — quantities only."""
+	bid, sec = _normalize_guest_browser_creds(browser_id, secret)
+	ensure_guest_browser_session(browser_id=bid, secret=sec)
+	so = _load_owned_consulta(preorder_name)
+	_assert_consulta_owned_by_browser(so, bid)
+	return _portal_consulta_detail(so)
+
+
+@frappe.whitelist(allow_guest=True)
+def update_consulta_items_by_client_access(
+	phone=None, pin=None, preorder_name=None, items=None
+):
+	"""Portal: edit items while still Consulta (docstatus 0). Rates stay server-side."""
+	auth = _authenticate_client(phone, pin)
+	so = _load_owned_consulta(preorder_name)
+	_assert_consulta_owned_by_client(so, auth)
+	return _update_owned_consulta_items(so, items)
+
+
+@frappe.whitelist(allow_guest=True)
+def update_consulta_items_by_guest_browser(
+	browser_id=None, secret=None, preorder_name=None, items=None
+):
+	"""This-device portal: edit items while still Consulta."""
+	bid, sec = _normalize_guest_browser_creds(browser_id, secret)
+	ensure_guest_browser_session(browser_id=bid, secret=sec)
+	so = _load_owned_consulta(preorder_name)
+	_assert_consulta_owned_by_browser(so, bid)
+	return _update_owned_consulta_items(so, items)
 
 
 def _selftest_guest_browser_isolation():

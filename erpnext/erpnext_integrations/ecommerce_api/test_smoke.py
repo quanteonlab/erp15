@@ -4934,6 +4934,15 @@ def suite_5_12_modules_read():
         assert out["failed"] == 0, out["failures"]
 
     _run("5.12.6c tms without Google (schema heal, soft geocode, local ETAs)", check_tms_no_google, "S2")
+
+    def check_tms_fleet_publish():
+        # Flota publish must move orders off stale Draft MATs, not 417 "Already assigned".
+        from erpnext.erpnext_integrations.ecommerce_api import test_tms_fleet_publish as tfp
+
+        out = tfp.run()
+        assert out["failed"] == 0, out["failures"]
+
+    _run("5.12.6d fleet publish releases stale draft stops", check_tms_fleet_publish, "S2")
     _run("5.12.6b return capture registry (Revisar devoluciones)", check_return_capture_registry, "S2")
     _run("5.12.7 get_shop_ui_settings", check_shop_ui, "S3")
     _run("5.12.8 search_tags", check_tags, "S3")

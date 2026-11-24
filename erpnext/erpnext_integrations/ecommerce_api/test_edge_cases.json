@@ -2282,6 +2282,69 @@
       "expect": "no_500"
     },
     {
+      "id": "get_consulta_by_client_access_null",
+      "source": "regression",
+      "bug": "get_consulta_by_client_access null phone/pin/name is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.get_consulta_by_client_access",
+      "args": {
+        "phone": null,
+        "pin": null,
+        "preorder_name": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "get_consulta_by_guest_browser_null",
+      "source": "regression",
+      "bug": "get_consulta_by_guest_browser null browser/secret/name is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.get_consulta_by_guest_browser",
+      "args": {
+        "browser_id": null,
+        "secret": null,
+        "preorder_name": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "update_consulta_items_by_client_access_null",
+      "source": "regression",
+      "bug": "update_consulta_items_by_client_access null args is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.update_consulta_items_by_client_access",
+      "args": {
+        "phone": null,
+        "pin": null,
+        "preorder_name": null,
+        "items": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "update_consulta_items_by_guest_browser_null",
+      "source": "regression",
+      "bug": "update_consulta_items_by_guest_browser null args is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.update_consulta_items_by_guest_browser",
+      "args": {
+        "browser_id": null,
+        "secret": null,
+        "preorder_name": null,
+        "items": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "update_consulta_items_by_client_access_empty_items",
+      "source": "regression",
+      "bug": "update_consulta_items_by_client_access with empty items list is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.client_access_api.update_consulta_items_by_client_access",
+      "args": {
+        "phone": "",
+        "pin": "",
+        "preorder_name": "",
+        "items": []
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "register_guest_browser_session_short",
       "source": "regression",
       "bug": "register_guest_browser_session rejects short/invalid browser id without 500",
@@ -8655,6 +8718,20 @@
       },
       "expect": "no_500",
       "bug": "Zone auto-assign without geo must report ungeocoded count, never crash"
+    },
+    {
+      "id": "publish_fleet_mat_null_driver",
+      "source": "regression",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.publish_fleet_mat",
+      "args": {
+        "date": "2026-11-24",
+        "driver": null,
+        "delivery_note_names": [
+          "MAT-DN-2026-00018"
+        ]
+      },
+      "expect": "fail",
+      "bug": "Flota publish 417 'Already assigned to another trip' when the order sat on another driver's stale Draft MAT — now released before create_trip; null driver stays a controlled ValidationError"
     }
   ]
 }
