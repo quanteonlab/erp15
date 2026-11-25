@@ -1262,6 +1262,56 @@ def suite_5_9_master_data():
             )
             frappe.db.commit()
 
+    def check_line_weight_policy_module():
+        """Sell UOM only; WEIGHT unweighed amount 0; Nos ignores Item.weight_uom."""
+        from erpnext.erpnext_integrations.ecommerce_api.weight_policy import line_weight_policy
+
+        unweighed = line_weight_policy(
+            {"uom": "WEIGHT", "qty": 2, "rate": 10, "total_weight": 0}
+        )
+        assert unweighed["sell_by"] == "weight", unweighed
+        assert abs(flt(unweighed["amount"])) < 1e-9, unweighed
+        measured = line_weight_policy(
+            {"uom": "WEIGHT", "qty": 2, "rate": 10, "total_weight": 1.5}
+        )
+        assert abs(flt(measured["amount"]) - 15) < 1e-9, measured
+        nos = line_weight_policy(
+            {"uom": "Nos", "qty": 2, "rate": 10, "weight_uom": "Kg", "total_weight": 0}
+        )
+        assert nos["sell_by"] == "unit", nos
+        assert abs(flt(nos["amount"]) - 20) < 1e-9, nos
+        none = line_weight_policy(None)
+        assert none["sell_by"] == "unit" and abs(flt(none["amount"])) < 1e-9, none
+
+    def check_armado_ean13_resolve_dirty():
+        """Caja EAN is 290…; dirty/product codes are controlled misses."""
+        from frappe.utils import add_days, today
+
+        from erpnext.erpnext_integrations.ecommerce_api import ops_kiosk_api as oka
+
+        code = oka.armado_ean13_for_order("SAL-ORD-SMOKE-EAN")
+        assert oka.is_armado_ean13(code) and len(code) == 13, code
+        miss = oka.resolve_armado_ean13(None)
+        assert miss.get("ok") is False
+        miss2 = oka.resolve_armado_ean13("7791234567898")
+        assert miss2.get("ok") is False
+        rows = frappe.get_all(
+            "Sales Order",
+            filters={
+                "docstatus": ["in", [0, 1]],
+                "modified": [">=", add_days(today(), -180)],
+            },
+            fields=["name"],
+            order_by="modified desc",
+            limit_page_length=1,
+            ignore_permissions=True,
+        )
+        if rows:
+            so = rows[0].name
+            hit = oka.resolve_armado_ean13(oka.armado_ean13_for_order(so))
+            assert hit.get("ok") is True, hit
+            assert hit.get("match") == so, hit
+
     def check_weight_line_bills_rate_times_kg():
         """WEIGHT + peso unitario: grand_total / payment outstanding = rate × kg (not qty×rate)."""
         so_name = None
@@ -2142,6 +2192,8 @@ def suite_5_9_master_data():
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
     _run("5.9.14a WEIGHT bills rate×kg", check_weight_line_bills_rate_times_kg, "S2")
     _run("5.9.14c Nos+weight_uom Kg not weight-based", check_nos_item_weight_uom_not_weight_based, "S2")
+    _run("5.9.14c2 LineWeightPolicy sell-UOM / unweighed 0", check_line_weight_policy_module, "S2")
+    _run("5.9.14c3 Armado caja EAN resolve dirty", check_armado_ean13_resolve_dirty, "S2")
     _run("5.9.14b measured kg no float drift", check_measured_total_weight_no_float_drift, "S2")
     _run(
         "5.9.14b2 peso promedio does not autofill total_weight",

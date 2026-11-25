@@ -6084,6 +6084,77 @@
       "bug": "Print Nos line with Item.weight_uom=Kg must not be treated as WEIGHT / blank importe"
     },
     {
+      "id": "line_weight_policy_null_row_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_policy.line_weight_policy",
+      "args": {
+        "row": null
+      },
+      "expect": {
+        "sell_by": "unit",
+        "amount": 0.0
+      },
+      "source": "regression",
+      "bug": "Dirty/null sales line must not crash LineWeightPolicy"
+    },
+    {
+      "id": "line_weight_policy_unweighed_weight_amount_0",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_policy.line_weight_policy",
+      "args": {
+        "row": {
+          "uom": "WEIGHT",
+          "qty": 2,
+          "rate": 10,
+          "total_weight": 0,
+          "weight_per_unit": 1.5
+        }
+      },
+      "expect": {
+        "sell_by": "weight",
+        "amount": 0.0,
+        "bill_qty": 0.0
+      },
+      "source": "regression",
+      "bug": "WEIGHT without measured total_weight must bill 0 (not qty×rate / peso promedio)"
+    },
+    {
+      "id": "line_weight_policy_measured_kg_times_rate",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_policy.line_weight_policy",
+      "args": {
+        "row": {
+          "uom": "WEIGHT",
+          "qty": 2,
+          "rate": 10,
+          "total_weight": 1.5
+        }
+      },
+      "expect": {
+        "sell_by": "weight",
+        "amount": 15.0
+      },
+      "source": "regression",
+      "bug": "WEIGHT + measured kg bills rate×kg (packs in qty are not money)"
+    },
+    {
+      "id": "line_weight_policy_nos_weight_uom_kg_is_unit",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.weight_policy.line_weight_policy",
+      "args": {
+        "row": {
+          "uom": "Nos",
+          "stock_uom": "Nos",
+          "qty": 2,
+          "rate": 10,
+          "weight_uom": "Kg",
+          "total_weight": 0
+        }
+      },
+      "expect": {
+        "sell_by": "unit",
+        "amount": 20.0
+      },
+      "source": "regression",
+      "bug": "Nos + Item.weight_uom=Kg must stay unit billing (Pedidos P.unit. /kg with empty PESO)"
+    },
+    {
       "id": "set_guest_preorder_status_orden_empty_name_controlled",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
       "args": {
@@ -9006,6 +9077,32 @@
         "force_split": "null"
       },
       "expect": "fail"
+    },
+    {
+      "id": "resolve_armado_ean13_null_code",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.resolve_armado_ean13",
+      "args": {
+        "code": null
+      },
+      "expect": {
+        "ok": false,
+        "match": null
+      },
+      "source": "regression",
+      "bug": "Dirty/null caja EAN must not crash armado lookup"
+    },
+    {
+      "id": "resolve_armado_ean13_product_prefix_not_order",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.resolve_armado_ean13",
+      "args": {
+        "code": "7791234567898"
+      },
+      "expect": {
+        "ok": false,
+        "match": null
+      },
+      "source": "regression",
+      "bug": "Retail product EAN (not 290…) must not resolve as an armado order"
     }
   ]
 }

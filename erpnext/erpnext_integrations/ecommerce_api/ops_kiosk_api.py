@@ -1299,38 +1299,40 @@ def _truthy_flag(raw) -> bool:
 
 @frappe.whitelist(allow_guest=True)
 def resolve_armado_ean13(code=None):
-	"""Map a scanned armado EAN-13 → Sales Order name (Orden-stage only)."""
+	"""Map a scanned armado/caja EAN-13 → Sales Order name (any pipeline stage).
+
+	Caja labels are printed at Empaque (Preparado+). Lookup must not be Orden-only.
+	"""
 	from erpnext.erpnext_integrations.ecommerce_api.api import _display_status_from_row
 
 	code = str(code or "").strip()
 	if not is_armado_ean13(code):
 		return {"ok": False, "match": None}
 
-	# Search today's + last 14 days guest SOs; compare deterministic codes.
 	frappe.flags.ignore_permissions = True
 	rows = frappe.get_all(
 		"Sales Order",
 		filters={
-			"docstatus": 1,
-			"status": [
-				"not in",
-				["Closed", "Completed", "Preparado", "Delivery", "En Delivery", "Cancelled", "Consulta"],
-			],
-			"transaction_date": [">=", frappe.utils.add_days(today(), -14)],
+			"docstatus": ["in", [0, 1]],
+			"modified": [">=", frappe.utils.add_days(today(), -180)],
 		},
 		fields=["name", "docstatus", "status", "grand_total", "advance_paid"],
 		order_by="modified desc",
-		limit_page_length=500,
+		limit_page_length=2500,
 		ignore_permissions=True,
 	)
 	for row in rows:
+		if armado_ean13_for_order(row.name) != code:
+			continue
 		disp = _display_status_from_row(
 			row.docstatus, row.status, row.grand_total, row.advance_paid
 		)
-		if disp != "Orden":
-			continue
-		if armado_ean13_for_order(row.name) == code:
-			return {"ok": True, "match": row.name, "ean13": code}
+		return {
+			"ok": True,
+			"match": row.name,
+			"ean13": code,
+			"display_status": disp,
+		}
 	return {"ok": False, "match": None, "ean13": code}
 
 
@@ -2471,11 +2473,8 @@ def get_delivery_check_items(delivery_note=None):
 	):
 		frappe.throw(_("Delivery Note not found"))
 
-	from erpnext.erpnext_integrations.ecommerce_api.api import (
-		_guest_preorder_line_amount,
-		_item_line_weight_fields,
-		_row_is_weight_sell,
-	)
+	from erpnext.erpnext_integrations.ecommerce_api.api import _item_line_weight_fields
+	from erpnext.erpnext_integrations.ecommerce_api.weight_policy import line_weight_policy
 
 	frappe.flags.ignore_permissions = True
 	dn = frappe.get_doc("Delivery Note", delivery_note)
@@ -2489,9 +2488,7 @@ def get_delivery_check_items(delivery_note=None):
 		rate = flt(getattr(d, "rate", None) or 0)
 		# Agreed line total: WEIGHT is rate×measured kg, never rate×units.
 		# Unweighed WEIGHT stays 0 (Armado required) — do not fall back to qty×rate.
-		agreed = flt(_guest_preorder_line_amount(d))
-		if agreed <= 0 and not _row_is_weight_sell(d):
-			agreed = flt(getattr(d, "amount", None) or (rate * qty))
+		agreed = flt(line_weight_policy(d)["amount"])
 		weight = _item_line_weight_fields(
 			d.item_code,
 			line_uom=getattr(d, "uom", None),

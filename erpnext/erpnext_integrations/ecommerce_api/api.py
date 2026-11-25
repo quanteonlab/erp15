@@ -29,6 +29,13 @@ from frappe.utils import (
 from erpnext.stock.get_item_details import get_item_details as get_item_details_base
 from erpnext.accounts.doctype.pricing_rule.pricing_rule import apply_pricing_rule
 from erpnext.erpnext_integrations.ecommerce_api.ops_kv import idempotent_request
+from erpnext.erpnext_integrations.ecommerce_api.weight_policy import (
+	billable_qty as _weight_billable_qty,
+	is_weight_sell_uom as _is_weight_sell_uom,
+	line_amount as _guest_preorder_line_amount,
+	line_weight_policy,
+	row_is_weight_sell as _row_is_weight_sell,
+)
 
 
 @frappe.whitelist(allow_guest=True)
@@ -5598,29 +5605,7 @@ def _item_line_weight_fields(
 	except Exception:
 		pass
 	sell_uom = cstr(line_uom or "").strip() or stock_uom
-	# Sell-by-weight from stock / line UOM only. Item.weight_uom is the UOM of
-	# the weight_per_unit *field* (often Kg even on Nos/CAJA) — including it
-	# falsely marked unit products as weight-based and Pedidos showed $/kg.
-	sell_uoms = {
-		cstr(stock_uom).strip().lower(),
-		cstr(sell_uom).strip().lower(),
-	}
-	weight_tokens = {
-		"weight",
-		"por peso",
-		"porpeso",
-		"kg",
-		"kgs",
-		"g",
-		"gr",
-		"gram",
-		"grams",
-		"l",
-		"lt",
-		"ml",
-		"milliliter",
-	}
-	is_weight_based = bool(sell_uoms & weight_tokens)
+	is_weight_based = _is_weight_sell_uom(sell_uom) or _is_weight_sell_uom(stock_uom)
 	# Prefer line-level pack weight / measured total (remeasure) over Item master.
 	# Never invent total_weight from peso promedio × qty — that is estimate-only (~ in UI).
 	line_wpu = flt(line_weight_per_unit) if line_weight_per_unit not in (None, "") else 0.0
@@ -5676,28 +5661,6 @@ def _normalize_preorder_line_uom(raw_uom):
 	return _normalize_stock_uom(cstr(raw_uom or "").strip() or None)
 
 
-def _weight_sell_uom_tokens():
-	return {
-		"weight",
-		"por peso",
-		"porpeso",
-		"kg",
-		"kgs",
-		"g",
-		"gr",
-		"gram",
-		"grams",
-		"l",
-		"lt",
-		"ml",
-		"milliliter",
-	}
-
-
-def _is_weight_sell_uom(uom):
-	return cstr(uom or "").strip().lower() in _weight_sell_uom_tokens()
-
-
 @contextmanager
 def _allow_weight_fractional_stock_qty(so):
 	"""Re-align stock_uom after set_missing resets it to Item Nos (whole-number check).
@@ -5725,11 +5688,10 @@ def _allow_weight_fractional_stock_qty(so):
 		if self.doc is not so and not getattr(getattr(self.doc, "flags", None), "ecommerce_weight_sell", False):
 			return
 		for item in self.doc.get("items") or []:
-			if not _row_is_weight_sell(item):
+			policy = line_weight_policy(item)
+			if policy["sell_by"] != "weight":
 				continue
-			bill = _weight_billable_qty(item)
-			rate = _weight_sell_effective_rate(item)
-			new_amount = flt(rate * bill, item.precision("amount")) if bill > 0 else 0.0
+			new_amount = flt(policy["amount"], item.precision("amount"))
 			if abs(flt(item.amount) - new_amount) < 1e-9:
 				continue
 			item.amount = new_amount
@@ -5745,66 +5707,6 @@ def _allow_weight_fractional_stock_qty(so):
 		tb.validate_uom_is_integer = orig_uom
 		_CTT.calculate_item_values = orig_civ
 		so.flags.ecommerce_weight_sell = False
-
-
-def _row_is_weight_sell(row) -> bool:
-	"""True when the line sells by kg (UOM WEIGHT / Kg / L / …)."""
-	uom = cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or "")
-	return _is_weight_sell_uom(uom)
-
-
-def _weight_billable_qty(row) -> float:
-	"""Kg used to bill a WEIGHT line.
-
-	Only measured ``total_weight`` (Armado / admin scale) is billable.
-	Peso promedio × qty is estimate-only — importe stays 0 until weighed.
-	"""
-	qty = flt(getattr(row, "qty", None) or 0)
-	if not _row_is_weight_sell(row):
-		return qty
-	tw = flt(getattr(row, "total_weight", None) or 0)
-	if tw > 0:
-		return tw
-	return 0.0
-
-
-def _weight_sell_effective_rate(row) -> float:
-	"""$/kg used for WEIGHT importe.
-
-	ERPNext only applies ``discount_percentage`` when price_list_rate / margin is set.
-	Pedidos often has neither — apply disc here so importe matches the UI
-	(``rate × kg × (1 - disc%)``). When ERPNext already netted ``rate``,
-	``discount_amount`` is set and we must not double-discount.
-	"""
-	rate = flt(getattr(row, "rate", None) or 0)
-	disc = flt(getattr(row, "discount_percentage", None) or 0)
-	if disc <= 0 or disc >= 100:
-		return 0.0 if disc >= 100 else rate
-	already_net = flt(getattr(row, "discount_amount", None) or 0) > 0 or (
-		flt(getattr(row, "price_list_rate", None) or 0) > 0
-		and abs(flt(getattr(row, "price_list_rate")) - rate) > 1e-9
-	)
-	if already_net:
-		return rate
-	return flt(rate * (1.0 - disc / 100.0))
-
-
-def _guest_preorder_line_amount(row) -> float:
-	"""Line importe for Pedidos: WEIGHT → rate×measured kg (0 until Armado); else rate×qty."""
-	if _row_is_weight_sell(row):
-		bill = _weight_billable_qty(row)
-		rate = _weight_sell_effective_rate(row)
-		if rate > 0 and bill > 0:
-			return flt(rate * bill)
-		return 0.0
-	rate = flt(getattr(row, "rate", None) or 0)
-	qty = flt(getattr(row, "qty", None) or 0)
-	disc = flt(getattr(row, "discount_percentage", None) or 0)
-	if rate > 0 and qty > 0:
-		already_net = flt(getattr(row, "discount_amount", None) or 0) > 0
-		eff = rate if already_net or disc <= 0 else rate * (1.0 - disc / 100.0)
-		return flt(eff * qty)
-	return flt(getattr(row, "amount", None) or 0)
 
 
 def _so_doc_discount_amount(so) -> float:

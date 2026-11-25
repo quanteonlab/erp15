@@ -3,6 +3,13 @@ import json
 import frappe
 from frappe import _
 from frappe.utils import cint, cstr, flt, nowdate
+from erpnext.erpnext_integrations.ecommerce_api.weight_policy import (
+	CATALOG_WEIGHT_TOKENS as _CATALOG_WEIGHT_TOKENS,
+	is_catalog_weight_uom as _is_catalog_weight_uom,
+	is_mass_uom as _is_mass_uom,
+	line_weight_policy,
+	row_is_weight_sell,
+)
 
 # Fields exposed per source doctype, plus the child-table (line items) fieldname
 # used by the 'line-items' element kind in the template designer.
@@ -97,50 +104,8 @@ _DELIVERY_CHECKLIST_CHILD_FIELDS = [
 	{"fieldname": "amount", "label": "Importe", "fieldtype": "Currency"},
 ]
 
-_WEIGHT_UOMS = {
-	"kg",
-	"kgs",
-	"kilogram",
-	"kilograms",
-	"kilogramo",
-	"kilogramos",
-	"g",
-	"gr",
-	"gram",
-	"grams",
-	"gramo",
-	"gramos",
-	"lb",
-	"lbs",
-	"oz",
-	"ounce",
-	"ounces",
-	# Catalog / PM sell-by-weight token (mayorista units → remesaure at armado).
-	"weight",
-	"por peso",
-	"porpeso",
-}
-
-
 def _norm_uom(uom) -> str:
 	return str(uom or "").strip().lower()
-
-
-def _is_weight_uom(uom) -> bool:
-	return _norm_uom(uom) in _WEIGHT_UOMS
-
-
-# Catalog mayorista token: qty is pack/unit count, kg lives in total_weight after armado.
-_CATALOG_WEIGHT_TOKENS = frozenset({"weight", "por peso", "porpeso"})
-
-
-def _is_catalog_weight_uom(uom) -> bool:
-	return _norm_uom(uom) in _CATALOG_WEIGHT_TOKENS
-
-
-def _is_mass_uom(uom) -> bool:
-	"""True kg/g/lb — not the catalog WEIGHT sell-by-weight token."""
-	return _is_weight_uom(uom) and not _is_catalog_weight_uom(uom)
 
 
 def _item_weight_meta(item_code):
@@ -180,17 +145,12 @@ def _order_print_client_knows_weight() -> bool:
 def _is_weight_based_line(row: dict, stock_uom: str = "", weight_uom: str = "") -> bool:
 	"""Sold-by-weight from line/stock UOM only.
 
-	Item.weight_uom is the UOM of the peso-promedio *field* (often Kg on Nos/CAJA)
-	and must not mark pack products as weight-based.
+	Item.weight_uom is ignored (UOM of peso-promedio, often Kg on Nos/CAJA).
 	"""
-	for u in (
-		row.get("uom"),
-		row.get("stock_uom"),
-		stock_uom,
-	):
-		if _is_weight_uom(u):
-			return True
-	return False
+	merged = dict(row or {})
+	if stock_uom and not merged.get("stock_uom"):
+		merged["stock_uom"] = stock_uom
+	return row_is_weight_sell(merged)
 
 
 def _positive_float(raw):
@@ -498,15 +458,11 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 		out["precio_kg"] = ""
 		out["precio_u"] = ""
 	# Weight lines without measured kg: never print qty×rate as Importe.
-	if weight_based and not client_knows_weight and total_w is None:
+	policy = line_weight_policy({**out, "qty": qty, "total_weight": total_w or 0})
+	if policy["sell_by"] == "weight" and not client_knows_weight and total_w is None:
 		out["amount"] = "" if blank_unknown_weight_amount else 0
-	elif not _positive_float(out.get("amount")):
-		# Fill Amount when rate × kg/qty is known (WEIGHT lines often store qty as packs).
-		rate = flt(out.get("rate"))
-		if rate > 0 and total_w is not None and weight_based:
-			out["amount"] = round(rate * float(total_w), 2)
-		elif rate > 0 and qty > 0 and not weight_based:
-			out["amount"] = round(rate * qty, 2)
+	elif not _positive_float(out.get("amount")) and policy["amount"] > 0:
+		out["amount"] = round(policy["amount"], 2)
 	if frappe.utils.cint(out.get("armado_missing")):
 		out["amount"] = 0
 		out["net_amount"] = 0
@@ -5668,7 +5624,9 @@ _STARTER_TEMPLATES = [
 		"is_default": True,
 		"gift": True,
 		"resync": True,
-		"resync_if_missing_id": "starter-armcaja-ean-v1",
+		"resync_if_missing_id": "starter-armcaja-ean-v2",
+		"canvas_width_mm": 80,
+		"canvas_height_mm": 72,
 		"margin_mm": [3, 3, 3, 3],
 		"elements": [
 			{
@@ -5702,7 +5660,7 @@ _STARTER_TEMPLATES = [
 				"x": 3,
 				"y": 22,
 				"width": 74,
-				"height": 10,
+				"height": 8,
 				"fieldPath": "customer_name",
 				"label": "Cliente",
 				"fontSize": 11,
@@ -5712,9 +5670,9 @@ _STARTER_TEMPLATES = [
 				"id": "starter-armcaja-cajas",
 				"kind": "field",
 				"x": 3,
-				"y": 34,
+				"y": 31,
 				"width": 36,
-				"height": 8,
+				"height": 7,
 				"fieldPath": "cajas",
 				"label": "Cajas",
 				"fontSize": 12,
@@ -5722,25 +5680,15 @@ _STARTER_TEMPLATES = [
 				"align": "left",
 			},
 			{
-				"id": "starter-armcaja-ean-v1",
-				"kind": "field",
-				"x": 3,
-				"y": 44,
-				"width": 74,
-				"height": 8,
-				"fieldPath": "order_ean13",
-				"label": "EAN",
-				"fontSize": 12,
-				"align": "left",
-			},
-			{
-				"id": "starter-armcaja-barcode",
+				"id": "starter-armcaja-ean-v2",
 				"kind": "barcode",
-				"x": 8,
-				"y": 54,
-				"width": 64,
-				"height": 18,
+				"x": 5,
+				"y": 40,
+				"width": 70,
+				"height": 28,
 				"fieldPath": "order_ean13",
+				"barcodeFormat": "EAN13",
+				"displayValue": True,
 			},
 		],
 	},
