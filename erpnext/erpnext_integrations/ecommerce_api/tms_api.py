@@ -1203,7 +1203,144 @@ def _stop_out(stop, address_geo=None, customer_meta=None, address_meta=None, tra
 		}
 		if (stop.visited or outcome)
 		else None,
+		# Always expose settlement so MAT table can show NC / Pend. cob before expand.
+		"amount_due": getattr(stop, "custom_amount_due", None),
+		"amount_collected": getattr(stop, "custom_amount_collected", None),
+		"balance_after_stop": getattr(stop, "custom_balance_after_stop", None),
+		"cliente_debe": bool(getattr(stop, "custom_cliente_debe", 0)),
+		"payment_method": getattr(stop, "custom_payment_method", None) or None,
+		"payment_summary": getattr(stop, "custom_payment_summary", None) or None,
+		"payments": (
+			frappe.parse_json(getattr(stop, "custom_payments_json", None))
+			if getattr(stop, "custom_payments_json", None)
+			else []
+		),
+		"nota_credito": 0.0,
+		"credit_notes": [],
+		"returns": [],
+		"returned_qty": 0.0,
 	}
+
+
+def _parse_applied_nc_from_notes(notes):
+	"""Extract applied open-NC total from PoD notes (``NC aplicada 1234.00: …``)."""
+	import re
+
+	text = cstr(notes or "")
+	if not text:
+		return 0.0
+	m = re.search(r"NC aplicada\s+([0-9]+(?:[.,][0-9]+)?)", text, flags=re.IGNORECASE)
+	if not m:
+		return 0.0
+	try:
+		return abs(flt(str(m.group(1)).replace(",", ".")))
+	except Exception:
+		return 0.0
+
+
+def _enrich_stops_returns_and_credits(trip_name, stops):
+	"""Attach Mobile Return Capture lines + credit-note totals onto stop payloads."""
+	if not stops:
+		return stops
+	trip_name = cstr(trip_name or "").strip()
+	if not trip_name or not frappe.db.exists("DocType", "Mobile Return Capture"):
+		return stops
+
+	by_idx = {cint(s.get("idx")): s for s in stops}
+	captures = frappe.get_all(
+		"Mobile Return Capture",
+		filters={"delivery_trip": trip_name},
+		fields=["name", "stop_idx", "captured_at", "notes", "status"],
+		order_by="stop_idx asc, creation asc",
+		ignore_permissions=True,
+	)
+	cn_names = set()
+	raw_by_idx = {}
+	for cap in captures or []:
+		idx = cint(cap.stop_idx)
+		frappe.flags.ignore_permissions = True
+		try:
+			doc = frappe.get_doc("Mobile Return Capture", cap.name)
+		except Exception:
+			continue
+		finally:
+			frappe.flags.ignore_permissions = False
+		lines = []
+		for row in doc.lines or []:
+			qty = flt(row.qty)
+			if qty <= 0:
+				continue
+			lines.append(
+				{
+					"item_code": cstr(row.item_code or ""),
+					"item_name": cstr(row.description or row.item_code or ""),
+					"qty": qty,
+					"reason": cstr(row.reason or ""),
+				}
+			)
+		cn = cstr(getattr(doc, "credit_note", None) or "").strip() or None
+		if cn:
+			cn_names.add(cn)
+		raw_by_idx.setdefault(idx, []).append(
+			{
+				"name": cap.name,
+				"captured_at": cap.captured_at,
+				"notes": cap.notes,
+				"status": cap.status,
+				"credit_note": cn,
+				"debit_note": cstr(getattr(doc, "debit_note", None) or "").strip() or None,
+				"delivery_note_return": cstr(getattr(doc, "delivery_note_return", None) or "").strip()
+				or None,
+				"lines": lines,
+			}
+		)
+
+	cn_amount = {}
+	if cn_names:
+		for row in frappe.get_all(
+			"Sales Invoice",
+			filters={"name": ["in", list(cn_names)]},
+			fields=["name", "grand_total", "outstanding_amount"],
+			ignore_permissions=True,
+		):
+			cn_amount[row.name] = {
+				"name": row.name,
+				"amount": abs(flt(row.grand_total)),
+				"outstanding": abs(flt(row.outstanding_amount)),
+			}
+
+	for idx, s in by_idx.items():
+		rets = raw_by_idx.get(idx) or []
+		s["returns"] = rets
+		s["returned_qty"] = sum(
+			flt(l.get("qty")) for r in rets for l in (r.get("lines") or [])
+		)
+		credits = []
+		seen = set()
+		nota = 0.0
+		for r in rets:
+			cn = cstr(r.get("credit_note") or "").strip()
+			if not cn or cn in seen:
+				continue
+			seen.add(cn)
+			meta = cn_amount.get(cn) or {"name": cn, "amount": 0.0, "outstanding": 0.0}
+			credits.append(meta)
+			nota += flt(meta.get("amount") or 0)
+		# Open NC applied at Completar Entrega (not a new return CN).
+		pod = s.get("pod") if isinstance(s.get("pod"), dict) else {}
+		stop_notes = cstr((pod or {}).get("notes") or "")
+		applied = _parse_applied_nc_from_notes(stop_notes)
+		if applied > 0.005:
+			nota += applied
+		s["credit_notes"] = credits
+		s["nota_credito"] = round(nota, 2)
+		# Pend. cob = unpaid remainder after this stop (cliente debe).
+		bal = flt(s.get("balance_after_stop"))
+		if bal <= 0.005:
+			bal = flt((pod or {}).get("balance_after_stop"))
+		s["pend_cobrar"] = round(max(0.0, bal), 2)
+
+	return stops
 
 
 # ---------------------------------------------------------------------------
@@ -3852,6 +3989,14 @@ def _materialize_dns_for_preorders(preorder_names):
 			continue
 		existing = _delivery_note_for_sales_order(so_name)
 		if existing:
+			try:
+				from erpnext.erpnext_integrations.ecommerce_api.archivo_api import (
+					ensure_remito_archivo_entry,
+				)
+
+				ensure_remito_archivo_entry(delivery_note=existing, sales_order=so_name)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "materialize remito → Documentos")
 			dns.append(existing)
 			continue
 		if not frappe.db.exists("Sales Order", so_name):
@@ -3870,6 +4015,14 @@ def _materialize_dns_for_preorders(preorder_names):
 				gate.get("delivery_warning")
 				or _("Could not create remito for {0}").format(so_name)
 			)
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.archivo_api import (
+				ensure_remito_archivo_entry,
+			)
+
+			ensure_remito_archivo_entry(delivery_note=dn, sales_order=so_name)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "materialize remito → Documentos")
 		dns.append(dn)
 	return dns
 
@@ -4180,6 +4333,19 @@ def get_trip_map_data(trip_name):
 			geo_by_address[row.name] = row
 
 	stops = _stops_payload(trip, geo_by_address)
+	try:
+		stops = _enrich_stops_returns_and_credits(trip.name, stops)
+	except Exception:
+		# NC / returns enrichment must never blank the MAT map payload.
+		frappe.log_error(frappe.get_traceback(), "get_trip_map_data enrich returns/credits")
+		for s in stops or []:
+			if not isinstance(s, dict):
+				continue
+			s.setdefault("returns", [])
+			s.setdefault("returned_qty", 0.0)
+			s.setdefault("credit_notes", [])
+			s.setdefault("nota_credito", 0.0)
+			s.setdefault("pend_cobrar", 0.0)
 
 	return {
 		"trip": {
@@ -12309,6 +12475,249 @@ def get_trip_delivery_summary(trip_name=None):
 	trip = frappe.get_doc("Delivery Trip", trip_name)
 	frappe.flags.ignore_permissions = False
 	return _build_trip_delivery_summary(trip)
+
+
+def _cargo_return_state(reason):
+	"""Map return reason → cargo row state (on-truck inbound)."""
+	r = cstr(reason or "").strip()
+	if r == "Excess":
+		return "excess"
+	if r == "Customer refusal":
+		return "refused_return"
+	# Inline set — do not depend on DAMAGED_HOLD_RETURN_REASONS load order.
+	if r in ("Damaged", "Expired", "Quality issue"):
+		return "damaged_return"
+	return "returned"
+
+
+def _cargo_empty_payload(trip):
+	return {
+		"trip": {
+			"name": getattr(trip, "name", None),
+			"status": getattr(trip, "status", None),
+			"departure_time": getattr(trip, "departure_time", None),
+			"driver": getattr(trip, "driver", None),
+			"driver_name": getattr(trip, "driver_name", None),
+			"vehicle": getattr(trip, "vehicle", None),
+		},
+		"items": [],
+		"totals": {
+			"lines": 0,
+			"on_truck_qty": 0.0,
+			"delivered_qty": 0.0,
+			"returned_qty": 0.0,
+		},
+	}
+
+
+def _cargo_item_dicts(raw):
+	"""Coerce planned/delivered/returned lists; skip dirty non-dicts."""
+	if not isinstance(raw, (list, tuple)):
+		return []
+	out = []
+	for it in raw:
+		if isinstance(it, dict):
+			out.append(it)
+	return out
+
+
+def _build_trip_cargo_items(trip):
+	"""Flat IN/OUT cargo lines for MAT Items tab (on truck vs delivered vs returns).
+
+	Never raises for dirty stop/item shapes — returns empty/partial payload instead.
+	States:
+	- ``pending`` — planned, trip not loaded yet (Draft)
+	- ``on_truck`` — still on the vehicle (scheduled / in transit / not home / refused)
+	- ``delivered`` — left the vehicle at the client
+	- ``returned`` / ``excess`` / ``refused_return`` / ``damaged_return`` — back on vehicle
+	"""
+	try:
+		summary = _build_trip_delivery_summary(trip)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "get_trip_cargo_items summary")
+		return _cargo_empty_payload(trip)
+
+	if not isinstance(summary, dict):
+		return _cargo_empty_payload(trip)
+
+	status = cstr(getattr(trip, "status", None) or (summary.get("trip") or {}).get("status") or "")
+	trip_loaded = status in ("Scheduled", "In Transit", "Completed")
+
+	so_names = []
+	for s in summary.get("stops") or []:
+		if not isinstance(s, dict):
+			continue
+		so = cstr(s.get("sales_order") or "").strip()
+		if not so:
+			sos = s.get("sales_orders") or []
+			so = cstr(sos[0] if isinstance(sos, (list, tuple)) and sos else "").strip()
+		if so:
+			so_names.append(so)
+	try:
+		boxes_by_so = _armado_box_counts_by_so(so_names)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "get_trip_cargo_items boxes")
+		boxes_by_so = {}
+
+	items = []
+	on_truck_qty = 0.0
+	delivered_qty = 0.0
+	returned_qty = 0.0
+
+	def _append(row):
+		nonlocal on_truck_qty, delivered_qty, returned_qty
+		try:
+			qty = flt(row.get("qty"))
+		except Exception:
+			qty = 0.0
+		if qty <= 0:
+			return
+		state = cstr(row.get("state") or "")
+		on_truck = bool(row.get("on_truck"))
+		row["on_truck"] = on_truck
+		row["qty"] = qty
+		items.append(row)
+		if on_truck:
+			on_truck_qty += qty
+		if state == "delivered":
+			delivered_qty += qty
+		elif state in ("returned", "excess", "refused_return", "damaged_return"):
+			returned_qty += qty
+
+	for s in summary.get("stops") or []:
+		if not isinstance(s, dict):
+			continue
+		try:
+			stop_idx = cint(s.get("idx"))
+			customer = cstr(s.get("customer") or "").strip()
+			customer_name = cstr(s.get("customer_name") or customer).strip()
+			dn = cstr(s.get("delivery_note") or "").strip()
+			so = cstr(s.get("sales_order") or "").strip()
+			if not so:
+				sos = s.get("sales_orders") or []
+				so = cstr(sos[0] if isinstance(sos, (list, tuple)) and sos else "").strip()
+			box_count = cint(boxes_by_so.get(so) or s.get("box_count") or 0)
+			visited = bool(s.get("visited"))
+			outcome = cstr(s.get("outcome") or "").strip()
+			planned = _cargo_item_dicts(s.get("planned_items"))
+			delivered = _cargo_item_dicts(s.get("delivered_items"))
+			returned = _cargo_item_dicts(s.get("returned_items"))
+
+			still_on_truck = (not visited) or outcome in ("", "Pending", "Not Home", "Refused")
+			if still_on_truck:
+				state = "on_truck" if trip_loaded else "pending"
+				for it in planned:
+					_append(
+						{
+							"stop_idx": stop_idx,
+							"customer": customer,
+							"customer_name": customer_name,
+							"delivery_note": dn,
+							"sales_order": so,
+							"item_code": cstr(it.get("item_code") or ""),
+							"item_name": cstr(it.get("item_name") or it.get("item_code") or ""),
+							"qty": flt(it.get("qty")),
+							"uom": cstr(it.get("uom") or ""),
+							"boxes": box_count if len(planned) == 1 and box_count > 0 else flt(it.get("qty")),
+							"box_count": box_count,
+							"state": state,
+							"on_truck": True,
+							"direction": "out",
+							"reason": None,
+							"outcome": outcome or None,
+						}
+					)
+			else:
+				for it in delivered:
+					_append(
+						{
+							"stop_idx": stop_idx,
+							"customer": customer,
+							"customer_name": customer_name,
+							"delivery_note": dn,
+							"sales_order": so,
+							"item_code": cstr(it.get("item_code") or ""),
+							"item_name": cstr(it.get("item_name") or it.get("item_code") or ""),
+							"qty": flt(it.get("qty")),
+							"uom": cstr(it.get("uom") or ""),
+							"boxes": flt(it.get("qty")),
+							"box_count": box_count,
+							"state": "delivered",
+							"on_truck": False,
+							"direction": "out",
+							"reason": None,
+							"outcome": outcome or None,
+						}
+					)
+
+			for it in returned:
+				reason = cstr(it.get("reason") or "").strip() or None
+				state = _cargo_return_state(reason)
+				_append(
+					{
+						"stop_idx": stop_idx,
+						"customer": customer,
+						"customer_name": customer_name,
+						"delivery_note": dn,
+						"sales_order": so,
+						"item_code": cstr(it.get("item_code") or ""),
+						"item_name": cstr(it.get("item_name") or it.get("item_code") or ""),
+						"qty": flt(it.get("qty")),
+						"uom": cstr(it.get("uom") or ""),
+						"boxes": flt(it.get("qty")),
+						"box_count": box_count,
+						"state": state,
+						"on_truck": True,
+						"direction": "in",
+						"reason": reason,
+						"outcome": outcome or None,
+					}
+				)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "get_trip_cargo_items stop")
+			continue
+
+	trip_meta = summary.get("trip") if isinstance(summary.get("trip"), dict) else None
+	return {
+		"trip": trip_meta
+		or {
+			"name": getattr(trip, "name", None),
+			"status": getattr(trip, "status", None),
+			"departure_time": getattr(trip, "departure_time", None),
+			"driver": getattr(trip, "driver", None),
+			"driver_name": getattr(trip, "driver_name", None),
+			"vehicle": getattr(trip, "vehicle", None),
+		},
+		"items": items,
+		"totals": {
+			"lines": len(items),
+			"on_truck_qty": on_truck_qty,
+			"delivered_qty": delivered_qty,
+			"returned_qty": returned_qty,
+		},
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def get_trip_cargo_items(trip_name=None):
+	"""MAT Items tab: what should be IN/OUT on the vehicle (incl. returns / excess)."""
+	trip_name = cstr(trip_name or "").strip()
+	if not trip_name or trip_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Trip is required."))
+	if not frappe.db.exists("Delivery Trip", trip_name):
+		frappe.throw(_("Delivery Trip {0} not found").format(trip_name), frappe.DoesNotExistError)
+	try:
+		frappe.flags.ignore_permissions = True
+		trip = frappe.get_doc("Delivery Trip", trip_name)
+		frappe.flags.ignore_permissions = False
+	except Exception:
+		frappe.flags.ignore_permissions = False
+		frappe.throw(_("Delivery Trip {0} not found").format(trip_name), frappe.DoesNotExistError)
+	try:
+		return _build_trip_cargo_items(trip)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "get_trip_cargo_items")
+		return _cargo_empty_payload(trip)
 
 
 @frappe.whitelist()

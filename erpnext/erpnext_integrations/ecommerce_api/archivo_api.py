@@ -36,6 +36,7 @@ RELATED_DOCTYPES = frozenset(
 		"Purchase Order",
 		"Sales Order",
 		"Sales Invoice",
+		"Delivery Note",
 		"Company Archive Entry",
 	}
 )
@@ -92,6 +93,7 @@ SYSTEM_KINDS = [
 	# i053 — one placeholder folder per (company, YYYY-MM) for auto-created docs.
 	{"code": "month_binder", "label_es": "Carpeta del mes", "label_en": "Month binder", "label_zh": "月度文件夹", "sync_template": "paper"},
 	{"code": "sales_invoice", "label_es": "Factura de venta", "label_en": "Sales invoice", "label_zh": "销售发票", "sync_template": "paper"},
+	{"code": "remito", "label_es": "Remito", "label_en": "Delivery note", "label_zh": "送货单", "sync_template": "paper"},
 ]
 
 # i051 — Documentos inbox. Queue = enqueued files nobody classified yet;
@@ -1092,6 +1094,200 @@ def attach_archivo_file(name=None, file_name=None, content_b64=None, is_private=
 		"file_url": file_doc.file_url,
 		"file_name": file_doc.file_name,
 		"attachment_count": _attachment_count(name),
+	}
+
+
+def _find_remito_archivo(dn_name: str) -> str | None:
+	"""Company Archive Entry for this Delivery Note (related_refs or payment_reference)."""
+	dn_name = _as_str(dn_name)
+	if not dn_name:
+		return None
+	if not frappe.db.exists("DocType", DOCTYPE):
+		return None
+	if frappe.db.exists("DocType", "Archive Related Ref"):
+		rows = frappe.db.sql(
+			"""
+			SELECT parent FROM `tabArchive Related Ref`
+			WHERE link_doctype = 'Delivery Note' AND link_name = %s
+			ORDER BY creation ASC
+			LIMIT 1
+			""",
+			(dn_name,),
+		)
+		if rows:
+			return rows[0][0]
+	# Fallback before migrate adds Delivery Note to related_refs options.
+	name = frappe.db.get_value(
+		DOCTYPE,
+		{"kind": "remito", "payment_reference": dn_name, "workflow_status": ["!=", "void"]},
+		"name",
+	)
+	return name or None
+
+
+def _decode_upload_b64(content_b64) -> bytes:
+	import base64
+
+	raw = _as_str(content_b64)
+	if not raw:
+		return b""
+	if "," in raw and raw.lower().startswith("data:"):
+		raw = raw.split(",", 1)[1]
+	try:
+		return base64.b64decode(raw)
+	except Exception:
+		return b""
+
+
+@frappe.whitelist(allow_guest=True)
+def ensure_remito_archivo_entry(delivery_note=None, sales_order=None):
+	"""Get-or-create a filed Documentos (Remito) row for a Delivery Note.
+
+	Soft-safe: missing DocType / dirty names return ``{ok:0}`` instead of 500.
+	"""
+	dn_name = _as_str(delivery_note)
+	so_name = _as_str(sales_order)
+	if not dn_name or dn_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Delivery Note is required."))
+	if not frappe.db.exists("DocType", DOCTYPE):
+		return {"ok": 0, "name": None, "reason": "no_doctype"}
+	if not frappe.db.exists("Delivery Note", dn_name):
+		frappe.throw(_("Delivery Note {0} not found").format(dn_name), frappe.DoesNotExistError)
+
+	existing = _find_remito_archivo(dn_name)
+	if existing:
+		return {"ok": 1, "name": existing, "created": 0}
+
+	frappe.flags.ignore_permissions = True
+	try:
+		dn = frappe.get_doc("Delivery Note", dn_name)
+	finally:
+		frappe.flags.ignore_permissions = False
+
+	if not so_name:
+		for row in dn.items or []:
+			so = _as_str(getattr(row, "against_sales_order", None))
+			if so:
+				so_name = so
+				break
+
+	customer = _as_str(getattr(dn, "customer", None))
+	posting = getattr(dn, "posting_date", None) or getattr(dn, "creation", None) or nowdate()
+	try:
+		posting = str(getdate(posting))
+	except Exception:
+		posting = nowdate()
+
+	tail = dn_name.split("-")[-1] if "-" in dn_name else dn_name
+	title = _("Remito · {0}").format(tail)
+	if customer:
+		cust_label = (
+			frappe.db.get_value("Customer", customer, "customer_name") or customer
+		)
+		title = f"{title} · {cust_label}"
+
+	refs = []
+	# Delivery Note on related_refs needs migrate (Archive Related Ref options).
+	allow_dn_ref = False
+	try:
+		child_meta = frappe.get_meta("Archive Related Ref")
+		dt_field = child_meta.get_field("link_doctype")
+		child_opts = (dt_field.options or "") if dt_field else ""
+		allow_dn_ref = "Delivery Note" in child_opts.split("\n")
+	except Exception:
+		allow_dn_ref = False
+	if allow_dn_ref:
+		refs.append({"link_doctype": "Delivery Note", "link_name": dn_name, "note": "remito"})
+	if so_name and frappe.db.exists("Sales Order", so_name):
+		refs.append({"link_doctype": "Sales Order", "link_name": so_name, "note": "pedido"})
+	if customer and frappe.db.exists("Customer", customer):
+		refs.append({"link_doctype": "Customer", "link_name": customer, "note": "cliente"})
+
+	try:
+		# party_type may or may not include Customer depending on migrate;
+		# prefer Customer when allowed, else leave party empty and keep related_refs.
+		party_type = None
+		party_val = None
+		try:
+			meta = frappe.get_meta(DOCTYPE)
+			pt_field = meta.get_field("party_type")
+			opts = (pt_field.options or "") if pt_field else ""
+			if "Customer" in opts.split("\n") and customer:
+				party_type = "Customer"
+				party_val = customer
+		except Exception:
+			party_type = None
+			party_val = None
+		row = create_archivo_entry(
+			title=title[:140],
+			kind="remito",
+			sync_template="paper",
+			posting_date=posting,
+			party_type=party_type,
+			party=party_val,
+			workflow_status="filed",
+			payment_reference=dn_name,
+			company=_as_str(getattr(dn, "company", None)) or None,
+			related_refs=refs,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "ensure_remito_archivo_entry create")
+		# Race: another request may have created it.
+		again = _find_remito_archivo(dn_name)
+		if again:
+			return {"ok": 1, "name": again, "created": 0}
+		return {"ok": 0, "name": None, "reason": "create_failed"}
+
+	name = row.get("name") if isinstance(row, dict) else None
+	if name:
+		try:
+			_link_entry_to_month_binder(name, year_month=posting, company=getattr(dn, "company", None))
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "ensure_remito_archivo binder")
+	return {"ok": 1, "name": name, "created": 1}
+
+
+@frappe.whitelist(allow_guest=True)
+def file_remito_pdf_to_archivo(
+	delivery_note=None,
+	file_name=None,
+	content_b64=None,
+	sales_order=None,
+):
+	"""Ensure Documentos remito row + attach the printed PDF (also on the DN)."""
+	dn_name = _as_str(delivery_note)
+	if not dn_name or dn_name.lower() in ("null", "undefined", "none"):
+		frappe.throw(_("Delivery Note is required."))
+	content = _decode_upload_b64(content_b64)
+	if not content:
+		frappe.throw(_("Empty or invalid PDF content."))
+	fname = _as_str(file_name) or f"Remito-{dn_name.split('-')[-1]}.pdf"
+	if not fname.lower().endswith(".pdf"):
+		fname = f"{fname}.pdf"
+
+	ensured = ensure_remito_archivo_entry(delivery_note=dn_name, sales_order=sales_order)
+	archivo_name = ensured.get("name") if isinstance(ensured, dict) else None
+
+	frappe.flags.ignore_permissions = True
+	try:
+		# Attach on Delivery Note (ERP paper trail).
+		if frappe.db.exists("Delivery Note", dn_name):
+			save_file(fname, content, "Delivery Note", dn_name, is_private=1)
+		if archivo_name:
+			save_file(fname, content, DOCTYPE, archivo_name, is_private=1)
+		frappe.db.commit()
+	except Exception:
+		frappe.flags.ignore_permissions = False
+		frappe.log_error(frappe.get_traceback(), "file_remito_pdf_to_archivo")
+		frappe.throw(_("Could not attach remito PDF."))
+	finally:
+		frappe.flags.ignore_permissions = False
+
+	return {
+		"ok": 1,
+		"archivo_name": archivo_name,
+		"file_name": fname,
+		"created": cint(ensured.get("created")) if isinstance(ensured, dict) else 0,
 	}
 
 

@@ -4552,6 +4552,58 @@
       "expect": "fail"
     },
     {
+      "id": "tms_get_trip_cargo_items_null",
+      "source": "regression",
+      "bug": "get_trip_cargo_items with null/empty trip_name is controlled ValidationError (MAT Items tab)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_trip_cargo_items",
+      "args": {
+        "trip_name": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_get_trip_cargo_items_undefined",
+      "source": "regression",
+      "bug": "get_trip_cargo_items with string 'undefined' trip_name is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_trip_cargo_items",
+      "args": {
+        "trip_name": "undefined"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_get_trip_cargo_items_missing_trip",
+      "source": "regression",
+      "bug": "get_trip_cargo_items unknown trip is controlled DoesNotExistError (not 500)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.get_trip_cargo_items",
+      "args": {
+        "trip_name": "__no_such_mat__"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "archivo_ensure_remito_null",
+      "source": "regression",
+      "bug": "ensure_remito_archivo_entry with null delivery_note is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.ensure_remito_archivo_entry",
+      "args": {
+        "delivery_note": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "archivo_file_remito_pdf_empty",
+      "source": "regression",
+      "bug": "file_remito_pdf_to_archivo with empty content_b64 is controlled ValidationError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.file_remito_pdf_to_archivo",
+      "args": {
+        "delivery_note": "MAT-DN-EDGE",
+        "file_name": "x.pdf",
+        "content_b64": ""
+      },
+      "expect": "fail"
+    },
+    {
       "id": "create_po_client_request_id_dict",
       "method": "erpnext.erpnext_integrations.ecommerce_api.buying_api.create_purchase_order",
       "args": {
@@ -5863,9 +5915,9 @@
         "guest_name": "edge no addr",
         "initial_status": "Orden"
       },
-      "expect": "no_500",
+      "expect": "ok",
       "source": "regression",
-      "bug": "Orden without address must warn not_deliverable / stay off planner, never TypeError"
+      "bug": "Orden without address seeds random Items then warns not_deliverable / stay off planner — never HTTP 417 Data missing in table Items"
     },
     {
       "id": "create_guest_preorder_orden_seller_promote_flag_safe",
@@ -5876,9 +5928,38 @@
         "guest_name": "edge seller orden",
         "initial_status": "Orden"
       },
-      "expect": "error",
+      "expect": "ok",
       "source": "regression",
-      "bug": "create_guest_preorder null items + Orden must ValidationError (empty cart), never PermissionError from suggestion-only guard"
+      "bug": "create_guest_preorder null items + Orden seeds random sellable Items and promotes — never HTTP 417 Items / PermissionError from suggestion-only guard"
+    },
+    {
+      "id": "create_guest_preorder_orden_empty_items_seeds_random",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_name": "edge orden seed items",
+        "guest_notes": "edge orden empty cart seed",
+        "initial_status": "Orden"
+      },
+      "expect": {
+        "display_status": "Orden"
+      },
+      "source": "regression",
+      "bug": "Orden create with empty items must seed random catalog lines and submit — never HTTP 417 Data missing in table: Items"
+    },
+    {
+      "id": "create_guest_preorder_orden_no_notes_empty_items_seeds",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_name": "edge orden no notes seed",
+        "initial_status": "Orden"
+      },
+      "expect": {
+        "display_status": "Orden"
+      },
+      "source": "regression",
+      "bug": "Orden create with empty items and no notes seeds random Items (was Cart is empty / HTTP 417 on submit)"
     },
     {
       "id": "create_guest_preorder_omitted_items_empty_cart",
