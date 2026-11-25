@@ -1243,6 +1243,25 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_nos_item_weight_uom_not_weight_based():
+        """Item.weight_uom=Kg must not mark Nos sell lines as weight-based (Pedidos $/kg bug)."""
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "stock_uom": "Nos"},
+            "name",
+        )
+        assert item_code, "need a Nos item"
+        prev = frappe.db.get_value("Item", item_code, "weight_uom")
+        try:
+            frappe.db.set_value("Item", item_code, "weight_uom", "Kg", update_modified=False)
+            fields = api._item_line_weight_fields(item_code, line_uom="Nos")
+            assert fields.get("is_weight_based") is False, fields
+        finally:
+            frappe.db.set_value(
+                "Item", item_code, "weight_uom", prev, update_modified=False
+            )
+            frappe.db.commit()
+
     def check_weight_line_bills_rate_times_kg():
         """WEIGHT + peso unitario: grand_total / payment outstanding = rate × kg (not qty×rate)."""
         so_name = None
@@ -1398,6 +1417,81 @@ def suite_5_9_master_data():
                 "total_weight",
             )
             assert not flt(db_tw2 or 0), db_tw2
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_orden_submit_does_not_autofill_total_weight():
+        """Salesman Consulta→Orden must not invent PESO from peso promedio × qty."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[
+                    {
+                        "item_code": item_code,
+                        "qty": 2,
+                        "rate": 10,
+                        "uom": "WEIGHT",
+                        "weight_per_unit": 1.25,
+                    }
+                ],
+                guest_notes="smoke orden no autofill tw",
+                guest_name="Smoke Orden No Tw",
+                initial_status="Orden",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name
+            detail = api.get_guest_preorder(so_name)
+            line = (detail.get("items") or [None])[0]
+            assert line, detail
+            assert not flt(line.get("total_weight") or 0), line
+            assert abs(flt(line.get("amount") or 0)) < 0.01, line
+            db_tw = frappe.db.get_value(
+                "Sales Order Item",
+                {"parent": so_name, "item_code": item_code},
+                "total_weight",
+            )
+            assert not flt(db_tw or 0), db_tw
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
+    def check_weight_line_importe_zero_until_measured():
+        """WEIGHT without measured total_weight bills 0 (Armado required)."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item", {"disabled": 0, "is_stock_item": 1}, "name"
+        )
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[
+                    {
+                        "item_code": item_code,
+                        "qty": 3,
+                        "rate": 100,
+                        "uom": "WEIGHT",
+                        "weight_per_unit": 2,
+                    }
+                ],
+                guest_notes="smoke weight zero until measured",
+                guest_name="Smoke Weight Zero",
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name
+            detail = api.get_guest_preorder(so_name)
+            line = (detail.get("items") or [None])[0]
+            assert line, detail
+            assert abs(flt(line.get("amount") or 0)) < 0.01, line
+            assert abs(flt(detail.get("estimated_total") or 0)) < 0.01, detail
         finally:
             if so_name and frappe.db.exists("Sales Order", so_name):
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
@@ -2047,10 +2141,21 @@ def suite_5_9_master_data():
     _run("5.9.13b merge same-client Consultas", check_merge_guest_preorders_same_client, "S2")
     _run("5.9.14 WEIGHT uom fractional qty", check_weight_uom_fractional_qty, "S2")
     _run("5.9.14a WEIGHT bills rate×kg", check_weight_line_bills_rate_times_kg, "S2")
+    _run("5.9.14c Nos+weight_uom Kg not weight-based", check_nos_item_weight_uom_not_weight_based, "S2")
     _run("5.9.14b measured kg no float drift", check_measured_total_weight_no_float_drift, "S2")
     _run(
         "5.9.14b2 peso promedio does not autofill total_weight",
         check_peso_promedio_does_not_autofill_total_weight,
+        "S2",
+    )
+    _run(
+        "5.9.14b3 Orden submit does not autofill total_weight",
+        check_orden_submit_does_not_autofill_total_weight,
+        "S2",
+    )
+    _run(
+        "5.9.14b4 WEIGHT importe 0 until measured",
+        check_weight_line_importe_zero_until_measured,
         "S2",
     )
     _run("5.9.14b consulta does not mint client PIN", check_consulta_does_not_mint_client_pin, "S2")
@@ -3471,12 +3576,16 @@ def suite_5_12_modules_read():
             in ("FACTURA DE VENTA", "DOCUMENTO NO VALIDO COMO FACTURA", "非正式发票单据")
             for e in es_els
         ), es_els
-        # DN remito keeps line amount for Importe even when WEIGHT + no measured kg yet.
+        # DN remito: WEIGHT without measured kg must not print qty×rate as Importe.
         dn_amt = pta._enrich_print_line_item(
             {"item_code": "SMOKE-WT", "qty": 1, "uom": "WEIGHT", "total_weight": 0, "amount": 7900},
             blank_unknown_weight_amount=False,
         )
-        assert abs(flt(dn_amt.get("amount")) - 7900) < 1e-9, dn_amt
+        assert not flt(dn_amt.get("amount") or 0), dn_amt
+        nos_not_kg = pta._is_weight_based_line(
+            {"uom": "Nos", "stock_uom": "Nos"}, stock_uom="Nos", weight_uom="Kg"
+        )
+        assert nos_not_kg is False, "Item.weight_uom=Kg must not mark Nos lines as weight-based"
         # SI preview: fill Amount from rate × measured kg when amount was blanked.
         filled = pta._enrich_print_line_item(
             {
@@ -5300,6 +5409,17 @@ def suite_5_13_offline_outbox():
             assert abs(flt(row.get("amount")) - 15680) < 0.05, row
             assert abs(flt(row.get("qty")) - 4) < 1e-9, row
             assert row.get("is_weight_based") in (True, 1), row
+            frappe.db.set_value(
+                "Delivery Note Item",
+                dni,
+                {"total_weight": 0},
+                update_modified=False,
+            )
+            frappe.db.commit()
+            check0 = ok_api.get_delivery_check_items(delivery_note=dn_name)
+            row0 = ((check0.get("cajas") or [{}])[0].get("items") or [None])[0]
+            assert row0, check0
+            assert abs(flt(row0.get("amount") or 0)) < 0.05, row0
         finally:
             if dn_name and frappe.db.exists("Delivery Note", dn_name):
                 frappe.delete_doc("Delivery Note", dn_name, ignore_permissions=True, force=True)

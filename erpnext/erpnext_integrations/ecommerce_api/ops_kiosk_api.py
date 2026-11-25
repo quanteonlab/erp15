@@ -2474,6 +2474,7 @@ def get_delivery_check_items(delivery_note=None):
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		_guest_preorder_line_amount,
 		_item_line_weight_fields,
+		_row_is_weight_sell,
 	)
 
 	frappe.flags.ignore_permissions = True
@@ -2486,10 +2487,10 @@ def get_delivery_check_items(delivery_note=None):
 			continue
 		qty = flt(d.qty)
 		rate = flt(getattr(d, "rate", None) or 0)
-		# Agreed line total: WEIGHT is rate×kg (total_weight), never rate×units.
-		# Falling back to stored amount / rate×qty only when weight math is empty.
+		# Agreed line total: WEIGHT is rate×measured kg, never rate×units.
+		# Unweighed WEIGHT stays 0 (Armado required) — do not fall back to qty×rate.
 		agreed = flt(_guest_preorder_line_amount(d))
-		if agreed <= 0:
+		if agreed <= 0 and not _row_is_weight_sell(d):
 			agreed = flt(getattr(d, "amount", None) or (rate * qty))
 		weight = _item_line_weight_fields(
 			d.item_code,

@@ -5598,10 +5598,11 @@ def _item_line_weight_fields(
 	except Exception:
 		pass
 	sell_uom = cstr(line_uom or "").strip() or stock_uom
-	uoms = {
+	# Sell-by-weight from stock / line UOM only. Item.weight_uom is the UOM of
+	# the weight_per_unit *field* (often Kg even on Nos/CAJA) — including it
+	# falsely marked unit products as weight-based and Pedidos showed $/kg.
+	sell_uoms = {
 		cstr(stock_uom).strip().lower(),
-		cstr(weight_uom).strip().lower(),
-		cstr(unit).strip().lower(),
 		cstr(sell_uom).strip().lower(),
 	}
 	weight_tokens = {
@@ -5619,7 +5620,7 @@ def _item_line_weight_fields(
 		"ml",
 		"milliliter",
 	}
-	is_weight_based = bool(uoms & weight_tokens)
+	is_weight_based = bool(sell_uoms & weight_tokens)
 	# Prefer line-level pack weight / measured total (remeasure) over Item master.
 	# Never invent total_weight from peso promedio × qty — that is estimate-only (~ in UI).
 	line_wpu = flt(line_weight_per_unit) if line_weight_per_unit not in (None, "") else 0.0
@@ -5724,14 +5725,11 @@ def _allow_weight_fractional_stock_qty(so):
 		if self.doc is not so and not getattr(getattr(self.doc, "flags", None), "ecommerce_weight_sell", False):
 			return
 		for item in self.doc.get("items") or []:
-			uom = cstr(getattr(item, "uom", None) or getattr(item, "stock_uom", None) or "")
-			if not _is_weight_sell_uom(uom):
+			if not _row_is_weight_sell(item):
 				continue
 			bill = _weight_billable_qty(item)
-			if bill <= 0:
-				continue
 			rate = _weight_sell_effective_rate(item)
-			new_amount = flt(rate * bill, item.precision("amount"))
+			new_amount = flt(rate * bill, item.precision("amount")) if bill > 0 else 0.0
 			if abs(flt(item.amount) - new_amount) < 1e-9:
 				continue
 			item.amount = new_amount
@@ -5749,19 +5747,25 @@ def _allow_weight_fractional_stock_qty(so):
 		so.flags.ecommerce_weight_sell = False
 
 
-def _weight_billable_qty(row) -> float:
-	"""Kg (or qty) used to bill a WEIGHT line — mirrors frontend preorderLineBillableQty."""
+def _row_is_weight_sell(row) -> bool:
+	"""True when the line sells by kg (UOM WEIGHT / Kg / L / …)."""
 	uom = cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or "")
+	return _is_weight_sell_uom(uom)
+
+
+def _weight_billable_qty(row) -> float:
+	"""Kg used to bill a WEIGHT line.
+
+	Only measured ``total_weight`` (Armado / admin scale) is billable.
+	Peso promedio × qty is estimate-only — importe stays 0 until weighed.
+	"""
 	qty = flt(getattr(row, "qty", None) or 0)
-	if not _is_weight_sell_uom(uom):
+	if not _row_is_weight_sell(row):
 		return qty
 	tw = flt(getattr(row, "total_weight", None) or 0)
 	if tw > 0:
 		return tw
-	wpu = flt(getattr(row, "weight_per_unit", None) or 0)
-	if wpu > 0 and qty > 0:
-		return flt(qty * wpu)
-	return qty
+	return 0.0
 
 
 def _weight_sell_effective_rate(row) -> float:
@@ -5786,14 +5790,13 @@ def _weight_sell_effective_rate(row) -> float:
 
 
 def _guest_preorder_line_amount(row) -> float:
-	"""Line importe for Pedidos: WEIGHT → rate×kg; else rate×qty (or stored amount)."""
-	uom = cstr(getattr(row, "uom", None) or getattr(row, "stock_uom", None) or "")
-	if _is_weight_sell_uom(uom):
+	"""Line importe for Pedidos: WEIGHT → rate×measured kg (0 until Armado); else rate×qty."""
+	if _row_is_weight_sell(row):
 		bill = _weight_billable_qty(row)
 		rate = _weight_sell_effective_rate(row)
 		if rate > 0 and bill > 0:
 			return flt(rate * bill)
-		return flt(getattr(row, "amount", None) or 0)
+		return 0.0
 	rate = flt(getattr(row, "rate", None) or 0)
 	qty = flt(getattr(row, "qty", None) or 0)
 	disc = flt(getattr(row, "discount_percentage", None) or 0)
@@ -5829,10 +5832,35 @@ def _guest_preorder_estimated_total(so) -> float:
 	return max(flt(total) - disc, 0.0)
 
 
+def _apply_weight_unmeasured_zero_amounts(so) -> None:
+	"""WEIGHT lines without measured kg must not keep qty×rate money on the SO."""
+	changed = False
+	for row in so.items or []:
+		if not _row_is_weight_sell(row):
+			continue
+		if flt(getattr(row, "total_weight", None) or 0) > 0:
+			continue
+		if flt(getattr(row, "amount", None) or 0) == 0 and flt(getattr(row, "net_amount", None) or 0) == 0:
+			continue
+		row.amount = 0
+		row.net_amount = 0
+		row.base_amount = 0
+		row.base_net_amount = 0
+		changed = True
+	if changed:
+		so.grand_total = _guest_preorder_estimated_total(so)
+		so.net_total = so.grand_total
+		so.base_grand_total = so.grand_total
+		so.base_net_total = so.grand_total
+		so.rounded_total = so.grand_total
+		so.outstanding_amount = so.grand_total
+
+
 def _calculate_guest_preorder_totals(so):
-	"""ERPNext qty×rate, then WEIGHT rebilled as $/kg × kg."""
+	"""ERPNext qty×rate, then WEIGHT rebilled as $/kg × kg (0 until measured)."""
 	with _allow_weight_fractional_stock_qty(so):
 		so.run_method("calculate_taxes_and_totals")
+	_apply_weight_unmeasured_zero_amounts(so)
 	# Submitted edits save with ignore_validate_update_after_submit, which skips
 	# the validate steps that refresh these — the print showed the old rate/total.
 	for row in so.items or []:
@@ -6133,6 +6161,10 @@ def create_guest_preorder(
 		rate = flt(item.get("rate", 0))
 		wpu = item.get("weight_per_unit")
 		wpu_val = flt(wpu) if wpu not in (None, "") else None
+		raw_uom = item.get("uom") or item.get("stock_uom")
+		line_uom = _normalize_preorder_line_uom(raw_uom) if raw_uom not in (None, "") else None
+		tw_raw = item.get("total_weight")
+		tw_val = flt(tw_raw) if tw_raw not in (None, "") else None
 		if not item_code:
 			continue
 		if not frappe.db.exists("Item", item_code):
@@ -6148,6 +6180,8 @@ def create_guest_preorder(
 				"qty": qty,
 				"rate": rate,
 				"weight_per_unit": wpu_val,
+				"uom": line_uom,
+				"total_weight": tw_val if tw_val and tw_val > 0 else None,
 			}
 		)
 
@@ -6331,6 +6365,12 @@ def create_guest_preorder(
 			"rate": rate,
 			"delivery_date": so.delivery_date,
 		}
+		line_uom = row.get("uom")
+		if line_uom:
+			line_kwargs["uom"] = line_uom
+			if _is_weight_sell_uom(line_uom):
+				line_kwargs["stock_uom"] = line_uom
+				line_kwargs["conversion_factor"] = 1
 		# Catalog peso promedio for ~estimates only — do not auto-fill measured total_weight.
 		wpu = row.get("weight_per_unit")
 		if wpu is None and frappe.db.has_column("Item", "weight_per_unit"):
@@ -6502,7 +6542,7 @@ def create_guest_preorder(
 
 	payload = {
 		"preorder_name": so.name,
-		"estimated_total": flt(so.grand_total),
+		"estimated_total": _guest_preorder_estimated_total(so),
 		"currency": so.currency,
 		"status": so.status,
 		"advance_paid": flt(so.advance_paid) if paid > 0 else 0,
@@ -7464,13 +7504,24 @@ def ensure_guest_preorder_status_options():
 	frappe.clear_cache(doctype="Sales Order")
 
 
+def _measured_total_weights_from_so(so) -> dict:
+	"""item_code → already-measured kg currently on the SO (ignore 0 / estimates)."""
+	out = {}
+	for row in so.get("items") or []:
+		code = cstr(getattr(row, "item_code", "") or "")
+		tw = flt(getattr(row, "total_weight", None) or 0)
+		if code and tw > 0:
+			out[code] = tw
+	return out
+
+
 def _save_guest_preorder_so(so):
 	"""
 	Save a guest-preorder Sales Order even when status is a custom pipeline marker.
 
 	Frappe Select validation rejects Consulta / Preparado / Delivery unless the
 	Property Setter has run; stash a valid ERP status for save, then restore.
-	WEIGHT lines are rebilled as $/kg × kg inside the save validate path.
+	Always strip ERPNext wpu×qty autofill and zero WEIGHT importe until measured.
 	"""
 	ensure_guest_preorder_status_options()
 	custom = cstr(getattr(so, "status", None) or "").strip()
@@ -7479,10 +7530,44 @@ def _save_guest_preorder_so(so):
 		so.status = "To Deliver and Bill" if cint(so.docstatus) == 1 else "Draft"
 	if cint(so.docstatus) == 1:
 		so.flags.ignore_validate_update_after_submit = True
-	with _allow_weight_fractional_stock_qty(so):
-		so.save(ignore_permissions=True)
+	measured = _measured_total_weights_from_so(so)
+	with _keep_only_measured_total_weights(so, measured):
+		with _allow_weight_fractional_stock_qty(so):
+			so.save(ignore_permissions=True)
+	_apply_weight_unmeasured_zero_amounts(so)
 	if restore:
 		so.db_set("status", restore, update_modified=False)
+
+
+def _submit_guest_preorder_so(so):
+	"""Submit without inventing PESO from peso promedio, and without qty×rate WEIGHT bills."""
+	measured = _measured_total_weights_from_so(so)
+	so.flags.ignore_permissions = True
+	with _keep_only_measured_total_weights(so, measured):
+		so.submit()
+	so.reload()
+	_apply_measured_total_weights(so, measured)
+	_apply_weight_unmeasured_zero_amounts(so)
+	for row in so.items or []:
+		code = cstr(getattr(row, "item_code", "") or "")
+		keep = measured.get(code)
+		vals = {
+			"total_weight": flt(keep) if keep else 0,
+			"amount": flt(getattr(row, "amount", None) or 0),
+			"net_amount": flt(getattr(row, "net_amount", None) or 0),
+		}
+		frappe.db.set_value("Sales Order Item", row.name, vals, update_modified=False)
+	so_vals = {
+		"grand_total": flt(so.grand_total),
+		"net_total": flt(so.net_total),
+		"base_grand_total": flt(so.base_grand_total),
+	}
+	if frappe.db.has_column("Sales Order", "outstanding_amount"):
+		so_vals["outstanding_amount"] = flt(
+			getattr(so, "outstanding_amount", None) or so.grand_total
+		)
+	frappe.db.set_value("Sales Order", so.name, so_vals, update_modified=False)
+	so.reload()
 
 
 def _normalize_pipeline_source(source):
@@ -8032,9 +8117,7 @@ def set_guest_preorder_status(
 				so.reload()
 			# Empty Items → HTTP 417 on submit; seed random catalog lines first.
 			_seed_random_items_onto_so_if_empty(so)
-			so.flags.ignore_permissions = True
-			so.submit()
-			so.reload()
+			_submit_guest_preorder_so(so)
 		except Exception as e:
 			frappe.throw(
 				_("Cannot move from Consulta to {0}: submit failed — {1}").format(
@@ -8131,8 +8214,7 @@ def confirm_guest_preorder(preorder_name):
 
 	if so.docstatus == 0:
 		_seed_random_items_onto_so_if_empty(so)
-		so.flags.ignore_permissions = True
-		so.submit()
+		_submit_guest_preorder_so(so)
 
 	so.update_status("To Deliver and Bill")
 	so.reload()
@@ -8841,7 +8923,8 @@ def _apply_item_changes(so, items, additional_discount_amount):
 			row.total_weight = flt(override.get("total_weight"))
 		elif "weight_per_unit" in override and override.get("weight_per_unit") is not None:
 			row.weight_per_unit = flt(override.get("weight_per_unit"))
-		row.amount = row.rate * row.qty
+		if not _row_is_weight_sell(row):
+			row.amount = row.rate * row.qty
 
 	# Add new items. Submitted SOs use ignore_validate_update_after_submit, so
 	# set_missing_values never fills item_name/uom — set them explicitly or
@@ -8917,7 +9000,8 @@ def update_guest_preorder_prices(preorder_name, items, additional_discount_amoun
 			row.discount_percentage = flt(override.get("discount_percentage", 0))
 			if override.get("uom") is not None or override.get("stock_uom") is not None:
 				_apply_so_line_uom(row, override.get("uom") or override.get("stock_uom"))
-			row.amount = row.rate * row.qty
+			if not _row_is_weight_sell(row):
+				row.amount = row.rate * row.qty
 
 	_set_so_doc_discount_amount(so, additional_discount_amount)
 	_calculate_guest_preorder_totals(so)

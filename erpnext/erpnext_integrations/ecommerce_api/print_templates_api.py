@@ -178,13 +178,15 @@ def _order_print_client_knows_weight() -> bool:
 
 
 def _is_weight_based_line(row: dict, stock_uom: str = "", weight_uom: str = "") -> bool:
-	"""Sold-by-weight when the transaction/stock UOM is a mass unit."""
+	"""Sold-by-weight from line/stock UOM only.
+
+	Item.weight_uom is the UOM of the peso-promedio *field* (often Kg on Nos/CAJA)
+	and must not mark pack products as weight-based.
+	"""
 	for u in (
 		row.get("uom"),
 		row.get("stock_uom"),
-		weight_uom,
 		stock_uom,
-		row.get("weight_uom"),
 	):
 		if _is_weight_uom(u):
 			return True
@@ -495,14 +497,9 @@ def _enrich_print_line_item(row, *, blank_unknown_weight_amount: bool = True) ->
 	else:
 		out["precio_kg"] = ""
 		out["precio_u"] = ""
-	# Armado sheets: hide $ until weighed. Remito/SI keep billed amount for Importe.
-	if (
-		blank_unknown_weight_amount
-		and weight_based
-		and not client_knows_weight
-		and total_w is None
-	):
-		out["amount"] = ""
+	# Weight lines without measured kg: never print qty×rate as Importe.
+	if weight_based and not client_knows_weight and total_w is None:
+		out["amount"] = "" if blank_unknown_weight_amount else 0
 	elif not _positive_float(out.get("amount")):
 		# Fill Amount when rate × kg/qty is known (WEIGHT lines often store qty as packs).
 		rate = flt(out.get("rate"))

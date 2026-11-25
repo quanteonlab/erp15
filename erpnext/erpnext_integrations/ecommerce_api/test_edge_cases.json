@@ -6021,6 +6021,69 @@
       "bug": "Relacionar on notes-only Consulta (no Items) must not HTTP 417 Data missing in table Items"
     },
     {
+      "id": "item_line_weight_fields_null_item_controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api._item_line_weight_fields",
+      "args": {
+        "item_code": null,
+        "line_uom": "Nos"
+      },
+      "expect": {
+        "is_weight_based": false
+      },
+      "source": "regression",
+      "bug": "Nos sell UOM must not be weight-based from Item.weight_uom=Kg metadata — Pedidos P.unit. was showing /kg with empty PESO"
+    },
+    {
+      "id": "create_guest_preorder_weight_no_total_weight_ok",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [
+          {
+            "item_code": "EDGE-IMG-MODE",
+            "qty": 2,
+            "rate": 10,
+            "uom": "WEIGHT",
+            "weight_per_unit": 1.5
+          }
+        ],
+        "guest_name": "edge weight no tw",
+        "guest_notes": "edge salesman no autofill peso",
+        "initial_status": "Orden"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Salesman Orden create with WEIGHT + peso unitario must not invent total_weight / HTTP 417; importe stays 0 until Armado"
+    },
+    {
+      "id": "get_delivery_check_items_null_dn_controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_delivery_check_items",
+      "args": {
+        "delivery_note": null
+      },
+      "expect": "no_500",
+      "source": "regression",
+      "bug": "Completar Entrega with null DN is controlled; WEIGHT amount must never fall back to qty×rate when unweighed"
+    },
+    {
+      "id": "enrich_print_line_weight_uom_kg_nos_not_weight",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.print_templates_api._enrich_print_line_item",
+      "args": {
+        "row": {
+          "item_code": "EDGE-IMG-MODE",
+          "qty": 2,
+          "uom": "Nos",
+          "stock_uom": "Nos",
+          "weight_uom": "Kg",
+          "rate": 10,
+          "amount": 20,
+          "total_weight": 0
+        }
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "Print Nos line with Item.weight_uom=Kg must not be treated as WEIGHT / blank importe"
+    },
+    {
       "id": "set_guest_preorder_status_orden_empty_name_controlled",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.set_guest_preorder_status",
       "args": {
