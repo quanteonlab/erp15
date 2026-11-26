@@ -4880,6 +4880,12 @@ def suite_5_12_modules_read():
         settings = tms.get_tms_settings()
         assert settings is not None
         assert "require_pin_for_order_actions" in settings
+        allowed = tms.list_allowed_delivery_dates(days_ahead=21)
+        assert isinstance(allowed, dict) and isinstance(allowed.get("dates"), list), allowed
+        assert allowed["dates"], "TMS go-out weekdays must yield ≥1 allowed delivery date"
+        today = str(nowdate())
+        assert today not in allowed["dates"], "today must not be selectable when lead≥1"
+        assert all(d > today for d in allowed["dates"]), allowed["dates"][:3]
         claimable = tms.list_claimable_orders()
         assert isinstance(claimable, dict) and isinstance(claimable.get("orders"), list)
 

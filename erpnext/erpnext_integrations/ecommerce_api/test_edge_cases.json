@@ -2570,6 +2570,32 @@
       "expect": "ok"
     },
     {
+      "id": "tms_list_allowed_delivery_dates_nulls",
+      "source": "regression",
+      "bug": "list_allowed_delivery_dates with null customer/zone/days_ahead must return dates list — never TypeError/500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_allowed_delivery_dates",
+      "args": {
+        "customer": null,
+        "zone": null,
+        "days_ahead": null,
+        "as_of": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_allowed_delivery_dates_dirty",
+      "source": "regression",
+      "bug": "list_allowed_delivery_dates with empty/string dirty args is controlled",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_allowed_delivery_dates",
+      "args": {
+        "customer": "",
+        "zone": "null",
+        "days_ahead": "undefined",
+        "as_of": " "
+      },
+      "expect": "ok"
+    },
+    {
       "id": "tms_list_delivery_clients_nulls",
       "source": "regression",
       "bug": "list_delivery_clients with null limit/only_geocoded must return clients dict, never TypeError/500",

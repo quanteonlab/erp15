@@ -6502,6 +6502,76 @@ def get_tms_settings():
 
 
 @frappe.whitelist(allow_guest=True)
+def list_allowed_delivery_dates(customer=None, zone=None, days_ahead=60, as_of=None):
+	"""TMS go-out weekdays as selectable delivery dates (YYYY-MM-DD).
+
+	- Never past; earliest = as_of + ``delivery_lead_days`` (default 1 → not today).
+	- Weekday ∈ company ``auto_group_working_days``.
+	- Optional ``zone`` / customer Address.custom_zone visit_days intersect when set.
+	"""
+	from frappe.utils import add_days, cint, cstr, getdate
+
+	settings = _load_tms_settings()
+	work = _normalize_working_days(settings.get("auto_group_working_days"))
+	if not work:
+		work = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+	raw_zone = cstr(zone or "").strip()
+	if not raw_zone or raw_zone.lower() in ("null", "undefined", "none"):
+		raw_zone = ""
+		cust = cstr(customer or "").strip()
+		if cust and cust.lower() not in ("null", "undefined", "none"):
+			try:
+				# Prefer shipping address zone when present.
+				addr = frappe.db.get_value(
+					"Dynamic Link",
+					{"link_doctype": "Customer", "link_name": cust, "parenttype": "Address"},
+					"parent",
+				)
+				if addr and frappe.db.has_column("Address", "custom_zone"):
+					raw_zone = cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip()
+			except Exception:
+				raw_zone = ""
+
+	visit = []
+	if raw_zone:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.api import _tms_zone_visit_days
+
+			visit = _tms_zone_visit_days(raw_zone) or []
+		except Exception:
+			visit = []
+
+	allowed = set(work)
+	if visit:
+		allowed = allowed.intersection(set(visit)) or set(work)
+
+	lead = max(1, cint(settings.get("delivery_lead_days") or 1))
+	try:
+		base = getdate(as_of) if as_of and cstr(as_of).strip() not in ("", "null", "undefined") else getdate()
+	except Exception:
+		base = getdate()
+	earliest = add_days(base, lead)
+	horizon = max(7, min(120, cint(days_ahead) if days_ahead not in (None, "", "null", "undefined") else 60))
+
+	dates = []
+	for i in range(0, horizon + 1):
+		d = add_days(earliest, i)
+		label = _WEEKDAY_ORDER[d.weekday()]
+		if label in allowed:
+			dates.append(str(d))
+
+	return {
+		"dates": dates,
+		"earliest": str(earliest),
+		"working_days": list(work),
+		"visit_days": list(visit) if visit else [],
+		"lead_days": lead,
+		"zone": raw_zone or None,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
 def preview_delivery_payment_surcharge(
 	goods_total=None,
 	payments=None,
