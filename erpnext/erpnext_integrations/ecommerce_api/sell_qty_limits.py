@@ -1,7 +1,8 @@
 """
 Product sell qty limits (Item.custom_min_sell_qty / custom_max_sell_qty_day).
 
-- min_sell_qty: per order line (stock UOM)
+- min_sell_qty: per order line qty (catalog pack/unit count; WEIGHT lines use
+  units sold, not measured Kg)
 - max_sell_qty_day: per client per calendar day (SO + SI), excluding walk-in
 """
 
