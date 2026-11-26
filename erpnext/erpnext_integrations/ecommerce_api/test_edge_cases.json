@@ -124,6 +124,20 @@
       "source": "seed"
     },
     {
+      "id": "get_products_ignore_perms_sell_limits_safe",
+      "source": "regression",
+      "bug": "get_products uses get_all(ignore_permissions) so guest/API still get min_sell aliases; dirty filters must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_products",
+      "args": {
+        "page_length": 3,
+        "start": 0,
+        "filters": null,
+        "search_term": "",
+        "include_disabled": 1
+      },
+      "expect": "ok"
+    },
+    {
       "id": "search_by_barcode_null",
       "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_by_barcode",
       "args": {

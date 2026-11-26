@@ -2721,6 +2721,7 @@ def suite_5_10_product_manager():
 
     def check_sell_qty_limits_fields_and_validate():
         """Product min / max-per-client-day: save fields + validate cart."""
+        from erpnext.erpnext_integrations.ecommerce_api import api
         from erpnext.erpnext_integrations.ecommerce_api import sell_qty_limits as sqlim
 
         pm.ensure_product_manager_custom_fields()
@@ -2740,6 +2741,19 @@ def suite_5_10_product_manager():
         assert sku, created
         assert flt(frappe.db.get_value("Item", sku, "custom_min_sell_qty")) == 2, sku
         assert flt(frappe.db.get_value("Item", sku, "custom_max_sell_qty_day")) == 5, sku
+        # Catalog payload must expose aliases (guest/API uses get_all ignore_permissions).
+        catalog = api.get_products(
+            page_length=5,
+            filters={"item_code": sku},
+            include_disabled=1,
+        )
+        cat_row = next(
+            (r for r in (catalog.get("items") or []) if r.get("item_code") == sku),
+            None,
+        )
+        assert cat_row, catalog
+        assert flt(cat_row.get("min_sell_qty")) == 2, cat_row
+        assert flt(cat_row.get("max_sell_qty_day")) == 5, cat_row
         # Below min → throw
         threw = False
         try:

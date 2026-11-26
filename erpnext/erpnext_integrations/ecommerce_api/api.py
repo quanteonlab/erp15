@@ -201,8 +201,9 @@ def get_products(
 			["description", "like", f"%{search_term}%"],
 		]
 
-	# Get items
-	items = frappe.get_list(
+	# get_all + ignore_permissions: guest / API-key sessions must still receive
+	# custom sell-limit fields (get_list can omit them when the role lacks Item read).
+	items = frappe.get_all(
 		"Item",
 		filters=filters,
 		or_filters=or_filters,
@@ -210,10 +211,20 @@ def get_products(
 		start=start,
 		page_length=page_length,
 		order_by=order_by,
+		ignore_permissions=True,
 	)
 
 	# Get total count (frappe.db.count doesn't support or_filters — use get_all with fields=["name"])
-	total_count = len(frappe.get_all("Item", filters=filters, or_filters=or_filters, fields=["name"], limit_page_length=0))
+	total_count = len(
+		frappe.get_all(
+			"Item",
+			filters=filters,
+			or_filters=or_filters,
+			fields=["name"],
+			limit_page_length=0,
+			ignore_permissions=True,
+		)
+	)
 
 	# Pricing: default to selling price list so callers always get rates
 	if not price_list:
