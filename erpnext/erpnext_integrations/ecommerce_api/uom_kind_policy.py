@@ -149,9 +149,40 @@ def is_unidad_uom(uom_name, kind_hint=None) -> bool:
 	return uom_kind(uom_name, kind_hint) == "unidad"
 
 
-def list_uoms_with_kind() -> list[dict]:
-	"""Enabled UOMs as ``{name, kind}`` — kind always resolved (DB or legacy)."""
+def _is_catalog_pickable_uom(name: str, stored_kind: str | None) -> bool:
+	"""Classic SilkOS UOMs (WEIGHT / Nos / CAJA|Box) + UOMs with an explicit kind.
+
+	ERPNext ships hundreds of scientific UOMs (Abampere, Acre, …) with blank
+	``custom_uom_kind`` — those must stay out of the PM / catalog picker.
+	Bare measure names (Kg, g, L, mL) are Unit measures, not stock UOM picks.
+	"""
+	raw = _norm(name)
+	if not raw:
+		return False
+	key = _norm_key(raw)
+	if raw in _BUILTIN_KIND:
+		return True
+	if key in _CONTENEDOR_NAME_TOKENS or key in _UNIDAD_NAME_TOKENS:
+		return True
+	if key in ("weight", "por peso", "porpeso"):
+		return True
+	stored = cstr(stored_kind or "").strip().lower()
+	if stored not in UOM_KINDS:
+		return False
+	# Explicit custom kind, but never promote raw measure tokens as stock UOM.
+	if key in _MEDIDA_NAME_TOKENS and raw != "WEIGHT":
+		return False
+	return True
+
+
+def list_uoms_with_kind(catalog_only=True) -> list[dict]:
+	"""Enabled UOMs as ``{name, kind}``.
+
+	``catalog_only`` (default True): classics + UOMs with ``custom_uom_kind`` set
+	(Create UDM). Pass falsy to get every enabled UOM (rare admin / migrate).
+	"""
 	import frappe
+	from frappe.utils import cint
 
 	ensure_uom_kind_custom_field()
 	has_kind = frappe.db.has_column("UOM", "custom_uom_kind")
@@ -168,12 +199,15 @@ def list_uoms_with_kind() -> list[dict]:
 		)
 	except Exception:
 		return []
+	only_catalog = cint(catalog_only) if catalog_only not in (None, "") else 1
 	out = []
 	for r in rows:
 		name = r.get("name")
 		if not name:
 			continue
 		hint = r.get("custom_uom_kind") if has_kind else None
+		if only_catalog and not _is_catalog_pickable_uom(name, hint):
+			continue
 		out.append({"name": name, "kind": uom_kind(name, hint)})
 	return out
 

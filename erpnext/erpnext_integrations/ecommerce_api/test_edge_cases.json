@@ -2044,6 +2044,19 @@
       "expect": "ok"
     },
     {
+      "id": "create_guest_preorder_items_null_sell_limits_safe",
+      "source": "regression",
+      "bug": "create_guest_preorder with null items + notes must not TypeError in sell qty limit validation",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": null,
+        "guest_notes": "edge null items sell limits",
+        "guest_name": "edge",
+        "send_client_pin": 0
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "create_guest_preorder_send_client_pin_null_phone_safe",
       "source": "regression",
       "bug": "create_guest_preorder send_client_pin=1 with null phone must not TypeError when minting",
@@ -9288,6 +9301,16 @@
       "expect": "ok",
       "source": "regression",
       "bug": "list_uoms must return [{name, kind}, …] — never crash when custom_uom_kind missing"
+    },
+    {
+      "id": "list_uoms_catalog_only_null_safe",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.list_uoms",
+      "args": {
+        "catalog_only": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_uoms catalog_only=null must default to catalog filter — never TypeError/500"
     },
     {
       "id": "get_unit_sku_graph_null_code",

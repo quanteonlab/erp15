@@ -1395,15 +1395,16 @@ def list_item_attribute_names():
 
 
 @frappe.whitelist()
-def list_uoms():
+def list_uoms(catalog_only=1):
     """Enabled UOMs as ``[{name, kind}, …]`` (p20).
 
-    Retro: older clients that expected bare strings can use ``.name``;
-    kind is always resolved (DB or legacy name aliases).
+    Default ``catalog_only=1``: WEIGHT / Nos / CAJA (and Box aliases) plus
+    UOMs created with an explicit ``custom_uom_kind`` — not the full ERPNext
+    scientific UOM library. Pass ``catalog_only=0`` for every enabled UOM.
     """
     from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import list_uoms_with_kind
 
-    return list_uoms_with_kind()
+    return list_uoms_with_kind(catalog_only=catalog_only)
 
 
 @frappe.whitelist(allow_guest=True)

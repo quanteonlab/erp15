@@ -6240,7 +6240,8 @@ def create_guest_preorder(
 		validate_items_sell_qty_limits,
 	)
 
-	validate_items_sell_qty_limits(items, customer=customer)
+	# Prefer resolved lines (barcode → item_code) so min/max bind to the real Item.
+	validate_items_sell_qty_limits(resolved_rows or items, customer=customer)
 
 	# Copy CRM horario + hour blocks onto the pedido when the caller did not send them
 	# (Traditional POS / Nueva Orden only passes customer).

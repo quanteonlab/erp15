@@ -1644,6 +1644,48 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_guest_preorder_rejects_below_min_sell_qty():
+        """Catalog consulta qty below Item.custom_min_sell_qty must throw."""
+        so_name = None
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        assert frappe.db.has_column("Item", "custom_min_sell_qty")
+        prev = frappe.db.get_value("Item", item_code, "custom_min_sell_qty")
+        frappe.db.set_value("Item", item_code, "custom_min_sell_qty", 2, update_modified=False)
+        frappe.db.commit()
+        try:
+            threw = False
+            try:
+                api.create_guest_preorder(
+                    items=[{"item_code": item_code, "qty": 1, "rate": 10}],
+                    guest_notes="smoke below min sell",
+                    guest_name="Smoke Min Sell",
+                    send_client_pin=0,
+                )
+            except Exception:
+                threw = True
+            assert threw, "create_guest_preorder must reject qty below min_sell_qty"
+            # Happy path at min still works.
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 2, "rate": 10}],
+                guest_notes="smoke at min sell",
+                guest_name="Smoke Min Sell Ok",
+                send_client_pin=0,
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name, out
+        finally:
+            frappe.db.set_value(
+                "Item", item_code, "custom_min_sell_qty", prev, update_modified=False
+            )
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_consulta_mints_client_pin_when_opted_in():
         """Catalog “Crear cuenta” → send_client_pin=1 mints a portal PIN on Consulta."""
         so_name = None
@@ -2312,6 +2354,11 @@ def suite_5_9_master_data():
     )
     _run("5.9.14b consulta does not mint client PIN", check_consulta_does_not_mint_client_pin, "S2")
     _run(
+        "5.9.14b4b guest preorder rejects below min sell qty",
+        check_guest_preorder_rejects_below_min_sell_qty,
+        "S1",
+    )
+    _run(
         "5.9.14b5 consulta mints PIN when send_client_pin=1",
         check_consulta_mints_client_pin_when_opted_in,
         "S2",
@@ -2469,6 +2516,13 @@ def suite_5_10_product_manager():
                 assert kinds["CAJA"] == "contenedor", kinds["CAJA"]
             if "Nos" in kinds:
                 assert kinds["Nos"] == "unidad", kinds["Nos"]
+            # Catalog picker must not dump the ERPNext scientific UOM library.
+            names_l = {cstr(n).lower() for n in kinds}
+            for junk in ("abampere", "acre", "barleycorn", "cable length", "btu"):
+                assert junk not in names_l, f"list_uoms(catalog) leaked system UOM {junk}"
+        # Full library still available when explicitly requested.
+        all_uoms = pm.list_uoms(catalog_only=0)
+        assert isinstance(all_uoms, list) and len(all_uoms) >= len(uoms or [])
 
     def check_unit_sku_leaf_factor_and_cycle():
         """p20 — nested pack product of packs; cycle rejected on save."""
