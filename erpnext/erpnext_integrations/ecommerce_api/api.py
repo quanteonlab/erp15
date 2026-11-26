@@ -7316,6 +7316,15 @@ def get_guest_preorder(preorder_name):
 		apply_armado_changed_display(payload)
 	except Exception:
 		payload["armado_progress"] = None
+	# p20 — pack graph on Pedidos lines (contenedor leaf denom for CANT. display)
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+			enrich_rows_with_pack_graph,
+		)
+
+		enrich_rows_with_pack_graph(payload.get("items") or [])
+	except Exception:
+		pass
 	payload["is_credit_note"] = cstr(tags.get("credit_note") or "") in ("1", "true", "yes")
 	payload["credit_of"] = cstr(tags.get("credit_of") or "").strip() or None
 	payload["credit_reason"] = cstr(tags.get("credit_reason") or "").strip() or None

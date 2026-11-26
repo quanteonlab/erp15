@@ -9269,6 +9269,16 @@
       "expect": "fail",
       "source": "regression",
       "bug": "ensure_product_lookup uom name=\"\" must controlled fail — never blank UOM"
+    },
+    {
+      "id": "get_armado_progress_missing_order_requested_qty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.get_armado_progress",
+      "args": {
+        "preorder_name": "__missing_armado_so__"
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "get_armado_progress unknown SO must controlled fail after requested_qty public shape — never TypeError"
     }
   ]
 }

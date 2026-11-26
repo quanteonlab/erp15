@@ -262,6 +262,8 @@ def _blank_progress_line(item_code: str) -> dict:
 		"missing_at": "",
 		"qty": None,
 		"total_weight": None,
+		# Frozen on first armado activity — Pedidos denominator (p20/armado qty UX).
+		"requested_qty": None,
 	}
 
 
@@ -450,6 +452,15 @@ def _require_armado_not_in_route(so_name: str, identity: dict) -> None:
 	)
 
 
+def _freeze_requested_qty(entry: dict, seed_qty) -> None:
+	"""Lock the Pedidos/armado denominator on first write. Never overwrite once set."""
+	if entry.get("requested_qty") is not None:
+		return
+	if seed_qty is None:
+		return
+	entry["requested_qty"] = flt(seed_qty)
+
+
 def _merge_armado_progress(
 	so_name: str,
 	identity: dict,
@@ -460,14 +471,20 @@ def _merge_armado_progress(
 	items: list | None = None,
 	via: str = "armado_items",
 	amend: bool = False,
+	requested_seed: dict | None = None,
 ) -> dict:
-	"""Merge line flags. Unknown keys are ignored. Packed and missing are exclusive."""
+	"""Merge line flags. Unknown keys are ignored. Packed and missing are exclusive.
+
+	``requested_seed`` maps line key → ordered qty captured *before* SO qty was
+	overwritten with packed qty (first partial armado).
+	"""
 	frappe.flags.ignore_permissions = True
 	so = frappe.get_doc("Sales Order", so_name)
 	rows = _so_armado_rows(so)
 	progress = _load_armado_progress(so_name)
 	lines = progress.setdefault("lines", {})
 	events = progress.setdefault("events", [])
+	seed = requested_seed if isinstance(requested_seed, dict) else {}
 	by_code = {}
 	if isinstance(items, list):
 		for row in items:
@@ -482,8 +499,13 @@ def _merge_armado_progress(
 			out["total_weight"] = flt(entry.get("total_weight"))
 		return out
 
-	def _touch_qty(entry: dict) -> dict:
-		"""Apply qty/weight from items payload; return after-snapshot."""
+	def _touch_qty(entry: dict, row: dict | None = None) -> dict:
+		"""Apply qty/weight from items payload; freeze requested_qty; return after-snapshot."""
+		key = (row or {}).get("key") if isinstance(row, dict) else None
+		seed_qty = seed.get(key) if key else None
+		if seed_qty is None and isinstance(row, dict):
+			seed_qty = row.get("qty")
+		_freeze_requested_qty(entry, seed_qty)
 		src = by_code.get(entry.get("item_code") or "")
 		if not isinstance(src, dict):
 			return _snapshot_qty(entry)
@@ -514,6 +536,7 @@ def _merge_armado_progress(
 		row = next(r for r in rows if r["key"] == key)
 		entry = lines.get(key) if isinstance(lines.get(key), dict) else _blank_progress_line(row["item_code"])
 		entry["item_code"] = row["item_code"]
+		_freeze_requested_qty(entry, seed.get(key, row["qty"]))
 		before = _snapshot_qty(entry)
 		want_missing = missing.get(token) if isinstance(missing, dict) and token in missing else None
 		if want_missing is None and isinstance(missing, dict) and key in missing:
@@ -561,7 +584,7 @@ def _merge_armado_progress(
 				entry["missing_by"] = ""
 				entry["missing_by_employee"] = ""
 				entry["missing_at"] = ""
-		after = _touch_qty(entry)
+		after = _touch_qty(entry, row)
 		if before != after:
 			qty_diffs.append((row["item_code"], key, before, after))
 		lines[key] = entry
@@ -575,17 +598,27 @@ def _merge_armado_progress(
 			if row["item_code"] not in by_code:
 				continue
 			if row["item_code"] in packed_codes:
-				_touch_qty(entry)
+				_touch_qty(entry, row)
 				continue
 			before = _snapshot_qty(entry)
 			entry["packed_by"] = _operator_label(identity)
 			entry["packed_by_employee"] = identity.get("employee") or ""
 			entry["packed_at"] = cstr(frappe.utils.now())
-			after = _touch_qty(entry)
+			after = _touch_qty(entry, row)
 			restamp_codes.append(row["item_code"])
 			restamp_keys.append(row["key"])
 			if before != after:
 				qty_diffs.append((row["item_code"], row["key"], before, after))
+
+	# First boxes count (or any save) also freezes requested on every current line.
+	if box_count is not None or by_code or packed_map is not None or missing_map is not None:
+		for row in rows:
+			entry = lines.get(row["key"])
+			if not isinstance(entry, dict):
+				entry = _blank_progress_line(row["item_code"])
+				entry["item_code"] = row["item_code"]
+				lines[row["key"]] = entry
+			_freeze_requested_qty(entry, seed.get(row["key"], row["qty"]))
 
 	if box_count is not None:
 		progress["boxes"] = {
@@ -649,10 +682,19 @@ def _merge_armado_progress(
 		_sync_missing_line_prices(so, lines)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"armado missing price {so_name}")
-	progress["snapshot"] = [
-		{"key": row["key"], "item_code": row["item_code"], "qty": flt(row["qty"]), "idx": row["idx"]}
-		for row in rows
-	]
+	progress["snapshot"] = []
+	for row in rows:
+		entry = lines.get(row["key"]) if isinstance(lines.get(row["key"]), dict) else {}
+		req = entry.get("requested_qty")
+		progress["snapshot"].append(
+			{
+				"key": row["key"],
+				"item_code": row["item_code"],
+				"qty": flt(row["qty"]),
+				"requested_qty": flt(req) if req is not None else flt(row["qty"]),
+				"idx": row["idx"],
+			}
+		)
 	progress["last_saved_at"] = cstr(frappe.utils.now())
 	progress["last_saved_by"] = _operator_label(identity)
 	_save_armado_progress(so_name, progress)
@@ -1242,16 +1284,36 @@ def _armado_progress_public(so_name: str) -> dict | None:
 		qty_measured = state.get("qty")
 		tw = state.get("total_weight")
 		is_missing = bool(state.get("missing"))
+		req = state.get("requested_qty")
+		# Denominator: frozen requested when set; else live SO qty (pre-armado).
+		ordered = flt(req) if req is not None else flt(row["qty"])
+		# Numerator: progress packed qty when set; else SO qty once armado started.
+		if qty_measured is not None:
+			packed_qty = flt(qty_measured)
+		elif _armado_has_activity(progress):
+			packed_qty = flt(row["qty"])
+		else:
+			packed_qty = None
 		out_lines.append(
 			{
 				"line_key": row["key"],
 				"item_code": row["item_code"],
 				"item_name": row["item_name"],
-				"ordered_qty": flt(row["qty"]),
-				"qty": flt(qty_measured) if qty_measured is not None else None,
+				"ordered_qty": ordered,
+				# Only set when frozen — FE uses presence to show packed/requested.
+				"requested_qty": flt(req) if req is not None else None,
+				"qty": packed_qty,
 				"total_weight": flt(tw) if tw is not None else None,
 				"packed": 1 if state.get("packed") else 0,
 				"missing": 1 if is_missing else 0,
+				"over": 1
+				if (
+					not is_missing
+					and packed_qty is not None
+					and ordered > 0
+					and flt(packed_qty) > ordered + 1e-9
+				)
+				else 0,
 				"changed": 0 if is_missing else (1 if _armado_line_changed(row, progress) else 0),
 				"missing_reason": state.get("missing_reason") or "",
 				"packed_by": state.get("packed_by") or "",
@@ -2157,6 +2219,9 @@ def update_armado_items(
 	amend = base_before in ("Preparado", "Delivery")
 	_require_armado_writable(so)
 
+	# Capture ordered qtys before SO lines are overwritten with packed qty.
+	requested_seed = {r["key"]: flt(r["qty"]) for r in _so_armado_rows(so)}
+
 	if has_items:
 		if _is_guest_preorder_sales_order(so):
 			update_guest_preorder_items(preorder_name, items)
@@ -2187,6 +2252,7 @@ def update_armado_items(
 			items=items if has_items else None,
 			via="armado_items",
 			amend=amend,
+			requested_seed=requested_seed,
 		)
 	_log_armado_operator(preorder_name, identity, via="armado_items")
 	out = get_armado_order(preorder_name)
