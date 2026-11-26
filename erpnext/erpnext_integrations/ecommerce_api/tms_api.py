@@ -11290,6 +11290,7 @@ def create_customer_at_location(
 	lng=None,
 	phone=None,
 	email=None,
+	tax_id=None,
 ):
 	"""Create Customer + shipping Address at the map pin."""
 	from erpnext.erpnext_integrations.ecommerce_api.api import create_customer
@@ -11299,9 +11300,16 @@ def create_customer_at_location(
 		frappe.throw(_("Customer name is required."))
 	lat = flt(lat)
 	lng = flt(lng)
-	cust = create_customer(customer_name=customer_name, phone=phone, email=email)
-	cust_name = cust.get("name") if isinstance(cust, dict) else cust
 	addr_line = cstr(address or "").strip() or customer_name
+	# Pass address (+ optional tax_id) so seller CUIT/address rules can run on create.
+	cust = create_customer(
+		customer_name=customer_name,
+		phone=phone,
+		email=email,
+		address_line1=addr_line,
+		tax_id=tax_id,
+	)
+	cust_name = cust.get("name") if isinstance(cust, dict) else cust
 	addr = _ensure_geo_address(
 		title=f"{customer_name} — envío",
 		line1=addr_line,

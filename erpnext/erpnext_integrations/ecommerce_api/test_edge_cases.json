@@ -960,6 +960,66 @@
       "expect": "no_500"
     },
     {
+      "id": "apply_cart_promotions_null_items_max_qty_safe",
+      "source": "regression",
+      "bug": "apply_cart_promotions must honor max_qty window without crashing on dirty items/qty (null/empty)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.apply_cart_promotions",
+      "args": {
+        "items": null,
+        "price_list": "Standard Selling"
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "apply_cart_promotions_empty_item_code_max_qty_safe",
+      "source": "regression",
+      "bug": "apply_cart_promotions with empty item_code / zero qty must not 500 when min/max qty filters run",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.apply_cart_promotions",
+      "args": {
+        "items": [
+          {
+            "item_code": "",
+            "qty": 0,
+            "rate": null,
+            "amount": null
+          }
+        ],
+        "price_list": ""
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "validate_sell_qty_limits_null_items_safe",
+      "source": "regression",
+      "bug": "validate_items_sell_qty_limits must no-op on null/empty items without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sell_qty_limits.validate_items_sell_qty_limits",
+      "args": {
+        "items": null,
+        "customer": null
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "validate_sell_qty_limits_dirty_row_safe",
+      "source": "regression",
+      "bug": "validate_items_sell_qty_limits with empty item_code / null qty must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.sell_qty_limits.validate_items_sell_qty_limits",
+      "args": {
+        "items": [
+          {
+            "item_code": "",
+            "qty": null
+          },
+          {
+            "item_code": "NOSUCH-ITEM",
+            "qty": "null"
+          }
+        ],
+        "customer": ""
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "dismiss_catalog_import_review_missing",
       "source": "regression",
       "bug": "dismiss_catalog_import_review with missing name must controlled error, not AttributeError",
@@ -1982,6 +2042,20 @@
         "send_client_pin": 0
       },
       "expect": "ok"
+    },
+    {
+      "id": "create_guest_preorder_send_client_pin_null_phone_safe",
+      "source": "regression",
+      "bug": "create_guest_preorder send_client_pin=1 with null phone must not TypeError when minting",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge create account no phone",
+        "guest_name": "edge",
+        "guest_phone": null,
+        "send_client_pin": 1
+      },
+      "expect": "no_500"
     },
     {
       "id": "create_guest_preorder_empty_no_notes",
@@ -4253,6 +4327,17 @@
         "client_phone_e164": null
       },
       "expect": "error"
+    },
+    {
+      "id": "save_preventa_settings_seller_cuit_address_null",
+      "source": "regression",
+      "bug": "save_preventa_settings seller_create_require_cuit_address null/dirty must not TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.save_preventa_settings",
+      "args": {
+        "seller_create_require_cuit_address": null,
+        "soft_stage_rules": null
+      },
+      "expect": "no_500"
     },
     {
       "id": "create_customer_null_salesmen",

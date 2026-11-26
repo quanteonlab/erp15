@@ -156,7 +156,12 @@ def get_products(
 		for std in ("weight_per_unit", "weight_uom", "shelf_life_in_days", "has_batch_no", "has_expiry_date"):
 			if std not in fields and frappe.db.has_column("Item", std):
 				fields.append(std)
-		for custom in ("custom_unit_weight_min", "custom_unit_weight_max"):
+		for custom in (
+			"custom_unit_weight_min",
+			"custom_unit_weight_max",
+			"custom_min_sell_qty",
+			"custom_max_sell_qty_day",
+		):
 			if custom not in fields and frappe.db.has_column("Item", custom):
 				fields.append(custom)
 
@@ -259,6 +264,10 @@ def get_products(
 			item["unit_weight_min"] = item.get("custom_unit_weight_min")
 		if "custom_unit_weight_max" in item and "unit_weight_max" not in item:
 			item["unit_weight_max"] = item.get("custom_unit_weight_max")
+		if "custom_min_sell_qty" in item and "min_sell_qty" not in item:
+			item["min_sell_qty"] = item.get("custom_min_sell_qty")
+		if "custom_max_sell_qty_day" in item and "max_sell_qty_day" not in item:
+			item["max_sell_qty_day"] = item.get("custom_max_sell_qty_day")
 
 	# p20 — uom_kind / leaf_factor / pack_contents_line for catalog + POS offline payloads
 	try:
@@ -1685,8 +1694,12 @@ def _compute_cart_promotions_local(items, price_list=None):
 			if not _rule_applies_to_item(rule, item_code):
 				continue
 			min_qty = flt(rule.get("min_qty") or 0)
+			max_qty = flt(rule.get("max_qty") or 0)
 			free_qty = flt(rule.get("free_qty") or 0)
 			if min_qty <= 0 or free_qty <= 0:
+				continue
+			# Over max_qty → inactive (ERPNext filter_pricing_rules_for_qty_amount).
+			if max_qty > 0 and qty > max_qty:
 				continue
 			label = _bogo_nxm_label(min_qty, free_qty) or "PROMO"
 			packs = int(qty // min_qty) if min_qty else 0
@@ -1730,6 +1743,8 @@ def _compute_cart_promotions_local(items, price_list=None):
 			if not _rule_applies_to_item(rule, item_code):
 				continue
 			min_amt = flt(rule.get("min_amt") or 0)
+			max_amt = flt(rule.get("max_amt") or 0)
+			max_qty = flt(rule.get("max_qty") or 0)
 			promo_style = _promo_style_from_rule(rule)
 			rod = (rule.get("rate_or_discount") or "").strip().lower()
 			is_rate_rule = rod == "rate" or (
@@ -1751,6 +1766,8 @@ def _compute_cart_promotions_local(items, price_list=None):
 			else:
 				offer = flt(rule.get("rate") or 0)
 				min_qty = flt(rule.get("min_qty") or 0)
+			if max_qty > 0 and qty > max_qty:
+				continue
 			# Pack Rate: upsell toward next complete pack (not "all units once N").
 			if is_rate_rule and promo_style == "pack" and min_qty > 1:
 				packs = int(qty // min_qty) if min_qty else 0
@@ -1790,6 +1807,8 @@ def _compute_cart_promotions_local(items, price_list=None):
 					})
 				continue
 			if min_amt > 0 and amount < min_amt:
+				continue
+			if max_amt > 0 and amount > max_amt:
 				continue
 			discount = 0
 			if flt(rule.get("discount_percentage") or 0) > 0:
@@ -3105,6 +3124,39 @@ def create_customer(
 		if client_phone_e164 is not None
 		else kwargs.get("custom_client_phone_e164")
 	).strip() or None
+
+	# Salesperson create: CUIT + address required by default (Tools → Preventa setting).
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import (
+			_acting_username,
+			_is_sales_admin,
+		)
+		from erpnext.erpnext_integrations.ecommerce_api.preventa_api import (
+			_load_preventa_settings,
+		)
+
+		_actor = cstr(_acting_username() or "").strip()
+		_require_cuit_addr = bool(
+			(_load_preventa_settings() or {}).get("seller_create_require_cuit_address", True)
+		)
+		_is_seller = (
+			_require_cuit_addr
+			and _actor
+			and _actor not in ("Guest", "Administrator")
+			and not _is_sales_admin()
+		)
+		if _is_seller:
+			if not tax_id_val:
+				frappe.throw(_("CUIT is required when a salesperson creates a client."), frappe.ValidationError)
+			if not addr_val:
+				frappe.throw(
+					_("Address is required when a salesperson creates a client."),
+					frappe.ValidationError,
+				)
+	except frappe.ValidationError:
+		raise
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "create_customer seller cuit/address gate")
 
 	customer = frappe.new_doc("Customer")
 	customer.customer_name = label
@@ -4460,6 +4512,12 @@ def create_order(
 	# Validate customer exists
 	if not frappe.db.exists("Customer", customer):
 		frappe.throw(_("Customer {0} not found").format(customer))
+
+	from erpnext.erpnext_integrations.ecommerce_api.sell_qty_limits import (
+		validate_items_sell_qty_limits,
+	)
+
+	validate_items_sell_qty_limits(items, customer=customer)
 
 	# Get default company if not provided
 	from erpnext.erpnext_integrations.ecommerce_api.company_context import resolve_company
@@ -6178,6 +6236,12 @@ def create_guest_preorder(
 	# (search is assigned-only; also block direct customer= API bypass).
 	_require_customer_visible_to_seller(customer)
 
+	from erpnext.erpnext_integrations.ecommerce_api.sell_qty_limits import (
+		validate_items_sell_qty_limits,
+	)
+
+	validate_items_sell_qty_limits(items, customer=customer)
+
 	# Copy CRM horario + hour blocks onto the pedido when the caller did not send them
 	# (Traditional POS / Nueva Orden only passes customer).
 	guest_preferred_hours, guest_preferred_hour_slots = _coalesce_preferred_delivery_from_customer(
@@ -6440,8 +6504,8 @@ def create_guest_preorder(
 	# Sellers may create Orden here; later edits stay suggestion-only.
 	want_orden = _normalize_create_initial_status(initial_status) == "Orden"
 
-	# PIN: mint only when the guest completes an Orden. Consulta-only guests keep
-	# the browser session; an admin-assigned PIN is still returned (reuse-only).
+	# PIN: mint on Orden, or when the guest opts in via send_client_pin (catalog
+	# “Crear cuenta”). Otherwise reuse an existing PIN only; Consulta stays anonymous.
 	client_access = None
 	if cstr(guest_phone or "").strip():
 		try:
@@ -6456,7 +6520,7 @@ def create_guest_preorder(
 				customer=so.customer,
 				allowed_countries=pin_allowed_countries,
 				send=0,
-				mint_if_missing=1 if want_orden else 0,
+				mint_if_missing=1 if (want_orden or cint(send_client_pin)) else 0,
 			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), f"Client access PIN failed for {so.name}")
@@ -13604,6 +13668,14 @@ def create_pos_sale(
 	is_borrador = 1 if sale_mode == "BLACK" else 0
 	pay_rows = _normalize_pos_payments(payment_method, payments, sale_mode)
 	cash_received = flt(cash_received or 0)
+
+	# Purchase min / daily max per client (skip for credit notes).
+	if not is_return:
+		from erpnext.erpnext_integrations.ecommerce_api.sell_qty_limits import (
+			validate_items_sell_qty_limits,
+		)
+
+		validate_items_sell_qty_limits(items, customer=customer)
 
 	# ── Idempotency check ────────────────────────────────────────────────────
 	# We store offline_order_uuid in the `remarks` field so we can look it up

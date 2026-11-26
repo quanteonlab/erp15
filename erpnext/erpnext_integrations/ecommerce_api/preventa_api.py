@@ -251,6 +251,8 @@ PREVENTA_SETTINGS_DEFAULTS = {
 	"soft_stage_rules": True,
 	# Stage key that triggers a best-effort core Opportunity on entry, or None.
 	"create_opportunity_on_stage": None,
+	# When a salesperson (non-admin) creates a Customer, require CUIT + address.
+	"seller_create_require_cuit_address": True,
 }
 
 
@@ -286,6 +288,7 @@ def save_preventa_settings(
 	auto_convert_on_won=None,
 	create_opportunity_on_stage=None,
 	soft_stage_rules=None,
+	seller_create_require_cuit_address=None,
 ):
 	_require_app_permission("tools.settings")
 	current = _load_preventa_settings()
@@ -297,6 +300,7 @@ def save_preventa_settings(
 		"auto_convert_on_won": auto_convert_on_won,
 		"create_opportunity_on_stage": create_opportunity_on_stage,
 		"soft_stage_rules": soft_stage_rules,
+		"seller_create_require_cuit_address": seller_create_require_cuit_address,
 	}
 	for key, value in raw.items():
 		if value is None:
@@ -306,7 +310,11 @@ def save_preventa_settings(
 				value = frappe.parse_json(value)
 			except Exception:
 				pass
-		if key in ("auto_convert_on_won", "soft_stage_rules"):
+		if key in (
+			"auto_convert_on_won",
+			"soft_stage_rules",
+			"seller_create_require_cuit_address",
+		):
 			value = frappe.parse_json(value) if isinstance(value, str) else bool(value)
 		current[key] = value
 

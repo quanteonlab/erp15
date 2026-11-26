@@ -693,6 +693,74 @@ def suite_5_5_promotions():
             )
             frappe.db.commit()
 
+    def check_min_max_qty_window():
+        """Price + Product rules: min_qty / max_qty window (isolated from site-wide rules)."""
+        from erpnext.erpnext_integrations.ecommerce_api import api as ecommerce_api
+
+        price_rule = {
+            "name": "SMOKE-MAX-PRICE",
+            "title": "SMOKE-MAX-PRICE",
+            "apply_on": "Transaction",
+            "price_or_product_discount": "Price",
+            "rate_or_discount": "Discount Percentage",
+            "discount_percentage": 10,
+            "discount_amount": 0,
+            "rate": 0,
+            "min_qty": 2,
+            "max_qty": 4,
+            "min_amt": 0,
+            "max_amt": 0,
+            "same_item": 0,
+            "free_item": None,
+            "free_qty": 0,
+            "threshold_percentage": 80,
+            "rule_description": "",
+            "for_price_list": None,
+            "applicable_items": [],
+            "applicable_groups": [],
+            "applicable_brands": [],
+        }
+        bogo_rule = {
+            **price_rule,
+            "name": "SMOKE-MAX-BOGO",
+            "title": "SMOKE-MAX-BOGO",
+            "price_or_product_discount": "Product",
+            "rate_or_discount": "Discount Percentage",
+            "discount_percentage": 0,
+            "same_item": 1,
+            "min_qty": 3,
+            "max_qty": 6,
+            "free_qty": 1,
+        }
+        original = ecommerce_api.get_active_promotions
+        try:
+            ecommerce_api.get_active_promotions = lambda price_list=None: [price_rule]
+            low = ecommerce_api.apply_cart_promotions(
+                items=[{"item_code": "X", "qty": 1, "rate": 1000, "amount": 1000}],
+            )
+            mid = ecommerce_api.apply_cart_promotions(
+                items=[{"item_code": "X", "qty": 3, "rate": 1000, "amount": 3000}],
+            )
+            high = ecommerce_api.apply_cart_promotions(
+                items=[{"item_code": "X", "qty": 5, "rate": 1000, "amount": 5000}],
+            )
+            assert not (low.get("line_discounts") or []), low
+            assert (mid.get("line_discounts") or []), mid
+            assert abs(flt(mid["line_discounts"][0]["discount_amount"]) - 300) < 0.01, mid
+            assert not (high.get("line_discounts") or []), high
+
+            ecommerce_api.get_active_promotions = lambda price_list=None: [bogo_rule]
+            b_ok = ecommerce_api.apply_cart_promotions(
+                items=[{"item_code": "X", "qty": 3, "rate": 1000, "amount": 3000}],
+            )
+            b_over = ecommerce_api.apply_cart_promotions(
+                items=[{"item_code": "X", "qty": 9, "rate": 1000, "amount": 9000}],
+            )
+            assert (b_ok.get("line_discounts") or []), b_ok
+            assert not (b_over.get("line_discounts") or []), b_over
+        finally:
+            ecommerce_api.get_active_promotions = original
+
     _run("5.5.1 Unknown coupon returns valid=False", check_unknown_coupon, "S3")
     _run("5.5.2 Empty coupon returns valid=False", check_empty_coupon, "S3")
     _run("5.5.3 Discount PIN open/closed mode consistent", check_discount_pin, "S3")
@@ -706,6 +774,7 @@ def suite_5_5_promotions():
     _run("5.5.7 create_guest_preorder applies a coupon server-side", check_guest_preorder_with_coupon, "S1")
     _run("5.5.8 Delivery promos: base fee, free-over / % off, cancel", check_delivery_promos_lifecycle, "S3")
     _run("5.5.9 create_guest_preorder books the delivery fee as a service line", check_guest_preorder_with_delivery, "S1")
+    _run("5.5.10 min_qty/max_qty window for Price + Product rules", check_min_max_qty_window, "S1")
 
 
 # ── Suite 5.7 — Receiving Flow ────────────────────────────────────────────────
@@ -1575,6 +1644,37 @@ def suite_5_9_master_data():
                 frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+    def check_consulta_mints_client_pin_when_opted_in():
+        """Catalog “Crear cuenta” → send_client_pin=1 mints a portal PIN on Consulta."""
+        so_name = None
+        phone = f"+54911{frappe.generate_hash(length=8)}"
+        # Keep E.164-ish length; digits only after country.
+        phone = "+54911" + "".join(ch for ch in frappe.generate_hash(length=8) if ch.isdigit())[:8]
+        if len(phone) < 12:
+            phone = "+5491188001122"
+        item_code = frappe.db.get_value(
+            "Item",
+            {"disabled": 0, "is_stock_item": 1, "name": ["like", "POSNET%"]},
+            "name",
+        ) or frappe.db.get_value("Item", {"disabled": 0, "is_stock_item": 1}, "name")
+        assert item_code, "need a stock item"
+        try:
+            out = api.create_guest_preorder(
+                items=[{"item_code": item_code, "qty": 1, "rate": 11}],
+                guest_notes="smoke consulta create account",
+                guest_name="Smoke Consulta Pin",
+                guest_phone=phone,
+                send_client_pin=1,
+            )
+            so_name = out.get("preorder_name") or out.get("name")
+            assert so_name, out
+            access = out.get("client_access") or {}
+            assert access.get("pin"), access
+        finally:
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                frappe.delete_doc("Sales Order", so_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_create_returns_before_side_effects():
         """Create/Orden returns with side_effects_queued; remito can finish after."""
         so_name = None
@@ -2211,6 +2311,11 @@ def suite_5_9_master_data():
         "S2",
     )
     _run("5.9.14b consulta does not mint client PIN", check_consulta_does_not_mint_client_pin, "S2")
+    _run(
+        "5.9.14b5 consulta mints PIN when send_client_pin=1",
+        check_consulta_mints_client_pin_when_opted_in,
+        "S2",
+    )
     _run("5.9.14c create queues side effects", check_create_returns_before_side_effects, "S2")
     _run("5.9.15 Orden item edit in place (no amend)", check_orden_item_edit_inplace, "S2")
     _run("5.9.16 relate customer clears stale contact", check_relate_clears_stale_contact, "S2")
@@ -2560,6 +2665,55 @@ def suite_5_10_product_manager():
             f"delete estimate changed Bin: {bin_before} → {bin_after}"
         )
 
+    def check_sell_qty_limits_fields_and_validate():
+        """Product min / max-per-client-day: save fields + validate cart."""
+        from erpnext.erpnext_integrations.ecommerce_api import sell_qty_limits as sqlim
+
+        pm.ensure_product_manager_custom_fields()
+        assert frappe.db.has_column("Item", "custom_min_sell_qty")
+        assert frappe.db.has_column("Item", "custom_max_sell_qty_day")
+        created = pm.create_product_row(
+            None,
+            {
+                "source_title": "Smoke sell limits",
+                "stock_uom": "Nos",
+                "min_sell_qty": 2,
+                "max_sell_qty_day": 5,
+            },
+            activate=0,
+        )
+        sku = created.get("item_code")
+        assert sku, created
+        assert flt(frappe.db.get_value("Item", sku, "custom_min_sell_qty")) == 2, sku
+        assert flt(frappe.db.get_value("Item", sku, "custom_max_sell_qty_day")) == 5, sku
+        # Below min → throw
+        threw = False
+        try:
+            sqlim.validate_items_sell_qty_limits(
+                [{"item_code": sku, "qty": 1}],
+                customer="Consumidor Final",
+            )
+        except Exception:
+            threw = True
+        assert threw, "expected min sell qty validation"
+        # Walk-in: min still applies; daily max skipped for Consumidor Final
+        sqlim.validate_items_sell_qty_limits(
+            [{"item_code": sku, "qty": 2}],
+            customer="Consumidor Final",
+        )
+        # Named client: daily max blocks qty above cap
+        cust = frappe.db.get_value("Customer", {"disabled": 0}, "name")
+        if cust and cust.strip().lower() != "consumidor final":
+            threw2 = False
+            try:
+                sqlim.validate_items_sell_qty_limits(
+                    [{"item_code": sku, "qty": 6}],
+                    customer=cust,
+                )
+            except Exception:
+                threw2 = True
+            assert threw2, "expected daily max validation"
+
     _run("5.10.1 get_pm_context", check_pm_context, "S2")
     _run("5.10.1b get_item_price_chart", check_item_price_chart, "S2")
     _run("5.10.2 get_product_rows page", check_product_rows, "S2")
@@ -2575,6 +2729,7 @@ def suite_5_10_product_manager():
     _run("5.10.11 get_accounting_sheet starter tabs", check_accounting_starter_sheet, "S2")
     _run("5.10.12 get_accounting_detail_tables dumps", check_accounting_detail_tables, "S2")
     _run("5.10.13 stock location estimates soft (Bin unchanged)", check_stock_location_estimates, "S2")
+    _run("5.10.14 min sell / max per client day", check_sell_qty_limits_fields_and_validate, "S1")
 
 
 # ── Suite 5.11 — POS session / cash / admin settings ──────────────────────────
@@ -3213,6 +3368,7 @@ def suite_5_12_modules_read():
         from erpnext.erpnext_integrations.ecommerce_api import preventa_api as pa
         s = pa.get_preventa_settings()
         assert s is not None
+        assert s.get("seller_create_require_cuit_address") is not False, s
         board = pa.get_my_board()
         assert board is not None
         admin = pa.list_leads_admin(filters={}, start=0, page_length=5)
@@ -3427,6 +3583,8 @@ def suite_5_12_modules_read():
                 try:
                     created_auto = api.create_customer(
                         customer_name=f"Smoke Orden Client {frappe.generate_hash(length=6)}",
+                        tax_id="20-30000000-1",
+                        address_line1="Smoke Calle 100",
                     )
                     auto_cust = (
                         created_auto.get("name")
@@ -3435,6 +3593,15 @@ def suite_5_12_modules_read():
                     )
                     assert auto_cust
                     assert seller in (created_auto.get("salesmen") or []), created_auto
+                    # Seller create without CUIT/address must fail when setting is on.
+                    blocked = False
+                    try:
+                        api.create_customer(
+                            customer_name=f"Smoke Seller NoCuit {frappe.generate_hash(length=6)}",
+                        )
+                    except Exception:
+                        blocked = True
+                    assert blocked, "seller create_customer must require CUIT + address by default"
                     auto_lead = frappe.db.get_value("Customer", auto_cust, "lead_name")
                     assert auto_lead, "orden-only create_customer must mirror Preventa CLIENTE"
                     assert frappe.db.get_value("Lead", auto_lead, "lead_owner") == seller

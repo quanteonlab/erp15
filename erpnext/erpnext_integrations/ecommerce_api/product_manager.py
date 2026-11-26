@@ -825,6 +825,22 @@ def ensure_product_manager_custom_fields() -> None:
                     "description": "Provisional warehouse path (Z21/F23) until assigned to a rack.",
                     "reqd": 0,
                 },
+                {
+                    "fieldname": "custom_min_sell_qty",
+                    "fieldtype": "Float",
+                    "label": "Min Sell Qty",
+                    "insert_after": "custom_unit_weight_max",
+                    "description": "Minimum qty per order line (stock UOM). 0 = no minimum.",
+                    "reqd": 0,
+                },
+                {
+                    "fieldname": "custom_max_sell_qty_day",
+                    "fieldtype": "Float",
+                    "label": "Max Sell Qty / Client / Day",
+                    "insert_after": "custom_min_sell_qty",
+                    "description": "Maximum qty one client may buy of this item per calendar day. 0 = no cap.",
+                    "reqd": 0,
+                },
             ]
         },
         ignore_validate=True,
@@ -845,6 +861,8 @@ def _ensure_pack_columns_nullable() -> None:
         ("custom_pack_unit", f"varchar({frappe.db.VARCHAR_LEN}) NULL DEFAULT NULL"),
         ("custom_unit_weight_min", "decimal(21,9) NULL DEFAULT NULL"),
         ("custom_unit_weight_max", "decimal(21,9) NULL DEFAULT NULL"),
+        ("custom_min_sell_qty", "decimal(21,9) NULL DEFAULT NULL"),
+        ("custom_max_sell_qty_day", "decimal(21,9) NULL DEFAULT NULL"),
     )
     for fieldname, ddl_type in alters:
         if not frappe.db.has_column("Item", fieldname):
@@ -1158,6 +1176,16 @@ def get_product_rows(
     wmax_select = (
         "COALESCE(i.custom_unit_weight_max, NULL) AS unit_weight_max" if has_wmax else "NULL AS unit_weight_max"
     )
+    has_min_sell = frappe.db.has_column("Item", "custom_min_sell_qty")
+    has_max_day = frappe.db.has_column("Item", "custom_max_sell_qty_day")
+    min_sell_select = (
+        "COALESCE(i.custom_min_sell_qty, NULL) AS min_sell_qty" if has_min_sell else "NULL AS min_sell_qty"
+    )
+    max_day_select = (
+        "COALESCE(i.custom_max_sell_qty_day, NULL) AS max_sell_qty_day"
+        if has_max_day
+        else "NULL AS max_sell_qty_day"
+    )
     wpu_select = (
         "COALESCE(i.weight_per_unit, NULL) AS weight_per_unit"
         if frappe.db.has_column("Item", "weight_per_unit")
@@ -1205,6 +1233,8 @@ def get_product_rows(
             {wuom_select},
             {wmin_select},
             {wmax_select},
+            {min_sell_select},
+            {max_day_select},
             {sell_by_select},
             {batch_select},
             {physical_select},
@@ -1446,6 +1476,8 @@ _ITEM_HISTORY_FIELD_LABEL = {
     "weight_per_unit": "weight_per_unit",
     "custom_unit_weight_min": "unit_weight_min",
     "custom_unit_weight_max": "unit_weight_max",
+    "custom_min_sell_qty": "min_sell_qty",
+    "custom_max_sell_qty_day": "max_sell_qty_day",
     "shelf_life_in_days": "sell_by_days",
     "disabled": "is_active",
 }
@@ -1528,6 +1560,8 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             "weight_uom": "weight_uom",
             "unit_weight_min": "custom_unit_weight_min",
             "unit_weight_max": "custom_unit_weight_max",
+            "min_sell_qty": "custom_min_sell_qty",
+            "max_sell_qty_day": "custom_max_sell_qty_day",
             "sell_by_days": "shelf_life_in_days",
             "physical_section": "custom_physical_section",
         }
@@ -1547,6 +1581,31 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
                     changes[weight_key] = max(0.0, flt(raw))
                 except (TypeError, ValueError):
                     changes[weight_key] = None
+        for sell_key in ("min_sell_qty", "max_sell_qty_day"):
+            if sell_key not in changes:
+                continue
+            raw = changes.get(sell_key)
+            if raw in (None, "", "null", "undefined"):
+                changes[sell_key] = None
+            else:
+                try:
+                    changes[sell_key] = max(0.0, flt(raw))
+                except (TypeError, ValueError):
+                    changes[sell_key] = None
+        if "min_sell_qty" in changes or "max_sell_qty_day" in changes:
+            mn = changes.get("min_sell_qty")
+            mx = changes.get("max_sell_qty_day")
+            if mn is None and "min_sell_qty" not in changes and frappe.db.has_column(
+                "Item", "custom_min_sell_qty"
+            ):
+                mn = frappe.db.get_value("Item", item_code, "custom_min_sell_qty")
+            if mx is None and "max_sell_qty_day" not in changes and frappe.db.has_column(
+                "Item", "custom_max_sell_qty_day"
+            ):
+                mx = frappe.db.get_value("Item", item_code, "custom_max_sell_qty_day")
+            if mn not in (None, "") and mx not in (None, "") and flt(mn) > 0 and flt(mx) > 0:
+                if flt(mn) > flt(mx):
+                    frappe.throw(_("Min sell qty cannot be greater than max sell qty / day"))
         if "sell_by_days" in changes:
             raw = changes.get("sell_by_days")
             if raw in (None, "", "null", "undefined"):
@@ -1902,6 +1961,14 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
     wmax = getattr(item_doc, "custom_unit_weight_max", None)
     if wmin is not None and wmax is not None and flt(wmin) > flt(wmax):
         frappe.throw(_("Min unit weight cannot be greater than max unit weight"))
+    if "min_sell_qty" in changes and frappe.db.has_column("Item", "custom_min_sell_qty"):
+        item_doc.custom_min_sell_qty = _coerce_float(changes.get("min_sell_qty"))
+    if "max_sell_qty_day" in changes and frappe.db.has_column("Item", "custom_max_sell_qty_day"):
+        item_doc.custom_max_sell_qty_day = _coerce_float(changes.get("max_sell_qty_day"))
+    smin = getattr(item_doc, "custom_min_sell_qty", None)
+    smax = getattr(item_doc, "custom_max_sell_qty_day", None)
+    if smin is not None and smax is not None and flt(smin) > 0 and flt(smax) > 0 and flt(smin) > flt(smax):
+        frappe.throw(_("Min sell qty cannot be greater than max sell qty / day"))
     if "sell_by_days" in changes and frappe.db.has_column("Item", "shelf_life_in_days"):
         raw = changes.get("sell_by_days")
         if raw in (None, "", "null", "undefined"):
