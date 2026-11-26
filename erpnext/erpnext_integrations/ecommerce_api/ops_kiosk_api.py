@@ -1831,6 +1831,15 @@ def get_armado_order(preorder_name=None):
 		if code and not it.get("image"):
 			it["image"] = images.get(code) or ""
 
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+			enrich_rows_with_pack_graph,
+		)
+
+		enrich_rows_with_pack_graph(detail.get("items") or [])
+	except Exception:
+		pass
+
 	# Product barcodes so the armado sheet can +1 qty on scan.
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.api import _attach_barcodes

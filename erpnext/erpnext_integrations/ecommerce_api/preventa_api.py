@@ -69,6 +69,71 @@ LEAD_FIELD_MAP = {
 	"no_of_employees": "no_of_employees",
 }
 
+# Preventa field id → Link target. Invalid / dirty values ("Website", "null", …)
+# must be cleared so upsert_lead does not 500 with LinkValidationError.
+LEAD_LINK_FIELD_TARGETS = {
+	"country": "Country",
+	"salutation": "Salutation",
+	"gender": "Gender",
+	"industry": "Industry Type",
+	"market_segment": "Market Segment",
+	"territory": "Territory",
+}
+
+_DIRTY_EMPTY = frozenset({"", "null", "undefined", "none", "nil"})
+
+
+def _clean_scalar(value):
+	"""Coerce Flutter / JS dirty empties to None; keep other values as stripped str."""
+	if value is None:
+		return None
+	if isinstance(value, bool):
+		return value
+	text = cstr(value).strip()
+	if not text or text.lower() in _DIRTY_EMPTY:
+		return None
+	return text
+
+
+def _existing_link(doctype: str, name) -> str | None:
+	name = _clean_scalar(name)
+	if not name:
+		return None
+	if frappe.db.exists(doctype, name):
+		return name
+	return None
+
+
+def _resolve_lead_owner(raw) -> str:
+	"""Pick a real User for Lead.lead_owner (Link). Drop Guest / missing users."""
+	candidate = _clean_scalar(raw) or _clean_scalar(_acting_user()) or _clean_scalar(frappe.session.user)
+	if candidate and candidate != "Guest" and frappe.db.exists("User", candidate):
+		return candidate
+	if frappe.db.exists("User", "Administrator"):
+		return "Administrator"
+	return candidate or "Administrator"
+
+
+def _sanitize_lead_values(values: dict) -> dict:
+	"""Drop invalid Link fields / dirty empties so Lead.insert does not LinkValidationError."""
+	out = dict(values or {})
+	if "source" in out:
+		out["source"] = _existing_link("Lead Source", out.get("source"))
+	for fid, target in LEAD_LINK_FIELD_TARGETS.items():
+		if fid in out:
+			out[fid] = _existing_link(target, out.get(fid))
+	if "lead_owner" in out:
+		owner = _existing_link("User", out.get("lead_owner"))
+		# Keep key only when a real user was provided; create path resolves otherwise.
+		if owner:
+			out["lead_owner"] = owner
+		else:
+			out.pop("lead_owner", None)
+	for fid in ("lead_name", "company_name", "mobile_no", "whatsapp_no", "phone", "email_id", "website", "job_title"):
+		if fid in out:
+			out[fid] = _clean_scalar(out.get(fid))
+	return out
+
 _preventa_fields_ready = False
 
 
@@ -1273,7 +1338,8 @@ def upsert_lead(lead=None, values=None):
 	ensure_preventa_custom_fields()
 	if isinstance(values, str):
 		values = frappe.parse_json(values)
-	values = values if isinstance(values, dict) else {}
+	values = _sanitize_lead_values(values if isinstance(values, dict) else {})
+	lead = _clean_scalar(lead)
 
 	if lead and frappe.db.exists("Lead", lead):
 		frappe.flags.ignore_permissions = True
@@ -1293,8 +1359,11 @@ def upsert_lead(lead=None, values=None):
 	else:
 		_require_app_permission("ops.preventa")
 		doc = frappe.new_doc("Lead")
-		doc.lead_owner = values.get("lead_owner") or _acting_user()
-		doc.custom_preventa_stage = values.get("custom_preventa_stage") or _default_new_stage_key()
+		doc.status = "Lead"
+		doc.lead_owner = _resolve_lead_owner(values.get("lead_owner"))
+		doc.custom_preventa_stage = (
+			_clean_scalar(values.get("custom_preventa_stage")) or _default_new_stage_key()
+		)
 		doc.custom_preventa_stage_since = now_datetime()
 		if values.get("source"):
 			doc.source = values["source"]
@@ -1305,7 +1374,7 @@ def upsert_lead(lead=None, values=None):
 
 	if "lead_owner" in values and not doc.is_new() and values["lead_owner"] != doc.lead_owner:
 		_require_app_permission("tables.crm")
-		doc.lead_owner = values["lead_owner"]
+		doc.lead_owner = _resolve_lead_owner(values["lead_owner"])
 
 	doc.flags.ignore_permissions = True
 	if doc.is_new():
@@ -1642,10 +1711,11 @@ def duplicate_lead(lead=None):
 	_require_owner_or_crm(src.lead_owner)
 
 	doc = frappe.new_doc("Lead")
-	doc.lead_owner = src.lead_owner
+	doc.lead_owner = _resolve_lead_owner(src.lead_owner)
 	doc.custom_preventa_stage = src.custom_preventa_stage or _default_new_stage_key()
 	doc.custom_preventa_stage_since = now_datetime()
-	doc.source = src.source
+	# Drop stale / deleted Lead Source links so clone insert does not 500.
+	doc.source = _existing_link("Lead Source", src.source)
 	doc.status = "Lead"
 	for _fid, attr in LEAD_FIELD_MAP.items():
 		doc.set(attr, src.get(attr))

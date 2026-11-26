@@ -376,6 +376,47 @@
       "bug": "duplicate_lead with null lead must not AttributeError"
     },
     {
+      "id": "upsert_lead_invalid_source_website",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.upsert_lead",
+      "args": {
+        "values": {
+          "lead_name": "Edge Website Source",
+          "source": "Website"
+        },
+        "client_request_id": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "upsert_lead with unknown Lead Source (Website) must drop source, not LinkValidationError"
+    },
+    {
+      "id": "upsert_lead_dirty_null_source",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.upsert_lead",
+      "args": {
+        "values": {
+          "lead_name": "Edge Null Source",
+          "source": "null",
+          "territory": "NoSuchTerritory",
+          "industry": ""
+        },
+        "client_request_id": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "upsert_lead must coerce dirty null/invalid Link fields instead of 500"
+    },
+    {
+      "id": "upsert_lead_null_values",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.upsert_lead",
+      "args": {
+        "lead": null,
+        "values": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "upsert_lead with null values must controlled error (Lead requires name), not TypeError"
+    },
+    {
       "id": "get_or_create_lead_seller_link_null",
       "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.get_or_create_lead_seller_link",
       "args": {
@@ -9103,6 +9144,131 @@
       },
       "source": "regression",
       "bug": "Retail product EAN (not 290…) must not resolve as an armado order"
+    },
+    {
+      "id": "create_guest_preorder_client_pin_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge client pin null",
+        "guest_name": "edge pin null",
+        "client_pin": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "create_guest_preorder client_pin=null must stay Consulta (ignore dirty PIN) — never TypeError"
+    },
+    {
+      "id": "create_guest_preorder_client_pin_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge client pin empty",
+        "guest_name": "edge pin empty",
+        "client_pin": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "create_guest_preorder client_pin=\"\" must stay Consulta — never AuthenticationError"
+    },
+    {
+      "id": "create_guest_preorder_client_pin_null_string",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge client pin null string",
+        "guest_name": "edge pin nullstr",
+        "client_pin": "null"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "create_guest_preorder client_pin=\"null\" dirty string must be ignored — never 500"
+    },
+    {
+      "id": "create_guest_preorder_client_pin_invalid",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_guest_preorder",
+      "args": {
+        "items": [],
+        "guest_notes": "edge client pin invalid",
+        "client_pin": "000000"
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "create_guest_preorder unknown client_pin must AuthenticationError Invalid PIN — never TypeError/500"
+    },
+    {
+      "id": "list_uoms_ok_shape",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.list_uoms",
+      "args": {},
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_uoms must return [{name, kind}, …] — never crash when custom_uom_kind missing"
+    },
+    {
+      "id": "get_unit_sku_graph_null_code",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_unit_sku_graph",
+      "args": {
+        "item_code": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "get_unit_sku_graph item_code=null must controlled throw — never TypeError/500"
+    },
+    {
+      "id": "get_unit_sku_graph_empty_code",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.get_unit_sku_graph",
+      "args": {
+        "item_code": ""
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "get_unit_sku_graph item_code=\"\" must controlled throw — never AttributeError"
+    },
+    {
+      "id": "format_item_pack_contents_null_code",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.format_item_pack_contents",
+      "args": {
+        "item_code": null,
+        "qty": 1
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "format_item_pack_contents null item_code must controlled throw — never TypeError"
+    },
+    {
+      "id": "format_item_pack_contents_qty_null_missing_sku",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.format_item_pack_contents",
+      "args": {
+        "item_code": "__edge_missing_sku__",
+        "qty": null
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "format_item_pack_contents qty=null + missing sku must return leaf factor 1 — never TypeError"
+    },
+    {
+      "id": "ensure_product_lookup_uom_name_null",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.ensure_product_lookup",
+      "args": {
+        "kind": "uom",
+        "name": null,
+        "uom_kind": null
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "ensure_product_lookup uom name=null must controlled fail — never create blank UOM"
+    },
+    {
+      "id": "ensure_product_lookup_uom_name_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.ensure_product_lookup",
+      "args": {
+        "kind": "uom",
+        "name": "",
+        "uom_kind": "contenedor"
+      },
+      "expect": "fail",
+      "source": "regression",
+      "bug": "ensure_product_lookup uom name=\"\" must controlled fail — never blank UOM"
     }
   ]
 }

@@ -260,6 +260,16 @@ def get_products(
 		if "custom_unit_weight_max" in item and "unit_weight_max" not in item:
 			item["unit_weight_max"] = item.get("custom_unit_weight_max")
 
+	# p20 — uom_kind / leaf_factor / pack_contents_line for catalog + POS offline payloads
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+			enrich_rows_with_pack_graph,
+		)
+
+		enrich_rows_with_pack_graph(items)
+	except Exception:
+		pass
+
 	return {
 		"items": items,
 		"total_count": total_count,
@@ -531,6 +541,16 @@ def get_product(item_code, price_list=None, warehouse=None, customer=None):
 		{"image": img.image_path, "is_primary": 1 if idx == 0 else 0}
 		for idx, img in enumerate(item.get("website_image", []))
 	] if hasattr(item, "website_image") else []
+
+	# p20 — pack graph fields on single-product payload
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+			enrich_rows_with_pack_graph,
+		)
+
+		enrich_rows_with_pack_graph([product])
+	except Exception:
+		pass
 
 	return product
 
@@ -3147,12 +3167,18 @@ def create_customer(
 		if explicit_salesmen:
 			assigned_salesmen = _set_customer_salesmen_users(customer.name, salesmen_list)
 		elif acting and acting not in ("Guest", "Administrator"):
+			# Staff creating a client from Nuevo pedido / Pedidos / Orden must
+			# auto-own it even when their group is orden-only (no ops.preventa).
 			may_own = (
 				_is_sales_admin()
 				or _can_app("tables.crm")
 				or _can_app("ops.catalog")
 				or _can_app("ops.preventa")
+				or _can_app("ops.orden")
 				or _can_app("ops.pos")
+				or _can_app("tables.orders")
+				or _can_app("tables.orders.own")
+				or _can_app("tables.orders.all")
 				or _can_app("sales.commit_assigned")
 				or _can_app("sales.commit_all")
 				or _can_app("sales.see_assigned")
@@ -5989,6 +6015,7 @@ def create_guest_preorder(
 	coupon_code=None,
 	guest_browser_id=None,
 	guest_browser_secret=None,
+	client_pin=None,
 ):
 	"""
 	Create a draft Sales Order to represent a guest preorder (no payment).
@@ -6001,6 +6028,10 @@ def create_guest_preorder(
 
 	``guest_browser_id`` / ``guest_browser_secret``: optional temp browser session
 	(Chrome/local). Tags the SO and registers a secret *hash* only — not a Customer.
+
+	``client_pin``: catalog client PIN (6 digits). When valid, the SO is created as
+	Orden for that Customer and parked in Revisar (yellow tag) for the assigned
+	salesman or any admin — not a walk-in Consulta.
 
 	``customer``: optional Customer override for known parties (e.g. seed data,
 	a repeat order placed from the client tracking portal for a known
@@ -6045,6 +6076,29 @@ def create_guest_preorder(
 		bool(cstr(guest_notes or "").strip())
 		or bool(cstr(guest_observation or "").strip())
 	) and not items
+
+	portal_client = None
+	raw_client_pin = cstr(client_pin or "").strip()
+	if raw_client_pin and raw_client_pin.lower() not in ("null", "undefined", "none"):
+		from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
+			resolve_client_access_pin,
+		)
+
+		ident = resolve_client_access_pin(raw_client_pin)
+		if not isinstance(ident, dict) or not ident.get("ok"):
+			frappe.throw(_("Invalid PIN"), frappe.AuthenticationError)
+		# Customer PIN → Orden + Revisar. Lead-only PIN stays a Consulta.
+		cust_from_pin = cstr(ident.get("customer") or "").strip()
+		if ident.get("kind") == "client" and cust_from_pin:
+			portal_client = ident
+			customer = cust_from_pin or customer
+			if not cstr(guest_name or "").strip():
+				guest_name = ident.get("customer_name") or guest_name
+			if not cstr(guest_phone or "").strip():
+				guest_phone = ident.get("phone_e164") or guest_phone
+			initial_status = "Orden"
+			send_client_pin = 0
+
 	want_orden_early = _normalize_create_initial_status(initial_status) == "Orden"
 
 	# Empty cart is OK for notes-only Consulta, or Orden (we seed random Items).
@@ -6092,11 +6146,14 @@ def create_guest_preorder(
 
 	# Orden requires Items to submit — seed random sellable lines when the cart
 	# is empty (notes-only / dirty null items) so create→Orden never 417s.
-	if want_orden_early and not resolved_rows:
+	# PIN-client catalog checkout must send a real cart (never seed).
+	if want_orden_early and not resolved_rows and not portal_client:
 		import random
 
 		resolved_rows = _random_orden_item_rows(random.randint(1, 2))
 		notes_only = False
+	if portal_client and not resolved_rows:
+		frappe.throw(_("Cart is empty"))
 
 	if not resolved_rows and not notes_only:
 		frappe.throw(_("Cart is empty"))
@@ -6166,8 +6223,10 @@ def create_guest_preorder(
 	so.flags.ignore_pricing_rule = True
 
 	remarks_parts = [GUEST_PREORDER_REMARKS_TAG, f"customer:{customer}"]
-	browser_id = cstr(guest_browser_id or "").strip()
-	browser_secret = cstr(guest_browser_secret or "").strip()
+	browser_id = "" if portal_client else cstr(guest_browser_id or "").strip()
+	browser_secret = "" if portal_client else cstr(guest_browser_secret or "").strip()
+	if portal_client:
+		remarks_parts.append("source:client_portal")
 	if browser_id and browser_secret:
 		try:
 			from erpnext.erpnext_integrations.ecommerce_api.client_access_api import (
@@ -6422,8 +6481,19 @@ def create_guest_preorder(
 		so = frappe.get_doc("Sales Order", so_name)
 		frappe.flags.ignore_permissions = False
 
+	if portal_client:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+				mark_client_portal_order_for_review,
+			)
+
+			mark_client_portal_order_for_review(so.name, so.customer)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "creation_review mark client portal order")
+
 	# Link the customer to the seller so Pedidos → Mis clientes lists it.
-	if (want_orden or tag_slug == "orden") and so.customer:
+	# PIN-client catalog Orden keeps existing salesman assignment.
+	if (want_orden or tag_slug == "orden") and so.customer and not portal_client:
 		assign_uid = cstr(seller_ref or acting or "").strip()
 		if assign_uid and assign_uid not in ("Guest", "Administrator"):
 			try:
@@ -6478,6 +6548,9 @@ def create_guest_preorder(
 			"sent": False,
 			"channel": None,
 		}
+	if portal_client:
+		payload["creation_review"] = "Pending"
+		payload["review_reason"] = "client_portal"
 
 	_enqueue_create_guest_preorder_side_effects(
 		so_name=so.name,
@@ -7273,6 +7346,18 @@ def get_guest_preorder(preorder_name):
 		and cstr(sug.get("status") or "pending").lower() != "rejected"
 	):
 		payload["review_actor"] = sug.get("actor")
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+			viewer_can_decide_creation_review,
+		)
+
+		payload["can_decide_creation_review"] = (
+			1
+			if viewer_can_decide_creation_review(payload.get("customer"), sug)
+			else 0
+		)
+	except Exception:
+		payload["can_decide_creation_review"] = 0
 	return payload
 
 

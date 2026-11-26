@@ -199,6 +199,103 @@ def mark_seller_amend_for_review(name: str, actor=None, reason: str = "seller_am
 	return True
 
 
+REASON_CLIENT_PORTAL = "client_portal"
+
+
+def viewer_is_review_admin() -> bool:
+	"""Desk Administrator / System Manager, or app admin (``*`` / permissionSource admin)."""
+	if is_creation_review_admin():
+		return True
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import _is_sales_admin
+
+		return bool(_is_sales_admin())
+	except Exception:
+		return False
+
+
+def viewer_can_see_review_order(customer: str | None) -> bool:
+	"""Assigned salesman of this Customer, or any review admin."""
+	if viewer_is_review_admin():
+		return True
+	cust = cstr(customer or "").strip()
+	if not cust:
+		return False
+	me = _acting_or_session_user()
+	if not me or me in ("Guest", "guest"):
+		return False
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.employee_api import customer_salesmen
+
+		return me in set(customer_salesmen(cust) or [])
+	except Exception:
+		return False
+
+
+def viewer_can_decide_creation_review(customer: str | None, pending_sug=None) -> bool:
+	"""True when the acting staff may Confirm/Reject this parked order."""
+	if not viewer_can_see_review_order(customer):
+		return False
+	if isinstance(pending_sug, dict) and cstr(pending_sug.get("reason") or "") == REASON_SELLER_SUGGESTION:
+		actor = cstr(pending_sug.get("actor") or "").strip()
+		me = _acting_or_session_user()
+		if actor and me and actor == me and not is_creation_review_admin():
+			return False
+	return True
+
+
+def mark_client_portal_order_for_review(name: str, customer: str | None = None) -> bool:
+	"""Park a PIN-client catalog Orden in Revisar (even if the API session is Administrator).
+
+	Yellow Pedidos badge + Revisar queue — same chrome as seller suggestions.
+	``review_actor`` is the assigned salesman when one exists.
+	"""
+	name = cstr(name or "").strip()
+	if not name:
+		return False
+	ensure_creation_review_custom_fields()
+	if not frappe.db.has_column("Sales Order", FIELDNAME):
+		return False
+	if not frappe.db.exists("Sales Order", name):
+		return False
+	frappe.db.set_value("Sales Order", name, FIELDNAME, STATUS_PENDING, update_modified=False)
+	cust = cstr(customer or frappe.db.get_value("Sales Order", name, "customer") or "").strip()
+	actor = ""
+	if cust:
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.employee_api import customer_salesmen
+
+			users = [cstr(u).strip() for u in (customer_salesmen(cust) or []) if cstr(u).strip()]
+			if users:
+				actor = users[0]
+		except Exception:
+			actor = ""
+	if not actor:
+		actor = "cliente"
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.api import (
+			_guest_preorder_tag_fieldname,
+			_sanitize_guest_tag,
+			_update_guest_preorder_tag,
+		)
+
+		tag_fn = _guest_preorder_tag_fieldname()
+		if tag_fn and frappe.db.exists("Sales Order", name):
+			frappe.flags.ignore_permissions = True
+			so = frappe.get_doc("Sales Order", name)
+			frappe.flags.ignore_permissions = False
+			_update_guest_preorder_tag(
+				so, "review_reason", _sanitize_guest_tag(REASON_CLIENT_PORTAL)
+			)
+			_update_guest_preorder_tag(so, "review_actor", _sanitize_guest_tag(actor)[:140])
+			frappe.db.set_value(
+				"Sales Order", name, tag_fn, getattr(so, tag_fn, None), update_modified=False
+			)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"mark_client_portal_order_for_review tag {name}")
+	return True
+
+
 # ── Seller suggestions (queue without applying until Revisar confirm) ─────────
 
 SUGGESTION_KV_SCOPE = "guest_preorder.suggestion"
@@ -847,6 +944,8 @@ def list_creation_reviews(kind="customer", status="Pending", limit=100, start=0)
 					row["suggestion_actor"] = cstr(data.get("actor") or "") or None
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "list_creation_reviews customer suggestion attach")
+		if not viewer_is_review_admin():
+			out = [row for row in out if viewer_can_see_review_order(row.get("name"))]
 		return out
 
 	# Orders = guest preorders only
@@ -950,6 +1049,8 @@ def list_creation_reviews(kind="customer", status="Pending", limit=100, start=0)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "list_creation_reviews suggestion attach")
 
+	if not viewer_is_review_admin():
+		out = [row for row in out if viewer_can_see_review_order(row.get("customer"))]
 	return out
 
 
@@ -967,6 +1068,10 @@ def confirm_creation_review(kind=None, name=None):
 	doctype = "Customer" if kind == "customer" else "Sales Order"
 	if not frappe.db.exists(doctype, name):
 		frappe.throw(_("{0} {1} not found").format(doctype, name), frappe.DoesNotExistError)
+
+	cust_for_scope = name if kind == "customer" else frappe.db.get_value("Sales Order", name, "customer")
+	if not viewer_can_see_review_order(cust_for_scope):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
 	applied = None
 	if kind == "order":
@@ -1066,6 +1171,8 @@ def delete_creation_review(kind=None, name=None):
 	if kind == "customer":
 		if not frappe.db.exists("Customer", name):
 			frappe.throw(_("Customer {0} not found").format(name), frappe.DoesNotExistError)
+		if not viewer_can_see_review_order(name):
+			frappe.throw(_("Not permitted"), frappe.PermissionError)
 
 		# Seller suggestion reject: keep Customer body, discard queued patch.
 		sug = get_pending_customer_suggestion(name)
@@ -1134,6 +1241,8 @@ def delete_creation_review(kind=None, name=None):
 	frappe.flags.ignore_permissions = False
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"), frappe.ValidationError)
+	if not viewer_can_see_review_order(so.customer):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
 	# Seller suggestion reject: keep the SO body as-is, discard the queued patch
 	# (no red leftover state — printing / both parties see the live order only).
@@ -1214,6 +1323,13 @@ def count_pending_creation_reviews():
 				)
 			)
 	out["total"] = out["customers"] + out["orders"]
+	if not viewer_is_review_admin():
+		# Salesman: only assigned clients (same filter as list_creation_reviews).
+		pending_orders = list_creation_reviews(kind="order", status=STATUS_PENDING, limit=500)
+		pending_cust = list_creation_reviews(kind="customer", status=STATUS_PENDING, limit=500)
+		out["orders"] = len(pending_orders or [])
+		out["customers"] = len(pending_cust or [])
+		out["total"] = out["customers"] + out["orders"]
 	return out
 
 

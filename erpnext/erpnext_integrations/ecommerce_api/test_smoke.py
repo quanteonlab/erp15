@@ -2349,6 +2349,91 @@ def suite_5_10_product_manager():
         assert hasattr(pm, "list_uoms"), "list_uoms missing on product_manager"
         uoms = pm.list_uoms()
         assert uoms is not None
+        assert isinstance(uoms, list), type(uoms)
+        if uoms:
+            sample = uoms[0]
+            assert isinstance(sample, dict) and sample.get("name") and sample.get("kind") in (
+                "medida",
+                "contenedor",
+                "unidad",
+            ), sample
+            kinds = {u.get("name"): u.get("kind") for u in uoms if isinstance(u, dict)}
+            if "WEIGHT" in kinds:
+                assert kinds["WEIGHT"] == "medida", kinds["WEIGHT"]
+            if "CAJA" in kinds:
+                assert kinds["CAJA"] == "contenedor", kinds["CAJA"]
+            if "Nos" in kinds:
+                assert kinds["Nos"] == "unidad", kinds["Nos"]
+
+    def check_unit_sku_leaf_factor_and_cycle():
+        """p20 — nested pack product of packs; cycle rejected on save."""
+        from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+            ensure_uom_kind_custom_field,
+            leaf_factor,
+            validate_unit_sku_link,
+        )
+
+        ensure_uom_kind_custom_field()
+        leaf = pm.create_product_row(
+            None,
+            {"source_title": "Smoke p20 leaf", "stock_uom": "Nos"},
+            activate=0,
+        )
+        assert leaf.get("item_code"), leaf
+        leaf_sku = leaf["item_code"]
+        c1 = pm.create_product_row(
+            None,
+            {
+                "source_title": "Smoke p20 C1",
+                "stock_uom": "CAJA",
+                "pack_qty": 4,
+                "unit_sku": leaf_sku,
+            },
+            activate=0,
+        )
+        c1_sku = c1["item_code"]
+        c2 = pm.create_product_row(
+            None,
+            {
+                "source_title": "Smoke p20 C2",
+                "stock_uom": "CAJA",
+                "pack_qty": 3,
+                "unit_sku": c1_sku,
+            },
+            activate=0,
+        )
+        c2_sku = c2["item_code"]
+        c3 = pm.create_product_row(
+            None,
+            {
+                "source_title": "Smoke p20 C3",
+                "stock_uom": "CAJA",
+                "pack_qty": 2,
+                "unit_sku": c2_sku,
+            },
+            activate=0,
+        )
+        c3_sku = c3["item_code"]
+        info = leaf_factor(c3_sku)
+        assert info["leaf"] == leaf_sku, info
+        assert float(info["factor"]) == 24.0, info
+        graph = pm.get_unit_sku_graph(item_code=c3_sku)
+        assert float(graph.get("factor") or 0) == 24.0, graph
+        contents = pm.format_item_pack_contents(item_code=c3_sku, qty=2, lang="es")
+        assert contents and "48" in str(contents.get("line") or ""), contents
+        # leaf → c3 would close a cycle (c3 → … → leaf)
+        try:
+            validate_unit_sku_link(leaf_sku, c3_sku)
+            cycle_preview_ok = False
+        except Exception:
+            cycle_preview_ok = True
+        assert cycle_preview_ok, "validate_unit_sku_link must reject leaf→ancestor"
+        try:
+            pm.save_product_row(leaf_sku, {"unit_sku": c3_sku})
+            cycle_ok = False
+        except Exception:
+            cycle_ok = True
+        assert cycle_ok, "cycle A←…←A must be rejected on save"
 
     def check_remove_white_bg_dry():
         assert hasattr(pm, "remove_white_bg_item_images"), "remove_white_bg_item_images missing"
@@ -2479,6 +2564,7 @@ def suite_5_10_product_manager():
     _run("5.10.1b get_item_price_chart", check_item_price_chart, "S2")
     _run("5.10.2 get_product_rows page", check_product_rows, "S2")
     _run("5.10.3 list_uoms", check_uoms, "S3")
+    _run("5.10.3b unit_sku leaf_factor + cycle", check_unit_sku_leaf_factor_and_cycle, "S3")
     _run("5.10.4 list_item_attribute_names", check_attr_names, "S3")
     _run("5.10.5 get_brand_suggestions", check_brand_suggestions, "S3")
     _run("5.10.6 get_category_list", check_category_list, "S3")
@@ -3160,6 +3246,23 @@ def suite_5_12_modules_read():
                 frappe.delete_doc("Lead", chk_lead.name, ignore_permissions=True, force=True)
             frappe.db.commit()
 
+        # upsert_lead: unknown Lead Source (e.g. UI default "Website") must not 500
+        bad_src_name = None
+        try:
+            out = pa.upsert_lead(
+                values={"lead_name": "Smoke Bad Source", "source": "Website"},
+                client_request_id=f"tmp:lead:smoke-bad-src-{frappe.generate_hash(length=6)}",
+            )
+            assert out and out.get("ok") and out.get("name"), out
+            bad_src_name = out["name"]
+            assert not frappe.db.get_value("Lead", bad_src_name, "source"), (
+                "invalid source must be dropped"
+            )
+        finally:
+            if bad_src_name and frappe.db.exists("Lead", bad_src_name):
+                frappe.delete_doc("Lead", bad_src_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
         # duplicate_lead must not 409 on unique email (clone clears email_id)
         src = frappe.new_doc("Lead")
         src.lead_name = "Smoke Dup Source"
@@ -3275,21 +3378,16 @@ def suite_5_12_modules_read():
             frappe.db.commit()
 
         # Orden/assigned Customer → CLIENTE ✓ with protected organicos tag.
+        from erpnext.erpnext_integrations.ecommerce_api import api
         from erpnext.erpnext_integrations.ecommerce_api import tags_api as ta
 
         owner = frappe.session.user or "Administrator"
         org_cust = None
         org_lead = None
         try:
-            # Skip Administrator owner (ensure_organic ignores it); use a staff user when possible.
-            staff = None
-            if owner == "Administrator":
-                staff = frappe.db.get_value(
-                    "User",
-                    {"enabled": 1, "name": ["not in", ["Administrator", "Guest", "guest@localhost"]]},
-                    "name",
-                )
-            seller = staff or owner
+            # Skip Administrator owner (ensure_organic ignores it); prefer non-admin sales staff.
+            staff = _ensure_smoke_creation_review_staff()
+            seller = staff if staff else owner
             if seller and seller not in ("Guest", "Administrator"):
                 created = api.create_customer(
                     customer_name=f"Smoke Organico {frappe.generate_hash(length=6)}",
@@ -3312,16 +3410,71 @@ def suite_5_12_modules_read():
                 assert card, "organic cliente missing from Preventa board"
                 assert card.get("stage") == "customer", card
                 assert ta.TAG_ORGANICO in (card.get("tags") or []), card.get("tags")
+
+                # Nuevo pedido path: acting seller with orden-only perms, no
+                # explicit salesmen → still auto-own + Preventa CLIENTE card.
+                from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+
+                auto_cust = None
+                auto_lead = None
+                orig_acting = ea._acting_username
+                orig_perm = ea._acting_perm_info
+                ea._acting_username = lambda: seller
+                ea._acting_perm_info = lambda: {
+                    "source": "groups",
+                    "permissions": ["ops.orden", "tables.orders.own"],
+                }
+                try:
+                    created_auto = api.create_customer(
+                        customer_name=f"Smoke Orden Client {frappe.generate_hash(length=6)}",
+                    )
+                    auto_cust = (
+                        created_auto.get("name")
+                        if isinstance(created_auto, dict)
+                        else created_auto
+                    )
+                    assert auto_cust
+                    assert seller in (created_auto.get("salesmen") or []), created_auto
+                    auto_lead = frappe.db.get_value("Customer", auto_cust, "lead_name")
+                    assert auto_lead, "orden-only create_customer must mirror Preventa CLIENTE"
+                    assert frappe.db.get_value("Lead", auto_lead, "lead_owner") == seller
+                    assert frappe.db.get_value("Lead", auto_lead, "status") == "Converted"
+                    assert (
+                        frappe.db.get_value("Lead", auto_lead, "custom_preventa_stage")
+                        == "customer"
+                    )
+                finally:
+                    ea._acting_username = orig_acting
+                    ea._acting_perm_info = orig_perm
+                    if auto_lead and frappe.db.exists("Lead", auto_lead):
+                        frappe.delete_doc(
+                            "Lead", auto_lead, ignore_permissions=True, force=True
+                        )
+                    if auto_cust and frappe.db.exists("Customer", auto_cust):
+                        frappe.delete_doc(
+                            "Customer", auto_cust, ignore_permissions=True, force=True
+                        )
+                    frappe.db.commit()
+
                 # Non-admin cannot strip organicos via set_doc_tags.
                 prev_user = frappe.session.user
+                orig_acting = ea._acting_username
+                orig_perm = ea._acting_perm_info
                 try:
                     frappe.set_user(seller)
+                    ea._acting_username = lambda: seller
+                    ea._acting_perm_info = lambda: {
+                        "source": "groups",
+                        "permissions": ["ops.preventa", "ops.orden"],
+                    }
                     try:
                         ta.set_doc_tags("Lead", org_lead, tags=[])
                         raise AssertionError("set_doc_tags must block removing organicos")
                     except frappe.ValidationError:
                         pass
                 finally:
+                    ea._acting_username = orig_acting
+                    ea._acting_perm_info = orig_perm
                     frappe.set_user(prev_user)
         finally:
             if org_lead and frappe.db.exists("Lead", org_lead):
@@ -5548,16 +5701,17 @@ def suite_5_17_mcp_gateway():
 
 # ── Suite 5.15 — Creation review (Revisión Pedidos / Clientes) ────────────────
 
-def _ensure_smoke_creation_review_staff():
+def _ensure_smoke_creation_review_staff(
+    email="smoke.creation.review@example.com", last_name="ReviewStaff"
+):
     """Non-admin user so create_customer / create_guest_preorder enter the queue."""
-    email = "smoke.creation.review@example.com"
     if not frappe.db.exists("User", email):
         u = frappe.get_doc(
             {
                 "doctype": "User",
                 "email": email,
                 "first_name": "Smoke",
-                "last_name": "ReviewStaff",
+                "last_name": last_name,
                 "send_welcome_email": 0,
                 "user_type": "System User",
             }
@@ -5802,6 +5956,107 @@ def suite_5_15_creation_review():
             if row is not None:
                 assert not (row.get("attention") or {}).get("hot"), row.get("attention")
 
+    def check_client_portal_pin_creates_orden_for_review():
+        """PIN-logged catalog client → Orden parked in Revisar for assigned salesman."""
+        from erpnext.erpnext_integrations.ecommerce_api import client_access_api as caa
+        from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
+
+        staff_a = _ensure_smoke_creation_review_staff()
+        staff_b = _ensure_smoke_creation_review_staff(
+            email="smoke.creation.review.b@example.com", last_name="ReviewStaffB"
+        )
+        item = _get_test_item()
+        so_name = None
+        cust_name = None
+        prev = frappe.session.user
+        orig_perm = ea._acting_perm_info
+        ea._acting_perm_info = lambda: {
+            "source": "groups",
+            "permissions": ["ops.preventa", "ops.orden"],
+        }
+        try:
+            frappe.set_user("Administrator")
+            phone = f"+54911{abs(hash(frappe.generate_hash(length=12))) % 10**8:08d}"
+            cust = api.create_customer(
+                customer_name=f"Smoke Portal Cust {frappe.generate_hash(length=6)}",
+                phone=phone,
+            )
+            cust_name = cust.get("name") if isinstance(cust, dict) else cust
+            assert cust_name, cust
+            ea._set_customer_salesmen_users(cust_name, [staff_a])
+            issued = caa.issue_client_access_pin(
+                guest_phone=phone,
+                guest_name="Smoke Portal Cust",
+                customer=cust_name,
+                send=0,
+                force_new=1,
+            )
+            assert issued.get("ok") and issued.get("pin"), issued
+            pin = issued["pin"]
+
+            empty_blocked = False
+            try:
+                api.create_guest_preorder(items=[], client_pin=pin)
+            except Exception as e:
+                empty_blocked = True
+                assert "empty" in str(e).lower(), e
+            assert empty_blocked, "PIN-client empty cart must not seed random Orden items"
+
+            out = api.create_guest_preorder(
+                items=[{"item_code": item["item_code"], "qty": 1, "rate": 15}],
+                client_pin=pin,
+            )
+            so_name = out.get("preorder_name")
+            assert so_name, out
+            assert out.get("display_status") == "Orden" or cint(
+                frappe.db.get_value("Sales Order", so_name, "docstatus")
+            ) == 1, out
+            assert out.get("creation_review") == cr.STATUS_PENDING, out
+            assert out.get("review_reason") == cr.REASON_CLIENT_PORTAL, out
+            assert frappe.db.get_value("Sales Order", so_name, cr.FIELDNAME) == cr.STATUS_PENDING
+            assert frappe.db.get_value("Sales Order", so_name, "customer") == cust_name
+
+            frappe.set_user(staff_a)
+            listed_a = api.list_creation_reviews(kind="order", status="Pending", limit=200)
+            names_a = {r.get("name") for r in (listed_a or [])}
+            assert so_name in names_a, (so_name, names_a)
+            row = next(r for r in listed_a if r.get("name") == so_name)
+            assert row.get("review_reason") == cr.REASON_CLIENT_PORTAL, row
+            detail_a = api.get_guest_preorder(so_name)
+            assert cint(detail_a.get("can_decide_creation_review")) == 1, detail_a
+
+            frappe.set_user(staff_b)
+            listed_b = api.list_creation_reviews(kind="order", status="Pending", limit=200)
+            names_b = {r.get("name") for r in (listed_b or [])}
+            assert so_name not in names_b, (so_name, names_b)
+            other_blocked = False
+            try:
+                api.get_guest_preorder(so_name)
+                api.confirm_creation_review(kind="order", name=so_name)
+            except Exception:
+                other_blocked = True
+            assert other_blocked, "unassigned salesman must not open/confirm client-portal review"
+
+            frappe.set_user(staff_a)
+            confirmed = api.confirm_creation_review(kind="order", name=so_name)
+            assert confirmed.get("ok"), confirmed
+            assert (
+                frappe.db.get_value("Sales Order", so_name, cr.FIELDNAME) == cr.STATUS_CONFIRMED
+            ), so_name
+        finally:
+            ea._acting_perm_info = orig_perm
+            frappe.set_user(prev)
+            if so_name and frappe.db.exists("Sales Order", so_name):
+                try:
+                    api.cancel_guest_preorder(so_name)
+                except Exception:
+                    pass
+                frappe.db.sql("delete from `tabSales Order Item` where parent=%s", so_name)
+                frappe.db.sql("delete from `tabSales Order` where name=%s", so_name)
+            if cust_name and frappe.db.exists("Customer", cust_name):
+                frappe.delete_doc("Customer", cust_name, ignore_permissions=True, force=True)
+            frappe.db.commit()
+
     def check_seller_can_create_orden():
         """Suggestion-only sellers may create Orden; later pipeline stays blocked."""
         from erpnext.erpnext_integrations.ecommerce_api import employee_api as ea
@@ -5869,6 +6124,11 @@ def suite_5_15_creation_review():
         "5.15.7 preventa attention count shape (i054)",
         check_preventa_attention_count,
         "S3",
+    )
+    _run(
+        "5.15.8 PIN client catalog → Orden + assigned salesman review",
+        check_client_portal_pin_creates_orden_for_review,
+        "S2",
     )
 
 

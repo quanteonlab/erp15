@@ -21,7 +21,7 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Event Type",
-   "options": "link_open\ncatalog_view\ncart_snapshot\ninquiry\nstage_change",
+   "options": "link_open\ncatalog_view\ncart_snapshot\ninquiry\nstage_change\nduplicate\ncreate",
    "reqd": 1
   },
   {

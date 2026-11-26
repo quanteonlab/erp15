@@ -406,22 +406,11 @@ def _ensure_item_group(name: str) -> str | None:
     return group_name
 
 
-def _ensure_uom(name: str) -> str | None:
-    uom_name = (name or "").strip()
-    if not uom_name:
-        return None
-    if frappe.db.exists("UOM", uom_name):
-        return uom_name
-    doc = {
-        "doctype": "UOM",
-        "uom_name": uom_name,
-        "enabled": 1,
-    }
-    # Weighed sell units must allow fractional qty (POS WEIGHT path).
-    if uom_name.upper() in ("WEIGHT", "KG", "G", "LB", "OZ"):
-        doc["must_be_whole_number"] = 0
-    frappe.get_doc(doc).insert(ignore_permissions=True)
-    return uom_name
+def _ensure_uom(name: str, kind: str | None = None) -> str | None:
+    """Create/ensure UOM; optional kind (medida|contenedor|unidad). Retro: name aliases still work."""
+    from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import ensure_uom_with_kind
+
+    return ensure_uom_with_kind(name, kind)
 
 
 # UI stock-UOM labels (products / receiving / buying) → ERPNext UOM master names.
@@ -450,20 +439,29 @@ def _normalize_stock_uom(name: str | None) -> str:
 
 
 @frappe.whitelist()
-def ensure_product_lookup(kind, name):
-    """Create a Brand, Item Group, or UOM if it does not already exist."""
+def ensure_product_lookup(kind, name, uom_kind=None):
+    """Create a Brand, Item Group, or UOM if it does not already exist.
+
+    For UOM, pass ``uom_kind`` = medida | contenedor | unidad (p20).
+    """
     frappe.has_permission("Item", "write", throw=True)
     kind_key = (kind or "").strip().lower()
+    label = (name if isinstance(name, str) else "") if name is not None else ""
+    label = cstr(label).strip()
+    if not label or label.lower() in ("null", "undefined"):
+        frappe.throw(_("Name is required"))
     if kind_key == "brand":
-        created = _ensure_brand(name)
+        created = _ensure_brand(label)
     elif kind_key in ("category", "item_group"):
-        created = _ensure_item_group(name)
+        created = _ensure_item_group(label)
     elif kind_key == "uom":
-        created = _ensure_uom(name)
+        created = _ensure_uom(label, uom_kind)
+        if not created:
+            frappe.throw(_("Could not create UOM"))
     else:
         frappe.throw(_("Unsupported lookup type"))
     frappe.db.commit()
-    return {"ok": True, "name": created}
+    return {"ok": True, "name": created, "kind": (uom_kind or None)}
 
 
 def _generate_unique_item_code(exclude_codes=None) -> str:
@@ -727,12 +725,19 @@ def ensure_product_manager_custom_fields() -> None:
     Ensure the pack/normalization/unit-sku custom fields used throughout Product Manager
     (get/save/create rows, description generation) exist on Item.
 
+    Also ensures UOM.custom_uom_kind + seeds WEIGHT/CAJA/Nos (p20).
+
     Wired into hooks.after_migrate so every `bench migrate` (fresh site or
     existing) guarantees these fields exist, instead of relying on each
     Product Manager endpoint to check for them at request time.
     Idempotent — create_custom_fields() skips fields that already exist.
     """
     from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+    from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+        ensure_uom_kind_custom_field,
+    )
+
+    ensure_uom_kind_custom_field()
 
     create_custom_fields(
         {
@@ -1305,6 +1310,13 @@ def get_product_rows(
             row["price_meta"] = meta_by_item.get(row["client_sku"], {})
             row["attributes"] = attr_by_item.get(row["client_sku"], {})
 
+    if rows:
+        from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+            enrich_rows_with_pack_graph,
+        )
+
+        enrich_rows_with_pack_graph(rows)
+
     count_vals = {k: v for k, v in values.items() if k not in ("page_length", "offset")}
     total = frappe.db.sql(
         f"SELECT COUNT(*) AS c FROM `tabItem` i WHERE {where_clause}",
@@ -1354,19 +1366,64 @@ def list_item_attribute_names():
 
 @frappe.whitelist()
 def list_uoms():
-    """Enabled ERPNext UOM master names — source of truth for stock_uom dropdowns
-    (i030 Part D), replacing the hardcoded ['Nos', 'Kg', 'g', 'L', 'mL', 'Unit'] list."""
-    try:
-        rows = frappe.get_all(
-            "UOM",
-            filters={"enabled": 1},
-            fields=["name"],
-            order_by="name",
+    """Enabled UOMs as ``[{name, kind}, …]`` (p20).
+
+    Retro: older clients that expected bare strings can use ``.name``;
+    kind is always resolved (DB or legacy name aliases).
+    """
+    from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import list_uoms_with_kind
+
+    return list_uoms_with_kind()
+
+
+@frappe.whitelist(allow_guest=True)
+def get_unit_sku_graph(item_code=None):
+    """Pack DAG slice for one SKU: path to leaf, parents that pack this SKU, contents helper."""
+    from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+        format_pack_contents,
+        leaf_factor,
+    )
+
+    code = (item_code or "").strip()
+    if not code:
+        frappe.throw(_("Item code is required"))
+    info = leaf_factor(code)
+    parents = []
+    if frappe.db.has_column("Item", "custom_unit_sku"):
+        parents = frappe.get_all(
+            "Item",
+            filters={"custom_unit_sku": code},
+            fields=["name", "item_name", "custom_pack_qty", "stock_uom"],
             ignore_permissions=True,
         )
-    except Exception:
-        return []
-    return [r.name for r in rows if r.get("name")]
+    return {
+        "item_code": code,
+        "leaf": info["leaf"],
+        "factor": info["factor"],
+        "path": info["path"],
+        "depth": info["depth"],
+        "parents": [
+            {
+                "item_code": p.name,
+                "title": p.item_name,
+                "pack_qty": p.custom_pack_qty,
+                "stock_uom": p.stock_uom,
+            }
+            for p in parents
+        ],
+        "contents": format_pack_contents(1, code),
+    }
+
+
+@frappe.whitelist(allow_guest=True)
+def format_item_pack_contents(item_code=None, qty=1, lang="es"):
+    """Catalog / POS / armado contents line for a contenedor qty."""
+    from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import format_pack_contents
+
+    code = (item_code or "").strip()
+    if not code:
+        frappe.throw(_("Item code is required"))
+    return format_pack_contents(qty, code, lang=lang or "es")
 
 
 # ---------------------------------------------------------------------------
@@ -1513,6 +1570,15 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
                 frappe.throw(
                     _("Item field custom_unit_sku is missing; cannot save Unit SKU. Run bench migrate.")
                 )
+            from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+                validate_unit_sku_link,
+            )
+
+            validate_unit_sku_link(
+                item_code,
+                changes.get("unit_sku"),
+                changes.get("pack_qty") if "pack_qty" in changes else None,
+            )
             direct_field_map["unit_sku"] = "custom_unit_sku"
         elif frappe.db.has_column("Item", "custom_unit_sku"):
             direct_field_map["unit_sku"] = "custom_unit_sku"
@@ -1810,6 +1876,12 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
                 _("Item field custom_unit_sku is missing; cannot save Unit SKU. Run bench migrate.")
             )
         unit_sku = (changes.get("unit_sku") or "").strip()
+        if unit_sku:
+            from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
+                validate_unit_sku_link,
+            )
+
+            validate_unit_sku_link(candidate_code, unit_sku, pack_qty)
         item_doc.custom_unit_sku = unit_sku or None
 
     def _coerce_float(raw):

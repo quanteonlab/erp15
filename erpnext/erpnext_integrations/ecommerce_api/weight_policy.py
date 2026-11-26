@@ -54,11 +54,35 @@ def _norm_uom(uom) -> str:
 
 
 def is_weight_sell_uom(uom) -> bool:
-	return _norm_uom(uom) in WEIGHT_SELL_UOM_TOKENS
+	"""True when line sells by weight/measure (WEIGHT token, Kg/L, or UOM kind=medida)."""
+	if _norm_uom(uom) in WEIGHT_SELL_UOM_TOKENS:
+		return True
+	# p20 custom UOMs tagged medida (DB); never fail closed if module/DB unavailable.
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import is_medida_uom
+
+		return bool(cstr(uom or "").strip()) and is_medida_uom(uom)
+	except Exception:
+		return False
 
 
 def is_catalog_weight_uom(uom) -> bool:
-	return _norm_uom(uom) in CATALOG_WEIGHT_TOKENS
+	"""Catalog WEIGHT-style token (pack count + measure on Item.unit), not raw Kg/g.
+
+	Custom UOMs with kind=medida that are *not* mass tokens (kg/g/l/…) count as catalog weight.
+	"""
+	key = _norm_uom(uom)
+	if key in CATALOG_WEIGHT_TOKENS:
+		return True
+	if key in WEIGHT_SELL_UOM_TOKENS:
+		# Known mass/volume measure name → not the catalog pack token.
+		return False
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import is_medida_uom
+
+		return bool(cstr(uom or "").strip()) and is_medida_uom(uom)
+	except Exception:
+		return False
 
 
 def is_mass_uom(uom) -> bool:
