@@ -2798,7 +2798,8 @@ def suite_5_10_product_manager():
     _run("5.10.8 create_product_row NOS (single)→Nos", check_create_with_nos_single_uom, "S3")
 
     def check_create_product_row_stock_off_by_default():
-        """New products start with Controlar stock off (is_stock_item=0)."""
+        """New products start with Controlar stock off (catalog badge + ERPNext)."""
+        pm.ensure_product_manager_custom_fields()
         created = pm.create_product_row(
             None,
             {"source_title": "Smoke stock control default off", "stock_uom": "Nos"},
@@ -2807,6 +2808,8 @@ def suite_5_10_product_manager():
         sku = created.get("item_code")
         assert sku, created
         assert cint(frappe.db.get_value("Item", sku, "is_stock_item")) == 0, sku
+        if frappe.db.has_column("Item", "custom_control_stock"):
+            assert cint(frappe.db.get_value("Item", sku, "custom_control_stock")) == 0, sku
 
     _run(
         "5.10.8b create_product_row is_stock_item default 0",

@@ -175,6 +175,7 @@ def get_products(
 			"custom_unit_weight_max",
 			"custom_min_sell_qty",
 			"custom_max_sell_qty_day",
+			"custom_control_stock",
 		):
 			if custom not in fields and frappe.db.has_column("Item", custom):
 				fields.append(custom)
@@ -262,10 +263,18 @@ def get_products(
 		stock_wh = cstr(warehouse or "").strip() or None
 
 	for item in items:
-		if item.get("is_stock_item"):
+		# ERPNext stock ledger flag (may be 1 on legacy Items).
+		tracks_bin = cint(item.get("is_stock_item"))
+		if tracks_bin:
 			item["stock_qty"] = get_stock_balance(item.item_code, stock_wh)
 			if stock_wh:
 				item["warehouse"] = stock_wh
+		# Catalog «Controlar stock» opt-in (default 0) — drives Sin stock / Poco stock tags.
+		if "custom_control_stock" in item:
+			item["is_stock_item"] = cint(item.get("custom_control_stock"))
+		elif frappe.db.has_column("Item", "custom_control_stock"):
+			item["is_stock_item"] = 0
+		# else: leave ERPNext flag (field not migrated yet)
 
 	# Filter to in-stock items only (stock items with qty > 0; services pass through)
 	if cint(in_stock_only):
@@ -549,7 +558,7 @@ def get_product(item_code, price_list=None, warehouse=None, customer=None):
 			if pricing_rule_result:
 				product["pricing_rules"] = pricing_rule_result
 
-	# Add stock information
+	# Add stock information (ERPNext tracking)
 	if item.is_stock_item:
 		if warehouse:
 			product["stock_qty"] = get_stock_balance(item_code, warehouse)
@@ -558,6 +567,10 @@ def get_product(item_code, price_list=None, warehouse=None, customer=None):
 			product["stock_qty"] = get_stock_balance(item_code)
 
 		product["projected_qty"] = get_projected_qty(item_code, warehouse)
+
+	# Catalog badge flag (opt-in). Frontends use is_stock_item for Sin stock tags.
+	if frappe.db.has_column("Item", "custom_control_stock"):
+		product["is_stock_item"] = cint(getattr(item, "custom_control_stock", 0))
 
 	# Add variants if this is a template
 	if item.has_variants:

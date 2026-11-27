@@ -173,14 +173,23 @@ def _new_unique_barcode() -> str:
 
 
 def _ensure_item_tracks_stock(item_code: str) -> bool:
-	"""Turn on Item.is_stock_item when stock is first controlled (recepción / PM qty)."""
+	"""Turn on stock control (ERPNext + catalog badge) on first recepción / PM qty save.
+
+	``custom_control_stock`` is the opt-in catalog flag (default 0) so legacy Items
+	with ERPNext ``is_stock_item=1`` do not suddenly show «Sin stock» everywhere.
+	"""
 	code = cstr(item_code or "").strip()
 	if not code or not frappe.db.exists("Item", code):
 		return False
-	if cint(frappe.db.get_value("Item", code, "is_stock_item")):
-		return False
-	frappe.db.set_value("Item", code, "is_stock_item", 1, update_modified=False)
-	return True
+	changed = False
+	if not cint(frappe.db.get_value("Item", code, "is_stock_item")):
+		frappe.db.set_value("Item", code, "is_stock_item", 1, update_modified=False)
+		changed = True
+	if frappe.db.has_column("Item", "custom_control_stock"):
+		if not cint(frappe.db.get_value("Item", code, "custom_control_stock")):
+			frappe.db.set_value("Item", code, "custom_control_stock", 1, update_modified=False)
+			changed = True
+	return changed
 
 
 def _reconcile_item_stock_qty(item_code: str, warehouse: str, target_qty: float) -> None:
@@ -853,6 +862,15 @@ def ensure_product_manager_custom_fields() -> None:
                     "description": "Maximum qty one client may buy of this item per calendar day. 0 = no cap.",
                     "reqd": 0,
                 },
+                {
+                    "fieldname": "custom_control_stock",
+                    "fieldtype": "Check",
+                    "label": "Control Stock (Catalog)",
+                    "insert_after": "is_stock_item",
+                    "description": "Opt-in: show Sin stock / Poco stock in catalog. Default off. Turns on with recepción or Product Manager qty.",
+                    "default": "0",
+                    "reqd": 0,
+                },
             ]
         },
         ignore_validate=True,
@@ -1228,6 +1246,12 @@ def get_product_rows(
         if frappe.db.has_column("Item", "custom_is_draft")
         else "0 AS is_draft"
     )
+    # Catalog badge flag (opt-in). Do not expose raw ERPNext is_stock_item here.
+    control_stock_select = (
+        "COALESCE(i.custom_control_stock, 0) AS is_stock_item"
+        if frappe.db.has_column("Item", "custom_control_stock")
+        else "0 AS is_stock_item"
+    )
 
     sql = f"""
         SELECT
@@ -1236,7 +1260,7 @@ def get_product_rows(
             i.brand                  AS brand,
             i.item_group             AS source_category,
             i.stock_uom              AS stock_uom,
-            COALESCE(i.is_stock_item, 0)               AS is_stock_item,
+            {control_stock_select},
             COALESCE(i.custom_pack_qty, NULL)          AS pack_qty,
             COALESCE(i.custom_pack_size, NULL)         AS pack_size,
             COALESCE(i.custom_pack_unit, NULL)         AS unit,
@@ -1578,7 +1602,8 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             "max_sell_qty_day": "custom_max_sell_qty_day",
             "sell_by_days": "shelf_life_in_days",
             "physical_section": "custom_physical_section",
-            "is_stock_item": "is_stock_item",
+            # Catalog «Controlar stock» — opt-in badge flag (not raw ERPNext is_stock_item).
+            "is_stock_item": "custom_control_stock",
         }
         direct_field_map = {
             k: v for k, v in direct_field_map.items() if frappe.db.has_column("Item", v)
@@ -1689,8 +1714,8 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             uom_name = (changes.get("stock_uom") or "").strip()
             updates["stock_uom"] = _normalize_stock_uom(uom_name) if uom_name else None
 
-        if "is_stock_item" in updates:
-            updates["is_stock_item"] = 1 if cint(updates["is_stock_item"]) else 0
+        if "custom_control_stock" in updates:
+            updates["custom_control_stock"] = 1 if cint(updates["custom_control_stock"]) else 0
 
         history: list[tuple[str, object, object]] = []
 
@@ -1700,6 +1725,8 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             for item_field, new_val in updates.items():
                 old_val = old_row.get(item_field)
                 label = _ITEM_HISTORY_FIELD_LABEL.get(item_field, item_field)
+                if item_field == "custom_control_stock":
+                    label = "is_stock_item"
                 history.append(
                     (
                         label,
@@ -1708,6 +1735,10 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
                     )
                 )
             frappe.db.set_value("Item", item_code, updates)
+            # Enabling catalog stock control also turns on ERPNext stock tracking.
+            if cint(updates.get("custom_control_stock")):
+                if not cint(frappe.db.get_value("Item", item_code, "is_stock_item")):
+                    frappe.db.set_value("Item", item_code, "is_stock_item", 1)
 
         unit_link = changes.get("unit_sku") if "unit_sku" in changes else ""
         if "unit_sku" not in changes and frappe.db.has_column("Item", "custom_unit_sku"):
@@ -1718,6 +1749,8 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
         # Pack SKUs that sell via a linked unit SKU do not track warehouse stock.
         if (unit_link or "").strip() and (unit_link or "").strip() != item_code and flt(pack_link) > 1:
             frappe.db.set_value("Item", item_code, "is_stock_item", 0)
+            if frappe.db.has_column("Item", "custom_control_stock"):
+                frappe.db.set_value("Item", item_code, "custom_control_stock", 0)
             stock_qty_target = None
 
         if "list_price" in changes:
@@ -1932,8 +1965,8 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
     pack_size = _normalize_pack_change_value("pack_size", changes.get("pack_size"))
     pack_unit = _normalize_pack_change_value("unit", changes.get("unit"))
 
-    # Stock control off by default (easy catalog ops). Turns on via checkbox,
-    # recepción / update_stock, or saving a stock qty (_ensure_item_tracks_stock).
+    # Catalog stock badges opt-in (custom_control_stock). ERPNext is_stock_item
+    # follows when enabling; both default off for new products.
     if "is_stock_item" in changes:
         track_stock = 1 if cint(changes.get("is_stock_item")) else 0
     else:
@@ -1955,6 +1988,8 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
         "custom_review_notes": (changes.get("review_notes") or "").strip() or None,
         "image": (changes.get("image") or "").strip() or None,
     }
+    if frappe.db.has_column("Item", "custom_control_stock"):
+        item_payload["custom_control_stock"] = track_stock
     if frappe.db.has_column("Item", "custom_is_draft"):
         item_payload["custom_is_draft"] = 1 if is_draft else 0
     item_doc = frappe.get_doc(item_payload)
