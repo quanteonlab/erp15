@@ -87,6 +87,16 @@ def set_taxonomy_aliases(doctype=None, name=None, aliases=None, overwrite=0):
 # ========================================
 
 @frappe.whitelist(allow_guest=True)
+def get_items_sell_qty_limits(item_codes=None):
+	"""Pedido cart: live min/max sell qty per SKU (avoids stale IndexedDB catalog)."""
+	from erpnext.erpnext_integrations.ecommerce_api.sell_qty_limits import (
+		get_items_sell_qty_limits as _get_items_sell_qty_limits,
+	)
+
+	return _get_items_sell_qty_limits(item_codes=item_codes)
+
+
+@frappe.whitelist(allow_guest=True)
 def get_products(
 	filters=None,
 	fields=None,
@@ -134,13 +144,17 @@ def get_products(
 			"has_variants",
 			"variant_of",
 			"image",
-			"thumbnail",
 			"disabled",
 			"standard_rate",
 			"opening_stock",
 			"brand",
 			"modified",
 		]
+		# thumbnail is optional / version-dependent — get_all cannot SELECT missing cols
+		# (get_list used to strip them silently).
+		for optional in ("thumbnail",):
+			if frappe.db.has_column("Item", optional):
+				fields.append(optional)
 		for custom in (
 			"custom_normalized_title",
 			"custom_variant_group",

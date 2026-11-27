@@ -1003,6 +1003,26 @@
       "expect": "no_500"
     },
     {
+      "id": "get_items_sell_qty_limits_null_codes_safe",
+      "source": "regression",
+      "bug": "get_items_sell_qty_limits must return {} on null/empty item_codes without TypeError",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_items_sell_qty_limits",
+      "args": {
+        "item_codes": null
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "get_items_sell_qty_limits_dirty_codes_safe",
+      "source": "regression",
+      "bug": "get_items_sell_qty_limits with \"null\" string / empty list / unknown sku must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.get_items_sell_qty_limits",
+      "args": {
+        "item_codes": ["", "null", "NOSUCH-SKU-SELL-LIMITS"]
+      },
+      "expect": "ok"
+    },
+    {
       "id": "validate_sell_qty_limits_null_items_safe",
       "source": "regression",
       "bug": "validate_items_sell_qty_limits must no-op on null/empty items without TypeError",

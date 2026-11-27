@@ -41,6 +41,41 @@ def get_item_sell_limits(item_code: str) -> tuple[float, float]:
 	return flt(row.get("custom_min_sell_qty") or 0), flt(row.get("custom_max_sell_qty_day") or 0)
 
 
+@frappe.whitelist(allow_guest=True)
+def get_items_sell_qty_limits(item_codes=None):
+	"""
+	Batch map for Pedido / catalog cart: { item_code: {min_sell_qty, max_sell_qty_day} }.
+	Null/empty/dirty item_codes → {}. Positive limits only (else null).
+	"""
+	if isinstance(item_codes, str):
+		raw = item_codes.strip()
+		if not raw or raw.lower() in ("null", "undefined", "none"):
+			item_codes = []
+		else:
+			try:
+				item_codes = frappe.parse_json(raw)
+			except Exception:
+				item_codes = [raw]
+	if item_codes is None or item_codes in ("", "null", "undefined"):
+		return {}
+	if isinstance(item_codes, dict):
+		item_codes = list(item_codes.values())
+	if not isinstance(item_codes, (list, tuple)):
+		return {}
+
+	out: dict[str, dict] = {}
+	for raw in item_codes:
+		code = cstr(raw or "").strip()
+		if not code or code in out:
+			continue
+		mn, mx = get_item_sell_limits(code)
+		out[code] = {
+			"min_sell_qty": mn if mn > 0 else None,
+			"max_sell_qty_day": mx if mx > 0 else None,
+		}
+	return out
+
+
 def client_item_qty_sold_today(
 	item_code: str,
 	customer: str | None = None,

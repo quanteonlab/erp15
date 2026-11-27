@@ -2754,6 +2754,10 @@ def suite_5_10_product_manager():
         assert cat_row, catalog
         assert flt(cat_row.get("min_sell_qty")) == 2, cat_row
         assert flt(cat_row.get("max_sell_qty_day")) == 5, cat_row
+        batch = api.get_items_sell_qty_limits(item_codes=[sku, "", None])
+        assert isinstance(batch, dict), batch
+        assert flt((batch.get(sku) or {}).get("min_sell_qty")) == 2, batch
+        assert flt((batch.get(sku) or {}).get("max_sell_qty_day")) == 5, batch
         # Below min → throw
         threw = False
         try:
