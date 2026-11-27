@@ -9200,6 +9200,26 @@
       "expect": "fail"
     },
     {
+      "id": "create_delivery_note_for_preorder_empty_name",
+      "source": "regression",
+      "bug": "create_delivery_note_for_preorder empty name is controlled ValidationError; missing address alone must not 417 (allow_missing_address placeholder on MAT/remito path)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_delivery_note_for_preorder",
+      "args": {
+        "preorder_name": ""
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "create_delivery_note_for_preorder_null_name",
+      "source": "regression",
+      "bug": "create_delivery_note_for_preorder null name is controlled; AssignMat Confirm with no street uses placeholder Sin dirección instead of not_deliverable 417",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_delivery_note_for_preorder",
+      "args": {
+        "preorder_name": null
+      },
+      "expect": "fail"
+    },
+    {
       "id": "tms_create_trip_plate_only_empty_dns",
       "source": "regression",
       "bug": "Date+plate Confirm with vehicle/plate but no matching MAT and empty dns is controlled ValidationError (create if none only after orders exist; never TypeError resolving driver from plate)",

@@ -10948,13 +10948,37 @@ def _no_address_delivery_warning():
 	)
 
 
-def _ensure_planner_delivery_note(so):
+def _placeholder_address_line():
+	return _("Sin dirección")
+
+
+def _stamp_placeholder_guest_address(so, line=None):
+	"""Persist a free-text / placeholder street on the SO guest tag so remito/MAT can proceed."""
+	text = cstr(line or "").strip() or _placeholder_address_line()
+	_update_guest_preorder_tag(so, "guest_address", text)
+	tag_fn = _guest_preorder_tag_fieldname()
+	if tag_fn:
+		frappe.db.set_value(
+			"Sales Order",
+			so.name,
+			tag_fn,
+			_guest_preorder_tag_text(so),
+			update_modified=False,
+		)
+	return text
+
+
+def _ensure_planner_delivery_note(so, *, allow_missing_address=False):
 	"""Create a submitted remito for stock/claim paths (optional for planning).
 
 	Rutas ``get_pending_deliveries`` lists Orden/Preparado Sales Orders by
 	``delivery_date`` without requiring a remito. Remitos are still created when
-	claiming onto a MAT / explicit create. When there is no deliverable address we
-	skip remito creation and return ``not_deliverable`` + warning.
+	claiming onto a MAT / explicit create.
+
+	When there is no deliverable address:
+	- default (Orden side-effects): skip remito → ``not_deliverable`` + warning
+	- ``allow_missing_address=True`` (MAT / create remito): stamp placeholder
+	  ``Sin dirección`` and continue so ops can assign a trip last-minute
 
 	Does **not** change pipeline status (Orden stays Orden until claim / manual remito).
 	"""
@@ -10973,19 +10997,38 @@ def _ensure_planner_delivery_note(so):
 	addr_name = addr.get("address_name")
 	addr_line = cstr(addr.get("address_line") or "").strip()
 	if not addr_name or not addr_line:
-		warn = _no_address_delivery_warning()
-		warnings.append(warn)
-		return {
-			"ok": False,
-			"planner_ready": False,
-			"not_deliverable": True,
-			"delivery_note": _delivery_note_for_sales_order(so.name),
-			"delivery_warning": warn,
-			"address_name": None,
-			"address_line": addr_line or None,
-			"geocoded": False,
-			"warnings": warnings,
-		}
+		if not allow_missing_address:
+			warn = _no_address_delivery_warning()
+			warnings.append(warn)
+			return {
+				"ok": False,
+				"planner_ready": False,
+				"not_deliverable": True,
+				"delivery_note": _delivery_note_for_sales_order(so.name),
+				"delivery_warning": warn,
+				"address_name": None,
+				"address_line": addr_line or None,
+				"geocoded": False,
+				"warnings": warnings,
+			}
+		# MAT / explicit remito: never block — placeholder street is enough to book a stop.
+		placeholder = _stamp_placeholder_guest_address(so, addr_line)
+		addr = _materialize_preorder_shipping_address(so, require_explicit=False)
+		addr_name = addr.get("address_name")
+		addr_line = cstr(addr.get("address_line") or "").strip() or placeholder
+		if not addr_name:
+			# Materialize may return line-only when Customer is missing; remito still proceeds.
+			warnings.append(
+				_(
+					"Pedido sin dirección ERP vinculada — se usa «{0}» para planificar el MAT."
+				).format(addr_line)
+			)
+		else:
+			warnings.append(
+				_(
+					"Pedido sin dirección — se planifica el MAT con «{0}» (editable después)."
+				).format(addr_line)
+			)
 
 	dn_name = _delivery_note_for_sales_order(so.name)
 	stock_warnings = []
@@ -11173,9 +11216,8 @@ def create_delivery_note_for_preorder(preorder_name):
 	if so.docstatus != 1:
 		frappe.throw(_("Confirm the order before creating a delivery note."))
 
-	gate = _ensure_planner_delivery_note(so)
-	if gate.get("not_deliverable"):
-		frappe.throw(gate.get("delivery_warning") or _no_address_delivery_warning())
+	# MAT / remito path: missing address must not 417 — placeholder street is OK.
+	gate = _ensure_planner_delivery_note(so, allow_missing_address=True)
 	if not gate.get("delivery_note"):
 		frappe.throw(
 			gate.get("delivery_warning")

@@ -4008,7 +4008,8 @@ def _materialize_dns_for_preorders(preorder_names):
 			frappe.throw(_("Not a Guest Preorder: {0}").format(so_name))
 		if cint(so.docstatus) != 1:
 			frappe.throw(_("Confirm the order before planning: {0}").format(so_name))
-		gate = _ensure_planner_delivery_note(so)
+		# Missing street must not block MAT assign — placeholder address is OK.
+		gate = _ensure_planner_delivery_note(so, allow_missing_address=True)
 		dn = gate.get("delivery_note")
 		if not dn:
 			frappe.throw(
