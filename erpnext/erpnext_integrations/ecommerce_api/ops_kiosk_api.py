@@ -986,11 +986,32 @@ def _summarize_progress(item_rows: list, progress: dict | None) -> dict:
 	last_saved_by = ""
 	amended = 0
 	remito_desynced = 0
+	armado_workers: list[str] = []
+	seen_workers: set[str] = set()
 	if isinstance(progress, dict):
 		last_saved_at = str(progress.get("last_saved_at") or last_event.get("at") or "")
 		last_saved_by = str(progress.get("last_saved_by") or last_event.get("employee_name") or "")
 		amended = 1 if cint(progress.get("amended_after_pack")) else 0
 		remito_desynced = 1 if cint(progress.get("remito_desynced")) else 0
+		for state in lines.values():
+			if not isinstance(state, dict):
+				continue
+			for key in ("packed_by", "missing_by"):
+				label = cstr(state.get(key) or "").strip()
+				if not label or label in seen_workers:
+					continue
+				seen_workers.add(label)
+				armado_workers.append(label)
+		for ev in events:
+			if not isinstance(ev, dict):
+				continue
+			label = cstr(ev.get("employee_name") or ev.get("employee") or "").strip()
+			if not label or label in seen_workers:
+				continue
+			seen_workers.add(label)
+			armado_workers.append(label)
+		if last_saved_by and last_saved_by not in seen_workers:
+			armado_workers.append(last_saved_by)
 	return {
 		"packed": packed,
 		"missing": missing,
@@ -1005,6 +1026,7 @@ def _summarize_progress(item_rows: list, progress: dict | None) -> dict:
 		"remito_desynced": remito_desynced,
 		"last_saved_at": last_saved_at,
 		"last_saved_by": last_saved_by,
+		"armado_workers": armado_workers,
 		"last_event": {
 			"at": last_event.get("at") or "",
 			"by": last_event.get("employee_name") or "",

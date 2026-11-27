@@ -5223,6 +5223,84 @@ def _seller_ref_from_guest_preorder(so_or_dict):
 	return _parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("seller_ref") or None
 
 
+def _is_responsibility_trace_admin(label: str) -> bool:
+	"""Skip desk admins / Guest from Pedidos blame/trace column."""
+	s = cstr(label or "").strip()
+	if not s or s.lower() in ("guest", "administrator", "system manager", "null", "undefined", "none"):
+		return True
+	# Display names like "Administrator Administrator"
+	first = s.split()[0] if s.split() else s
+	if first.lower() == "administrator":
+		return True
+	if "@" in s or frappe.db.exists("User", s):
+		try:
+			from erpnext.erpnext_integrations.ecommerce_api.creation_review_api import (
+				is_creation_review_admin,
+			)
+
+			if is_creation_review_admin(s):
+				return True
+		except Exception:
+			roles = set(frappe.get_roles(s) or [])
+			if roles & {"Administrator", "System Manager"}:
+				return True
+	return False
+
+
+def _short_trace_user(label: str) -> str:
+	"""Compact label for tags: email local-part or first+initial."""
+	s = cstr(label or "").strip()
+	if not s:
+		return ""
+	if "@" in s:
+		return s.split("@", 1)[0]
+	parts = s.split()
+	if len(parts) >= 2 and len(parts[-1]) > 0:
+		return f"{parts[0]} {parts[-1][0]}."
+	return s
+
+
+def _attach_responsibility_trace(orders: list) -> None:
+	"""Stamp ``responsibility_trace`` — non-admin people who touched the pedido.
+
+	Roles: seller (seller_ref), cashier, armado (pack operators), driver.
+	Used by Pedidos «Trazas» column for quick blame / responsibility.
+	"""
+	for o in orders or []:
+		if not isinstance(o, dict):
+			continue
+		people = []
+		seen: set[tuple[str, str]] = set()
+
+		def add(raw, role: str):
+			label = cstr(raw or "").strip()
+			if not label or _is_responsibility_trace_admin(label):
+				return
+			key = (label.lower(), role)
+			if key in seen:
+				return
+			seen.add(key)
+			people.append(
+				{
+					"user": label,
+					"user_short": _short_trace_user(label),
+					"role": role,
+				}
+			)
+
+		add(o.get("seller_ref_user"), "seller")
+		add(o.get("cashier_user"), "cashier")
+		prog = o.get("progress_summary") if isinstance(o.get("progress_summary"), dict) else {}
+		for w in prog.get("armado_workers") or []:
+			add(w, "armado")
+		add(prog.get("last_saved_by"), "armado")
+		# Detail payload may only have armado_progress (no workers list yet).
+		arm = o.get("armado_progress") if isinstance(o.get("armado_progress"), dict) else {}
+		add(arm.get("last_saved_by"), "armado")
+		add(o.get("driver_name") or o.get("driver"), "driver")
+		o["responsibility_trace"] = people
+
+
 def _delivery_date_forced_from_tags(so_or_dict) -> bool:
 	return (_parse_remarks_tags(_guest_preorder_tag_text(so_or_dict)).get("delivery_forced") or "") in (
 		"1",
@@ -7240,6 +7318,7 @@ def get_guest_preorders_list(
 		for o in filtered:
 			o.setdefault("has_suggestion", False)
 			o.setdefault("suggestion_actor", None)
+	_attach_responsibility_trace(filtered)
 	for o in filtered:
 		o.pop("_tag_raw", None)
 	out = {"preorders": filtered, "total_count": total_count}
@@ -7402,10 +7481,42 @@ def get_guest_preorder(preorder_name):
 		)
 
 		payload["armado_progress"] = _armado_progress_public(preorder_name)
+		# Mirror list chip for responsibility_trace (armado workers).
+		pub = payload.get("armado_progress") or {}
+		workers = []
+		seen = set()
+		for line in pub.get("lines") or []:
+			if not isinstance(line, dict):
+				continue
+			for key in ("packed_by", "missing_by"):
+				label = cstr(line.get(key) or "").strip()
+				if label and label not in seen:
+					seen.add(label)
+					workers.append(label)
+		for ev in pub.get("events") or []:
+			if not isinstance(ev, dict):
+				continue
+			label = cstr(ev.get("employee_name") or ev.get("employee") or "").strip()
+			if label and label not in seen:
+				seen.add(label)
+				workers.append(label)
+		lsb = cstr(pub.get("last_saved_by") or "").strip()
+		if lsb and lsb not in seen:
+			workers.append(lsb)
+		payload["progress_summary"] = {
+			**(payload.get("progress_summary") or {}),
+			"last_saved_by": lsb or None,
+			"armado_workers": workers,
+			"packed": pub.get("packed"),
+			"missing": pub.get("missing"),
+			"item_count": pub.get("item_count"),
+			"bucket": pub.get("bucket"),
+		}
 
 		apply_armado_changed_display(payload)
 	except Exception:
 		payload["armado_progress"] = None
+	_attach_responsibility_trace([payload])
 	# p20 — pack graph on Pedidos lines (contenedor leaf denom for CANT. display)
 	try:
 		from erpnext.erpnext_integrations.ecommerce_api.uom_kind_policy import (
