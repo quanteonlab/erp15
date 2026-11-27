@@ -7402,7 +7402,8 @@ def get_guest_preorder(preorder_name):
 		"delivery_date_forced": _delivery_date_forced_from_tags(so),
 		"delivery_date_changed_at": _delivery_date_changed_at_from_tags(so)
 		or (cstr(getattr(so, "modified", None) or "")[:19] or None),
-		"address": geo.get("address") or tags.get("guest_address") or None,
+		# Prefer SO shipping / guest tag so one-shot delivery edits show on the pedido.
+		"address": _preorder_address_line(so) or geo.get("address") or tags.get("guest_address") or None,
 		"territory": geo.get("territory"),
 		"zone": geo.get("zone"),
 		"docstatus": so.docstatus,
@@ -8705,6 +8706,7 @@ def update_guest_preorder_details(preorder_name, data=None):
 	  delivery_date?,
 	  delivery_date_forced?,  # bool / 0 / 1 — black date when forced; blue when auto
 	  address_line1? / address?,
+	  update_customer_address?,  # default 1 — when 0, street is this delivery only (SO shipping + guest tag)
 	  territory? / zone?,     # CRM territory + Address.custom_zone; auto-recomputes delivery when not forced
 	  customer?,          # Customer link (must exist)
 	  customer_name?,     # Display name on Customer
@@ -8737,18 +8739,40 @@ def update_guest_preorder_details(preorder_name, data=None):
 		raw_f = data.get("delivery_date_forced")
 		force_flag = str(raw_f).strip().lower() in ("1", "true", "yes") if raw_f is not None and raw_f != "" else False
 
+	# Default True — Assign entrega checkbox "actualizar perfil" / legacy callers.
+	sync_cust_addr = True
+	if "update_customer_address" in data:
+		raw_sync = data.get("update_customer_address")
+		if raw_sync is not None and raw_sync != "":
+			sync_cust_addr = str(raw_sync).strip().lower() in ("1", "true", "yes")
+
 	addr_val = data.get("address_line1") if "address_line1" in data else data.get("address")
 	zone_val = data.get("zone") if "zone" in data else data.get("territory")
 	if addr_val is not None or zone_val is not None or ("territory" in data):
 		territory_val = data.get("territory") if "territory" in data else zone_val
-		_set_customer_zone_and_address(
-			so.customer,
-			territory=territory_val if territory_val is not None else None,
-			zone=zone_val if zone_val is not None else territory_val,
-			address_line1=addr_val if addr_val is not None else None,
-		)
-		geo_touched = True
-		if force_flag is not True:
+		if sync_cust_addr:
+			_set_customer_zone_and_address(
+				so.customer,
+				territory=territory_val if territory_val is not None else None,
+				zone=zone_val if zone_val is not None else territory_val,
+				address_line1=addr_val if addr_val is not None else None,
+			)
+			geo_touched = True
+		else:
+			# This delivery only: stamp SO shipping + guest tag; leave Customer primary alone.
+			if addr_val is not None:
+				line = cstr(addr_val).strip() or "Sin dirección"
+				_update_guest_preorder_tag(so, "guest_address", line)
+				_set_preorder_shipping_address_line(so, line)
+			if zone_val is not None or ("territory" in data):
+				_set_customer_zone_and_address(
+					so.customer,
+					territory=territory_val if territory_val is not None else None,
+					zone=zone_val if zone_val is not None else territory_val,
+					address_line1=None,
+				)
+				geo_touched = True
+		if geo_touched and force_flag is not True:
 			# Zone change → auto delivery date (unless explicitly forcing).
 			geo = _customer_address_zone_map([so.customer]).get(so.customer) or {}
 			auto_due = _auto_delivery_date_for_zone(geo.get("zone") or geo.get("territory"))
@@ -10894,6 +10918,60 @@ def _orden_has_explicit_direction(so):
 	if cust and cust != "Consumidor Final":
 		return bool(_preorder_address_line(so, allow_customer_primary=True))
 	return False
+
+
+def _set_preorder_shipping_address_line(so, address_line1: str):
+	"""Point this SO's shipping Address at ``address_line1`` without changing Customer primary.
+
+	Used when ops edits delivery street for this trip only (``update_customer_address=0``).
+	"""
+	line = cstr(address_line1 or "").strip()
+	if not line or line in ("-", "null", "undefined"):
+		return None
+	customer = cstr(getattr(so, "customer", None) or "").strip()
+	if not customer or not frappe.db.exists("Customer", customer):
+		return None
+	country = frappe.db.get_default("country") or "Argentina"
+	existing_rows = frappe.db.sql(
+		"""
+		SELECT addr.name
+		FROM `tabAddress` addr
+		INNER JOIN `tabDynamic Link` link ON link.parent = addr.name
+		WHERE link.link_doctype = 'Customer'
+		  AND link.link_name = %s
+		  AND TRIM(IFNULL(addr.address_line1, '')) = %s
+		LIMIT 1
+		""",
+		(customer, line),
+		as_dict=True,
+	)
+	if existing_rows:
+		addr_name = existing_rows[0].name
+	else:
+		cust_title = frappe.db.get_value("Customer", customer, "customer_name") or customer
+		addr = frappe.get_doc(
+			{
+				"doctype": "Address",
+				"address_title": cust_title,
+				"address_type": "Shipping",
+				"address_line1": line,
+				"city": "-",
+				"country": country,
+				"links": [{"link_doctype": "Customer", "link_name": customer}],
+			}
+		)
+		if hasattr(addr, "is_shipping_address"):
+			addr.is_shipping_address = 1
+		addr.insert(ignore_permissions=True)
+		addr_name = addr.name
+	frappe.db.set_value(
+		"Sales Order",
+		so.name,
+		{"shipping_address_name": addr_name},
+		update_modified=True,
+	)
+	so.shipping_address_name = addr_name
+	return addr_name
 
 
 def _materialize_preorder_shipping_address(so, *, require_explicit=False):

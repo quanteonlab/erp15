@@ -2570,6 +2570,36 @@
       "expect": "no_500"
     },
     {
+      "id": "update_guest_preorder_details_update_customer_address_dirty",
+      "source": "regression",
+      "bug": "Assign entrega: null/empty/0 update_customer_address must not TypeError when also sending address",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_details",
+      "args": {
+        "preorder_name": "",
+        "data": {
+          "address_line1": null,
+          "address": "",
+          "guest_address": "   ",
+          "update_customer_address": null
+        }
+      },
+      "expect": "no_500"
+    },
+    {
+      "id": "update_guest_preorder_details_update_customer_address_zero",
+      "source": "regression",
+      "bug": "update_customer_address=0 (this delivery only) must coerce cleanly with empty preorder",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_guest_preorder_details",
+      "args": {
+        "preorder_name": "",
+        "data": {
+          "address": "Calle Falsa 123",
+          "update_customer_address": 0
+        }
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "update_guest_preorder_details_customer_null",
       "source": "regression",
       "bug": "Relacionar: null customer on update_guest_preorder_details must not TypeError; party-link resync path",
