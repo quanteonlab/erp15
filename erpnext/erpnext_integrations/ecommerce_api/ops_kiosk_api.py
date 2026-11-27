@@ -170,20 +170,27 @@ def _operator_label(identity: dict | None) -> str:
 
 
 def _log_armado_operator(so_name: str, identity: dict, *, via: str = "armado") -> None:
-	so_name = str(so_name or "").strip()
-	if not so_name:
-		return
-	try:
-		from erpnext.erpnext_integrations.ecommerce_api.table_history import log_field_changes
+	"""Operator is already stamped on armado progress + Info activity actor.
 
-		label = _operator_label(identity)
-		log_field_changes(
-			"Sales Order",
-			so_name,
-			[("weighed_by", "", label), ("weighed_via", "", via)],
-		)
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "armado operator audit")
+	Formerly wrote Version rows for ``weighed_by`` / ``weighed_via`` which flooded
+	Actividad with technical null→armado_items noise. Kept as a no-op so callers
+	do not need to change.
+	"""
+	return
+
+
+def _armado_mode_label(sources) -> str:
+	"""Human label for Activity: manual / automático / both."""
+	srcs = {cstr(s).strip() for s in (sources or []) if cstr(s).strip()}
+	has_scale = "scale" in srcs
+	has_manual = "manual" in srcs
+	if has_scale and has_manual:
+		return f"{_('manual')} + {_('automático')}"
+	if has_scale:
+		return _("automático")
+	if has_manual:
+		return _("manual")
+	return ""
 
 
 ARMADO_PROGRESS_EVENT_CAP = 100
@@ -248,6 +255,24 @@ def _save_armado_progress(so_name: str, progress: dict) -> None:
 	frappe.db.commit()
 
 
+def _normalize_weight_source(raw) -> str:
+	"""``scale`` (automático / balanza) or ``manual`` (typed). Empty if unknown."""
+	s = cstr(raw or "").strip().lower()
+	if s in ("scale", "auto", "automatico", "automático", "balanza", "pesa"):
+		return "scale"
+	if s in ("manual", "typed", "numpad", "teclado"):
+		return "manual"
+	return ""
+
+
+def _weight_source_label(src: str) -> str:
+	if src == "scale":
+		return _("automático")
+	if src == "manual":
+		return _("manual")
+	return ""
+
+
 def _blank_progress_line(item_code: str) -> dict:
 	return {
 		"item_code": item_code,
@@ -262,6 +287,7 @@ def _blank_progress_line(item_code: str) -> dict:
 		"missing_at": "",
 		"qty": None,
 		"total_weight": None,
+		"weight_source": "",
 		# Frozen on first armado activity — Pedidos denominator (p20/armado qty UX).
 		"requested_qty": None,
 	}
@@ -497,6 +523,9 @@ def _merge_armado_progress(
 			out["qty"] = flt(entry.get("qty"))
 		if entry.get("total_weight") is not None:
 			out["total_weight"] = flt(entry.get("total_weight"))
+		ws = _normalize_weight_source(entry.get("weight_source"))
+		if ws:
+			out["weight_source"] = ws
 		return out
 
 	def _touch_qty(entry: dict, row: dict | None = None) -> dict:
@@ -513,6 +542,15 @@ def _merge_armado_progress(
 			entry["qty"] = flt(src.get("qty"))
 		if src.get("total_weight") is not None:
 			entry["total_weight"] = flt(src.get("total_weight"))
+			# Prefer explicit source from this save; keep prior if omitted.
+			ws = _normalize_weight_source(
+				src.get("weight_source") or src.get("peso_source") or src.get("source")
+			)
+			if ws:
+				entry["weight_source"] = ws
+			elif not _normalize_weight_source(entry.get("weight_source")):
+				# Typed/unknown clients that only send kg → treat as manual.
+				entry["weight_source"] = "manual"
 		return _snapshot_qty(entry)
 
 	packed_codes = []
@@ -657,7 +695,19 @@ def _merge_armado_progress(
 
 	# Per-line qty/weight diffs (collaborative history).
 	for code, key, before, after in qty_diffs:
-		action = "amend" if amend else ("weight" if "total_weight" in after or "total_weight" in before else "qty")
+		is_weight = "total_weight" in after or "total_weight" in before
+		action = "amend" if amend else ("weight" if is_weight else "qty")
+		ws = ""
+		if is_weight:
+			entry = lines.get(key) if isinstance(lines.get(key), dict) else {}
+			ws = _normalize_weight_source(
+				(after or {}).get("weight_source") or (entry or {}).get("weight_source")
+			)
+		detail_parts = []
+		if amend:
+			detail_parts.append("post-armado")
+		if ws:
+			detail_parts.append(ws)
 		events.append(
 			_progress_event(
 				identity,
@@ -667,7 +717,7 @@ def _merge_armado_progress(
 				line_keys=[key],
 				before=before,
 				after=after,
-				detail="post-armado" if amend else "",
+				detail=" · ".join(detail_parts),
 			)
 		)
 
@@ -708,12 +758,57 @@ def _merge_armado_progress(
 			bits.append(_("missing {0}").format(", ".join(missing_codes[:12])))
 		if unpacked_codes:
 			bits.append(_("unchecked {0}").format(", ".join(unpacked_codes[:8])))
+		# Weight entry method (automático / manual) belongs in order Activity.
+		weight_bits = []
+		sources = set()
+		for code, key, before, after in qty_diffs[:20]:
+			if "total_weight" not in after and "total_weight" not in before:
+				continue
+			entry = lines.get(key) if isinstance(lines.get(key), dict) else {}
+			ws = _normalize_weight_source(
+				(after or {}).get("weight_source") or (entry or {}).get("weight_source")
+			)
+			if ws:
+				sources.add(ws)
+			w = after.get("total_weight") if after.get("total_weight") is not None else before.get("total_weight")
+			src_label = _weight_source_label(ws)
+			if w is None:
+				continue
+			if src_label:
+				weight_bits.append(
+					_("peso {0}: {1} kg ({2})").format(code, flt(w), src_label)
+				)
+			else:
+				weight_bits.append(_("peso {0}: {1} kg").format(code, flt(w)))
+		bits.extend(weight_bits)
+		# Pack-only / unit lines: still label the session (no scale → manual).
+		for key in packed_keys + restamp_keys:
+			entry = lines.get(key) if isinstance(lines.get(key), dict) else {}
+			ws = _normalize_weight_source((entry or {}).get("weight_source"))
+			if ws:
+				sources.add(ws)
+		if isinstance(items, list):
+			for row in items:
+				if not isinstance(row, dict):
+					continue
+				ws = _normalize_weight_source(
+					row.get("weight_source") or row.get("peso_source") or row.get("source")
+				)
+				if ws:
+					sources.add(ws)
+		if (packed_codes or missing_codes or restamp_codes or weight_bits) and not sources:
+			sources.add("manual")
+		mode = _armado_mode_label(sources)
 		if bits:
+			msg = "; ".join(bits)
+			# Pack/missing without per-line peso labels → tag session mode (manual if no scale).
+			if mode and not weight_bits:
+				msg = f"{msg} ({mode})"
 			actor = identity.get("user_id") or identity.get("employee_name") or None
 			log_doc_activity_info(
 				"Sales Order",
 				so_name,
-				_("armado: {0}").format("; ".join(bits)),
+				_("armado: {0}").format(msg),
 				user=actor,
 			)
 	except Exception:
@@ -1326,6 +1421,7 @@ def _armado_progress_public(so_name: str) -> dict | None:
 				"requested_qty": flt(req) if req is not None else None,
 				"qty": packed_qty,
 				"total_weight": flt(tw) if tw is not None else None,
+				"weight_source": _normalize_weight_source(state.get("weight_source")),
 				"packed": 1 if state.get("packed") else 0,
 				"missing": 1 if is_missing else 0,
 				"over": 1
@@ -2388,10 +2484,26 @@ def confirm_armado(preorder_name=None, items=None, pin=None, packed=None, missin
 
 		boxes = cint((progress.get("boxes") or {}).get("count"))
 		actor = identity.get("user_id") or identity.get("employee_name") or None
+		sources = set()
+		pline = progress.get("lines") if isinstance(progress.get("lines"), dict) else {}
+		for entry in pline.values():
+			if not isinstance(entry, dict) or not entry.get("packed"):
+				continue
+			ws = _normalize_weight_source(entry.get("weight_source"))
+			if ws:
+				sources.add(ws)
+		if not sources:
+			sources.add("manual")
+		mode = _armado_mode_label(sources)
+		confirm_msg = (
+			_("confirmed armado ({0} boxes · {1})").format(boxes or "—", mode)
+			if mode
+			else _("confirmed armado ({0} boxes)").format(boxes or "—")
+		)
 		log_doc_activity_info(
 			"Sales Order",
 			(detail or {}).get("name") or preorder_name,
-			_("confirmed armado ({0} boxes)").format(boxes or "—"),
+			confirm_msg,
 			user=actor,
 		)
 	except Exception:

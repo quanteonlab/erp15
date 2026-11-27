@@ -3509,12 +3509,19 @@ def _customer_names_matching_address(term: str, limit: int = 40) -> list[str]:
 
 
 @frappe.whitelist(allow_guest=True)
-def search_customers(search_term="", page_length=20, ensure_buckets=0):
+def search_customers(
+	search_term="", page_length=20, ensure_buckets=0, include_disabled=0, only_disabled=0
+):
 	"""Typeahead / CRM list for Customer (name + phone + tax id + address).
 
 	``sales.see_assigned``: browse **and** typed search stay inside assigned
 	clients only (Orden / Pedidos must not leak other sellers' clients).
 	``sales.see_all`` / admin: full directory; assigned matches still rank first.
+
+	Archive policy (recommend / typeahead must stay on the default):
+	- default: ``disabled=0`` only (archived never appear in pickers)
+	- ``include_disabled=1``: active + archived (CRM "Incluir archivados")
+	- ``only_disabled=1``: archived only (CRM "Solo archivados" — do not use for pickers)
 	"""
 	if cint(ensure_buckets):
 		ensure_crm_party_buckets()
@@ -3566,6 +3573,7 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 		"primary_address",
 		"customer_primary_address",
 		"default_price_list",
+		"disabled",
 	]
 	if frappe.db.has_column("Customer", "custom_client_access_pin"):
 		base_fields += ["custom_client_access_pin", "custom_client_phone_e164"]
@@ -3591,7 +3599,11 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 	assigned_set = set(assigned_names)
 
 	def _fetch(extra_filters=None, page_len=None, use_or=True):
-		flt = {"disabled": 0}
+		flt = {}
+		if cint(only_disabled):
+			flt["disabled"] = 1
+		elif not cint(include_disabled):
+			flt["disabled"] = 0
 		if extra_filters:
 			flt.update(extra_filters)
 		return frappe.get_all(
@@ -3711,6 +3723,7 @@ def search_customers(search_term="", page_length=20, ensure_buckets=0):
 				"catalog_lang": normalize_catalog_lang(
 					getattr(r, "custom_catalog_lang", None) if has_catalog_lang else None
 				),
+				"disabled": cint(getattr(r, "disabled", 0)),
 				"is_bucket": (r.customer_name or r.name or "")
 				in (CONSUMIDOR_FINAL_NAME, UNCATEGORIZED_CUSTOMER_NAME),
 				"salesmen": salesmen,
@@ -3789,6 +3802,13 @@ def update_supplier(supplier_name=None, **kwargs):
 				val = ""
 			doc.set(field, cstr(val).strip() if field != "supplier_group" else (cstr(val).strip() or doc.supplier_group))
 
+	if "disabled" in kwargs:
+		raw = kwargs.get("disabled")
+		if raw is None or (isinstance(raw, str) and raw.strip().lower() in ("", "null", "undefined", "none")):
+			doc.disabled = 0
+		else:
+			doc.disabled = 1 if cint(raw) else 0
+
 	doc.save(ignore_permissions=True)
 	frappe.db.commit()
 	return {
@@ -3797,19 +3817,32 @@ def update_supplier(supplier_name=None, **kwargs):
 		"phone": doc.mobile_no,
 		"email": doc.email_id,
 		"supplier_group": doc.supplier_group,
+		"disabled": cint(doc.disabled),
 		"is_bucket": (doc.supplier_name or doc.name or "") == UNCATEGORIZED_SUPPLIER_NAME,
 	}
 
 
 @frappe.whitelist(allow_guest=True)
-def search_suppliers(search_term="", page_length=20, ensure_buckets=0):
-	"""Typeahead / CRM list for Supplier."""
+def search_suppliers(
+	search_term="", page_length=20, ensure_buckets=0, include_disabled=0, only_disabled=0
+):
+	"""Typeahead / CRM list for Supplier.
+
+	Archive policy (same as ``search_customers``):
+	- default: active only (pickers / recommend)
+	- ``include_disabled=1``: active + archived
+	- ``only_disabled=1``: archived only (CRM table filter)
+	"""
 	if cint(ensure_buckets):
 		_get_or_create_named_supplier(UNCATEGORIZED_SUPPLIER_NAME)
 
 	term = (search_term or "").strip()
 	limit = max(1, min(cint(page_length) or 20, 100))
-	filters = {"disabled": 0}
+	filters = {}
+	if cint(only_disabled):
+		filters["disabled"] = 1
+	elif not cint(include_disabled):
+		filters["disabled"] = 0
 	or_filters = None
 	if term:
 		like = f"%{term}%"
@@ -3823,7 +3856,7 @@ def search_suppliers(search_term="", page_length=20, ensure_buckets=0):
 		"Supplier",
 		filters=filters,
 		or_filters=or_filters,
-		fields=["name", "supplier_name", "mobile_no", "email_id", "supplier_group"],
+		fields=["name", "supplier_name", "mobile_no", "email_id", "supplier_group", "disabled"],
 		order_by="supplier_name asc",
 		limit_page_length=limit,
 		ignore_permissions=True,
@@ -3836,6 +3869,7 @@ def search_suppliers(search_term="", page_length=20, ensure_buckets=0):
 				"phone": r.mobile_no,
 				"email": r.email_id,
 				"supplier_group": r.supplier_group,
+				"disabled": cint(r.disabled),
 				"is_bucket": (r.supplier_name or r.name or "") == UNCATEGORIZED_SUPPLIER_NAME,
 			}
 			for r in rows
@@ -3996,6 +4030,7 @@ def update_customer(customer_name, **kwargs):
 		"customer_name", "customer_group", "territory", "customer_type",
 		"default_currency", "default_price_list", "default_sales_partner",
 		"mobile_no", "email_id", "tax_id", "tax_category",
+		"disabled",
 	]
 	if frappe.db.has_column("Customer", "custom_preferred_hours"):
 		allowed_fields.append("custom_preferred_hours")
@@ -4063,6 +4098,16 @@ def update_customer(customer_name, **kwargs):
 	# CRM TEL column aliases
 	if "phone" in kwargs and "mobile_no" not in kwargs:
 		kwargs["mobile_no"] = kwargs.get("phone")
+
+	# Archive / restore (Customer.disabled) — dirty null/""/"null" → 0
+	if "disabled" in kwargs:
+		raw = kwargs.get("disabled")
+		if raw is None or (
+			isinstance(raw, str) and cstr(raw).strip().lower() in ("", "null", "undefined", "none")
+		):
+			kwargs["disabled"] = 0
+		else:
+			kwargs["disabled"] = 1 if cint(raw) else 0
 
 	for field, value in kwargs.items():
 		if field in allowed_fields:
@@ -7422,6 +7467,11 @@ def get_guest_preorder(preorder_name):
 		"customer": so.customer,
 		"modified": cstr(getattr(so, "modified", None) or "") or None,
 		"customer_name": frappe.db.get_value("Customer", so.customer, "customer_name") or so.customer,
+		# Keep assigned archived clients visible on the pedido; FE shows Archive icon.
+		"customer_disabled": cint(
+			frappe.db.get_value("Customer", so.customer, "disabled") if so.customer else 0
+		)
+		or 0,
 		"customer_stage": client_state.get("stage"),
 		"customer_stage_label": client_state.get("stage_label"),
 		"creation_review": (

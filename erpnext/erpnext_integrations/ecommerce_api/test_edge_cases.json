@@ -9622,6 +9622,159 @@
       "expect": "fail",
       "source": "regression",
       "bug": "get_armado_progress unknown SO must controlled fail after requested_qty public shape — never TypeError"
+    },
+    {
+      "id": "update_customer_disabled_null_customer",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_customer",
+      "args": {
+        "customer_name": null,
+        "disabled": "null"
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "update_customer disabled with null customer must controlled fail — never TypeError on disabled coerce"
+    },
+    {
+      "id": "update_supplier_disabled_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.update_supplier",
+      "args": {
+        "supplier_name": null,
+        "disabled": ""
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "update_supplier disabled=\"\" with null name is controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "search_customers_include_disabled_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
+      "args": {
+        "search_term": "",
+        "page_length": 5,
+        "include_disabled": "null"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_customers include_disabled=\"null\" must coerce to 0 and return list — never TypeError"
+    },
+    {
+      "id": "search_suppliers_include_disabled_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_suppliers",
+      "args": {
+        "search_term": "",
+        "page_length": 5,
+        "include_disabled": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_suppliers include_disabled=\"\" must coerce to 0 and return list — never TypeError"
+    },
+    {
+      "id": "unarchive_leads_empty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.unarchive_leads",
+      "args": {
+        "leads": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "unarchive_leads with null leads is controlled ValidationError, never TypeError"
+    },
+    {
+      "id": "search_customers_only_disabled_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_customers",
+      "args": {
+        "search_term": "",
+        "page_length": 5,
+        "only_disabled": "null"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_customers only_disabled=\"null\" must coerce and return active list — never TypeError"
+    },
+    {
+      "id": "search_suppliers_only_disabled_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.search_suppliers",
+      "args": {
+        "search_term": "",
+        "page_length": 5,
+        "only_disabled": ""
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "search_suppliers only_disabled=\"\" must coerce and return active list — never TypeError"
+    },
+    {
+      "id": "list_leads_admin_only_archived_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.preventa_api.list_leads_admin",
+      "args": {
+        "page_length": 5,
+        "only_archived": "null"
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "list_leads_admin only_archived=\"null\" must coerce to active list — never TypeError"
+    },
+    {
+      "id": "update_armado_items_weight_source_dirty",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.update_armado_items",
+      "args": {
+        "preorder_name": null,
+        "items": [
+          {
+            "item_code": "X",
+            "qty": 1,
+            "total_weight": "null",
+            "weight_source": "undefined"
+          }
+        ],
+        "pin": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "update_armado_items with null order + dirty weight_source must controlled fail — never TypeError on weight_source"
+    },
+    {
+      "id": "confirm_armado_weight_source_scale_null_order",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.ops_kiosk_api.confirm_armado",
+      "args": {
+        "preorder_name": null,
+        "items": [
+          {
+            "item_code": "X",
+            "qty": 1,
+            "total_weight": 1.2,
+            "weight_source": "scale"
+          }
+        ],
+        "box_count": 1,
+        "pin": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "confirm_armado with null order + weight_source=scale must controlled fail — Activity mode label path must not TypeError"
+    },
+    {
+      "id": "get_doc_activity_armado_noise_null_name",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.doc_activity.get_doc_activity",
+      "args": {
+        "doctype": "Sales Order",
+        "name": null
+      },
+      "expect": "error",
+      "source": "regression",
+      "bug": "get_doc_activity with null name must controlled fail; weighed_by/weighed_via filter must not crash version parse"
+    },
+    {
+      "id": "archivo_month_dump_excludes_archived",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.archivo_api.archivo_month_dump",
+      "args": {
+        "month_start": "2020-01-01",
+        "as_of": "2020-01-31",
+        "limit": 5
+      },
+      "expect": "ok",
+      "source": "regression",
+      "bug": "archivo_month_dump must filter is_archived=0 so accounting never lists archived docs"
     }
   ]
 }

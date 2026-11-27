@@ -221,7 +221,7 @@ def _parse_version_summary(data_raw) -> str:
 		if not isinstance(ch, (list, tuple)) or len(ch) < 3:
 			continue
 		field, prev, new = ch[0], ch[1], ch[2]
-		if field in ("status_via",):
+		if field in ("status_via", "weighed_by", "weighed_via"):
 			continue
 		prev_s = "null" if prev is None or prev == "" else str(prev)
 		new_s = "null" if new is None or new == "" else str(new)
@@ -327,6 +327,7 @@ def get_doc_activity(doctype=None, name=None, limit=50):
 		limit=limit,
 		ignore_permissions=True,
 	)
+	_ARMADO_AUDIT_NOISE = {"weighed_by", "weighed_via"}
 	for v in versions:
 		try:
 			vdata = json.loads(v.data) if isinstance(v.data, str) else (v.data or {})
@@ -335,6 +336,15 @@ def get_doc_activity(doctype=None, name=None, limit=50):
 		# Requested / approved are narrated by Info comments — skip duplicate Version lines.
 		event = cstr(vdata.get("event") or "").strip().lower()
 		if event in ("requested", "approved"):
+			continue
+		# Hide armado operator Version spam (weighed_by / weighed_via only).
+		changed = vdata.get("changed") or []
+		changed_fields = {
+			cstr(ch[0])
+			for ch in changed
+			if isinstance(ch, (list, tuple)) and len(ch) >= 1
+		}
+		if changed_fields and changed_fields <= _ARMADO_AUDIT_NOISE:
 			continue
 		actor = _version_actor_from_data(vdata) or (v.owner or "")
 		who = _user_label(actor)

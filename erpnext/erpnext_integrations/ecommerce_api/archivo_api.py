@@ -2632,19 +2632,16 @@ def archivo_month_dump(month_start, as_of, limit: int = 45) -> dict:
 			"month_start": str(month_start),
 			"as_of": str(as_of),
 		}
-	total = int(
-		frappe.db.count(
-			DOCTYPE,
-			{"posting_date": ["between", [month_start, as_of]], "workflow_status": ["!=", "void"]},
-		)
-		or 0
-	)
+	# Archived docs must not appear in accounting dumps (act as if absent).
+	month_filters = {
+		"posting_date": ["between", [month_start, as_of]],
+		"workflow_status": ["!=", "void"],
+		"is_archived": 0,
+	}
+	total = int(frappe.db.count(DOCTYPE, month_filters) or 0)
 	rows = frappe.get_all(
 		DOCTYPE,
-		filters={
-			"posting_date": ["between", [month_start, as_of]],
-			"workflow_status": ["!=", "void"],
-		},
+		filters=month_filters,
 		fields=[
 			"name",
 			"posting_date",

@@ -1484,6 +1484,10 @@ def get_purchase_order_detail(name=None, include_overdue=0):
 	base["lines"] = lines
 	base["payments"] = _payments_for_purchase_order(doc.name, flt(doc.grand_total))
 	base["files"] = _po_file_rows(doc.name)
+	# Keep assigned archived suppliers visible; FE shows Archive icon.
+	base["supplier_disabled"] = (
+		cint(frappe.db.get_value("Supplier", doc.supplier, "disabled")) if doc.supplier else 0
+	)
 	return {"ok": True, "order": base}
 
 

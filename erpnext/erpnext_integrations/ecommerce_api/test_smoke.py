@@ -3095,6 +3095,17 @@ def suite_5_11_pos_session():
             assert stored[rows[0]["line_key"]]["packed"] is True, stored
             assert stored[rows[0]["line_key"]].get("packed_by"), stored
             assert "NO-SUCH-SKU" not in stored
+            # Pack-only (no scale) must show "(manual)" in Actividad — not weighed_by noise.
+            from erpnext.erpnext_integrations.ecommerce_api import doc_activity as da
+
+            feed_pack = da.get_doc_activity(doctype="Sales Order", name=so_name, limit=40)
+            pack_summaries = [cstr(r.get("summary") or "") for r in (feed_pack.get("items") or [])]
+            assert any(
+                "armado:" in s.lower() and "manual" in s.lower() for s in pack_summaries
+            ), pack_summaries[:12]
+            assert not any(
+                "weighed_by" in s or "weighed_via" in s for s in pack_summaries
+            ), pack_summaries[:12]
             if len(rows) > 1:
                 assert stored[rows[1]["line_key"]]["missing"] is True, stored
                 so_miss = frappe.get_doc("Sales Order", so_name)
@@ -3250,6 +3261,14 @@ def suite_5_11_pos_session():
                 box_count=2,
             )
             assert confirmed.get("ok"), confirmed
+            feed_confirm = da.get_doc_activity(doctype="Sales Order", name=so_name, limit=40)
+            confirm_summaries = [
+                cstr(r.get("summary") or "") for r in (feed_confirm.get("items") or [])
+            ]
+            assert any(
+                "confirmed armado" in s.lower() and "manual" in s.lower()
+                for s in confirm_summaries
+            ), confirm_summaries[:12]
             detail_armed = api.get_guest_preorder(so_name)
             assert detail_armed.get("display_status") == "Preparado", (
                 "re-confirmed pack should leave the pipeline on Armado, got "

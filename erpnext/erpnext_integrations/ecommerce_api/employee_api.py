@@ -3834,11 +3834,21 @@ def get_customer_salesmen(customer=None):
 	if not cust:
 		frappe.throw(_("Customer required"))
 	users = customer_salesmen(cust)
+	labels = []
+	archived_labels = []
+	for u in users:
+		label = _salesman_label_for_user(u)
+		labels.append(label)
+		# Keep assigned inactive salesmen visible; FE marks chips with Archive icon.
+		emp = frappe.db.get_value("Employee", {"user_id": u}, ["name", "status"], as_dict=True)
+		if emp and cstr(emp.status or "") != "Active":
+			archived_labels.append(label)
 	return {
 		"ok": True,
 		"customer": cust,
 		"salesmen": users,
-		"salesmen_labels": [_salesman_label_for_user(u) for u in users],
+		"salesmen_labels": labels,
+		"salesmen_archived_labels": archived_labels,
 	}
 
 

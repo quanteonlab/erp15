@@ -1787,6 +1787,34 @@ def archive_leads(leads=None):
 	return {"ok": True, "archived": archived}
 
 
+@frappe.whitelist(allow_guest=True)
+def unarchive_leads(leads=None):
+	"""Restore archived leads (clear disabled + Do Not Contact → Open)."""
+	if isinstance(leads, str):
+		leads = frappe.parse_json(leads)
+	leads = [str(x).strip() for x in (leads or []) if str(x).strip()]
+	if not leads:
+		frappe.throw(_("At least one lead is required"))
+	restored = []
+	for name in leads:
+		if not frappe.db.exists("Lead", name):
+			continue
+		frappe.flags.ignore_permissions = True
+		doc = frappe.get_doc("Lead", name)
+		frappe.flags.ignore_permissions = False
+		_require_owner_or_crm(doc.lead_owner)
+		# db.set_value — same reason as archive (StatusUpdater can overwrite status).
+		frappe.db.set_value(
+			"Lead",
+			name,
+			{"status": "Open", "disabled": 0},
+			update_modified=True,
+		)
+		restored.append(name)
+	frappe.db.commit()
+	return {"ok": True, "restored": restored}
+
+
 def _norm_merge_value(v):
 	if v is None:
 		return ""
@@ -2537,8 +2565,16 @@ def track_preventa_event(event_type, lead=None, seller_link=None, visitor_key=No
 
 
 @frappe.whitelist(allow_guest=True)
-def list_leads_admin(filters=None, start=0, page_length=50):
-	"""Admin CRM lead list — same card shape as get_my_board (incl. nested `fields`)."""
+def list_leads_admin(
+	filters=None, start=0, page_length=50, include_archived=0, only_archived=0
+):
+	"""Admin CRM lead list — same card shape as get_my_board (incl. nested `fields`).
+
+	Archive policy (pickers / board must stay on the default):
+	- default: hide archived (``Do Not Contact`` / ``disabled=1``)
+	- ``include_archived=1``: active + archived
+	- ``only_archived=1``: archived only (CRM "Solo archivados")
+	"""
 	_require_app_permission("tables.crm")
 	ensure_preventa_custom_fields()
 	try:
@@ -2559,6 +2595,15 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 	if filters.get("owner"):
 		query_filters["lead_owner"] = filters["owner"]
 
+	want_only = cint(only_archived) or cint(filters.get("only_archived") or 0)
+	want_include = cint(include_archived) or cint(filters.get("include_archived") or 0)
+	if want_only:
+		# Prefer disabled=1; also catch legacy DNC without disabled flag via or_filters below.
+		query_filters["disabled"] = 1
+	elif not want_include:
+		query_filters["disabled"] = 0
+		query_filters["status"] = ["!=", "Do Not Contact"]
+
 	or_filters = None
 	search = (filters.get("search") or "").strip()
 	if search:
@@ -2577,7 +2622,7 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 		"custom_preventa_stage", "custom_preventa_stage_since",
 		"mobile_no", "whatsapp_no", "phone", "email_id",
 		"city", "state", "country", "custom_address_line1", "custom_pincode",
-		"modified",
+		"modified", "disabled",
 	]
 	if frappe.db.has_column("Lead", "custom_client_access_pin"):
 		lead_fields.extend(["custom_client_access_pin", "custom_client_phone_e164"])
@@ -2618,6 +2663,7 @@ def list_leads_admin(filters=None, start=0, page_length=50):
 				"company_name": r.company_name,
 				"lead_owner": r.lead_owner,
 				"status": r.status,
+				"disabled": cint(r.get("disabled") or 0),
 				"stage": r.custom_preventa_stage or _default_new_stage_key(settings),
 				"stage_since": r.custom_preventa_stage_since,
 				"fields": fields_out,
