@@ -2796,6 +2796,23 @@ def suite_5_10_product_manager():
     _run("5.10.6 get_category_list", check_category_list, "S3")
     _run("5.10.7 generate_item_code", check_generate_item_code, "S3")
     _run("5.10.8 create_product_row NOS (single)→Nos", check_create_with_nos_single_uom, "S3")
+
+    def check_create_product_row_stock_off_by_default():
+        """New products start with Controlar stock off (is_stock_item=0)."""
+        created = pm.create_product_row(
+            None,
+            {"source_title": "Smoke stock control default off", "stock_uom": "Nos"},
+            activate=0,
+        )
+        sku = created.get("item_code")
+        assert sku, created
+        assert cint(frappe.db.get_value("Item", sku, "is_stock_item")) == 0, sku
+
+    _run(
+        "5.10.8b create_product_row is_stock_item default 0",
+        check_create_product_row_stock_off_by_default,
+        "S2",
+    )
     _run("5.10.9 remove_white_bg_item_images dry_run", check_remove_white_bg_dry, "S3")
     _run("5.10.10 get_accounting_constants starter keys", check_accounting_constants_starter, "S2")
     _run("5.10.11 get_accounting_sheet starter tabs", check_accounting_starter_sheet, "S2")

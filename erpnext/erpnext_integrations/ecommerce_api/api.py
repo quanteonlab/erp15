@@ -2427,6 +2427,13 @@ def update_stock(item_code, warehouse, qty, posting_date=None):
 		dict: Stock entry details
 	"""
 	from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+	from erpnext.erpnext_integrations.ecommerce_api.product_manager import (
+		_ensure_item_tracks_stock,
+	)
+
+	# Recepción / stock movement → start controlling stock on the Item.
+	if flt(qty) != 0:
+		_ensure_item_tracks_stock(item_code)
 
 	if not posting_date:
 		posting_date = nowdate()
@@ -5030,6 +5037,37 @@ def _is_guest_preorder_sales_order(so):
 			if tag in str(val):
 				return True
 	return False
+
+
+def _guest_preorder_pipeline_label(so) -> str:
+	"""Human pipeline label for error copy (Consulta / Orden / …)."""
+	try:
+		label = cstr(_display_status(so) or "").strip()
+		if label:
+			return label
+	except Exception:
+		pass
+	return cstr(getattr(so, "status", None) or "Consulta").strip() or "Consulta"
+
+
+def _pass_to_orden_message(so, action: str) -> str:
+	"""Clear Pedidos action when the SO is still Consulta/Draft.
+
+	``action`` is an English gerund phrase, e.g. ``planning a route``.
+	"""
+	name = cstr(getattr(so, "name", None) or "").strip() or "?"
+	pipe = _guest_preorder_pipeline_label(so)
+	action = cstr(action or "continuing").strip() or "continuing"
+	return _(
+		"{0} is still {1}. Pass it to Orden in Pedidos before {2}."
+	).format(name, pipe, action)
+
+
+def _require_guest_preorder_passed_to_orden(so, *, action: str) -> None:
+	"""Throw when guest preorder is not submitted (still Consulta)."""
+	if cint(getattr(so, "docstatus", 0)) == 1:
+		return
+	frappe.throw(_pass_to_orden_message(so, action))
 
 
 def _sanitize_guest_tag(value) -> str:
@@ -9330,8 +9368,7 @@ def record_preorder_payment(preorder_name, paid_amount, mode_of_payment="Efectiv
 		frappe.throw(_("Not a Guest Preorder"))
 	_require_guest_preorder_visible(so)
 
-	if so.docstatus != 1:
-		frappe.throw(_("Payment can only be recorded on submitted (confirmed) orders"))
+	_require_guest_preorder_passed_to_orden(so, action="recording a payment")
 
 	paid_amount = flt(paid_amount)
 	if paid_amount <= 0:
@@ -10762,7 +10799,12 @@ def update_guest_preorder_logistics(
 		if not frappe.db.exists("Delivery Trip", trip_in):
 			frappe.throw(_("MAT / trip {0} not found").format(trip_in))
 		if not dn_name:
-			frappe.throw(_("Confirm the order and create a remito before assigning a MAT."))
+			_require_guest_preorder_passed_to_orden(so, action="assigning a MAT")
+			frappe.throw(
+				_(
+					"Could not create a remito for {0}. Pass it to Orden in Pedidos, then assign the MAT."
+				).format(so.name)
+			)
 		# Move off previous draft trip if different.
 		if current_trip and current_trip.trip_name != trip_in and cint(current_trip.docstatus) == 0:
 			try:
@@ -11186,7 +11228,7 @@ def _ensure_planner_delivery_note(so, *, allow_missing_address=False):
 			"planner_ready": False,
 			"not_deliverable": False,
 			"delivery_note": None,
-			"delivery_warning": _("Confirm the order before creating a delivery note."),
+			"delivery_warning": _pass_to_orden_message(so, "creating a remito"),
 			"warnings": warnings,
 		}
 
@@ -11410,8 +11452,7 @@ def create_delivery_note_for_preorder(preorder_name):
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
 	_require_guest_preorder_visible(so)
-	if so.docstatus != 1:
-		frappe.throw(_("Confirm the order before creating a delivery note."))
+	_require_guest_preorder_passed_to_orden(so, action="creating a remito")
 
 	# MAT / remito path: missing address must not 417 — placeholder street is OK.
 	gate = _ensure_planner_delivery_note(so, allow_missing_address=True)
@@ -12566,7 +12607,7 @@ def get_preorder_invoice_state(preorder_name=None):
 	suggested_mode = "factura_a" if requires_fa else "negro"
 	blockers = []
 	if cint(so.docstatus) != 1:
-		blockers.append(_("Confirm the order before invoicing."))
+		blockers.append(_pass_to_orden_message(so, "invoicing"))
 	if fully:
 		blockers.append(_("Already invoiced — use reprint."))
 
@@ -12707,8 +12748,7 @@ def issue_preorder_invoice(
 	if not _is_guest_preorder_sales_order(so):
 		frappe.throw(_("Not a Guest Preorder"))
 	_require_guest_preorder_visible(so)
-	if cint(so.docstatus) != 1:
-		frappe.throw(_("Confirm the order before invoicing."))
+	_require_guest_preorder_passed_to_orden(so, action="invoicing")
 
 	existing = _billing_record_for(preorder_name)
 	if cstr(existing.get("source") or "").strip() == "external" and existing.get("invoiced"):
@@ -14705,7 +14745,8 @@ def commit_receiving_session(
 			"item_name": d["item_name"],
 			"item_group": item_group,
 			"stock_uom": stock_uom,
-			"is_stock_item": 1,
+			# Off until recepción qty / PM stock save turns it on.
+			"is_stock_item": 0,
 			"include_item_in_manufacturing": 0,
 			"description": d.get("normalized_title") or d["item_name"],
 			"disabled": 0 if is_approved else 1,

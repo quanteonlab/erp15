@@ -1980,6 +1980,22 @@
       "expect": "ok"
     },
     {
+      "id": "create_product_row_stock_control_default_off",
+      "source": "regression",
+      "bug": "New Item must default is_stock_item=0 (Controlar stock off) until recepción / checkbox / qty save",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.product_manager.create_product_row",
+      "args": {
+        "item_code": null,
+        "changes": {
+          "source_title": "Edge stock control default off",
+          "stock_uom": "Nos",
+          "is_stock_item": null
+        },
+        "activate": 0
+      },
+      "expect": "ok"
+    },
+    {
       "id": "get_product_rows_draft_only_null_filters",
       "source": "regression",
       "bug": "draft_only filter (suggestion/recepción create-as-Draft) must not 500 on dirty filters",
@@ -2656,6 +2672,30 @@
         "zone": "null",
         "days_ahead": "undefined",
         "as_of": " "
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_allowed_delivery_dates_day_zone_not_locked",
+      "source": "regression",
+      "bug": "fecha deseada must not lock to a single day-zone weekday (T*-TUE); company work days remain selectable unless respect_visit_days=1",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_allowed_delivery_dates",
+      "args": {
+        "zone": "T1-TUE",
+        "days_ahead": 14,
+        "respect_visit_days": "null"
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "tms_list_allowed_delivery_dates_respect_visit_dirty",
+      "source": "regression",
+      "bug": "list_allowed_delivery_dates dirty respect_visit_days must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_allowed_delivery_dates",
+      "args": {
+        "zone": "T1-TUE",
+        "respect_visit_days": "undefined",
+        "days_ahead": ""
       },
       "expect": "ok"
     },
@@ -8636,6 +8676,18 @@
       "bug": "upsert_fleet_vehicle all-null must not 500"
     },
     {
+      "id": "upsert_fleet_vehicle_dirty_max_boxes",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.upsert_fleet_vehicle",
+      "args": {
+        "vehicle": null,
+        "license_plate": null,
+        "max_boxes": "null"
+      },
+      "expect": "controlled_error",
+      "source": "regression",
+      "bug": "upsert_fleet_vehicle dirty max_boxes with null vehicle must not 500"
+    },
+    {
       "id": "list_pending_vehicle_returns_null_vehicle",
       "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_pending_vehicle_returns",
       "args": {
@@ -9263,6 +9315,42 @@
         "vehicle": null,
         "delivery_note_names": ["SAL-ORD-2099-NOEXIST"],
         "preorder_names": null
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "tms_create_trip_consulta_must_pass_orden",
+      "source": "regression",
+      "bug": "create_trip on Consulta/Draft SO is controlled ValidationError with Pass … to Orden in Pedidos (not opaque Confirm the order before planning)",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.create_trip",
+      "args": {
+        "date": "2026-11-27",
+        "driver": null,
+        "vehicle": null,
+        "delivery_note_names": null,
+        "preorder_names": ["SAL-ORD-2026-00823"]
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "create_dn_consulta_must_pass_orden",
+      "source": "regression",
+      "bug": "create_delivery_note_for_preorder on Consulta throws Pass … to Orden before creating a remito",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.create_delivery_note_for_preorder",
+      "args": {
+        "preorder_name": "SAL-ORD-2026-00823"
+      },
+      "expect": "fail"
+    },
+    {
+      "id": "record_payment_consulta_must_pass_orden",
+      "source": "regression",
+      "bug": "record_preorder_payment on Consulta throws Pass … to Orden before recording a payment",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.api.record_preorder_payment",
+      "args": {
+        "preorder_name": "SAL-ORD-2026-00823",
+        "paid_amount": 100,
+        "mode_of_payment": "Cash"
       },
       "expect": "fail"
     },

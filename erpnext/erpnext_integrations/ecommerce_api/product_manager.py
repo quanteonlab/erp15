@@ -172,12 +172,24 @@ def _new_unique_barcode() -> str:
     return body + _ean_check_digit(body)
 
 
+def _ensure_item_tracks_stock(item_code: str) -> bool:
+	"""Turn on Item.is_stock_item when stock is first controlled (recepción / PM qty)."""
+	code = cstr(item_code or "").strip()
+	if not code or not frappe.db.exists("Item", code):
+		return False
+	if cint(frappe.db.get_value("Item", code, "is_stock_item")):
+		return False
+	frappe.db.set_value("Item", code, "is_stock_item", 1, update_modified=False)
+	return True
+
+
 def _reconcile_item_stock_qty(item_code: str, warehouse: str, target_qty: float) -> None:
     """Set absolute stock in *warehouse* via Stock Reconciliation (POS Product Manager)."""
     target_qty = flt(target_qty)
     if target_qty < 0:
         frappe.throw(_("Quantity cannot be negative"))
 
+    _ensure_item_tracks_stock(item_code)
     item = frappe.get_doc("Item", item_code)
     if not item.is_stock_item:
         frappe.throw(_("Item {0} is not a stock item").format(item_code))
@@ -1224,6 +1236,7 @@ def get_product_rows(
             i.brand                  AS brand,
             i.item_group             AS source_category,
             i.stock_uom              AS stock_uom,
+            COALESCE(i.is_stock_item, 0)               AS is_stock_item,
             COALESCE(i.custom_pack_qty, NULL)          AS pack_qty,
             COALESCE(i.custom_pack_size, NULL)         AS pack_size,
             COALESCE(i.custom_pack_unit, NULL)         AS unit,
@@ -1565,6 +1578,7 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             "max_sell_qty_day": "custom_max_sell_qty_day",
             "sell_by_days": "shelf_life_in_days",
             "physical_section": "custom_physical_section",
+            "is_stock_item": "is_stock_item",
         }
         direct_field_map = {
             k: v for k, v in direct_field_map.items() if frappe.db.has_column("Item", v)
@@ -1675,6 +1689,9 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
             uom_name = (changes.get("stock_uom") or "").strip()
             updates["stock_uom"] = _normalize_stock_uom(uom_name) if uom_name else None
 
+        if "is_stock_item" in updates:
+            updates["is_stock_item"] = 1 if cint(updates["is_stock_item"]) else 0
+
         history: list[tuple[str, object, object]] = []
 
         if updates:
@@ -1698,6 +1715,7 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
         pack_link = changes.get("pack_qty") if "pack_qty" in changes else None
         if pack_link is None and frappe.db.has_column("Item", "custom_pack_qty"):
             pack_link = frappe.db.get_value("Item", item_code, "custom_pack_qty")
+        # Pack SKUs that sell via a linked unit SKU do not track warehouse stock.
         if (unit_link or "").strip() and (unit_link or "").strip() != item_code and flt(pack_link) > 1:
             frappe.db.set_value("Item", item_code, "is_stock_item", 0)
             stock_qty_target = None
@@ -1743,6 +1761,9 @@ def _save_product_row_impl(item_code, changes, price_list=None, commit=True, war
                 frappe.throw(
                     _("Select a warehouse in Product Manager before saving quantity changes.")
                 )
+            # Saving qty (recepción / manual) turns on stock control when off.
+            if _ensure_item_tracks_stock(item_code):
+                history.append(("is_stock_item", 0, 1))
             # Dirty / null mode → absolute set (legacy Product Manager behaviour).
             mode = cstr(stock_qty_mode or "set").strip().lower()
             if mode in ("", "null", "undefined", "none"):
@@ -1911,12 +1932,20 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
     pack_size = _normalize_pack_change_value("pack_size", changes.get("pack_size"))
     pack_unit = _normalize_pack_change_value("unit", changes.get("unit"))
 
+    # Stock control off by default (easy catalog ops). Turns on via checkbox,
+    # recepción / update_stock, or saving a stock qty (_ensure_item_tracks_stock).
+    if "is_stock_item" in changes:
+        track_stock = 1 if cint(changes.get("is_stock_item")) else 0
+    else:
+        track_stock = 0
+
     item_payload = {
         "doctype": "Item",
         "item_code": candidate_code,
         "item_name": title,
         "item_group": item_group,
         "stock_uom": stock_uom,
+        "is_stock_item": track_stock,
         "disabled": 0 if is_active else 1,
         "brand": brand_name or None,
         "custom_normalized_title": (changes.get("normalized_title") or "").strip() or None,
@@ -1997,6 +2026,7 @@ def create_product_row(item_code=None, changes=None, price_list=None, activate=0
         ("source_title", None, title),
         ("source_category", None, item_group),
         ("stock_uom", None, stock_uom),
+        ("is_stock_item", None, track_stock),
         ("is_active", None, 1 if is_active else 0),
         ("is_draft", None, 1 if is_draft else 0),
     ]

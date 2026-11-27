@@ -1386,6 +1386,8 @@ def get_planner_context(company=None):
 		fields=["name", "license_plate", "make", "model"],
 		ignore_permissions=True,
 	)
+	for v in vehicles or []:
+		v["max_boxes"] = _vehicle_max_boxes(v.name)
 
 	company = company or frappe.defaults.get_user_default("Company")
 	wh_filters = {"is_group": 0, "disabled": 0}
@@ -3306,6 +3308,7 @@ def claim_orders_to_trip(
 	from erpnext.erpnext_integrations.ecommerce_api.api import (
 		_delivery_note_for_sales_order,
 		_is_guest_preorder_sales_order,
+		_require_guest_preorder_passed_to_orden,
 	)
 	from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
 
@@ -3318,8 +3321,7 @@ def claim_orders_to_trip(
 		frappe.flags.ignore_permissions = False
 		if not _is_guest_preorder_sales_order(so):
 			frappe.throw(_("Not a Guest Preorder: {0}").format(so_name))
-		if so.docstatus != 1:
-			frappe.throw(_("Confirm the order before claiming: {0}").format(so_name))
+		_require_guest_preorder_passed_to_orden(so, action="claiming it onto a trip")
 
 		dn_name = _delivery_note_for_sales_order(so_name)
 		if not dn_name:
@@ -4185,6 +4187,7 @@ def _materialize_dns_for_preorders(preorder_names):
 		_delivery_note_for_sales_order,
 		_ensure_planner_delivery_note,
 		_is_guest_preorder_sales_order,
+		_require_guest_preorder_passed_to_orden,
 	)
 
 	names = preorder_names or []
@@ -4220,8 +4223,7 @@ def _materialize_dns_for_preorders(preorder_names):
 		frappe.flags.ignore_permissions = False
 		if not _is_guest_preorder_sales_order(so):
 			frappe.throw(_("Not a Guest Preorder: {0}").format(so_name))
-		if cint(so.docstatus) != 1:
-			frappe.throw(_("Confirm the order before planning: {0}").format(so_name))
+		_require_guest_preorder_passed_to_orden(so, action="planning a route")
 		# Missing street must not block MAT assign — placeholder address is OK.
 		gate = _ensure_planner_delivery_note(so, allow_missing_address=True)
 		dn = gate.get("delivery_note")
@@ -6287,10 +6289,15 @@ def _fleet_resolve_vehicle_name(raw):
 	return None
 
 
-def _fleet_members_blob(vehicle_name):
+def _fleet_vehicle_blob(vehicle_name):
 	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_get
 
-	_name, data = kv_get(FLEET_VEHICLE_SCOPE, vehicle_name)
+	_name, data = kv_get(FLEET_VEHICLE_SCOPE, cstr(vehicle_name or "").strip())
+	return data if isinstance(data, dict) else {}
+
+
+def _fleet_members_blob(vehicle_name):
+	data = _fleet_vehicle_blob(vehicle_name)
 	members = data.get("members") if isinstance(data, dict) else None
 	if not isinstance(members, list):
 		members = []
@@ -6309,6 +6316,45 @@ def _fleet_members_blob(vehicle_name):
 			}
 		)
 	return out
+
+
+def _vehicle_max_boxes(vehicle_name):
+	"""Soft max cajas on ``fleet.vehicle`` KV (else DEFAULT_DRIVER_MAX_BOXES)."""
+	raw = _fleet_vehicle_blob(vehicle_name).get("max_boxes")
+	if raw in (None, "", "null", "undefined"):
+		return DEFAULT_DRIVER_MAX_BOXES
+	try:
+		n = cint(raw)
+	except Exception:
+		return DEFAULT_DRIVER_MAX_BOXES
+	return n if n > 0 else DEFAULT_DRIVER_MAX_BOXES
+
+
+def _vehicle_set_max_boxes(vehicle_name, max_boxes):
+	"""Persist soft box capacity on ``fleet.vehicle`` KV (preserves members)."""
+	from erpnext.erpnext_integrations.ecommerce_api.ops_kv import kv_set
+
+	name = cstr(vehicle_name or "").strip()
+	if not name:
+		return None
+	data = dict(_fleet_vehicle_blob(name))
+	if max_boxes is None:
+		data.pop("max_boxes", None)
+	else:
+		raw = _dirty_str(max_boxes)
+		if raw is None:
+			data.pop("max_boxes", None)
+		else:
+			n = cint(raw)
+			if n > 0:
+				data["max_boxes"] = n
+			else:
+				data.pop("max_boxes", None)
+	data["updated_at"] = str(now_datetime())
+	if "members" not in data:
+		data["members"] = []
+	kv_set(FLEET_VEHICLE_SCOPE, name, data)
+	return data.get("max_boxes")
 
 
 def _fleet_save_members(vehicle_name, members):
@@ -6339,11 +6385,11 @@ def _fleet_save_members(vehicle_name, members):
 	elif primary_emp:
 		for m in clean:
 			m["primary"] = 1 if m["employee"] == primary_emp else 0
-	kv_set(
-		FLEET_VEHICLE_SCOPE,
-		vehicle_name,
-		{"members": clean, "updated_at": str(now_datetime())},
-	)
+	# Preserve max_boxes (and any other KV keys) when rewriting members.
+	prev = dict(_fleet_vehicle_blob(vehicle_name))
+	prev["members"] = clean
+	prev["updated_at"] = str(now_datetime())
+	kv_set(FLEET_VEHICLE_SCOPE, vehicle_name, prev)
 	# Keep Vehicle.employee as primary for trip defaults / legacy reads.
 	if frappe.db.has_column("Vehicle", "employee"):
 		frappe.db.set_value(
@@ -6427,6 +6473,7 @@ def _fleet_serialize_vehicle(vehicle_name, *, with_pins=True):
 		"primary_driver": (primary or {}).get("driver"),
 		"members": members,
 		"member_count": len(members),
+		"max_boxes": _vehicle_max_boxes(doc.name),
 	}
 
 
@@ -6476,6 +6523,7 @@ def list_fleet_vehicles(q=None, limit=100):
 					(m["employee"] for m in members if cint(m.get("primary"))),
 					(members[0]["employee"] if members else None),
 				),
+				"max_boxes": _vehicle_max_boxes(r.name),
 			}
 		)
 	return {"vehicles": out}
@@ -6538,14 +6586,24 @@ def ensure_fleet_vehicle(license_plate=None, make=None, model=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def upsert_fleet_vehicle(vehicle=None, license_plate=None, make=None, model=None):
-	"""Create or update plate / make / model on a fleet Vehicle."""
+def upsert_fleet_vehicle(vehicle=None, license_plate=None, make=None, model=None, max_boxes=None):
+	"""Create or update plate / make / model / max_boxes on a fleet Vehicle."""
 	name = _fleet_resolve_vehicle_name(vehicle or license_plate)
 	plate = cstr(license_plate or "").strip() or None
 	if not name:
 		if not plate:
 			frappe.throw(_("License plate is required."))
-		return ensure_fleet_vehicle(license_plate=plate, make=make, model=model)
+		detail = ensure_fleet_vehicle(license_plate=plate, make=make, model=model)
+		name = detail.get("name")
+		if max_boxes is not None and name:
+			_vehicle_set_max_boxes(name, max_boxes)
+			# Keep Flota driver capacity in sync when a primary driver is linked.
+			primary_drv = (detail or {}).get("primary_driver")
+			if primary_drv:
+				_driver_set_max_boxes(primary_drv, max_boxes)
+			frappe.db.commit()
+			return _fleet_serialize_vehicle(name, with_pins=True)
+		return detail
 	frappe.flags.ignore_permissions = True
 	doc = frappe.get_doc("Vehicle", name)
 	frappe.flags.ignore_permissions = False
@@ -6560,6 +6618,13 @@ def upsert_fleet_vehicle(vehicle=None, license_plate=None, make=None, model=None
 	if model is not None:
 		doc.model = cstr(model).strip() or doc.model or "N/A"
 	doc.save(ignore_permissions=True)
+	if max_boxes is not None:
+		_vehicle_set_max_boxes(name, max_boxes)
+		members = _fleet_members_blob(name)
+		primary = next((m for m in members if cint(m.get("primary"))), None)
+		primary_drv = (primary or {}).get("driver")
+		if primary_drv:
+			_driver_set_max_boxes(primary_drv, max_boxes)
 	frappe.db.commit()
 	return _fleet_serialize_vehicle(name, with_pins=True)
 
@@ -6717,12 +6782,17 @@ def get_tms_settings():
 
 
 @frappe.whitelist(allow_guest=True)
-def list_allowed_delivery_dates(customer=None, zone=None, days_ahead=60, as_of=None):
+def list_allowed_delivery_dates(
+	customer=None, zone=None, days_ahead=60, as_of=None, respect_visit_days=0
+):
 	"""TMS go-out weekdays as selectable delivery dates (YYYY-MM-DD).
 
 	- Never past; earliest = as_of + ``delivery_lead_days`` (default 1 → not today).
-	- Weekday ∈ company ``auto_group_working_days``.
-	- Optional ``zone`` / customer Address.custom_zone visit_days intersect when set.
+	- Weekday ∈ company ``auto_group_working_days`` (Mon–Fri by default).
+	- Day-zones (``T1-TUE`` → only Tue) are **not** applied by default: Orden /
+	  fecha deseada promises the next company work day (see
+	  ``_next_business_delivery_date``). Pass ``respect_visit_days=1`` only when
+	  a packing / zone UI needs that narrower set.
 	"""
 	from frappe.utils import add_days, cint, cstr, getdate
 
@@ -6737,14 +6807,39 @@ def list_allowed_delivery_dates(customer=None, zone=None, days_ahead=60, as_of=N
 		cust = cstr(customer or "").strip()
 		if cust and cust.lower() not in ("null", "undefined", "none"):
 			try:
-				# Prefer shipping address zone when present.
-				addr = frappe.db.get_value(
-					"Dynamic Link",
-					{"link_doctype": "Customer", "link_name": cust, "parenttype": "Address"},
-					"parent",
-				)
-				if addr and frappe.db.has_column("Address", "custom_zone"):
-					raw_zone = cstr(frappe.db.get_value("Address", addr, "custom_zone") or "").strip()
+				# Prefer shipping address with a zone; fall back to any linked Address.
+				if frappe.db.has_column("Address", "custom_zone"):
+					addrs = frappe.get_all(
+						"Dynamic Link",
+						filters={
+							"link_doctype": "Customer",
+							"link_name": cust,
+							"parenttype": "Address",
+						},
+						pluck="parent",
+						ignore_permissions=True,
+					)
+					ship = None
+					any_zone = None
+					for addr in addrs or []:
+						row = frappe.db.get_value(
+							"Address",
+							addr,
+							["custom_zone", "address_type", "is_shipping_address"],
+							as_dict=True,
+						) or {}
+						z = cstr(row.get("custom_zone") or "").strip()
+						if not z:
+							continue
+						if any_zone is None:
+							any_zone = z
+						is_ship = cint(row.get("is_shipping_address")) or cstr(
+							row.get("address_type") or ""
+						).lower() in ("shipping", "shipment", "entrega")
+						if is_ship:
+							ship = z
+							break
+					raw_zone = ship or any_zone or ""
 			except Exception:
 				raw_zone = ""
 
@@ -6757,8 +6852,10 @@ def list_allowed_delivery_dates(customer=None, zone=None, days_ahead=60, as_of=N
 		except Exception:
 			visit = []
 
+	# Default: company work days only — day-zones must not lock fecha deseada.
+	use_visit = cint(respect_visit_days) == 1
 	allowed = set(work)
-	if visit:
+	if use_visit and visit:
 		allowed = allowed.intersection(set(visit)) or set(work)
 
 	lead = max(1, cint(settings.get("delivery_lead_days") or 1))
@@ -6781,6 +6878,7 @@ def list_allowed_delivery_dates(customer=None, zone=None, days_ahead=60, as_of=N
 		"earliest": str(earliest),
 		"working_days": list(work),
 		"visit_days": list(visit) if visit else [],
+		"respect_visit_days": 1 if use_visit else 0,
 		"lead_days": lead,
 		"zone": raw_zone or None,
 	}
