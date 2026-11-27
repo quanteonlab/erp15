@@ -2763,6 +2763,20 @@
       "expect": "no_500"
     },
     {
+      "id": "tms_link_customer_update_orders_dirty",
+      "source": "regression",
+      "bug": "link_customer_at_location update_open_orders null/empty must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.link_customer_at_location",
+      "args": {
+        "customer": "",
+        "address": "",
+        "lat": "",
+        "lng": "",
+        "update_open_orders": "null"
+      },
+      "expect": "no_500"
+    },
+    {
       "id": "tms_auto_assign_zones_ok",
       "source": "regression",
       "bug": "auto_assign_tms_zones with null only_missing is controlled",
@@ -4296,6 +4310,29 @@
         "zone": null
       },
       "expect": "error"
+    },
+    {
+      "id": "list_saved_delivery_addresses_dirty",
+      "source": "regression",
+      "bug": "list_saved_delivery_addresses with null q/limit must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.list_saved_delivery_addresses",
+      "args": {
+        "limit": null,
+        "q": "null",
+        "backfill": ""
+      },
+      "expect": "ok"
+    },
+    {
+      "id": "search_saved_delivery_addresses_null",
+      "source": "regression",
+      "bug": "search_saved_delivery_addresses with null q must not 500",
+      "method": "erpnext.erpnext_integrations.ecommerce_api.tms_api.search_saved_delivery_addresses",
+      "args": {
+        "q": null,
+        "limit": ""
+      },
+      "expect": "ok"
     },
     {
       "id": "update_pending_delivery_address_empty",

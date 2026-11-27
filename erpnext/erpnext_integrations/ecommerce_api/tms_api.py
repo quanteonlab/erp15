@@ -2013,6 +2013,214 @@ def _resolve_pending_shipping_address(delivery_note=None, sales_order=None, addr
 	return None
 
 
+SAVED_DELIVERY_ADDRESS_DT = "Saved Delivery Address"
+
+
+def _normalize_saved_address_key(line):
+	"""Lowercase + collapse whitespace — unique key for Saved Delivery Address."""
+	return " ".join(cstr(line or "").strip().lower().split())
+
+
+def _saved_delivery_address_ready():
+	return bool(frappe.db.exists("DocType", SAVED_DELIVERY_ADDRESS_DT))
+
+
+def _record_saved_delivery_address(
+	address_line=None,
+	city=None,
+	lat=None,
+	lng=None,
+):
+	"""Upsert a street that was inserted at least once (Órdenes / map / CRM).
+
+	No-ops until the DocType is migrated. Never raises to callers.
+	"""
+	try:
+		if not _saved_delivery_address_ready():
+			return None
+		line = cstr(address_line or "").strip()
+		if not line or line.lower() in ("null", "undefined", "none", "-", "sin dirección"):
+			return None
+		key = _normalize_saved_address_key(line)
+		if not key:
+			return None
+		city_raw = cstr(city or "").strip()
+		if city_raw.lower() in ("null", "undefined", "none", "-"):
+			city_raw = ""
+		lat_f = None
+		lng_f = None
+		if lat not in (None, "", "null", "undefined", "none") and lng not in (
+			None,
+			"",
+			"null",
+			"undefined",
+			"none",
+		):
+			try:
+				lat_f = flt(lat)
+				lng_f = flt(lng)
+			except Exception:
+				lat_f = None
+				lng_f = None
+		has_coords = (
+			lat_f is not None
+			and lng_f is not None
+			and (abs(lat_f) > 0.0001 or abs(lng_f) > 0.0001)
+		)
+		existing = frappe.db.get_value(
+			SAVED_DELIVERY_ADDRESS_DT,
+			{"normalized_key": key},
+			["name", "use_count", "latitude", "longitude", "city", "address_line"],
+			as_dict=True,
+		)
+		now = now_datetime()
+		if existing:
+			updates = {
+				"use_count": cint(existing.use_count or 0) + 1,
+				"last_used": now,
+				"address_line": line[:255],
+			}
+			if city_raw and not cstr(existing.city or "").strip():
+				updates["city"] = city_raw[:140]
+			if has_coords and not (
+				flt(existing.latitude) or flt(existing.longitude)
+			):
+				updates["latitude"] = lat_f
+				updates["longitude"] = lng_f
+				updates["geocoded"] = 1
+			elif has_coords:
+				updates["latitude"] = lat_f
+				updates["longitude"] = lng_f
+				updates["geocoded"] = 1
+			frappe.db.set_value(
+				SAVED_DELIVERY_ADDRESS_DT,
+				existing.name,
+				updates,
+				update_modified=True,
+			)
+			return existing.name
+		doc = frappe.get_doc(
+			{
+				"doctype": SAVED_DELIVERY_ADDRESS_DT,
+				"address_line": line[:255],
+				"normalized_key": key[:255],
+				"city": city_raw[:140] if city_raw else None,
+				"latitude": lat_f if has_coords else None,
+				"longitude": lng_f if has_coords else None,
+				"geocoded": 1 if has_coords else 0,
+				"use_count": 1,
+				"last_used": now,
+			}
+		)
+		doc.insert(ignore_permissions=True)
+		return doc.name
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "record_saved_delivery_address")
+		return None
+
+
+def _backfill_saved_delivery_addresses(limit=500):
+	"""Seed catalog from existing Address.address_line1 rows (once / when empty)."""
+	if not _saved_delivery_address_ready():
+		return 0
+	existing = cint(
+		frappe.db.count(SAVED_DELIVERY_ADDRESS_DT) or 0
+	)
+	if existing > 0:
+		return 0
+	rows = frappe.get_all(
+		"Address",
+		filters={"disabled": 0},
+		fields=["address_line1", "city", "custom_latitude", "custom_longitude"]
+		if frappe.db.has_column("Address", "custom_latitude")
+		else ["address_line1", "city"],
+		limit_page_length=cint(limit) or 500,
+		ignore_permissions=True,
+	)
+	n = 0
+	for row in rows or []:
+		line = cstr(row.get("address_line1") or "").strip()
+		if not line:
+			continue
+		name = _record_saved_delivery_address(
+			line,
+			city=row.get("city"),
+			lat=row.get("custom_latitude"),
+			lng=row.get("custom_longitude"),
+		)
+		if name:
+			n += 1
+	if n:
+		frappe.db.commit()
+	return n
+
+
+def _serialize_saved_delivery_address(row):
+	lat = row.get("latitude")
+	lng = row.get("longitude")
+	has_geo = bool(cint(row.get("geocoded"))) and (
+		flt(lat) or flt(lng)
+	)
+	city = cstr(row.get("city") or "").strip() or None
+	line = cstr(row.get("address_line") or "").strip()
+	display = f"{line}, {city}" if city and city.lower() not in line.lower() else line
+	return {
+		"name": row.get("name"),
+		"address_line": line,
+		"city": city,
+		"display": display,
+		"lat": flt(lat) if has_geo else None,
+		"lng": flt(lng) if has_geo else None,
+		"geocoded": bool(has_geo),
+		"use_count": cint(row.get("use_count") or 0),
+		"last_used": str(row.get("last_used") or "") or None,
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def list_saved_delivery_addresses(limit=200, q=None, backfill=None):
+	"""Saved streets for Órdenes Dirección combobox (most recently used first)."""
+	if not _saved_delivery_address_ready():
+		return {"addresses": [], "ready": False}
+	do_backfill = True
+	if backfill is not None and backfill != "":
+		do_backfill = str(backfill).strip().lower() in ("1", "true", "yes")
+	if do_backfill:
+		_backfill_saved_delivery_addresses()
+	limit = max(1, min(cint(limit) or 200, 500))
+	filters = {}
+	query = cstr(q or "").strip()
+	if query and query.lower() not in ("null", "undefined", "none"):
+		filters["address_line"] = ["like", f"%{query}%"]
+	rows = frappe.get_all(
+		SAVED_DELIVERY_ADDRESS_DT,
+		filters=filters,
+		fields=[
+			"name",
+			"address_line",
+			"city",
+			"latitude",
+			"longitude",
+			"geocoded",
+			"use_count",
+			"last_used",
+		],
+		order_by="last_used desc, use_count desc, modified desc",
+		limit_page_length=limit,
+		ignore_permissions=True,
+	)
+	return {
+		"ready": True,
+		"addresses": [_serialize_saved_delivery_address(r) for r in (rows or [])],
+	}
+
+
+@frappe.whitelist(allow_guest=True)
+def search_saved_delivery_addresses(q=None, limit=40):
+	"""Text filter over Saved Delivery Address (same payload as list)."""
+	return list_saved_delivery_addresses(limit=limit, q=q, backfill=0)
+
+
 @frappe.whitelist(allow_guest=True)
 def update_pending_delivery_address(
 	delivery_note=None,
@@ -2078,6 +2286,12 @@ def update_pending_delivery_address(
 	if not updates:
 		frappe.throw(_("Address fields are not available on this site."))
 	frappe.db.set_value("Address", addr_name, updates, update_modified=True)
+	_record_saved_delivery_address(
+		street,
+		city=city_raw if city_raw and city_raw.lower() not in ("null", "undefined", "none") else None,
+		lat=lat_f if has_coords else None,
+		lng=lng_f if has_coords else None,
+	)
 	frappe.db.commit()
 	display_bits = [street]
 	if city_raw and city_raw.lower() not in ("null", "undefined", "none"):
@@ -11024,12 +11238,13 @@ def _ensure_geo_address(title, line1, lat, lng, link_doctype=None, link_name=Non
 	"""Insert Address with coordinates; optionally link to Customer/Warehouse."""
 	lat = flt(lat)
 	lng = flt(lng)
+	line = cstr(line1 or title or "").strip() or "Buenos Aires"
 	doc = frappe.get_doc(
 		{
 			"doctype": "Address",
 			"address_title": cstr(title or line1 or "Map pin")[:140],
 			"address_type": address_type,
-			"address_line1": cstr(line1 or title or "").strip() or "Buenos Aires",
+			"address_line1": line,
 			"city": "Buenos Aires",
 			"country": "Argentina",
 			"is_shipping_address": 1 if address_type == "Shipping" else 0,
@@ -11040,6 +11255,7 @@ def _ensure_geo_address(title, line1, lat, lng, link_doctype=None, link_name=Non
 	if link_doctype and link_name:
 		doc.append("links", {"link_doctype": link_doctype, "link_name": link_name})
 	doc.insert(ignore_permissions=True)
+	_record_saved_delivery_address(line, city="Buenos Aires", lat=lat, lng=lng)
 	frappe.db.commit()
 	return doc
 
@@ -11433,9 +11649,68 @@ def create_customer_at_location(
 	}
 
 
+def _propagate_delivery_address_to_open_orders(customer, address_line, address_name=None):
+	"""Point open Sales Orders for ``customer`` at this delivery street (map Assign checkbox)."""
+	from erpnext.erpnext_integrations.ecommerce_api.api import (
+		_guest_preorder_tag_fieldname,
+		_is_guest_preorder_sales_order,
+		_update_guest_preorder_tag,
+	)
+
+	customer = cstr(customer or "").strip()
+	line = cstr(address_line or "").strip()
+	if not customer or not line:
+		return []
+	# Open / in-flight only — skip closed / cancelled.
+	rows = frappe.get_all(
+		"Sales Order",
+		filters={
+			"customer": customer,
+			"docstatus": ["<", 2],
+			"status": ["not in", ["Completed", "Closed", "Cancelled"]],
+		},
+		fields=["name"],
+		ignore_permissions=True,
+	)
+	addr_ok = bool(address_name and frappe.db.exists("Address", address_name))
+	tag_fn = _guest_preorder_tag_fieldname()
+	updated = []
+	for row in rows or []:
+		name = cstr(row.get("name") or "").strip()
+		if not name:
+			continue
+		frappe.flags.ignore_permissions = True
+		try:
+			so = frappe.get_doc("Sales Order", name)
+		finally:
+			frappe.flags.ignore_permissions = False
+		fields = {}
+		if addr_ok:
+			fields["shipping_address_name"] = address_name
+			so.shipping_address_name = address_name
+		if _is_guest_preorder_sales_order(so) and tag_fn:
+			_update_guest_preorder_tag(so, "guest_address", line)
+			fields[tag_fn] = getattr(so, tag_fn, None)
+		if fields:
+			frappe.db.set_value("Sales Order", so.name, fields, update_modified=True)
+		updated.append(so.name)
+	return updated
+
+
 @frappe.whitelist(allow_guest=True)
-def link_customer_at_location(customer=None, address=None, lat=None, lng=None, label=None):
-	"""Attach a new geocoded shipping Address to an existing Customer."""
+def link_customer_at_location(
+	customer=None,
+	address=None,
+	lat=None,
+	lng=None,
+	label=None,
+	update_open_orders=None,
+):
+	"""Attach a new geocoded shipping Address to an existing Customer.
+
+	When ``update_open_orders`` is truthy (map Assign checkbox), also rewrite
+	shipping / guest_address on that client's open Sales Orders.
+	"""
 	customer = cstr(customer or "").strip()
 	if not customer or not frappe.db.exists("Customer", customer):
 		frappe.throw(_("Customer not found."))
@@ -11452,6 +11727,29 @@ def link_customer_at_location(customer=None, address=None, lat=None, lng=None, l
 		link_name=customer,
 		address_type="Shipping",
 	)
+	# Keep CRM primary in sync with the map pin.
+	try:
+		frappe.db.set_value(
+			"Customer",
+			customer,
+			{
+				"customer_primary_address": addr.name,
+				"primary_address": addr_line,
+			},
+			update_modified=True,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "link_customer_at_location primary")
+
+	sync_orders = True
+	if update_open_orders is not None and update_open_orders != "":
+		sync_orders = str(update_open_orders).strip().lower() in ("1", "true", "yes")
+	orders_updated = []
+	if sync_orders:
+		orders_updated = _propagate_delivery_address_to_open_orders(
+			customer, addr_line, addr.name
+		)
+
 	store = _load_tms_map_store()
 	pin = {
 		"id": _new_map_id("cust"),
@@ -11468,7 +11766,15 @@ def link_customer_at_location(customer=None, address=None, lat=None, lng=None, l
 	}
 	store["pins"] = list(store.get("pins") or []) + [pin]
 	_save_tms_map_store(store)
-	return {"customer": customer, "address": addr.name, "pin": pin, "pins": store["pins"]}
+	frappe.db.commit()
+	return {
+		"customer": customer,
+		"address": addr.name,
+		"pin": pin,
+		"pins": store["pins"],
+		"orders_updated": orders_updated,
+		"orders_updated_count": len(orders_updated),
+	}
 
 
 # ---------------------------------------------------------------------------

@@ -10971,6 +10971,14 @@ def _set_preorder_shipping_address_line(so, address_line1: str):
 		update_modified=True,
 	)
 	so.shipping_address_name = addr_name
+	try:
+		from erpnext.erpnext_integrations.ecommerce_api.tms_api import (
+			_record_saved_delivery_address,
+		)
+
+		_record_saved_delivery_address(line)
+	except Exception:
+		pass
 	return addr_name
 
 

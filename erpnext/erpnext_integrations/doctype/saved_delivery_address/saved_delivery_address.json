@@ -1,0 +1,140 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-11-27 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "address_line",
+  "normalized_key",
+  "city",
+  "column_break_geo",
+  "latitude",
+  "longitude",
+  "geocoded",
+  "section_usage",
+  "use_count",
+  "last_used"
+ ],
+ "fields": [
+  {
+   "fieldname": "address_line",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Address Line",
+   "length": 255,
+   "reqd": 1
+  },
+  {
+   "description": "Lowercased / collapsed whitespace key for de-duplication.",
+   "fieldname": "normalized_key",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Normalized Key",
+   "length": 255,
+   "read_only": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "city",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "City"
+  },
+  {
+   "fieldname": "column_break_geo",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "latitude",
+   "fieldtype": "Float",
+   "label": "Latitude",
+   "precision": "9"
+  },
+  {
+   "fieldname": "longitude",
+   "fieldtype": "Float",
+   "label": "Longitude",
+   "precision": "9"
+  },
+  {
+   "default": "0",
+   "fieldname": "geocoded",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Geocoded"
+  },
+  {
+   "fieldname": "section_usage",
+   "fieldtype": "Section Break",
+   "label": "Usage"
+  },
+  {
+   "default": "1",
+   "fieldname": "use_count",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Use Count",
+   "non_negative": 1
+  },
+  {
+   "fieldname": "last_used",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Last Used"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-11-27 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERPNext Integrations",
+ "name": "Saved Delivery Address",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "Sales User",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 0,
+   "print": 0,
+   "read": 1,
+   "report": 0,
+   "role": "Stock User",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "last_used",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "address_line",
+ "track_changes": 0
+}
